@@ -34,7 +34,7 @@ const ERROR_STATUS: u8 = 2;
 
 fn run(command: Command) -> anyhow::Result<Exit> {
     let repo = repo::Repo::open()?;
-    match command {
+    let result = match command {
         Command::Fetch { upstreams } => commands::fetch::run(&repo, &upstreams),
         Command::Start { upstreams } => commands::update::start(&repo, &upstreams),
         Command::Continue => commands::update::resume(&repo),
@@ -46,7 +46,9 @@ fn run(command: Command) -> anyhow::Result<Exit> {
         Command::Log { upstreams, json } => commands::log::run(&repo, &upstreams, json),
         Command::Branches { upstreams, json } => commands::branches::run(&repo, &upstreams, json),
         Command::Doctor { json } => commands::doctor::run(&repo, json),
-    }
+    };
+    repo.note_removed_directory();
+    result
 }
 
 fn main() -> ExitCode {

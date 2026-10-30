@@ -134,7 +134,9 @@ git intake finish       # fast-forward, publish, clean up
 # once the merge request is merged, run finish again to complete the update
 ```
 
-Every command works the same from any directory of the repository: the main checkout, a linked worktree, or the update worktree itself. Git operations on the repository as a whole, such as fetching, pushing and moving branches, run in the main worktree, so a relative remote URL means what it means there. When `finish` or `abort` removes the update worktree it was run from, the command still completes and notes that the current directory is gone; change to another directory before the next command.
+Every command works the same from any directory of the repository: the main checkout, a linked worktree, or the update worktree itself. This holds for a submodule and for a repository whose git directory lies outside its checkout as well. Git operations on the repository as a whole, such as fetching, pushing and moving branches, run in the main worktree, so a relative remote URL means what it means there. A revision named to `start` is resolved in the worktree `start` runs in. When `finish` or `abort` removes the update worktree it was run from, the command still completes and notes that the current directory is gone; change to another directory before the next command.
+
+Git cannot locate the main worktree of a repository whose git directory lies outside it, without naming it, from a linked worktree. The tool then finds it in the update in progress, which `start` records. Without an update, run `start` in the main worktree; from elsewhere it refuses, `doctor` fails its checkout check, and a relative remote URL is resolved against the git directory.
 
 `start` refuses to begin if any of these hold:
 

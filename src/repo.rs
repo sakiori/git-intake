@@ -1,6 +1,7 @@
 //! The repository the tool runs in: its common git directory, worktrees,
 //! cleanliness, and the committed configuration.
 
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,16 +13,37 @@ use crate::state::{self, Paths, UpdateState};
 
 pub struct Repo {
     /// Runs every repository-wide git command. It is bound to the main
-    /// worktree, or to the repository itself when it is bare, never to the
-    /// directory the tool was started in: that directory may be the update
-    /// worktree, which `finish` and `abort` remove, and relative remote URLs
-    /// must mean what they mean in the main worktree.
+    /// worktree, or to the git directory when the repository is bare or its
+    /// main worktree cannot be located, never to the directory the tool was
+    /// started in: that directory may be the update worktree, which `finish`
+    /// and `abort` remove, and relative remote URLs must mean what they mean
+    /// in the main worktree.
     pub git: Git,
+    /// Bound to the directory the tool was started in. Only for what the user
+    /// names there, such as the revisions given to `start`, which removes no
+    /// worktree.
+    pub here: Git,
     pub paths: Paths,
+    /// The repository's common git directory.
+    common: PathBuf,
+    main: MainWorktree,
     /// The top of the worktree the tool was started in.
     toplevel: Option<PathBuf>,
     /// The commit at `HEAD` of the worktree the tool was started in.
     head: Option<String>,
+    /// Whether this command removed the update worktree it was started in.
+    left_removed_directory: Cell<bool>,
+}
+
+/// Where the repository's main worktree is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MainWorktree {
+    /// The repository is bare and has none.
+    Bare,
+    At(PathBuf),
+    /// The git directory lies outside the main worktree and does not name it,
+    /// the tool was not started in it, and no update in progress recorded it.
+    Unknown,
 }
 
 /// One entry of `git worktree list`.
@@ -29,7 +51,6 @@ pub struct Repo {
 pub struct Worktree {
     pub path: PathBuf,
     pub branch: Option<String>,
-    pub bare: bool,
 }
 
 /// The configuration and whether the working copy differs from it.
@@ -51,19 +72,28 @@ impl Repo {
             .success()
             .then(|| canonical(Path::new(top.stdout.trim())));
         let head = here.commit("HEAD")?;
-        let worktrees = here.run(&["worktree", "list", "--porcelain", "-z"])?;
-        let main = parse_worktrees(&worktrees)
-            .into_iter()
-            .next()
-            .map(|w| w.path)
-            .filter(|main| matches!(common_dir(&Git::worktree(main)), Ok(Ok(c)) if c == common));
+        let git_dir = here.raw(&["rev-parse", "--path-format=absolute", "--git-dir"])?;
+        let started_in_main =
+            git_dir.success() && canonical(Path::new(git_dir.stdout.trim())) == common;
+        let paths = Paths::new(&common);
+        let main = locate_main_worktree(
+            &common,
+            toplevel.as_deref().filter(|_| started_in_main),
+            &paths,
+        )?;
+        let anchor = match &main {
+            MainWorktree::At(dir) => dir.clone(),
+            MainWorktree::Bare | MainWorktree::Unknown => common.clone(),
+        };
         Ok(Self {
-            // A main worktree that is gone or no longer belongs to this
-            // repository leaves the repository itself as the place to run in.
-            git: Git::worktree(main.unwrap_or_else(|| common.clone())),
-            paths: Paths::new(&common),
+            git: Git::worktree(anchor),
+            here,
+            paths,
+            common,
+            main,
             toplevel,
             head,
+            left_removed_directory: Cell::new(false),
         })
     }
 
@@ -84,26 +114,55 @@ impl Repo {
         state::save(&self.paths.state, state)
     }
 
-    /// Every worktree of the repository, the main one first.
+    /// Every worktree of the repository, the main one first. Git lists the
+    /// git directory for a main worktree that lies elsewhere; it is replaced
+    /// by the main worktree when that is known.
     pub fn worktrees(&self) -> Result<Vec<Worktree>> {
         let out = self.git.run(&["worktree", "list", "--porcelain", "-z"])?;
-        Ok(parse_worktrees(&out))
+        let mut list = parse_worktrees(&out);
+        if let (Some(first), MainWorktree::At(dir)) = (list.first_mut(), &self.main) {
+            first.path = dir.clone();
+        }
+        Ok(list)
     }
 
-    /// The main checkout, unless the repository is bare.
+    /// Where the main worktree is.
+    pub fn main_worktree(&self) -> &MainWorktree {
+        &self.main
+    }
+
+    /// The main checkout, unless the repository is bare. Refuses when it
+    /// cannot be located.
     pub fn main_checkout(&self) -> Result<Option<PathBuf>> {
-        Ok(self
-            .worktrees()?
-            .into_iter()
-            .next()
-            .filter(|w| !w.bare)
-            .map(|w| w.path))
+        match &self.main {
+            MainWorktree::Bare => Ok(None),
+            MainWorktree::At(dir) => Ok(Some(dir.clone())),
+            MainWorktree::Unknown => bail!("{}", self.unknown_main_worktree()),
+        }
     }
 
-    /// Worktrees that have `branch` checked out.
+    /// Why the main worktree cannot be located.
+    pub fn unknown_main_worktree(&self) -> String {
+        format!(
+            "the main worktree cannot be located from here: the git directory {} lies outside it and does not name it; \
+             run the command in the main worktree",
+            self.common.display()
+        )
+    }
+
+    /// Worktrees that have `branch` checked out. Refuses when the main
+    /// worktree has it checked out but cannot be located.
     pub fn checkouts_of(&self, branch: &str) -> Result<Vec<PathBuf>> {
-        Ok(self
-            .worktrees()?
+        let list = self.worktrees()?;
+        if self.main == MainWorktree::Unknown
+            && list.first().and_then(|w| w.branch.as_deref()) == Some(branch)
+        {
+            bail!(
+                "'{branch}' is checked out in the main worktree, and {}",
+                self.unknown_main_worktree()
+            );
+        }
+        Ok(list
             .into_iter()
             .filter(|w| w.branch.as_deref() == Some(branch))
             .map(|w| w.path)
@@ -274,11 +333,19 @@ impl Repo {
         }
         self.git.run(&["worktree", "prune"])?;
         if started_inside && !removed.is_empty() {
+            self.left_removed_directory.set(true);
+        }
+        Ok(removed)
+    }
+
+    /// Notes that the command removed the update worktree it was started in.
+    /// Printed once the command's own output is complete.
+    pub fn note_removed_directory(&self) {
+        if self.left_removed_directory.get() {
             eprintln!(
                 "note: the current directory was in the update worktree, which is now removed"
             );
         }
-        Ok(removed)
     }
 
     /// Whether the tool was started in the update worktree.
@@ -295,6 +362,67 @@ impl Repo {
         fs::remove_dir_all(logs).with_context(|| format!("cannot remove {}", logs.display()))?;
         Ok(vec![format!("logs {}", logs.display())])
     }
+}
+
+/// Locates the main worktree of the repository whose common git directory is
+/// `common`. `started_in` is the top of the worktree the tool was started in
+/// when that is the main worktree.
+fn locate_main_worktree(
+    common: &Path,
+    started_in: Option<&Path>,
+    paths: &Paths,
+) -> Result<MainWorktree> {
+    let repo = Git::worktree(common);
+    if repo.line(&["rev-parse", "--is-bare-repository"])? == "true" {
+        return Ok(MainWorktree::Bare);
+    }
+    // `core.worktree`, as a submodule's git directory sets it.
+    let top = repo.raw(&["rev-parse", "--show-toplevel"])?;
+    if top.success() {
+        return Ok(MainWorktree::At(canonical(Path::new(top.stdout.trim()))));
+    }
+    // The usual layout: the git directory is `.git` at the top of the main
+    // worktree.
+    if common.file_name().is_some_and(|n| n == ".git")
+        && let Some(parent) = common.parent()
+        && is_main_worktree(parent, common)?
+    {
+        return Ok(MainWorktree::At(parent.to_path_buf()));
+    }
+    // A git directory placed elsewhere names its main worktree nowhere: the
+    // tool was started in it, or the update in progress recorded it.
+    if let Some(top) = started_in {
+        return Ok(MainWorktree::At(top.to_path_buf()));
+    }
+    // An unreadable state is reported by the command that needs it.
+    let recorded = state::load(&paths.state)
+        .ok()
+        .flatten()
+        .and_then(|s| s.main_worktree);
+    if let Some(dir) = recorded
+        && is_main_worktree(&dir, common)?
+    {
+        return Ok(MainWorktree::At(dir));
+    }
+    Ok(MainWorktree::Unknown)
+}
+
+/// Whether `dir` is the top of the main worktree of the repository whose
+/// common git directory is `common`.
+fn is_main_worktree(dir: &Path, common: &Path) -> Result<bool> {
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    let out = Git::worktree(dir).raw(&[
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-dir",
+        "--show-toplevel",
+    ])?;
+    let mut lines = out.stdout.lines();
+    Ok(out.success()
+        && lines.next().map(|l| canonical(Path::new(l))).as_deref() == Some(common)
+        && lines.next().map(|l| canonical(Path::new(l))).as_deref() == Some(dir))
 }
 
 /// The canonical common git directory of the repository `git` runs in, or
@@ -320,14 +448,11 @@ fn parse_worktrees(out: &str) -> Vec<Worktree> {
             current = Some(Worktree {
                 path: canonical(Path::new(path)),
                 branch: None,
-                bare: false,
             });
-        } else if let Some(w) = current.as_mut() {
-            if let Some(b) = line.strip_prefix("branch ") {
-                w.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
-            } else if line == "bare" {
-                w.bare = true;
-            }
+        } else if let Some(w) = current.as_mut()
+            && let Some(b) = line.strip_prefix("branch ")
+        {
+            w.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
         }
     }
     if let Some(w) = current {

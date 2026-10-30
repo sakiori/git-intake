@@ -132,7 +132,7 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
             .and_then(|t| t.rev.clone());
         let target = match &rev {
             None => tip,
-            Some(rev) => match target::resolve(git, up, rev, &tip)? {
+            Some(rev) => match target::resolve(git, &repo.here, up, rev, &tip)? {
                 Ok(commit) => commit,
                 Err(why) => {
                     refusals.push(why);
@@ -228,6 +228,7 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
         &base,
     ])?;
     let mut state = UpdateState::new(config, base.clone(), repo.paths.worktree.clone(), queue);
+    state.main_worktree = repo.main_checkout()?;
     repo.save_state(&state)?;
     println!(
         "update started from {} at {} in {}",
