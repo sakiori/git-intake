@@ -1012,8 +1012,16 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
         retry_of: None,
     };
     // An open merge request is read again just before and right after the
-    // push, as `sync` reads it.
-    let read_head = open.as_ref().map(|o| o.head.clone()).unwrap_or_default();
+    // push, as `sync` reads it, against its branch as the remote has it now.
+    let read_head = match &open {
+        Some(open) => {
+            let full = branch_ref(&open.source);
+            remote_refs(&repo.git, &remote, std::slice::from_ref(&full))?
+                .remove(&full)
+                .unwrap_or_default()
+        }
+        None => String::new(),
+    };
     let published = match &open {
         Some(open) => {
             let mut guard = guard(repo, forge.as_ref(), &remote, open, &read_head, &tip);
