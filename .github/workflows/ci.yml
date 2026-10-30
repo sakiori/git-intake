@@ -169,6 +169,22 @@ jobs:
       - run: cargo update --dry-run
       - run: cargo deny --locked check
 
+  # Packages the crate as cargo publish does and builds the packaged crate,
+  # which the release job, publishing with publish_no_verify, does not do.
+  # The release job requires this check on the release pull request's last
+  # commit.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - run: cargo package --locked
+
   # Builds and packs the release archive of every release target exactly as
   # binaries.yml does for a release tag, with the third-party notices and the
   # manual pages, and checks its layout; it attests and uploads nothing. A

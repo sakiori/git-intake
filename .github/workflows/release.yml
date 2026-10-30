@@ -123,7 +123,8 @@ jobs:
           fi
       # The crate is published before any binary is built, and a published
       # version cannot be replaced, so this step finds the commit release-plz
-      # will release and requires CI's release builds of every target on it.
+      # will release and requires CI's package check and release builds of
+      # every target on it.
       # release-plz 0.3.174 takes the first pull request associated with the
       # commit whose branch starts with release-plz-, lists its commits with
       # one unpaginated request, which returns the first 30, and releases the
@@ -132,7 +133,7 @@ jobs:
       # so publication is refused unless the two agree. A commit that is not
       # the merge of a release pull request releases nothing and needs no
       # check.
-      - name: Require the release builds of the commit release-plz releases
+      - name: Require the package check and release builds of the commit release-plz releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -159,15 +160,15 @@ jobs:
           fi
           runs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$head/check-runs?per_page=100" --jq '.check_runs[]' | jq -s .)
           failed=0
-          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin; do
-            check="release-build ($target)"
+          for check in package "release-build (x86_64-unknown-linux-musl)" "release-build (aarch64-unknown-linux-musl)" \
+            "release-build (aarch64-apple-darwin)" "release-build (x86_64-apple-darwin)"; do
             conclusion=$(printf '%s' "$runs" | jq -r --arg name "$check" \
               '[.[] | select(.name == $name and .app.slug == "github-actions")] | sort_by(.completed_at // "") | last | .conclusion // "missing"')
             echo "$check on $head: $conclusion"
             [ "$conclusion" = success ] || failed=1
           done
           if [ "$failed" != 0 ]; then
-            echo "::error::the release builds did not all pass on $head, the release pull request's last commit; nothing was published"
+            echo "::error::the package check and the release builds did not all pass on $head, the release pull request's last commit; nothing was published"
             exit 1
           fi
       # Tags created with the workflow's own token start no workflow, so

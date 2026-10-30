@@ -16,6 +16,12 @@ release_always = false
 git_release_enable = false
 # A binary has no library API for cargo-semver-checks to compare.
 semver_check = false
+# cargo publish does not build the packaged crate, and with it the build
+# scripts and procedural macros of its dependencies, in the job that holds the
+# GitHub App's token and the OIDC token crates.io accepts. CI's package job
+# builds the packaged crate instead, and the release job requires it on the
+# release pull request's last commit.
+publish_no_verify = true
 
 [[package]]
 name = "git-intake"
