@@ -256,6 +256,13 @@ impl Git {
         Ok(parse_porcelain_z(&out))
     }
 
+    /// Files in this worktree that differ from `HEAD` or the index, untracked
+    /// files included and ignored files left out.
+    pub fn worktree_changes(&self) -> Result<Vec<String>> {
+        let out = self.run(&["status", "--porcelain", "-z", "--untracked-files=all"])?;
+        Ok(parse_porcelain_z(&out))
+    }
+
     /// Files with unmerged index entries in this worktree.
     pub fn unmerged_files(&self) -> Result<Vec<String>> {
         let out = self.run(&["diff", "--name-only", "-z", "--diff-filter=U"])?;

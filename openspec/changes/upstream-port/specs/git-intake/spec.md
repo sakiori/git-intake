@@ -153,11 +153,15 @@ A copy that stops on conflicts SHALL stop the update as a conflicted merge does,
 - **THEN** the first `continue` stops with the hook's output, and the next commits the staged fix as the copy with the upstream author, message and trailers, keeping any unstaged work
 
 ### Requirement: Unstaged copy
-A copy SHALL be recorded as `have` only when neither the index nor the worktree differs from the update branch head. When the index holds no change of the copy but tracked files in the worktree differ, the tool SHALL stop the update as for a failed commit, change nothing, and say to stage what belongs to the copy.
+A copy SHALL be recorded as `have` only when neither the index nor the worktree differs from the update branch head. When the index holds no change of the copy but files in the worktree differ, untracked files included, the tool SHALL stop the update as for a failed commit, change nothing, and say to stage what belongs to the copy.
 
 #### Scenario: Interrupted copy left in the worktree
 - **WHEN** `continue` resumes a copy whose changes are in the worktree but not staged
 - **THEN** it stops, commits nothing and records no decision, and after the changes are staged the next `continue` commits them as the copy
+
+#### Scenario: File added by the copy and unstaged
+- **WHEN** the commit of a copy that adds a file fails, and the user unstages that file before `continue`
+- **THEN** `continue` stops again instead of recording the commit as present
 
 ### Requirement: Git-intake files in copies
 A copy SHALL NOT change `.git-intake.toml` or anything under `.git-intake/`. The tool SHALL restore those paths from the update branch head before committing a copy, report the paths it left out in the output of `continue` and in `report`, and record a copy that changed nothing else as `have`.

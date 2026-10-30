@@ -1521,7 +1521,9 @@ fn an_interrupted_copy_left_unstaged_stops_until_it_is_staged() {
     env.git(&wt, &["add", "-N", "p1.txt"]);
     let out = stdout(&f.tool(&["continue"]).code(1));
     assert!(
-        out.contains("nothing of the copy is staged, but tracked files have unstaged changes"),
+        out.contains(
+            "nothing of the copy is staged, but files in the worktree have unstaged changes"
+        ),
         "{out}"
     );
     assert!(out.contains("stage what belongs to the copy"), "{out}");
@@ -1537,4 +1539,45 @@ fn an_interrupted_copy_left_unstaged_stops_until_it_is_staged() {
     assert_eq!(taken_by(&f, &env.rev(&wt, "HEAD~1")), c[0]);
     let journal = fs::read_to_string(wt.join(JOURNAL)).unwrap();
     assert!(!journal.contains("verdict = \"have\""), "{journal}");
+}
+
+#[test]
+fn a_copy_whose_added_file_was_unstaged_is_not_recorded_as_present() {
+    let f = Fork::port();
+    let env = &f.env;
+    let added = upstream_change(&f, "q.txt", "FORBIDDEN\n", "upstream: add q.txt");
+    let hook = f.down.join(".git").join("hooks").join("pre-commit");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        "#!/bin/sh\nif git diff --cached | grep -q FORBIDDEN; then echo 'forbidden content' >&2; exit 1; fi\nexit 0\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    f.tool(&["start"]).success();
+    write_plan(&f, &[("take", &added, "")]);
+    f.tool(&["continue"]).code(1);
+    let wt = env.update_worktree(&f.down);
+    let head = env.rev(&wt, "HEAD");
+    // The added file is unstaged and becomes untracked.
+    env.git(&wt, &["restore", "--staged", "q.txt"]);
+    let out = stdout(&f.tool(&["continue"]).code(1));
+    assert!(
+        out.contains(
+            "nothing of the copy is staged, but files in the worktree have unstaged changes"
+        ),
+        "{out}"
+    );
+    assert_eq!(env.rev(&wt, "HEAD"), head, "nothing is committed");
+    assert!(!wt.join(JOURNAL).exists(), "no decision is recorded");
+
+    fs::write(wt.join("q.txt"), "fine\n").unwrap();
+    env.git(&wt, &["add", "q.txt"]);
+    f.tool(&["continue"])
+        .success()
+        .stdout(contains(format!("upstream: copied {} as", &added[..12])));
+    // The copy, then the journal that the first plan starts.
+    assert_eq!(taken_by(&f, &env.rev(&wt, "HEAD~1")), added);
 }

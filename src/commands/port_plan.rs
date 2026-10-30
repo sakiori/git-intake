@@ -251,12 +251,13 @@ fn finish_copy(
     let name = state.upstreams[i].name.clone();
     let entry = plan_of(state, i)?.commits[index].clone();
     if wt.test(&["diff", "--cached", "--quiet"])? {
-        let unstaged = wt.tracked_changes()?;
+        let unstaged = wt.worktree_changes()?;
         if !unstaged.is_empty() {
-            // Only what is staged is committed: a copy left in the worktree
-            // would be recorded as present though nothing was taken.
+            // Only what is staged is committed: a copy left in the worktree,
+            // including a file it added that is no longer staged, would be
+            // recorded as present though nothing was taken.
             let why = format!(
-                "nothing of the copy is staged, but tracked files have unstaged changes:\n{}",
+                "nothing of the copy is staged, but files in the worktree have unstaged changes:\n{}",
                 bullet(&unstaged)
             );
             stop_on_failed_commit(repo, state, i, index, &why)?;
