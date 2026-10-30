@@ -207,6 +207,9 @@ pub type Guard<'g> = &'g mut dyn FnMut(Stage) -> Result<Option<Stopped>>;
 pub struct Stopped {
     pub exit: Exit,
     pub message: String,
+    /// The merge request when it is no longer open, and whether the branch
+    /// a push recreated after its merge was deleted.
+    pub ended: Option<(MergeRequest, bool)>,
 }
 
 /// What [`publish`] publishes.
@@ -358,6 +361,7 @@ pub fn guard<'a>(
                             now.state.describe(),
                             kind.term()
                         ),
+                        ended: Some((now, false)),
                     }));
                 }
                 let integration = format!("refs/heads/{}", open.target);
@@ -375,6 +379,7 @@ pub fn guard<'a>(
                             named(kind, &now),
                             open.target
                         ),
+                        ended: None,
                     }));
                 }
                 Ok(None)
@@ -392,6 +397,7 @@ pub fn guard<'a>(
                         named(kind, &now),
                         now.state.describe()
                     ),
+                    ended: Some((now, true)),
                 }))
             }
         }
@@ -1031,6 +1037,22 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     };
     let mr = match published {
         Published::Done(mr) => mr,
+        // A merge request no longer open is refused as for an update carried
+        // on from it, keeping the update.
+        Published::Stopped(Stopped {
+            ended: Some((mr, deleted)),
+            ..
+        }) => bail!(
+            "the {} is now {}, so the update is not published to it{}. The update is kept: run \
+             `git intake abort` to end it",
+            named(kind, &mr),
+            mr.state.describe(),
+            if deleted {
+                "; the branch the push recreated after it ended was deleted again"
+            } else {
+                "; nothing was pushed"
+            }
+        ),
         Published::Stopped(stop) => {
             println!("{}", stop.message);
             return Ok(stop.exit);

@@ -1016,12 +1016,15 @@ fn finish_reads_the_open_merge_request_again_before_the_push() {
         "post-merge",
         &format!("touch {}", marker.display()),
     );
-    let out = stdout(&f.tool(&["finish"]).success());
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(err.contains("the merge request !1"), "{err}");
     assert!(
-        out.contains("was merged before the update was pushed to it; nothing was pushed"),
-        "{out}"
+        err.contains("is now merged, so the update is not published to it; nothing was pushed"),
+        "{err}"
     );
+    assert!(err.contains("`git intake abort`"), "{err}");
     assert_eq!(on_remote(&f, MERGE_REQUEST_BRANCH), before);
+    assert!(env.update_worktree(&f.down).exists(), "the update is kept");
 }
 
 #[test]
@@ -1038,12 +1041,16 @@ fn finish_deletes_the_branch_a_push_recreated_after_a_merge() {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
     f.forge().clear_requests();
-    let out = stdout(&f.tool(&["finish"]).success());
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(err.contains("the merge request !1"), "{err}");
+    assert!(err.contains("is now merged"), "{err}");
     assert!(
-        out.contains("the branch the push recreated was deleted again"),
-        "{out}"
+        err.contains("the branch the push recreated after it ended was deleted again"),
+        "{err}"
     );
+    assert!(err.contains("`git intake abort`"), "{err}");
     assert_eq!(on_remote(&f, MERGE_REQUEST_BRANCH), None);
+    assert!(env.update_worktree(&f.down).exists(), "the update is kept");
     assert!(
         !f.forge()
             .changes()
