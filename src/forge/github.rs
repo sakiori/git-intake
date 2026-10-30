@@ -89,20 +89,23 @@ impl GitHub {
         // Only the repository's own pull requests: one from a fork in the
         // same organisation matches the head filter too, and one whose fork
         // was deleted has no head repository at all.
-        let own = format!("{}/{}", self.owner, self.repo);
         list.iter()
-            .filter(|v| from_the_repository(v, &own))
+            .filter(|v| from_the_repository(v))
             .map(pull)
             .collect()
     }
 }
 
-/// Whether a pull request comes from a branch of the repository `own`
-/// (`owner/repo`) itself.
-fn from_the_repository(v: &Value, own: &str) -> bool {
-    v.pointer("/head/repo/full_name")
-        .and_then(Value::as_str)
-        .is_some_and(|name| name.eq_ignore_ascii_case(own))
+/// Whether a pull request comes from a branch of its base repository
+/// itself: its head repository is the base repository, compared by id, so
+/// that a renamed or transferred repository keeps its pull requests. A
+/// deleted fork leaves no head repository.
+fn from_the_repository(v: &Value) -> bool {
+    let id = |side: &str| {
+        v.pointer(&format!("/{side}/repo/id"))
+            .and_then(Value::as_u64)
+    };
+    id("head").is_some() && id("head") == id("base")
 }
 
 fn pull(v: &Value) -> Result<MergeRequest> {
@@ -547,9 +550,15 @@ mod tests {
 
     #[test]
     fn only_the_repository_s_own_pull_requests_count() {
-        let own = |repo: Value| from_the_repository(&json!({"head": {"repo": repo}}), "team/app");
-        assert!(own(json!({"full_name": "Team/App"})));
-        assert!(!own(json!({"full_name": "team/app-fork"})));
+        let own = |head: Value| {
+            from_the_repository(&json!({
+                "head": {"repo": head},
+                "base": {"repo": {"id": 7, "full_name": "team/app"}}
+            }))
+        };
+        // Renamed since the remote's URL was written: the ids still match.
+        assert!(own(json!({"id": 7, "full_name": "acme/app-renamed"})));
+        assert!(!own(json!({"id": 8, "full_name": "team/app"})));
         assert!(!own(Value::Null));
     }
 

@@ -102,6 +102,9 @@ pub struct World {
     /// A merge request the forge merges once this file exists, as a
     /// person does while the tool runs.
     pub merge_when: Option<(u64, PathBuf)>,
+    /// GitHub: the repository's name as GitHub reports it, which differs
+    /// from the remote's path once the repository was renamed.
+    pub full_name: String,
     clock: u64,
 }
 
@@ -171,6 +174,7 @@ impl FakeForge {
             redirects: Vec::new(),
             stale_lists: 0,
             merge_when: None,
+            full_name: format!("{OWNER}/{REPO}"),
             clock: 0,
         }));
         let mut mocks = Vec::new();
@@ -637,7 +641,8 @@ fn gitlab(
     }
 }
 
-fn github_pr(mr: &FakeMr, bare: &Path, host: &str) -> Value {
+fn github_pr(mr: &FakeMr, bare: &Path, host: &str, full_name: &str) -> Value {
+    let repo = json!({"id": 1, "full_name": full_name});
     json!({
         "number": mr.number,
         "html_url": format!("{host}/{OWNER}/{REPO}/pull/{}", mr.number),
@@ -648,12 +653,12 @@ fn github_pr(mr: &FakeMr, bare: &Path, host: &str) -> Value {
             "sha": head_of(mr, bare),
             "ref": mr.source,
             "repo": if mr.fork {
-                Value::Null
+                json!({"id": 2, "full_name": format!("someone/{REPO}")})
             } else {
-                json!({"full_name": format!("{OWNER}/{REPO}")})
+                repo.clone()
             },
         },
-        "base": {"ref": mr.target},
+        "base": {"ref": mr.target, "repo": repo},
         "title": mr.title,
         "body": mr.description,
     })
@@ -703,11 +708,15 @@ fn github(
             list.sort_by_key(|m| std::cmp::Reverse(m.number));
             reply(
                 200,
-                Value::Array(list.iter().map(|m| github_pr(m, bare, host)).collect()),
+                Value::Array(
+                    list.iter()
+                        .map(|m| github_pr(m, bare, host, &w.full_name))
+                        .collect(),
+                ),
             )
         }
         ("GET", ["pulls", n]) => match w.mrs.iter().find(|m| m.number.to_string() == *n) {
-            Some(m) => reply(200, github_pr(m, bare, host)),
+            Some(m) => reply(200, github_pr(m, bare, host, &w.full_name)),
             None => reply(404, json!({"message": "Not Found"})),
         },
         ("POST", ["pulls"]) => {
@@ -740,13 +749,14 @@ fn github(
                 squash: None,
                 remove_source_branch: None,
             };
-            let json = github_pr(&mr, bare, host);
+            let json = github_pr(&mr, bare, host, &w.full_name);
             w.mrs.push(mr);
             reply(201, json)
         }
         ("PATCH", ["pulls", n]) => {
             w.clock += 1;
             let clock = w.clock;
+            let full_name = w.full_name.clone();
             let Some(mr) = w.mrs.iter_mut().find(|m| m.number.to_string() == *n) else {
                 return reply(404, json!({"message": "Not Found"}));
             };
@@ -761,7 +771,7 @@ fn github(
                 mr.state = "closed";
                 mr.ended = Some(clock);
             }
-            reply(200, github_pr(mr, bare, host))
+            reply(200, github_pr(mr, bare, host, &full_name))
         }
         _ => reply(404, json!({"message": "Not Found"})),
     }

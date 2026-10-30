@@ -441,3 +441,19 @@ fn a_project_the_forge_does_not_show_is_named_as_such() {
         "{doctor}"
     );
 }
+
+#[test]
+fn a_renamed_github_repository_keeps_its_pull_requests() {
+    let f = Fork::github();
+    behind(&f);
+    f.tool(&["sync"]).success();
+    // GitHub now names the repository otherwise than the remote's URL.
+    f.forge().world().full_name = "acme/app-renamed".to_string();
+    let out = stdout(&f.tool(&["sync"]).success());
+    assert!(
+        out.contains("the update waits for the pull request #1"),
+        "{out}"
+    );
+    let status = f.env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["merge_request"]["number"], 1);
+}
