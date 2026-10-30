@@ -48,9 +48,12 @@ pub fn run(
         cmd.args(args);
         verify::clear_inherited(&mut cmd);
         cmd.envs(vars.iter().map(|(k, v)| (k, v)));
-        let status = cmd
-            .status()
-            .with_context(|| format!("cannot run `{}`", command.join(" ")))?;
+        let status = cmd.status().with_context(|| {
+            format!(
+                "cannot run `{}`",
+                crate::redact::redacted(&command.join(" "))
+            )
+        })?;
         return Ok(match status.code() {
             Some(0) => Exit::Success,
             Some(code) => Exit::Code(u8::try_from(code).unwrap_or(1)),

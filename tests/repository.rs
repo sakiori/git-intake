@@ -883,3 +883,66 @@ fn another_release_after_the_push_is_not_advised_to_abort() {
     assert!(!first.contains("abort"), "{first}");
     env.assert_no_update(&f.down);
 }
+
+/// Asserts that no run of `args` shows `secret`, in text or JSON.
+fn assert_never_shown(f: &Fork, secret: &str, runs: &[&[&str]]) {
+    for args in runs {
+        let run = f.tool(args);
+        let out = run.get_output();
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!shown.is_empty(), "{args:?}");
+        assert!(!shown.contains(secret), "{args:?}: {shown}");
+    }
+}
+
+#[test]
+fn an_api_url_with_credentials_is_refused_without_showing_them() {
+    let f = Fork::new();
+    f.reconfigure(
+        "via = \"push\"",
+        "via = \"push\"\napi = \"https://user:s3cret@gitlab.example.com/api/v4\"",
+    );
+    let err = stderr(&f.tool(&["status"]).code(2));
+    assert!(err.contains("carries credentials"), "{err}");
+    assert!(err.contains("https://gitlab.example.com/api/v4"), "{err}");
+    assert_never_shown(
+        &f,
+        "s3cret",
+        &[
+            &["status"],
+            &["status", "--json"],
+            &["doctor"],
+            &["doctor", "--json"],
+        ],
+    );
+}
+
+#[test]
+fn a_git_command_that_cannot_start_is_named_without_credentials() {
+    let f = Fork::new();
+    // An argument this long is more than the system lets a process start
+    // with, so git cannot be run with it.
+    let url = format!(
+        "https://user:s3cret@example.com/{}.git",
+        "a".repeat(3 * 1024 * 1024)
+    );
+    f.reconfigure(
+        &format!("url = {:?}", f.up.url()),
+        &format!("url = {url:?}"),
+    );
+    let err = stderr(&f.tool(&["status"]).code(2));
+    assert!(
+        err.contains("cannot run `git"),
+        "{}",
+        &err[..err.len().min(400)]
+    );
+    assert_never_shown(
+        &f,
+        "s3cret",
+        &[&["status"], &["status", "--json"], &["doctor", "--json"]],
+    );
+}

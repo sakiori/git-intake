@@ -434,7 +434,7 @@ pub fn no_release(up: &Upstream) -> String {
         "upstream '{}': no tag of {} matching '{}' is a release version on {} as fetched; \
          name the target with `git intake start {}=<rev>`",
         up.name,
-        crate::git::redacted(&up.url),
+        crate::redact::redacted(&up.url),
         up.tags.as_deref().unwrap_or_default(),
         up.source(),
         up.name
@@ -1247,7 +1247,10 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
             ),
             Ok((_, None)) => {}
             Err(err) => {
-                println!("could not read the forge for the update's merge request: {err:#}")
+                println!(
+                    "could not read the forge for the update's merge request: {}",
+                    crate::redact::redacted(&format!("{err:#}"))
+                )
             }
         }
     }

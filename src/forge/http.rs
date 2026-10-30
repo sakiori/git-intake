@@ -250,14 +250,15 @@ impl Client {
             }
             _ => "",
         };
-        format!(
+        // The forge's message may quote what it was sent, the token as well.
+        crate::redact::redacted(&format!(
             "the {} API answered {} {} with {} {}{hint}",
             self.forge,
             method.as_str(),
             shown(url),
             reply.status,
             reply.message()
-        )
+        ))
     }
 
     /// Whether `url` may carry the token: it is on the API's host, by the

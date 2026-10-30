@@ -19,7 +19,7 @@ use url::Url;
 use crate::config::Publish;
 use crate::git::Git;
 
-pub use locate::Location;
+pub use locate::{Location, TOKEN_VARIABLES};
 
 /// A kind of forge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

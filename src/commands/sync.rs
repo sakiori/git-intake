@@ -209,7 +209,11 @@ fn plan(repo: &Repo, config: &Config, base: &str, fetches: &mut Fetches) -> Resu
                     up.name,
                     port::no_base_advice(&up.name)
                 ),
-                Err(err) => println!("{}: port upstream not taken by sync: {err:#}", up.name),
+                Err(err) => println!(
+                    "{}: port upstream not taken by sync: {}",
+                    up.name,
+                    crate::redact::redacted(&format!("{err:#}"))
+                ),
             },
             Mode::Follow => {
                 let tags = match UpstreamTags::list(git, up)? {
@@ -235,7 +239,7 @@ fn plan(repo: &Repo, config: &Config, base: &str, fetches: &mut Fetches) -> Resu
         }
     }
     for why in &plan.left_out {
-        println!("left out: {why}");
+        println!("left out: {}", crate::redact::redacted(why));
     }
     Ok(plan)
 }

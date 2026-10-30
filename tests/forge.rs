@@ -469,3 +469,33 @@ fn a_renamed_github_repository_keeps_its_pull_requests() {
     let status = f.env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["merge_request"]["number"], 1);
 }
+
+#[test]
+fn a_forge_message_that_echoes_the_token_is_shown_without_it() {
+    let f = Fork::merge_request();
+    f.forge().fail(
+        "GET",
+        "/projects/team%2Fapp",
+        401,
+        &format!("401 Unauthorized: the token {TOKEN} is not valid"),
+    );
+    let shown = |args: &[&str], code: i32| {
+        let run = f.tool(args).code(code);
+        format!("{}{}", stdout(&run), stderr(&run))
+    };
+    behind(&f);
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    for (args, code) in [
+        (&["doctor"][..], 1),
+        (&["doctor", "--json"], 1),
+        (&["finish"], 2),
+    ] {
+        let out = shown(args, code);
+        assert!(
+            out.contains("401 Unauthorized: the token"),
+            "{args:?}: {out}"
+        );
+        assert!(!out.contains(TOKEN), "{args:?}: {out}");
+    }
+}

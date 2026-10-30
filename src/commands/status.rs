@@ -129,7 +129,7 @@ impl UpstreamStatus {
         Self {
             name: up.name.clone(),
             path: up.path.clone(),
-            url: crate::git::redacted(&up.url),
+            url: crate::redact::redacted(&up.url),
             branch: up.branch.clone(),
             mode: up.mode,
             tip,

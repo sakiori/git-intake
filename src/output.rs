@@ -3,17 +3,20 @@
 use anyhow::Result;
 use serde::Serialize;
 
+use crate::redact::redacted;
+
 /// A command result that has a text form; its JSON form is its serialisation.
 pub trait Render: Serialize {
     fn render(&self) -> String;
 }
 
-/// Prints a result in the requested form.
+/// Prints a result in the requested form, through [`redacted`] as every
+/// message the tool shows.
 pub fn emit<T: Render>(value: &T, json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        println!("{}", redacted(&serde_json::to_string_pretty(value)?));
     } else {
-        let text = value.render();
+        let text = redacted(&value.render());
         print!("{text}");
         if !text.ends_with('\n') {
             println!();

@@ -19,8 +19,9 @@ use crate::commands::{catch_up, finish};
 use crate::config::{self, Config, Publish};
 use crate::description::{self, Content, Targets};
 use crate::forge::{self, Forge, Kind, MergeRequest, State};
-use crate::git::{Git, abbrev, branch_ref, redacted, split_z, tracking_ref};
+use crate::git::{Git, abbrev, branch_ref, split_z, tracking_ref};
 use crate::port::Verb;
+use crate::redact::redacted;
 use crate::repo::{Repo, bullet};
 use crate::state::{
     CopyStep, EarlierMergeRequest, MergeKind, UPDATE_BRANCH, UpdateState, Waiting, Work,

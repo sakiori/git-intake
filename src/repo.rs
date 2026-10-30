@@ -529,9 +529,9 @@ impl Repo {
                     "publish remote '{}' has the URL {}, which names the repository of upstream '{}' ({}); \
                      the tool never pushes to an upstream",
                     publish.remote,
-                    crate::git::redacted(url),
+                    crate::redact::redacted(url),
                     up.name,
-                    crate::git::redacted(&up.url)
+                    crate::redact::redacted(&up.url)
                 ));
             }
         }

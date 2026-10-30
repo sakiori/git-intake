@@ -517,8 +517,9 @@ fn parse_publish(value: toml::Value) -> std::result::Result<Publish, String> {
 fn check_api(api: &str) -> std::result::Result<String, String> {
     let refuse = |why: &str| {
         format!(
-            "publish api: '{api}' {why}; give the base URL of the forge's REST API as an `https` URL, \
-             such as `https://gitlab.example.com/api/v4` or `https://github.example.com/api/v3`"
+            "publish api: '{}' {why}; give the base URL of the forge's REST API as an `https` URL, \
+             such as `https://gitlab.example.com/api/v4` or `https://github.example.com/api/v3`",
+            crate::redact::redacted(api)
         )
     };
     let url = url::Url::parse(api).map_err(|e| refuse(&format!("is not a URL ({e})")))?;
@@ -573,7 +574,7 @@ fn check_layout(integration: &str, upstreams: &[Upstream], problems: &mut Vec<St
     for (url, branch, n) in sources.into_iter().filter(|s| s.2 > 1) {
         problems.push(format!(
             "{n} upstreams share the URL '{}' and the branch '{branch}'",
-            crate::git::redacted(url)
+            crate::redact::redacted(url)
         ));
     }
 
@@ -1134,10 +1135,6 @@ via = "merge-request"
             ("http://forge.example/api/v4", "is not an `https` URL"),
             ("forge.example/api/v4", "is not a URL"),
             (
-                "https://user:secret@forge.example/api/v4",
-                "carries credentials",
-            ),
-            (
                 "https://forge.example/api/v4?x=1",
                 "has a query or a fragment",
             ),
@@ -1148,6 +1145,16 @@ via = "merge-request"
             assert!(e.contains(&format!("publish api: '{api}' {why}")), "{e}");
             assert!(e.contains("as an `https` URL"), "{e}");
         }
+        // The refusal of credentials does not show them.
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\n\
+             api = \"https://user:secret@forge.example/api/v4\"\n"
+        ));
+        assert!(
+            e.contains("publish api: 'https://forge.example/api/v4' carries credentials"),
+            "{e}"
+        );
+        assert!(!e.contains("secret") && !e.contains("user"), "{e}");
     }
 
     #[test]

@@ -303,8 +303,17 @@ fn project_path(path: &str, api: &Url) -> String {
     }
 }
 
+/// Every variable a token is read from.
+pub const TOKEN_VARIABLES: &[&str] = &[
+    "GITLAB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
+
 /// The token for the forge, from the variables its own command-line tools
-/// read.
+/// read; each is one of [`TOKEN_VARIABLES`].
 fn token(
     kind: Kind,
     host: &str,

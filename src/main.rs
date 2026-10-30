@@ -11,6 +11,7 @@ mod git;
 mod integration_line;
 mod output;
 mod port;
+mod redact;
 mod repo;
 mod state;
 mod sync_record;
@@ -76,12 +77,18 @@ fn run(command: Command) -> anyhow::Result<Exit> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // No message shows a token the tool may read, whatever quotes it.
+    for name in forge::TOKEN_VARIABLES {
+        if let Ok(value) = std::env::var(name) {
+            redact::hold(value.trim());
+        }
+    }
     match run(cli.command) {
         Ok(Exit::Success) => ExitCode::SUCCESS,
         Ok(Exit::Negative) => ExitCode::from(1),
         Ok(Exit::Code(code)) => ExitCode::from(code),
         Err(err) => {
-            eprintln!("error: {err:#}");
+            eprintln!("error: {}", redact::redacted(&format!("{err:#}")));
             ExitCode::from(ERROR_STATUS)
         }
     }

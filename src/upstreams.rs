@@ -144,7 +144,7 @@ impl<'r> Fetches<'r> {
             None => Err(format!(
                 "fetching branch '{}' from {} left no commit",
                 up.branch,
-                crate::git::redacted(&up.url)
+                crate::redact::redacted(&up.url)
             )),
         })
     }
@@ -230,9 +230,10 @@ impl Drop for Fetches<'_> {
     fn drop(&mut self) {
         if let Err(err) = self.clean_up() {
             eprintln!(
-                "warning: cannot remove the references this command fetched under {}: {err:#}; \
+                "warning: cannot remove the references this command fetched under {}: {}; \
                  `git intake doctor` lists them",
-                self.namespace
+                self.namespace,
+                crate::redact::redacted(&format!("{err:#}"))
             );
         }
     }

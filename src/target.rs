@@ -4,7 +4,8 @@
 use anyhow::Result;
 
 use crate::config::Upstream;
-use crate::git::{Git, abbrev, redacted};
+use crate::git::{Git, abbrev};
+use crate::redact::redacted;
 use crate::tags::UpstreamTags;
 
 /// The commit a revision names, with the upstream tag it named, if any.
