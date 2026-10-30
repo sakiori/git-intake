@@ -13,6 +13,8 @@ pub enum DriftState {
     Current,
     Behind,
     NotImported,
+    /// A synced path upstream whose path no longer exists on the integration branch.
+    PathRemoved,
     Rewritten,
     Unavailable,
 }
@@ -23,6 +25,7 @@ impl DriftState {
             DriftState::Current => "current",
             DriftState::Behind => "behind",
             DriftState::NotImported => "not imported",
+            DriftState::PathRemoved => "path removed",
             DriftState::Rewritten => "rewritten",
             DriftState::Unavailable => "unavailable",
         }
@@ -118,20 +121,34 @@ pub fn evaluate(
     // shows a last synced commit: shared history at the root, or a merge that
     // brought the upstream into its path (`git subtree add` or `pull`).
     let imported = last_synced.is_some();
+    // Precedence: unavailable and rewritten are decided above; a synced path
+    // upstream whose path is gone comes before behind or current.
+    let removed = match &up.path {
+        Some(path) if imported => git.object_type(integration_tip, path)?.is_none(),
+        _ => false,
+    };
     let state = if !imported {
         DriftState::NotImported
+    } else if removed {
+        DriftState::PathRemoved
     } else if behind == 0 {
         DriftState::Current
     } else {
         DriftState::Behind
     };
+    let detail = removed.then(|| {
+        format!(
+            "path '{}' no longer exists on the integration branch; restore it or correct the configuration",
+            up.path.as_deref().unwrap_or_default()
+        )
+    });
     Ok(Drift {
         last_synced,
         last_synced_source: source,
         tip: Some(tip),
         commits_behind: Some(behind),
         state,
-        detail: None,
+        detail,
     })
 }
 

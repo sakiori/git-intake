@@ -1047,3 +1047,53 @@ fn subtree_pull_merge_without_record_is_the_newest_sync() {
     assert_eq!(status["upstreams"][0]["commits_behind"], 1);
     assert_eq!(status["upstreams"][0]["last_synced"], a2.as_str());
 }
+
+fn assert_path_removed(env: &Env, repo: &Path, index: usize, source: &str) {
+    let status = env.tool_json(repo, &["status", "--json"], 0);
+    let u = &status["upstreams"][index];
+    assert_eq!(u["state"], "path_removed", "{u}");
+    assert_eq!(u["last_synced_source"], source, "{u}");
+    assert!(
+        u["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no longer exists on the integration branch")
+    );
+    let text = stdout(&env.tool(repo, &["status"]).success());
+    assert!(text.contains("path removed"), "{text}");
+    let check = env.tool(repo, &["status", "--check"]).code(1);
+    let out = stdout(&check);
+    assert!(
+        out.contains("path 'apps/a' no longer exists on the integration branch"),
+        "{out}"
+    );
+    assert!(
+        out.contains("drift: not every upstream is current"),
+        "{out}"
+    );
+    let json = env.tool_json(repo, &["status", "--check", "--json"], 1);
+    assert_eq!(json["upstreams"][index]["state"], "path_removed");
+    assert_eq!(json["all_current"], false);
+}
+
+#[test]
+fn synced_upstream_with_removed_path_is_reported_as_path_removed() {
+    // With a sync record.
+    let m = Mono::new();
+    m.import_all();
+    m.env.git(&m.down, &["rm", "-q", "-r", "apps/a"]);
+    m.env
+        .git(&m.down, &["commit", "-q", "-m", "mono: remove apps/a"]);
+    assert_path_removed(&m.env, &m.down, 0, "record");
+    let status = m.env.tool_json(&m.down, &["status", "--json"], 0);
+    assert_eq!(status["upstreams"][1]["state"], "current");
+
+    // Imported by other means, synced from history.
+    let t = twins();
+    t.env.tool(&t.down, &["fetch"]).success();
+    subtree_add(&t.env, &t.down, "apps/a", "app-a/main");
+    t.env.git(&t.down, &["rm", "-q", "-r", "apps/a"]);
+    t.env
+        .git(&t.down, &["commit", "-q", "-m", "mono: remove apps/a"]);
+    assert_path_removed(&t.env, &t.down, 0, "history");
+}

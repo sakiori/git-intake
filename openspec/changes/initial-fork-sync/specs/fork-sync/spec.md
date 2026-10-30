@@ -172,7 +172,7 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **THEN** the output lists, for each merged upstream, the merged range, each conflicted file with its resolution source, and the diff size against that upstream before and after
 
 ### Requirement: Upstream status
-`status` SHALL report, for every configured upstream, its path, its branch, its last synced commit, its fetched tip, the number of commits the integration branch lacks, and one state: current, behind, not imported, rewritten, or unavailable when its remote or branch is missing. Without options it SHALL use the remote-tracking refs as last fetched. `status --check` SHALL first fetch every upstream, additionally list the files a merge of each behind upstream's tip would conflict in, create no worktree, branch or state, and exit with a failure status unless every upstream is current, so that it can run on a schedule and gate a cutover.
+`status` SHALL report, for every configured upstream, its path, its branch, its last synced commit, its fetched tip, the number of commits the integration branch lacks, and one state: current, behind, not imported, path removed when a synced path upstream's path no longer exists, rewritten, or unavailable when its remote or branch is missing. Without options it SHALL use the remote-tracking refs as last fetched. `status --check` SHALL first fetch every upstream, additionally list the files a merge of each behind upstream's tip would conflict in, create no worktree, branch or state, and exit with a failure status unless every upstream is current, so that it can run on a schedule and gate a cutover.
 
 #### Scenario: Several upstreams
 - **WHEN** `status` runs on a repository with three upstreams, two of them behind
