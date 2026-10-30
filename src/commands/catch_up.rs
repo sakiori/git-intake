@@ -593,6 +593,7 @@ fn conclude_at(repo: &Repo, state: &mut UpdateState, merge: &str, head: &str) ->
     done.step = CatchUpStep::Merged;
     state.base = c.tip.clone();
     state.verification = None;
+    repo.drop_partial_run(state)?;
     repo.save_state(state)?;
     println!(
         "caught up with '{integration}' at {} as {}",

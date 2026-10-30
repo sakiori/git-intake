@@ -16,8 +16,9 @@ struct RawConfig {
     /// a message showing the table form.
     publish: Option<toml::Value>,
     install: Option<String>,
-    #[serde(default)]
-    checks: Vec<String>,
+    /// Read as a value first so that the plain command strings of earlier
+    /// releases get a message showing the table form.
+    checks: Option<toml::Value>,
     #[serde(default, rename = "upstream")]
     upstreams: Vec<RawUpstream>,
 }
@@ -121,8 +122,15 @@ pub struct Config {
     pub integration: String,
     pub publish: Option<Publish>,
     pub install: Option<String>,
-    pub checks: Vec<String>,
+    pub checks: Vec<Check>,
     pub upstreams: Vec<Upstream>,
+}
+
+/// One check: a name, unique ignoring letter case, and the command it runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Check {
+    pub name: String,
+    pub run: String,
 }
 
 /// One upstream: a source taken at the root or under its own path.
@@ -228,11 +236,10 @@ pub fn parse(text: &str) -> Result<Config> {
     {
         problems.push("install: the command is empty".to_string());
     }
-    for (i, check) in raw.checks.iter().enumerate() {
-        if check.trim().is_empty() {
-            problems.push(format!("checks[{i}]: the command is empty"));
-        }
-    }
+    let checks = match raw.checks {
+        None => Vec::new(),
+        Some(value) => parse_checks(value, &mut problems),
+    };
     if raw.upstreams.is_empty() {
         problems.push("no [[upstream]] is configured".to_string());
     }
@@ -321,9 +328,150 @@ pub fn parse(text: &str) -> Result<Config> {
         integration,
         publish,
         install: raw.install,
-        checks: raw.checks,
+        checks,
         upstreams,
     })
+}
+
+/// Reads the list of checks, each a table with exactly the keys `name` and
+/// `run`. A list of plain command strings, the form of earlier releases, is
+/// refused with the table form written out for it.
+fn parse_checks(value: toml::Value, problems: &mut Vec<String>) -> Vec<Check> {
+    let toml::Value::Array(entries) = value else {
+        problems.push(
+            "checks: expected a list of tables such as `checks = [{ name = \"test\", run = \"make test\" }]`"
+                .to_string(),
+        );
+        return Vec::new();
+    };
+    let plain: Vec<&str> = entries.iter().filter_map(toml::Value::as_str).collect();
+    if !entries.is_empty() && plain.len() == entries.len() {
+        problems.push(format!(
+            "checks: each check is a table with a name and the command it runs, not a plain command; write `checks = [{}]`, \
+             naming each check",
+            plain
+                .iter()
+                .map(|run| table_form(run))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        return Vec::new();
+    }
+    let mut checks = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let table = match entry {
+            toml::Value::Table(table) => table,
+            toml::Value::String(run) => {
+                problems.push(format!(
+                    "checks[{i}]: a check is a table with a name and the command it runs, not a plain command; \
+                     write `{}`, naming the check",
+                    table_form(run)
+                ));
+                continue;
+            }
+            _ => {
+                problems.push(format!(
+                    "checks[{i}]: expected a table with the keys `name` and `run`"
+                ));
+                continue;
+            }
+        };
+        let name = table.get("name").and_then(toml::Value::as_str);
+        let label = match name {
+            Some(name) if !name.is_empty() => format!("check '{name}'"),
+            _ => format!("checks[{i}]"),
+        };
+        let mut valid = true;
+        for key in table
+            .keys()
+            .filter(|k| !matches!(k.as_str(), "name" | "run"))
+        {
+            problems.push(format!(
+                "{label}: unknown key `{key}`; a check has exactly the keys `name` and `run`"
+            ));
+            valid = false;
+        }
+        match (table.get("name"), name) {
+            (None, _) => {
+                problems.push(format!("{label}: `name` is required"));
+                valid = false;
+            }
+            (Some(_), None) => {
+                problems.push(format!("{label}: `name` must be a string"));
+                valid = false;
+            }
+            (Some(_), Some(name)) => {
+                if let Err(why) = check_check_name(name) {
+                    problems.push(format!("{label}: {why}"));
+                    valid = false;
+                }
+            }
+        }
+        let run = match table.get("run") {
+            None => {
+                problems.push(format!("{label}: `run` is required"));
+                None
+            }
+            Some(toml::Value::String(run)) if run.trim().is_empty() => {
+                problems.push(format!("{label}: the command is empty"));
+                None
+            }
+            Some(toml::Value::String(run)) => Some(run.clone()),
+            Some(_) => {
+                problems.push(format!("{label}: `run` must be a string"));
+                None
+            }
+        };
+        if let (true, Some(name), Some(run)) = (valid, name, run) {
+            checks.push(Check {
+                name: name.to_string(),
+                run,
+            });
+        }
+    }
+    let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+    for check in &checks {
+        let key = check.name.to_ascii_lowercase();
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, names)) => names.push(&check.name),
+            None => groups.push((key, vec![&check.name])),
+        }
+    }
+    for (_, names) in groups.into_iter().filter(|(_, n)| n.len() > 1) {
+        let (last, first) = names.split_last().unwrap_or((&"", &[]));
+        problems.push(format!(
+            "checks {} and '{last}' share a name; check names are unique ignoring letter case",
+            quote_list(first)
+        ));
+    }
+    checks
+}
+
+/// A check in the table form, with the command `run` and a name to fill in.
+fn table_form(run: &str) -> String {
+    format!(
+        "{{ name = \"...\", run = {} }}",
+        toml::Value::String(run.to_string())
+    )
+}
+
+/// The rule for a check's name, which names its log file and selects it
+/// for `verify --only` and `--skip`.
+fn check_check_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        Err("the name is empty".to_string())
+    } else if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        || name.starts_with(['-', '.'])
+    {
+        Err(format!(
+            "'{name}' is not a valid check name: it may contain only ASCII letters, digits, '-', '_' and '.', \
+             and may not start with '-' or '.'"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Reads the `[publish]` table.
@@ -598,7 +746,7 @@ mod tests {
             r#"
 integration = "main"
 install = "make deps"
-checks = ["make lint", "make test"]
+checks = [{ name = "lint", run = "make lint" }, { name = "test", run = "make test" }]
 
 [[upstream]]
 name = "app-a"
@@ -622,7 +770,19 @@ via = "merge-request"
                 api: None,
             })
         );
-        assert_eq!(cfg.checks.len(), 2);
+        assert_eq!(
+            cfg.checks,
+            [
+                Check {
+                    name: "lint".into(),
+                    run: "make lint".into()
+                },
+                Check {
+                    name: "test".into(),
+                    run: "make test".into()
+                }
+            ]
+        );
         let up = &cfg.upstreams[0];
         assert_eq!(up.path.as_deref(), Some("apps/app-a"));
         assert_eq!(up.url, "git@example.com:team/app-a.git");
@@ -799,6 +959,109 @@ via = "merge-request"
         assert_eq!(cfg.publish.unwrap().via, PublishVia::Push);
         let cfg = parse(&format!("integration = \"main\"\n{UP_A}")).unwrap();
         assert_eq!(cfg.publish, None);
+    }
+
+    #[test]
+    fn checks_are_tables_in_order() {
+        let cfg = parse(&format!(
+            "integration = \"main\"\n{UP_A}[[checks]]\nname = \"Unit.tests_2\"\nrun = \"make test\"\n\
+             [[checks]]\nname = \"lint\"\nrun = \"make lint\"\n"
+        ))
+        .unwrap();
+        let names: Vec<&str> = cfg.checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Unit.tests_2", "lint"]);
+    }
+
+    #[test]
+    fn rejects_checks_as_plain_commands() {
+        let e = err(&format!(
+            "integration = \"main\"\nchecks = [\"make lint\", \"make test\"]\n{UP_A}"
+        ));
+        assert!(
+            e.contains(
+                "write `checks = [{ name = \"...\", run = \"make lint\" }, { name = \"...\", run = \"make test\" }]`"
+            ),
+            "{e}"
+        );
+        // A command with quotes is written as TOML writes it.
+        let e = err(&format!(
+            "integration = \"main\"\nchecks = ['test -f \"a b\"']\n{UP_A}"
+        ));
+        assert!(e.contains(r#"run = 'test -f "a b"' }"#), "{e}");
+        // A plain command among tables is named by its place.
+        let e = err(&format!(
+            "integration = \"main\"\nchecks = [{{ name = \"lint\", run = \"make lint\" }}, \"make test\"]\n{UP_A}"
+        ));
+        assert!(
+            e.contains("checks[1]: a check is a table with a name and the command it runs"),
+            "{e}"
+        );
+        assert!(
+            e.contains("write `{ name = \"...\", run = \"make test\" }`"),
+            "{e}"
+        );
+        let e = err(&format!(
+            "integration = \"main\"\nchecks = \"make\"\n{UP_A}"
+        ));
+        assert!(e.contains("checks: expected a list of tables"), "{e}");
+    }
+
+    #[test]
+    fn rejects_invalid_checks_naming_them() {
+        let config = |checks: &str| format!("integration = \"main\"\nchecks = [{checks}]\n{UP_A}");
+        let e = err(&config(r#"{ name = "lint", cmd = "make lint" }"#));
+        assert!(
+            e.contains(
+                "check 'lint': unknown key `cmd`; a check has exactly the keys `name` and `run`"
+            ),
+            "{e}"
+        );
+        assert!(e.contains("check 'lint': `run` is required"), "{e}");
+        let e = err(&config(r#"{ run = "make lint" }"#));
+        assert!(e.contains("checks[0]: `name` is required"), "{e}");
+        let e = err(&config(r#"{ name = "lint", run = " " }"#));
+        assert!(e.contains("check 'lint': the command is empty"), "{e}");
+        let e = err(&config(r#"{ name = 1, run = "make" }"#));
+        assert!(e.contains("checks[0]: `name` must be a string"), "{e}");
+        let e = err(&config(r#"{ name = "lint", run = ["make"] }"#));
+        assert!(e.contains("check 'lint': `run` must be a string"), "{e}");
+        let e = err(&config(r#"{ name = "", run = "make" }"#));
+        assert!(e.contains("checks[0]: the name is empty"), "{e}");
+        let e = err(&config("42"));
+        assert!(
+            e.contains("checks[0]: expected a table with the keys `name` and `run`"),
+            "{e}"
+        );
+        for name in ["a b", "-x", ".x", "läuft", "a/b"] {
+            let e = err(&config(&format!("{{ name = {name:?}, run = \"make\" }}")));
+            assert!(
+                e.contains(&format!(
+                    "check '{name}': '{name}' is not a valid check name"
+                )),
+                "{e}"
+            );
+        }
+        for name in ["a", "A-1", "x_y.z", "install", "9"] {
+            assert!(
+                parse(&config(&format!("{{ name = {name:?}, run = \"make\" }}"))).is_ok(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_check_names_that_differ_only_in_case() {
+        let e = err(&format!(
+            "integration = \"main\"\nchecks = [{{ name = \"test\", run = \"a\" }}, {{ name = \"lint\", run = \"b\" }}, \
+             {{ name = \"Test\", run = \"c\" }}]\n{UP_A}"
+        ));
+        assert!(
+            e.contains(
+                "checks 'test' and 'Test' share a name; check names are unique ignoring letter case"
+            ),
+            "{e}"
+        );
+        assert!(!e.contains("'lint'"), "{e}");
     }
 
     #[test]

@@ -6,7 +6,7 @@ mod common;
 
 use std::fs;
 
-use common::{FORK_FILE, Fork, Mono};
+use common::{FORK_CHECK, FORK_FILE, Fork, Mono, checks_line};
 
 /// A check that writes the tool's variables, sorted, to `$HOME/<file>`. The
 /// variables are read by name, so a multi-line value of another variable
@@ -41,7 +41,7 @@ fn sorted(mut lines: Vec<String>) -> Vec<String> {
 
 #[test]
 fn follow_upstream_names_the_base_head_target_and_previous_commit() {
-    let f = Fork::with_checks(&[&dump("check-env"), REACHABLE]);
+    let f = Fork::with_checks(&[("env", &dump("check-env")), ("reachable", REACHABLE)]);
     let env = &f.env;
     f.reconfigure(
         "install = \"true\"",
@@ -109,7 +109,7 @@ fn follow_upstream_names_the_base_head_target_and_previous_commit() {
 
 #[test]
 fn follow_target_named_by_a_revision_is_not_the_fetched_tip() {
-    let f = Fork::with_checks(&[&dump("check-env"), REACHABLE]);
+    let f = Fork::with_checks(&[("env", &dump("check-env")), ("reachable", REACHABLE)]);
     let env = &f.env;
     let initial = env.rev(&f.up.bare, "main");
     let t1 = env.push_upstream(&f.up, &[("one.txt", "1\n")], "upstream: one");
@@ -146,7 +146,11 @@ fn every_queued_upstream_gets_its_own_variables() {
             ".git-intake.toml",
             &common::mono_config(&m.a, &m.b, "").replace(
                 "checks = [",
-                &format!("checks = [{:?}, {:?}, ", dump("check-env"), REACHABLE),
+                &format!(
+                    "checks = [{{ name = \"env\", run = {:?} }}, {{ name = \"reachable\", run = {:?} }}, ",
+                    dump("check-env"),
+                    REACHABLE
+                ),
             ),
         )],
         "mono: dump the check environment",
@@ -199,8 +203,8 @@ fn port_upstream_names_the_newest_commit_it_takes_or_decides() {
     let f = Fork::port();
     let env = &f.env;
     f.reconfigure(
-        "checks = [\"test -f app.txt\"]",
-        &format!("checks = [{:?}, {:?}]", dump("check-env"), REACHABLE),
+        &checks_line(&[FORK_CHECK]),
+        &checks_line(&[("env", &dump("check-env")), ("reachable", REACHABLE)]),
     );
     let c: Vec<String> = (1..=3)
         .map(|i| {
@@ -269,7 +273,7 @@ fn upstream_names_that_share_variables_are_refused() {
 
 #[test]
 fn a_catch_up_names_the_tip_it_caught_up_with_as_the_base() {
-    let f = Fork::with_checks(&[&dump("check-env"), REACHABLE]);
+    let f = Fork::with_checks(&[("env", &dump("check-env")), ("reachable", REACHABLE)]);
     let env = &f.env;
     env.push_upstream(&f.up, &[("new.txt", "x\n")], "upstream: new");
     f.tool(&["start"]).success();

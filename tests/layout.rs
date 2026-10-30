@@ -19,7 +19,7 @@ const LEFT_REMOVED_DIRECTORY: &str =
 /// a publish remote.
 fn root_config(url: &str) -> String {
     format!(
-        "integration = \"main\"\nchecks = [\"test -f {FORK_FILE}\"]\n\n\
+        "integration = \"main\"\nchecks = [{{ name = \"app\", run = \"test -f {FORK_FILE}\" }}]\n\n\
          [[upstream]]\nname = \"upstream\"\nurl = {url:?}\nbranch = \"main\"\n"
     )
 }

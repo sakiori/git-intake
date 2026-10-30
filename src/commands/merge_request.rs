@@ -23,7 +23,7 @@ use crate::git::{Git, abbrev, branch_ref, redacted, split_z, tracking_ref};
 use crate::port::Verb;
 use crate::repo::{Repo, bullet};
 use crate::state::{
-    self, CopyStep, EarlierMergeRequest, MergeKind, UPDATE_BRANCH, UpdateState, Work,
+    self, CopyStep, EarlierMergeRequest, MergeKind, UPDATE_BRANCH, UpdateState, Waiting, Work,
 };
 use crate::sync_record;
 use crate::update_line::{self, History};
@@ -459,20 +459,80 @@ fn check_changes(
             changes.push(format!("`{file}`"));
         }
     }
-    let read = |rev: &str| -> Result<Option<Config>> {
-        Ok(git
-            .show_file(rev, config::FILE_NAME)?
-            .and_then(|text| config::parse(&text).ok()))
-    };
-    if let (Some(before), Some(after)) = (read(&state.base)?, read(head)?) {
-        if before.install != after.install {
-            changes.push(format!("the install command of `{}`", config::FILE_NAME));
-        }
-        if before.checks != after.checks {
-            changes.push(format!("the checks of `{}`", config::FILE_NAME));
-        }
+    let before = git.show_file(&state.base, config::FILE_NAME)?;
+    let after = git.show_file(head, config::FILE_NAME)?;
+    if before != after {
+        let parse = |text: Option<String>| text.and_then(|t| config::parse(&t).ok());
+        changes.extend(config_changes(
+            parse(before).as_ref(),
+            parse(after).as_ref(),
+        ));
     }
     Ok(changes)
+}
+
+/// The changes between two versions of the configuration that differ to its
+/// install command and checks: each check added, removed or given another
+/// command, by its name, or only their order. A renamed check is one removed
+/// and one added. When either side cannot be read, the install command and
+/// the checks are named as changed without names.
+fn config_changes(before: Option<&Config>, after: Option<&Config>) -> Vec<String> {
+    let file = config::FILE_NAME;
+    let (Some(before), Some(after)) = (before, after) else {
+        return vec![format!("the install command and the checks of `{file}`")];
+    };
+    let mut changes = Vec::new();
+    if before.install != after.install {
+        changes.push(format!("the install command of `{file}`"));
+    }
+    let named = |names: Vec<&str>| {
+        let quoted: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
+        let list = match quoted.split_last() {
+            Some((last, [])) => last.clone(),
+            Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+            None => String::new(),
+        };
+        (if names.len() == 1 { "check" } else { "checks" }, list)
+    };
+    let find =
+        |checks: &[config::Check], name: &str| checks.iter().find(|c| c.name == name).cloned();
+    let added: Vec<&str> = after
+        .checks
+        .iter()
+        .filter(|c| find(&before.checks, &c.name).is_none())
+        .map(|c| c.name.as_str())
+        .collect();
+    let removed: Vec<&str> = before
+        .checks
+        .iter()
+        .filter(|c| find(&after.checks, &c.name).is_none())
+        .map(|c| c.name.as_str())
+        .collect();
+    let changed: Vec<&str> = after
+        .checks
+        .iter()
+        .filter(|c| find(&before.checks, &c.name).is_some_and(|b| b.run != c.run))
+        .map(|c| c.name.as_str())
+        .collect();
+    if !added.is_empty() {
+        let (what, list) = named(added.clone());
+        changes.push(format!("the {what} {list} added to `{file}`"));
+    }
+    if !removed.is_empty() {
+        let (what, list) = named(removed.clone());
+        changes.push(format!("the {what} {list} removed from `{file}`"));
+    }
+    if !changed.is_empty() {
+        let (what, list) = named(changed.clone());
+        changes.push(format!(
+            "the {what} {list} given another command in `{file}`"
+        ));
+    }
+    if added.is_empty() && removed.is_empty() && changed.is_empty() && before.checks != after.checks
+    {
+        changes.push(format!("the order of the checks of `{file}`"));
+    }
+    changes
 }
 
 /// The follow targets of the update, as its merge request records them.
@@ -798,11 +858,12 @@ pub fn withdraw(
 }
 
 /// The publication setting of the integration tip for an update in
-/// progress, or the one the update recorded when the tip's cannot be read.
-pub fn publication(repo: &Repo, state: &UpdateState) -> Option<Publish> {
+/// progress, or `recorded`, the one the update recorded, when the tip's
+/// cannot be read.
+pub fn publication(repo: &Repo, recorded: Option<&Publish>) -> Option<Publish> {
     match repo.load_config() {
         Ok(loaded) => loaded.config.publish,
-        Err(_) => state.config.publish.clone(),
+        Err(_) => recorded.cloned(),
     }
 }
 
@@ -824,15 +885,13 @@ fn earlier_request(
 
 /// What the forge says of the merge request an update of an earlier release
 /// waits for, as `abort` reports it.
-pub fn earlier_state(repo: &Repo, state: &UpdateState) -> String {
-    let Some(mr) = &state.merge_request else {
-        return String::new();
-    };
-    let found = publication(repo, state)
+pub fn earlier_state(repo: &Repo, waiting: &Waiting) -> String {
+    let mr = &waiting.merge_request;
+    let found = publication(repo, waiting.publish.as_ref())
         .context("no publication setting is configured")
         .and_then(|publish| connect(repo, &publish))
         .and_then(|forge| {
-            let found = earlier_request(forge.as_ref(), mr, &state.config.integration)?;
+            let found = earlier_request(forge.as_ref(), mr, &waiting.integration)?;
             Ok((forge.kind(), found))
         });
     match found {
@@ -845,7 +904,7 @@ pub fn earlier_state(repo: &Repo, state: &UpdateState) -> String {
             "no {} from '{}' into '{}' was found",
             kind.term(),
             mr.branch,
-            state.config.integration
+            waiting.integration
         ),
         Err(err) => format!("could not read the forge: {err:#}"),
     }
@@ -855,14 +914,12 @@ pub fn earlier_state(repo: &Repo, state: &UpdateState) -> String {
 /// request: hands it over to the merge request. Says whether the merge
 /// request is open, merged or closed, records the resolutions of a catch-up
 /// step, and removes the update worktree, branch, upstream references and
-/// state, keeping the merge request and its branch.
-pub fn hand_over(repo: &Repo, state: UpdateState) -> Result<Exit> {
-    let mr = state
-        .merge_request
-        .clone()
-        .context("the update does not wait for a merge request")?;
-    let integration = state.config.integration.clone();
-    let publish = publication(repo, &state).with_context(|| {
+/// state, keeping the merge request and its branch. The state is read as
+/// [`Waiting`] and never written.
+pub fn hand_over(repo: &Repo, waiting: &Waiting) -> Result<Exit> {
+    let mr = &waiting.merge_request;
+    let integration = &waiting.integration;
+    let publish = publication(repo, waiting.publish.as_ref()).with_context(|| {
         format!(
             "the update waits for its merge request from '{}', but no publication setting is configured on '{integration}'",
             mr.branch
@@ -870,7 +927,7 @@ pub fn hand_over(repo: &Repo, state: UpdateState) -> Result<Exit> {
     })?;
     let forge = connect(repo, &publish)?;
     let kind = forge.kind();
-    match earlier_request(forge.as_ref(), &mr, &integration)? {
+    match earlier_request(forge.as_ref(), mr, integration)? {
         Some(found) => println!(
             "the update waited for {}, which is {}; it carries the update from now on",
             named(kind, &found),
@@ -882,8 +939,8 @@ pub fn hand_over(repo: &Repo, state: UpdateState) -> Result<Exit> {
             mr.branch
         ),
     }
-    if state.catching_up().is_some() && state.worktree.exists() {
-        let wt = Git::worktree(&state.worktree);
+    if waiting.catching_up && waiting.worktree.exists() {
+        let wt = Git::worktree(&waiting.worktree);
         if wt.merge_in_progress()? {
             wt.run(&["rerere"])?;
             println!("recorded the resolutions made so far in the catch-up merge");
@@ -892,9 +949,12 @@ pub fn hand_over(repo: &Repo, state: UpdateState) -> Result<Exit> {
     let mut removed = repo.remove_update_artifacts()?;
     removed.extend(repo.remove_plan()?);
     removed.extend(
-        upstreams::release(&repo.git, &state)?
-            .into_iter()
-            .map(|r| format!("reference {r}")),
+        upstreams::release_refs(
+            &repo.git,
+            waiting.upstreams.iter().map(|(name, _)| name.as_str()),
+        )?
+        .into_iter()
+        .map(|r| format!("reference {r}")),
     );
     removed.extend(repo.remove_logs()?);
     state::remove(&repo.paths.state)?;
@@ -1271,33 +1331,81 @@ pub fn remote_refs(
         .collect())
 }
 
-/// The next command for an update of an earlier release that waits for its
-/// merge request.
-pub fn earlier_next(mr: &EarlierMergeRequest) -> String {
-    format!(
-        "`git intake finish` hands the update over to its merge request from '{}', which an earlier release left it \
-         waiting for; `git intake abort` ends it here and keeps the merge request, and `git intake abort \
-         --merge-request` also withdraws the merge request",
-        mr.branch
-    )
-}
-
-/// Refuses a command that carries an update on while an update of an
-/// earlier release waits for its merge request.
-pub fn refuse_earlier(state: &UpdateState) -> Result<()> {
-    if let Some(mr) = &state.merge_request {
-        bail!(
-            "the update in progress waits for its merge request from '{}', as an earlier release left it; {}",
-            mr.branch,
-            earlier_next(mr)
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config(install: Option<&str>, checks: &[(&str, &str)]) -> Config {
+        Config {
+            integration: "main".into(),
+            publish: None,
+            install: install.map(str::to_string),
+            checks: checks
+                .iter()
+                .map(|(name, run)| config::Check {
+                    name: name.to_string(),
+                    run: run.to_string(),
+                })
+                .collect(),
+            upstreams: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn changed_checks_are_named() {
+        let before = config(
+            Some("make deps"),
+            &[("lint", "make lint"), ("test", "make test")],
+        );
+        let after = config(
+            Some("make deps"),
+            &[
+                ("lint", "make lint"),
+                ("test", "make test-all"),
+                ("audit", "make audit"),
+            ],
+        );
+        assert_eq!(
+            config_changes(Some(&before), Some(&after)),
+            [
+                "the check `audit` added to `.git-intake.toml`",
+                "the check `test` given another command in `.git-intake.toml`"
+            ]
+        );
+        // A rename is a removal and an addition.
+        let renamed = config(None, &[("style", "make lint"), ("test", "make test")]);
+        assert_eq!(
+            config_changes(Some(&before), Some(&renamed)),
+            [
+                "the install command of `.git-intake.toml`",
+                "the check `style` added to `.git-intake.toml`",
+                "the check `lint` removed from `.git-intake.toml`"
+            ]
+        );
+        let none = config(Some("make deps"), &[]);
+        assert_eq!(
+            config_changes(Some(&before), Some(&none)),
+            ["the checks `lint` and `test` removed from `.git-intake.toml`"]
+        );
+        // Only the order changed.
+        let reordered = config(
+            Some("make deps"),
+            &[("test", "make test"), ("lint", "make lint")],
+        );
+        assert_eq!(
+            config_changes(Some(&before), Some(&reordered)),
+            ["the order of the checks of `.git-intake.toml`"]
+        );
+        // The same install command and checks: nothing to name.
+        assert!(config_changes(Some(&before), Some(&before.clone())).is_empty());
+        // A side that cannot be read.
+        for (b, a) in [(None, Some(&after)), (Some(&before), None), (None, None)] {
+            assert_eq!(
+                config_changes(b, a),
+                ["the install command and the checks of `.git-intake.toml`"]
+            );
+        }
+    }
 
     #[test]
     fn update_branches_are_recognised() {

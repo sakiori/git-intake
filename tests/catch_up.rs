@@ -7,7 +7,7 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::{FORK_FILE, Fork, stderr, stdout};
+use common::{FORK_CHECK, FORK_FILE, Fork, checks_line, stderr, stdout};
 use predicates::str::contains;
 
 const TRAILER: &str = "Intake-Catch-Up: main";
@@ -118,7 +118,7 @@ fn finish_catches_up_with_a_local_commit_and_publishes() {
         "{out}"
     );
     assert!(out.contains("caught up with 'main' at"), "{out}");
-    assert!(out.contains("passed   test -f app.txt"), "{out}");
+    assert!(out.contains("passed   app"), "{out}");
     assert!(out.contains("pushed main to 'origin'"), "{out}");
     let merge = env.rev(&f.down, "main");
     assert_eq!(parents(&f, &merge), [local.clone(), verified.clone()]);
@@ -302,13 +302,13 @@ fn a_conflicting_catch_up_stops_and_continue_concludes_it() {
 
 #[test]
 fn failed_checks_after_a_catch_up_leave_it_unverified() {
-    let f = Fork::with_checks(&["test ! -f breaks.txt"]);
+    let f = Fork::with_checks(&[("unbroken", "test ! -f breaks.txt")]);
     let env = &f.env;
     let (verified, _) = verify_update(&f);
     let local = env.commit(&f.down, &[("breaks.txt", "b\n")], "fork: breaks");
 
     let out = stdout(&f.tool(&["finish"]).code(1));
-    assert!(out.contains("FAILED   test ! -f breaks.txt"), "{out}");
+    assert!(out.contains("FAILED   unbroken"), "{out}");
     assert!(out.contains("verification of the catch-up merge"), "{out}");
     let merge = env.rev(&f.down, "git-intake/update");
     assert_eq!(parents(&f, &merge), [local.clone(), verified]);
@@ -336,9 +336,12 @@ fn a_move_during_verification_stops_and_the_next_finish_catches_up_again() {
     // The check lands a commit on the integration branch once, while
     // `finish` verifies the first catch-up merge.
     let f = Fork::with_checks(&[
-        "test -f app.txt",
-        "if [ -f \"$HOME/move\" ]; then rm \"$HOME/move\"; \
+        FORK_CHECK,
+        (
+            "meanwhile",
+            "if [ -f \"$HOME/move\" ]; then rm \"$HOME/move\"; \
          git -C \"$(cat \"$HOME/down\")\" commit -q --allow-empty -m 'fork: meanwhile'; fi",
+        ),
     ]);
     let env = &f.env;
     fs::write(
@@ -740,13 +743,13 @@ fn checks_added_on_the_integration_branch_verify_the_catch_up() {
     let cfg = fs::read_to_string(dir.join(".git-intake.toml"))
         .unwrap()
         .replace(
-            "checks = [\"test -f app.txt\"]",
-            "checks = [\"test -f app.txt\", \"touch \\\"$HOME/added-check-ran\\\"\"]",
+            &checks_line(&[FORK_CHECK]),
+            &checks_line(&[FORK_CHECK, ("added", "touch \"$HOME/added-check-ran\"")]),
         );
     land(&f, &[(".git-intake.toml", &cfg)], "other: add a check");
 
     let out = stdout(&f.tool(&["finish"]).success());
-    assert!(out.contains("passed   touch"), "{out}");
+    assert!(out.contains("passed   added"), "{out}");
     assert!(env.path("home").join("added-check-ran").exists());
     env.assert_no_update(&f.down);
 }
@@ -878,43 +881,6 @@ fn abort_in_the_catch_up_step_records_the_resolutions_made_by_hand() {
 }
 
 #[test]
-fn a_state_of_format_4_is_carried_on_and_written_in_format_5() {
-    let f = Fork::new();
-    let env = &f.env;
-    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
-    f.tool(&["start"]).success();
-    edit_state(&f.down, |s| {
-        s["version"] = 4.into();
-        s["release"] = "0.3.5".into();
-        let object = s.as_object_mut().unwrap();
-        object.remove("start_base");
-        object.remove("catch_ups");
-    });
-    f.tool(&["status"])
-        .success()
-        .stdout(contains("update in progress: merged"));
-    assert_eq!(read_state(&f.down)["version"], 4);
-    f.tool(&["migrate"]).code(2).stderr(contains(
-        "keeps its state in format 4, which this release carries on without migration",
-    ));
-    let verify = f.tool(&["verify"]).success();
-    let err = stderr(&verify);
-    assert!(
-        err.contains("the update was started by git-intake 0.3.5"),
-        "{err}"
-    );
-    assert!(
-        err.contains("releases before v0.3.6 can no longer carry the update on"),
-        "{err}"
-    );
-    let state = read_state(&f.down);
-    assert_eq!(state["version"], 5);
-    assert_eq!(state["start_base"], state["base"]);
-    f.tool(&["finish"]).success();
-    env.assert_no_update(&f.down);
-}
-
-#[test]
 fn a_catch_up_given_up_by_hand_is_dropped() {
     let f = Fork::new();
     let env = &f.env;
@@ -973,7 +939,7 @@ fn continue_drops_a_catch_up_given_up_by_hand_and_names_verify() {
 
 #[test]
 fn a_concluded_catch_up_is_the_runs_only_catch_up() {
-    let f = Fork::with_checks(&["test -f app.txt", "touch \"$HOME/checked\""]);
+    let f = Fork::with_checks(&[FORK_CHECK, ("checked", "touch \"$HOME/checked\"")]);
     let env = &f.env;
     let (verified, _) = verify_update(&f);
     let checked = env.path("home").join("checked");

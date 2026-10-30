@@ -8,7 +8,6 @@ pub mod env;
 pub mod finish;
 pub mod log;
 pub mod merge_request;
-pub mod migrate;
 pub mod port_plan;
 pub mod report;
 pub mod status;

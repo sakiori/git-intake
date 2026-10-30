@@ -6,7 +6,7 @@ mod common;
 use std::fs;
 use std::path::PathBuf;
 
-use common::{Fork, MERGE_REQUEST_BRANCH, Mono, stderr, stdout};
+use common::{FORK_CHECK, Fork, MERGE_REQUEST_BRANCH, Mono, checks_line, stderr, stdout};
 
 /// A command that writes the tool's variables, sorted, to `$HOME/<file>`.
 fn dump(file: &str) -> String {
@@ -59,8 +59,8 @@ fn a_merge_request_pipeline_gets_what_verify_gives() {
     let f = Fork::merge_request();
     let env = &f.env;
     f.reconfigure(
-        "checks = [\"test -f app.txt\"]",
-        &format!("checks = [{:?}]", dump("verify-env")),
+        &checks_line(&[FORK_CHECK]),
+        &checks_line(&[("env", &dump("verify-env"))]),
     );
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
@@ -304,8 +304,8 @@ fn a_port_update_of_decisions_only_sets_its_variables() {
     let f = Fork::port();
     let env = &f.env;
     f.reconfigure(
-        "checks = [\"test -f app.txt\"]",
-        &format!("checks = [{:?}]", dump("verify-env")),
+        &checks_line(&[FORK_CHECK]),
+        &checks_line(&[("env", &dump("verify-env"))]),
     );
     let c1 = env.push_upstream(&f.up, &[("p1.txt", "1\n")], "upstream: one");
     let c2 = env.push_upstream(&f.up, &[("p2.txt", "2\n")], "upstream: two");

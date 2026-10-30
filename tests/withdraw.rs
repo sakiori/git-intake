@@ -7,7 +7,7 @@ mod common;
 use std::fs;
 
 use common::forge::branch_tip;
-use common::{Fork, How, MERGE_REQUEST_BRANCH, merge_on_fake, stderr, stdout};
+use common::{Fork, How, MERGE_REQUEST_BRANCH, as_earlier_release, merge_on_fake, stderr, stdout};
 use serde_json::json;
 
 fn behind(f: &Fork) -> String {
@@ -177,7 +177,9 @@ fn waiting(f: &Fork, branch: &str, number: Option<u64>, version: u64) -> String 
     let path = env.intake_dir(&f.down).join("state.json");
     let mut state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    state["version"] = version.into();
+    // Another release, so that a command that wrote the state for its
+    // release warning would change it.
+    as_earlier_release(&mut state, version, "0.3.6");
     let mut mr = json!({
         "remote": "origin",
         "branch": branch,
@@ -294,5 +296,68 @@ fn aborting_a_waiting_update_names_its_merged_merge_request() {
     assert!(out.contains("update aborted"), "{out}");
     assert!(out.contains("merge request !1"), "{out}");
     assert!(out.contains("is merged"), "{out}");
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn finish_hands_over_a_waiting_update_while_the_checks_are_plain_commands() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    behind(&f);
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    let head = waiting(&f, MERGE_REQUEST_BRANCH, Some(1), 5);
+    f.forge().add(MERGE_REQUEST_BRANCH, "main", "");
+    // The integration tip still lists its checks as plain commands, as the
+    // earlier release reads them.
+    f.plain_checks();
+    let path = env.intake_dir(&f.down).join("state.json");
+    let recorded = fs::read_to_string(&path).unwrap();
+
+    // Other commands refuse, and the state file stays as it was.
+    for args in [
+        &["continue"][..],
+        &["verify"],
+        &["sync"],
+        &["start"],
+        &["status"],
+    ] {
+        f.tool(args).code(2);
+        assert_eq!(fs::read_to_string(&path).unwrap(), recorded, "{args:?}");
+    }
+    let err = stderr(&f.tool(&["status"]).code(2));
+    assert!(
+        err.contains("write `checks = [{ name = \"...\", run = \"test -f app.txt\" }]`"),
+        "{err}"
+    );
+
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(
+        out.contains("which is open; it carries the update from now on"),
+        "{out}"
+    );
+    env.assert_no_update(&f.down);
+    assert!(!env.intake_dir(&f.down).join("logs").exists());
+    assert_eq!(branch_tip(&f.publish, MERGE_REQUEST_BRANCH), Some(head));
+}
+
+#[test]
+fn abort_withdraws_a_waiting_update_while_the_checks_are_plain_commands() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    behind(&f);
+    f.tool(&["start"]).success();
+    waiting(&f, MERGE_REQUEST_BRANCH, Some(1), 5);
+    f.forge().add(MERGE_REQUEST_BRANCH, "main", "");
+    f.plain_checks();
+    let path = env.intake_dir(&f.down).join("state.json");
+    let recorded = fs::read_to_string(&path).unwrap();
+    f.tool(&["report"]).code(2);
+    assert_eq!(fs::read_to_string(&path).unwrap(), recorded);
+
+    let out = stdout(&f.tool(&["abort", "--merge-request"]).success());
+    assert!(out.contains("update aborted; 'main' is unchanged"), "{out}");
+    assert!(out.contains("closed merge request !1"), "{out}");
+    assert_eq!(branch_tip(&f.publish, MERGE_REQUEST_BRANCH), None);
     env.assert_no_update(&f.down);
 }

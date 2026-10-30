@@ -24,16 +24,16 @@ use crate::commands::{catch_up, merge_request, verify};
 use crate::config::PublishVia;
 use crate::git::{Git, abbrev, branch_ref, tracking_ref};
 use crate::repo::{Repo, bullet};
-use crate::state::{self, Finishing, PlannedMove, UpdateState, Work};
+use crate::state::{self, Finishing, PlannedMove, Stored, UpdateState, Work};
 use crate::upstreams;
 
 pub fn run(repo: &Repo, no_publish: bool) -> Result<Exit> {
-    let state = repo.require_state()?;
     // An update an earlier release left waiting for its merge request is
     // the merge request's from now on.
-    if state.merge_request.is_some() {
-        return merge_request::hand_over(repo, state);
+    if let Some(Stored::Waiting(waiting)) = repo.stored()? {
+        return merge_request::hand_over(repo, &waiting);
     }
+    let state = repo.require_state()?;
     let via = state.config.publish.as_ref().map(|p| p.via);
     if via == Some(PublishVia::MergeRequest) && state.finishing.is_none() && !no_publish {
         return merge_request::finish(repo, state);
@@ -495,8 +495,25 @@ fn clean_head(state: &UpdateState, wt: &Git) -> Result<String> {
     wt.line(&["rev-parse", "HEAD"])
 }
 
-/// Refuses an update head that is not the verified commit.
+/// Refuses an update head that is not the verified commit. A partial run
+/// on the head does not count; the refusal names the checks it left out.
 fn require_verified(state: &UpdateState, head: &str) -> Result<()> {
+    let verified = state
+        .verification
+        .as_ref()
+        .is_some_and(|v| v.passed && v.commit == head);
+    if !verified && let Some(p) = state.partial_run.as_ref().filter(|p| p.run.commit == head) {
+        bail!(
+            "the update head {} has only a partial run, which left out {} and does not verify the update; \
+             run `git intake verify` without `--only` or `--skip` to run every check",
+            abbrev(head),
+            p.left_out
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     match &state.verification {
         None => bail!("the update is not verified; run `git intake verify`"),
         Some(v) if v.commit != head => bail!(
@@ -626,17 +643,18 @@ fn not_yet_published(repo: &Repo, remote: &str, moves: &[PlannedMove]) -> Result
 
 /// Completes an update: keeps it as the last update for `report` and
 /// removes the worktree, the update branch, the plan, the update's upstream
-/// references and the state.
+/// references, its logs and the state.
 pub fn close(repo: &Repo, mut state: UpdateState, unpublished: Vec<String>) -> Result<Exit> {
     state.finished = true;
     if let Some(f) = state.finishing.as_mut() {
         f.push_error = None;
         f.unpublished = unpublished;
     }
-    state::save(&repo.paths.last_update, &state::in_current_format(&state).0)?;
+    state::save(&repo.paths.last_update, &state)?;
     repo.remove_update_artifacts()?;
     repo.remove_plan()?;
     upstreams::release(&repo.git, &state)?;
+    repo.remove_logs()?;
     state::remove(&repo.paths.state)?;
     println!("update finished");
     Ok(Exit::Success)

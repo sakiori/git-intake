@@ -18,7 +18,7 @@ use crate::port::{self, PlanLine};
 use crate::repo::{Repo, bullet};
 use crate::state::{
     self, CatchUpStep, ConflictFile, CopyStep, FollowMerge, MergeKind, PlannedCommit, PortPlan,
-    QueuedUpstream, Resolution, UPDATE_BRANCH, UpdateState, UpstreamStep, Work,
+    QueuedUpstream, Resolution, Stored, UPDATE_BRANCH, UpdateState, UpstreamStep, Work,
 };
 use crate::sync_record::{self, Record};
 use crate::tags::{self, TagPattern, UpstreamTags};
@@ -170,7 +170,6 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
 /// Refuses a new update while one is in progress, naming its step and the
 /// next command.
 pub fn refuse_in_progress(state: &UpdateState) -> Result<()> {
-    merge_request::refuse_earlier(state)?;
     if state.finishing.is_some() {
         bail!(
             "the previous update is finishing; run `git intake finish` to publish it, \
@@ -1122,8 +1121,16 @@ fn read_plan(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<()> {
 /// logs and state. With `--merge-request` it then withdraws the update's
 /// merge request through the forge: closes it and deletes its branch.
 pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
-    let state = repo.state()?;
-    if let Some(finishing) = state.as_ref().and_then(|s| s.finishing.as_ref()) {
+    let stored = repo.stored()?;
+    let state = match &stored {
+        Some(Stored::Update(state)) => Some(state.as_ref()),
+        _ => None,
+    };
+    let waiting = match &stored {
+        Some(Stored::Waiting(w)) => Some(w.as_ref()),
+        _ => None,
+    };
+    if let Some(finishing) = state.and_then(|s| s.finishing.as_ref()) {
         let mut moved = Vec::new();
         for m in &finishing.moves {
             if repo.git.commit(&branch_ref(&m.branch))? != m.old {
@@ -1141,12 +1148,16 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
     // The forge is reached before anything is removed, so that a missing
     // token or setting refuses with the update intact.
     let withdrawal = if withdraw {
-        let (publish, integration) = match &state {
-            Some(s) => (
-                merge_request::publication(repo, s),
+        let (publish, integration) = match (&state, &waiting) {
+            (Some(s), _) => (
+                merge_request::publication(repo, s.config.publish.as_ref()),
                 s.config.integration.clone(),
             ),
-            None => {
+            (_, Some(w)) => (
+                merge_request::publication(repo, w.publish.as_ref()),
+                w.integration.clone(),
+            ),
+            (None, None) => {
                 let config = repo.load_config()?.config;
                 (config.publish, config.integration)
             }
@@ -1166,17 +1177,15 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
     } else {
         None
     };
-    let earlier_state = match &state {
-        Some(s) if s.merge_request.is_some() && !withdraw => {
-            Some(merge_request::earlier_state(repo, s))
-        }
+    let earlier_state = match waiting {
+        Some(w) if !withdraw => Some(merge_request::earlier_state(repo, w)),
         _ => None,
     };
     let mut removed = repo.remove_update_artifacts()?;
     removed.extend(repo.remove_plan()?);
-    if let Some(state) = &state {
+    if let Some(stored) = &stored {
         removed.extend(
-            upstreams::release(&repo.git, state)?
+            upstreams::release_refs(&repo.git, stored.upstream_names())?
                 .into_iter()
                 .map(|r| format!("reference {r}")),
         );
@@ -1186,33 +1195,30 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
     for r in &removed {
         println!("removed {r}");
     }
-    match &state {
-        Some(state) => println!(
-            "update aborted; '{}' is unchanged",
-            state.config.integration
-        ),
+    match &stored {
+        Some(stored) => println!("update aborted; '{}' is unchanged", stored.integration()),
         None if !removed.is_empty() => println!("removed the remains of an interrupted update"),
         None if withdrawal.is_none() => println!("no update is in progress; nothing to abort"),
         None => {}
     }
     if let Some((publish, integration)) = withdrawal {
-        let earlier = state.as_ref().and_then(|s| s.merge_request.as_ref());
+        let earlier = waiting.map(|w| &w.merge_request);
         merge_request::withdraw(repo, &publish, &integration, earlier)?;
         return Ok(Exit::Success);
     }
-    if let Some(state) = &state {
-        if let Some(carried) = &state.carried_from {
-            println!(
-                "the update was carried on from {}, which stays open; `git intake abort --merge-request` withdraws it",
-                carried.url
-            );
-        }
-        if let (Some(mr), Some(found)) = (&state.merge_request, &earlier_state) {
-            println!(
-                "{found}; it is kept, with its branch '{}'; `git intake abort --merge-request` withdraws it",
-                mr.branch
-            );
-        }
+    if let Some(carried) = state.and_then(|s| s.carried_from.as_ref()) {
+        println!(
+            "the update was carried on from {}, which stays open; `git intake abort --merge-request` withdraws it",
+            carried.url
+        );
+    }
+    if let (Some(w), Some(found)) = (waiting, &earlier_state) {
+        println!(
+            "{found}; it is kept, with its branch '{}'; `git intake abort --merge-request` withdraws it",
+            w.merge_request.branch
+        );
+    }
+    if stored.is_some() {
         return Ok(Exit::Success);
     }
     // With no update in progress, `abort` names the merge request it does
@@ -1245,7 +1251,6 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
 /// unless it has caught up with the integration branch in its worktree
 /// since: `continue` and `verify` then work on the catch-up.
 pub fn require_merging(repo: &Repo, state: &UpdateState) -> Result<()> {
-    merge_request::refuse_earlier(state)?;
     if state.finishing.is_some() && moved_on(state)? && repo.update_worktree_registered()? {
         return Ok(());
     }
@@ -1286,9 +1291,6 @@ pub fn require_worktree(repo: &Repo, state: &UpdateState) -> Result<()> {
 
 /// The step an update has reached, as a stable name.
 pub fn step_name(state: &UpdateState, wt: &Git) -> Result<&'static str> {
-    if state.merge_request.is_some() {
-        return Ok("waiting_for_merge_request");
-    }
     if let Some(c) = state.catching_up() {
         let merging = wt.dir().exists() && wt.merge_in_progress()?;
         return Ok(if c.step == CatchUpStep::Conflict || merging {
@@ -1368,10 +1370,6 @@ pub fn next_step(state: &UpdateState, wt: &Git) -> Result<String> {
         },
         "merging" => "git intake continue".to_string(),
         "verified" => "git intake finish".to_string(),
-        "waiting_for_merge_request" => match &state.merge_request {
-            Some(mr) => merge_request::earlier_next(mr),
-            None => "git intake finish".to_string(),
-        },
         "finishing" => match state.finishing.as_ref().and_then(|f| f.push_error.as_ref()) {
             Some(_) => "`git intake finish` to retry the push, catching up first when the publish remote moved, \
                         or `git intake finish --no-publish` to close the update locally"

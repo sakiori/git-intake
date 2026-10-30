@@ -72,6 +72,17 @@ pub enum Command {
     },
     /// Run the install command and checks on the update
     ///
+    /// Runs the install command, then the update's checks in their order, and records the verified
+    /// commit when every check passes. The update's checks are those of the configuration at the
+    /// integration tip at `start`, or at the last catch-up merge. Each command's output goes to a log
+    /// named after it, `install.log` or `check-<NAME>.log`.
+    ///
+    /// `--only` and `--skip` select checks by name. A run that leaves out a check is a partial run:
+    /// it runs the install command and the selected checks the same way, is recorded beside the
+    /// verification with logs of its own, and never verifies the update, nor changes or completes
+    /// its verification. A later partial run replaces the earlier one; a full run and a catch-up
+    /// merge drop it.
+    ///
     /// Each command runs through `sh -c` in the update worktree with variables that describe
     /// the update, as full commit ids: `GIT_INTAKE_BASE`, the integration tip the update started
     /// from, or the one it last caught up with; `GIT_INTAKE_HEAD`, the commit being verified; `GIT_INTAKE_INTEGRATION`, the
@@ -82,15 +93,22 @@ pub enum Command {
     /// commit before the update also gets it as `GIT_INTAKE_UPSTREAM_<NAME>_PREVIOUS`. `<NAME>` is
     /// the upstream's name in upper case with every character other than a letter or a digit
     /// replaced by `_`. `env` gives a merge request pipeline the same variables.
-    Verify,
+    Verify {
+        /// Run only this check; repeat it to select several
+        #[arg(long, value_name = "NAME", conflicts_with = "skip")]
+        only: Vec<String>,
+        /// Leave this check out; repeat it to leave out several
+        #[arg(long, value_name = "NAME")]
+        skip: Vec<String>,
+    },
     /// Publish the update by push or as a merge request, and complete it
     ///
     /// When the integration branch moved past the update's base, `finish` first catches up: it
     /// merges the update into the new tip with a merge commit that carries an `Intake-Catch-Up`
     /// trailer. It makes at most one catch-up merge per run; a conflict stops it for `continue`.
     ///
-    /// With `via = "push"`, `finish` requires a verified update and verifies a catch-up merge
-    /// itself. It fetches the publish remote, fast-forwards a local integration branch strictly
+    /// With `via = "push"`, `finish` requires a verified update, which a partial run of `verify`
+    /// does not make, and verifies a catch-up merge itself, running every check. It fetches the publish remote, fast-forwards a local integration branch strictly
     /// behind it, fast-forwards the integration branch to the verified commit, then pushes it
     /// without force.
     ///
@@ -153,16 +171,6 @@ pub enum Command {
         #[arg(last = true, value_name = "COMMAND")]
         command: Vec<String>,
     },
-    /// Carry an update in progress over from state format 3
-    ///
-    /// Rewrites the state of an update started by a release with state format 3 in the current
-    /// format, in place, keeping its branch, commits, merge in progress, index, uncommitted and untracked
-    /// files, plan, logs and references. An update worktree in the git directory moves to
-    /// `.worktrees/git-intake/update` in the main worktree; stop the processes, shells and editors
-    /// that use it before running this command. A verification run in the old location is dropped
-    /// unless `finish` has begun. Run again after an interruption, it completes the migration. An
-    /// update of state format 4 needs no migration: this release carries it on.
-    Migrate,
     /// Fetch every upstream and show its drift, and the update in progress
     ///
     /// A follow upstream with `tags` is compared with its newest release tag instead of its

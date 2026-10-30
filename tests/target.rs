@@ -419,7 +419,7 @@ fn first_import_of_a_path_upstream_at_a_chosen_revision() {
     // Only app-a is imported, so only its check runs.
     let cfg = fs::read_to_string(m.down.join(".git-intake.toml"))
         .unwrap()
-        .replace(", \"test -f apps/b/b.txt\"", "");
+        .replace(", { name = \"b\", run = \"test -f apps/b/b.txt\" }", "");
     env.commit(
         &m.down,
         &[(".git-intake.toml", &cfg)],

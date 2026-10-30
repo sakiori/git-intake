@@ -14,7 +14,7 @@ use crate::git::{Git, abbrev, branch_ref, lines, redacted};
 use crate::output::{Render, emit};
 use crate::port::{self, Standing};
 use crate::repo::{MainWorktree, Repo};
-use crate::state::{CatchUpStep, UPDATE_BRANCH, UpstreamStep, Work};
+use crate::state::{CatchUpStep, Stored, UPDATE_BRANCH, UpstreamStep, Work};
 use crate::sync_record::{self, Record};
 use crate::upstreams::{self, Fetches, REFS_PREFIX};
 
@@ -108,8 +108,12 @@ pub fn run(repo: &Repo, json: bool) -> Result<Exit> {
 /// The references the update in progress holds, and references under
 /// `refs/git-intake/` that no update accounts for.
 fn reference_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
-    let state = repo.state().ok().flatten();
-    let held = state.as_ref().map(upstreams::held_by).unwrap_or_default();
+    let held = repo
+        .stored()
+        .ok()
+        .flatten()
+        .map(|s| s.held())
+        .unwrap_or_default();
     let existing = upstreams::existing(&repo.git)?;
     let value = |name: &str| existing.iter().find(|(n, _)| n == name).map(|(_, v)| v);
     // The commits of held references that are missing: another reference
@@ -664,7 +668,7 @@ fn state_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
         }
     };
     let branch = repo.update_branch_exists()?;
-    let state = match repo.state() {
+    let state = match repo.stored() {
         Ok(s) => s,
         Err(err) => {
             checks.add("update_state", None, CheckStatus::Fail, format!("{err:#}"));
@@ -690,21 +694,24 @@ fn state_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
     };
     // An earlier release removed the worktree once it pushed the merge
     // request branch, unless the update caught up meanwhile.
-    if let Some(mr) = &state.merge_request {
-        checks.add(
-            "update_state",
-            None,
-            CheckStatus::Warn,
-            format!(
-                "the update waits for its merge request from '{}' into '{}' on '{}', as an earlier release left it; {}",
-                mr.branch,
-                state.config.integration,
-                mr.remote,
-                merge_request::earlier_next(mr)
-            ),
-        );
-        return Ok(());
-    }
+    let state = match state {
+        Stored::Update(state) => state,
+        Stored::Waiting(w) => {
+            checks.add(
+                "update_state",
+                None,
+                CheckStatus::Warn,
+                format!(
+                    "the update waits for its merge request from '{}' into '{}' on '{}', as an earlier release left it; {}",
+                    w.merge_request.branch,
+                    w.integration,
+                    w.merge_request.remote,
+                    w.next()
+                ),
+            );
+            return Ok(());
+        }
+    };
     let mut problems = Vec::new();
     if !registered || !state.worktree.exists() {
         problems.push(format!(
