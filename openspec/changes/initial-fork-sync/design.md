@@ -23,3 +23,29 @@ An update spans several invocations and possibly several shells. Its state (targ
 ## Publication checks before any ref moves
 
 `finish` compares the recorded base with the integration tip and the verified commit with the worktree head before moving anything. Branches only fast-forward; a push without force is rejected by the remote when someone else published first, and the tool then stops with the local branches advanced and an explanation, because overwriting a remote branch is never the fork's intent.
+
+## Upstreams at a path
+
+A monorepo assembled from repositories that keep moving is a downstream repository with several upstreams, each owning one path. The configuration is therefore a list of upstreams, and a fork is the case of one upstream at the root. Every other part of the procedure (fixed targets, an isolated worktree, recorded resolutions, one verification of the published tree, guarded publication) applies unchanged, so the monorepo case is the same tool rather than a separate migration script.
+
+A path-scoped upstream is merged with git's subtree merge: the first import merges the upstream with the `ours` strategy and reads its tree under the path, and later updates merge with the `subtree=<path>` strategy option. This is the merge `git subtree add` and `git subtree pull` perform without `--squash`; the tool issues it directly because the merge has to run inside its own worktree and state, and because `git subtree` is a contributed script not every git installation carries. History is kept in full: squashed imports would lose the commit identities that drift counts and the sync record rely on, so the tool does not offer them.
+
+The subtree strategy maps paths by prefix and then relies on git's rename detection. Files the monorepo moves within an upstream's path merge as renames; files moved out of the path, or split and joined during restructuring, may conflict or arrive at their old location, and are resolved by hand like any other conflict.
+
+Paths may not nest, and an upstream at the root cannot share the repository with others, so that every file has at most one upstream and conflicts are always attributable.
+
+## The history is the sync record
+
+What each upstream last delivered is a fact about the integration branch, so it lives there: every merge commit the tool creates carries trailers naming the upstream and the target. `status` reads the newest such trailer per upstream; `doctor` uses the same trailers to notice an upstream dropped from the configuration. A last synced commit in the configuration would be a second copy that drifts from the history at the first manual merge or reverted update. The trailers also detect a rewritten upstream: if its branch no longer contains the recorded target, a merge would silently reintroduce or duplicate history, so the tool stops.
+
+## One update, many upstreams
+
+One `start` queues every selected upstream with new commits in configuration order and merges each with its own commit, so upstream changes stay separable from the repository's own work and from one another in history. Verification runs once on the combined tree: checks across a monorepo are expensive, and an intermediate tree that is never published needs no proof. An upstream whose conflict cannot be resolved now is handled by aborting and starting again with the others named; recorded resolutions make the repeated merges cheap, so the tool needs no partial-skip state.
+
+## Remotes from the configuration
+
+Upstream URLs are facts about the repository and are committed with it, so a new clone becomes operable by its first `fetch`, which adds missing remotes. An existing remote with a different URL is never rewritten: it may be a deliberate local mirror, and silently retargeting it would fetch from the wrong source.
+
+## Output for agents
+
+Reporting commands produce a JSON document with stable field names alongside the text, and the same exit status. Agents and scheduled jobs act on drift, conflicts and doctor failures without parsing prose, and `status --check` failing on any drift gives a cutover a single gate.
