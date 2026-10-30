@@ -84,6 +84,10 @@ fn main() -> ExitCode {
             redact::hold(value.trim());
         }
     }
+    // A panic's message goes the same way as every other.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("{}", redact::redacted(&info.to_string()));
+    }));
     match run(cli.command) {
         Ok(Exit::Success) => ExitCode::SUCCESS,
         Ok(Exit::Negative) => ExitCode::from(1),

@@ -7,12 +7,17 @@ use std::sync::{Mutex, PoisonError};
 /// What a token the tool holds is replaced with in a message.
 const HIDDEN: &str = "[hidden]";
 
+/// The shortest value held as a token. A shorter one is no credential a
+/// forge issues, and hiding it would mangle every message that contains it.
+const SHORTEST_TOKEN: usize = 8;
+
 /// The tokens the tool holds, which no message shows.
 static HELD: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// Keeps every later message from showing `secret`.
+/// Keeps every later message from showing `secret`, unless it is shorter
+/// than any token a forge issues.
 pub fn hold(secret: &str) {
-    if secret.is_empty() {
+    if secret.chars().count() < SHORTEST_TOKEN {
         return;
     }
     let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
@@ -26,6 +31,12 @@ pub fn hold(secret: &str) {
 pub fn redacted(text: &str) -> String {
     let held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
     without_secrets(&without_credentials(text), &held)
+}
+
+/// Whether `text` holds a URL with credentials, as [`redacted`] removes
+/// them.
+pub fn has_credentials(text: &str) -> bool {
+    without_credentials(text) != text
 }
 
 /// `text` with each of `secrets` replaced, the longest first, so that a

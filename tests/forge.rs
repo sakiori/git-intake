@@ -372,21 +372,22 @@ fn credentials_in_urls_never_reach_the_output() {
         !out.contains("s3cret") && !err.contains("s3cret"),
         "{out}{err}"
     );
-    // An upstream whose URL carries a credential and cannot be fetched.
+    // An upstream whose URL carries a credential is refused, and its
+    // refusal shows the URL without it.
     let g = Fork::new();
     g.reconfigure(
         &format!("url = {:?}", g.up.url()),
         "url = \"https://user:s3cret-word@127.0.0.1:9/team/up.git\"",
     );
-    let status = g.tool(&["status"]).code(1);
-    let (out, err) = (stdout(&status), stderr(&status));
-    assert!(out.contains("https://127.0.0.1:9/team/up.git"), "{out}");
-    assert!(
-        !out.contains("s3cret") && !err.contains("s3cret"),
-        "{out}{err}"
-    );
-    let json = g.env.tool_json(&g.down, &["status", "--json"], 1);
-    assert!(!json.to_string().contains("s3cret"), "{json}");
+    for args in [&["status"][..], &["status", "--json"]] {
+        let status = g.tool(args).code(2);
+        let (out, err) = (stdout(&status), stderr(&status));
+        assert!(err.contains("https://127.0.0.1:9/team/up.git"), "{err}");
+        assert!(
+            !out.contains("s3cret") && !err.contains("s3cret"),
+            "{out}{err}"
+        );
+    }
 }
 
 #[test]

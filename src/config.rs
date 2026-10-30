@@ -270,6 +270,14 @@ pub fn parse(text: &str) -> Result<Config> {
                 problems.push(format!("{label} url: the URL is empty"));
                 String::new()
             }
+            Some(url) if crate::redact::has_credentials(&url) => {
+                problems.push(format!(
+                    "{label} url: '{}' carries credentials, which belong in the environment; give the URL \
+                     without them and let git's credential helper or SSH key supply them",
+                    crate::redact::redacted(&url)
+                ));
+                url
+            }
             Some(url) => url,
             None => {
                 if up.remote.is_none() {

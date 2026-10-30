@@ -1132,26 +1132,86 @@ fn an_api_url_with_credentials_is_refused_without_showing_them() {
 
 #[test]
 fn a_git_command_that_cannot_start_is_named_without_credentials() {
-    let f = Fork::new();
+    let f = Fork::merge_request();
+    let env = &f.env;
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
     // An argument this long is more than the system lets a process start
-    // with, so git cannot be run with it.
+    // with, so git cannot be run with it when the push URL is read.
     let url = format!(
         "https://user:s3cret@example.com/{}.git",
         "a".repeat(3 * 1024 * 1024)
     );
-    f.reconfigure(
-        &format!("url = {:?}", f.up.url()),
-        &format!("url = {url:?}"),
-    );
-    let err = stderr(&f.tool(&["status"]).code(2));
+    let config = f.down.join(".git").join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("[remote \"origin\"]\n\tpushurl = {url}\n"));
+    std::fs::write(&config, text).unwrap();
+    let err = stderr(&f.tool(&["finish"]).code(2));
     assert!(
         err.contains("cannot run `git"),
         "{}",
         &err[..err.len().min(400)]
     );
-    assert_never_shown(
-        &f,
-        "s3cret",
-        &[&["status"], &["status", "--json"], &["doctor", "--json"]],
+    assert!(!err.contains("s3cret"), "{}", &err[..err.len().min(400)]);
+}
+
+#[test]
+fn an_upstream_url_with_credentials_is_refused_without_showing_them() {
+    let f = Fork::new();
+    for (url, shown) in [
+        (
+            "https://user:s3cret@example.com/upstream.git",
+            "https://example.com/upstream.git",
+        ),
+        (
+            "https://s3cret@example.com/upstream.git",
+            "https://example.com/upstream.git",
+        ),
+        (
+            "ssh://deploy:s3cret@example.com/upstream.git",
+            "ssh://deploy@example.com/upstream.git",
+        ),
+    ] {
+        let path = f.down.join(".git-intake.toml");
+        let committed = std::fs::read_to_string(&path).unwrap();
+        let at = committed.find("url = ").unwrap();
+        let end = at + committed[at..].find('\n').unwrap();
+        let config = format!("{}url = {url:?}{}", &committed[..at], &committed[end..]);
+        f.env.commit(
+            &f.down,
+            &[(".git-intake.toml", &config)],
+            "fork: an upstream URL with credentials",
+        );
+        let err = stderr(&f.tool(&["status"]).code(2));
+        assert!(
+            err.contains(&format!("url: '{shown}' carries credentials")),
+            "{url}: {err}"
+        );
+        assert_never_shown(
+            &f,
+            "s3cret",
+            &[&["status"], &["status", "--json"], &["doctor", "--json"]],
+        );
+        f.env.git(&f.down, &["reset", "-q", "--hard", "HEAD~1"]);
+    }
+    // The user of an SSH URL names an account, not a credential.
+    f.reconfigure(
+        &format!("url = {:?}", f.up.url()),
+        "url = \"ssh://git@example.com/upstream.git\"",
     );
+    let err = stderr(&f.tool(&["status"]));
+    assert!(!err.contains("carries credentials"), "{err}");
+}
+
+#[test]
+fn a_short_token_value_leaves_the_output_intact() {
+    let f = Fork::new();
+    let run = f
+        .env
+        .tool_env(&f.down, &["status", "--json"], &[("GITLAB_TOKEN", "a")])
+        .success();
+    let json: serde_json::Value = serde_json::from_slice(&run.get_output().stdout).unwrap();
+    assert_eq!(json["integration"], "main");
+    assert_eq!(json["publish_via"], "push");
 }
