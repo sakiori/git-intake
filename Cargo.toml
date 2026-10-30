@@ -1,15 +1,29 @@
 [package]
 name = "git-intake"
 version = "0.0.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Merge-based, verified, resumable updates of a downstream repository from its upstreams"
 readme = "README.md"
-publish = false
+keywords = ["git", "upstream", "fork", "merge", "monorepo"]
+categories = ["command-line-utilities", "development-tools"]
+# The published crate holds what building and installing the binary needs.
+include = ["/src/", "/Cargo.lock", "/LICENSE", "/README.md"]
 
 # `xtask` holds development tasks, such as generating the manual page, so that
 # their dependencies stay out of the shipped binary.
 [workspace]
 members = ["xtask"]
+
+# rust-version is the oldest toolchain that builds the workspace with the
+# locked dependencies; CI builds it with that toolchain.
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/sakiori/git-intake"
 
 [dependencies]
 anyhow = "1.0.104"

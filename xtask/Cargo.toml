@@ -1,7 +1,10 @@
 [package]
 name = "xtask"
 version = "0.0.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Development tasks of git-intake that stay out of the shipped binary"
 publish = false
 
