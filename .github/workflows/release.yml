@@ -74,40 +74,15 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
       - run: .github/scripts/install-release-plz.sh "$RUNNER_TEMP/release-plz"
+      # release-plz commits the release pull request through GitHub's API, so
+      # the commit is signed ("Verified") and names the App's bot user,
+      # sakiori-release[bot], the only identity besides Sakiori
+      # <oss@sakiori.app> that the release automation uses.
       - env:
           GIT_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           release-plz release-pr --forge github \
-            --repo-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --output json | tee "$RUNNER_TEMP/release-pr.json"
-      # On GitHub, release-plz commits through the API, so the commit names
-      # the App. The project's commits are authored and committed as
-      # Sakiori <oss@sakiori.app>: the release pull request's single commit is
-      # made again with that identity, the same tree and message, and pushed
-      # over the one release-plz made, under a lease on it.
-      - name: Commit the release pull request as the project
-        env:
-          GIT_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          branch=$(jq -r '.prs[0].head_branch // empty' "$RUNNER_TEMP/release-pr.json")
-          if [ -z "$branch" ]; then
-            echo "::notice::no release pull request is open"
-            exit 0
-          fi
-          case "$branch" in release-plz-*) ;; *) echo "::error::unexpected release branch $branch"; exit 1 ;; esac
-          auth=$(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 -w0)
-          echo "::add-mask::$auth"
-          header="AUTHORIZATION: basic $auth"
-          git -c "http.extraheader=$header" fetch --no-tags origin "+refs/heads/$branch:refs/release-pr"
-          made=$(git rev-parse refs/release-pr)
-          if [ "$(git log -1 --format='%an <%ae>|%cn <%ce>' "$made")" = "Sakiori <oss@sakiori.app>|Sakiori <oss@sakiori.app>" ]; then
-            echo "::notice::$made is the project's commit already"
-            exit 0
-          fi
-          git -c advice.detachedHead=false checkout -q --detach "$made"
-          git -c user.name=Sakiori -c user.email=oss@sakiori.app commit -q --amend --no-edit --reset-author
-          git -c "http.extraheader=$header" push --force-with-lease="refs/heads/$branch:$made" \
-            origin "HEAD:refs/heads/$branch"
-          git log -1 --format='%H %an <%ae> / %cn <%ce>'
+            --repo-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --output json
 
   release:
     if: github.repository_owner == 'sakiori'
