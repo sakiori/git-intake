@@ -5,6 +5,7 @@ use std::fs;
 use anyhow::{Context, Result, bail};
 
 use crate::Exit;
+use crate::commands::merge_request::{self, Landing};
 use crate::config::Upstream;
 use crate::drift::{self, DriftState};
 use crate::git::{Git, abbrev, branch_ref, tracking_ref};
@@ -18,6 +19,19 @@ use crate::sync_record;
 
 pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
     if let Some(state) = repo.state()? {
+        if let Some(mr) = state
+            .merge_request
+            .as_ref()
+            .filter(|_| state.finishing.is_none())
+        {
+            bail!(
+                "the previous update waits for its merge request from '{}' into '{}' on '{}'; \
+                 run `git intake finish` once it is merged, or `git intake abort` to withdraw it",
+                mr.branch,
+                state.config.integration,
+                mr.remote
+            );
+        }
         if state.finishing.is_some() {
             bail!(
                 "the previous update is finishing; run `git intake finish` to publish it, \
@@ -64,7 +78,7 @@ pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
         )
     })?;
     if let Some(publish) = &config.publish {
-        require_not_behind_published(git, publish, &config.integration, &base)?;
+        require_not_behind_published(git, &publish.remote, &config.integration, &base)?;
     }
 
     let latest = sync_record::latest(&sync_record::records(git, &base, &config)?);
@@ -569,9 +583,7 @@ fn print_conflict(state: &UpdateState, i: usize, stderr: &str) {
 /// `continue`: concludes the merge stopped on conflicts and merges the rest.
 pub fn resume(repo: &Repo) -> Result<Exit> {
     let mut state = repo.require_state()?;
-    if state.finishing.is_some() {
-        bail!("`finish` is in progress; run `git intake finish` to complete it");
-    }
+    require_merging(&state)?;
     require_worktree(repo, &state)?;
     let wt = Git::worktree(&state.worktree);
     if let Some(i) = state
@@ -624,7 +636,8 @@ pub fn resume(repo: &Repo) -> Result<Exit> {
     merge_pending(repo, &mut state)
 }
 
-/// `abort`: removes the update worktree, branch and state.
+/// `abort`: removes the update worktree, branch, logs and state, and
+/// withdraws a merge request the update waits for.
 pub fn abort(repo: &Repo) -> Result<Exit> {
     let state = repo.state()?;
     if let Some(finishing) = state.as_ref().and_then(|s| s.finishing.as_ref()) {
@@ -642,7 +655,30 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
             );
         }
     }
-    let removed = repo.remove_update_artifacts()?;
+    let merge_request = state.as_ref().and_then(|s| s.merge_request.clone());
+    let mut unverified = None;
+    if let (Some(state), Some(mr)) = (&state, &merge_request) {
+        let landing = if state.finishing.is_some() {
+            // `finish` plans its moves only once the verified tree landed.
+            None
+        } else {
+            Some(merge_request::inspect(repo, &mut state.clone())?)
+        };
+        match landing {
+            None | Some(Landing::Landed { .. }) => bail!(
+                "the merge request from '{}' was merged with the verified commit; the update can no longer be aborted. \
+                 Run `git intake finish` to complete it",
+                mr.branch
+            ),
+            Some(Landing::Unverified { tip, landing, head }) => {
+                unverified = Some((tip, landing, head))
+            }
+            Some(_) => {}
+        }
+        merge_request::delete_branch(&repo.git, mr)?;
+    }
+    let mut removed = repo.remove_update_artifacts()?;
+    removed.extend(repo.remove_logs()?);
     state::remove(&repo.paths.state)?;
     if state.is_none() && removed.is_empty() {
         println!("no update is in progress; nothing to abort");
@@ -651,15 +687,81 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
     for r in &removed {
         println!("removed {r}");
     }
-    if let Some(state) = state {
-        println!(
-            "update aborted; '{}' and the mirror branches are unchanged",
-            state.config.integration
-        );
-    } else {
-        println!("removed the remains of an interrupted update");
+    match state {
+        Some(state) => {
+            println!("update aborted; {}", unchanged_branches(&state));
+            if let (Some(mr), Some((tip, landing, head))) = (&merge_request, &unverified) {
+                let integration = &state.config.integration;
+                let how = match head {
+                    Some(head) => format!(
+                        "{}, and it landed instead of the verified commit",
+                        head.describe()
+                    ),
+                    None => format!(
+                        "{} brought in '{}' without the verified tree",
+                        abbrev(landing),
+                        mr.branch
+                    ),
+                };
+                println!(
+                    "'{}/{integration}' at {} holds an unverified merge: {how}; review it before building on it",
+                    mr.remote,
+                    abbrev(tip)
+                );
+            } else if let Some(mr) = merge_request {
+                let integration = &state.config.integration;
+                if mr.requested {
+                    println!(
+                        "close the merge request from '{}' into '{integration}' on '{}'",
+                        mr.branch, mr.remote
+                    );
+                } else {
+                    println!(
+                        "if a merge request from '{}' into '{integration}' was opened on '{}', close it",
+                        mr.branch, mr.remote
+                    );
+                }
+            }
+        }
+        None => println!("removed the remains of an interrupted update"),
     }
     Ok(Exit::Success)
+}
+
+/// Names the integration branch and the configured mirror branches, which an
+/// aborted update leaves as they were.
+fn unchanged_branches(state: &UpdateState) -> String {
+    let mut names = vec![format!("'{}'", state.config.integration)];
+    names.extend(
+        state
+            .config
+            .upstreams
+            .iter()
+            .filter_map(|u| u.mirror.as_ref())
+            .map(|m| format!("'{m}'")),
+    );
+    match names.as_slice() {
+        [one] => format!("{one} is unchanged"),
+        [rest @ .., last] => format!("{} and {last} are unchanged", rest.join(", ")),
+        [] => unreachable!("the integration branch is always named"),
+    }
+}
+
+/// Refuses merge-phase commands once the update has left the merge phase.
+pub fn require_merging(state: &UpdateState) -> Result<()> {
+    if state.finishing.is_some() {
+        bail!("`finish` is in progress; run `git intake finish` to complete it");
+    }
+    if let Some(mr) = &state.merge_request {
+        bail!(
+            "the update waits for its merge request from '{}' into '{}' on '{}'; run `git intake finish` once it is merged, \
+             or `git intake abort` to withdraw it",
+            mr.branch,
+            state.config.integration,
+            mr.remote
+        );
+    }
+    Ok(())
 }
 
 /// Refuses when the update worktree is missing.
@@ -677,6 +779,9 @@ pub fn require_worktree(repo: &Repo, state: &UpdateState) -> Result<()> {
 pub fn step_name(state: &UpdateState, wt: &Git) -> Result<&'static str> {
     if state.finishing.is_some() {
         return Ok("finishing");
+    }
+    if state.merge_request.is_some() {
+        return Ok("waiting_for_merge_request");
     }
     if state
         .upstreams
@@ -704,6 +809,10 @@ pub fn next_step(state: &UpdateState, wt: &Git) -> Result<String> {
         ),
         "merging" => "git intake continue".to_string(),
         "verified" => "git intake finish".to_string(),
+        "waiting_for_merge_request" => match &state.merge_request {
+            Some(mr) => merge_request::waiting_next(mr, &state.config.integration),
+            None => "git intake finish".to_string(),
+        },
         "finishing" => match state.finishing.as_ref().and_then(|f| f.push_error.as_ref()) {
             Some(_) => "`git intake finish` to retry the same push, or `git intake finish --no-publish` to close the update locally".to_string(),
             None => "git intake finish".to_string(),

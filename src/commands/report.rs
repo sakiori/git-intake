@@ -49,7 +49,7 @@ pub struct DiffStat {
 pub fn run(repo: &Repo, json: bool) -> Result<Exit> {
     let (state, in_progress) = match repo.state()? {
         Some(s) => (s, true),
-        None => match state::load(&repo.paths.last_update)? {
+        None => match state::load_finished(&repo.paths.last_update)? {
             Some(s) => (s, false),
             None => bail!("no update is in progress or finished; nothing to report"),
         },

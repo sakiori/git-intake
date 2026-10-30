@@ -10,12 +10,13 @@ fn status_shows_configuration_values() {
     let f = Fork::new();
     let out = stdout(&f.tool(&["status"]).success());
     assert!(out.contains("integration: main at"), "{out}");
-    assert!(out.contains("publish: origin"), "{out}");
+    assert!(out.contains("publish: origin (via push)"), "{out}");
     assert!(out.contains("install: true"), "{out}");
     assert!(out.contains("checks:\n  test -f app.txt"), "{out}");
     let json = f.env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(json["integration"], "main");
     assert_eq!(json["publish"], "origin");
+    assert_eq!(json["publish_via"], "push");
     assert_eq!(json["install"], "true");
     assert_eq!(json["checks"], serde_json::json!(["test -f app.txt"]));
     assert_eq!(json["config_working_copy_differs"], false);
@@ -118,6 +119,48 @@ fn invalid_configuration_is_refused() {
     m.tool(&["status"])
         .code(2)
         .stderr(contains("no .git-intake.toml is committed at HEAD"));
+}
+
+#[test]
+fn publish_setting_is_a_table_with_a_mode() {
+    let f = Fork::new();
+    let env = &f.env;
+    let committed = std::fs::read_to_string(f.down.join(".git-intake.toml")).unwrap();
+
+    let string_form = committed.replace("[publish]\nremote = \"origin\"\nvia = \"push\"\n", "");
+    let string_form = format!("publish = \"origin\"\n{string_form}");
+    env.commit(
+        &f.down,
+        &[(".git-intake.toml", &string_form)],
+        "bad: publish as a string",
+    );
+    let err = stderr(&f.tool(&["status"]).code(2));
+    assert!(
+        err.contains("publish: expected a table, not a string"),
+        "{err}"
+    );
+    assert!(err.contains("publish = { remote = \"origin\" }"), "{err}");
+    assert!(err.contains("placed after the top-level keys"), "{err}");
+
+    let unknown = committed.replace("via = \"push\"", "via = \"pull-request\"");
+    env.commit(
+        &f.down,
+        &[(".git-intake.toml", &unknown)],
+        "bad: unknown publication mode",
+    );
+    f.tool(&["start"]).code(2).stderr(contains(
+        "unknown variant `pull-request`, expected `push` or `merge-request`",
+    ));
+
+    let default = committed.replace("via = \"push\"\n", "");
+    env.commit(
+        &f.down,
+        &[(".git-intake.toml", &default)],
+        "publish by default mode",
+    );
+    let json = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(json["publish"], "origin");
+    assert_eq!(json["publish_via"], "push");
 }
 
 #[test]
@@ -376,4 +419,30 @@ fn running_outside_a_repository_is_an_error() {
     env.tool(&env.path("home"), &["status"])
         .code(2)
         .stderr(contains("not inside a git repository"));
+}
+
+#[test]
+fn state_files_of_another_format_are_named_or_ignored() {
+    let f = Fork::new();
+    let env = &f.env;
+    let dir = env.intake_dir(&f.down);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A finished update recorded by an earlier release only feeds `report`.
+    std::fs::write(
+        dir.join("last-update.json"),
+        r#"{"version": 1, "config": {"integration": "main", "publish": "origin"}}"#,
+    )
+    .unwrap();
+    f.tool(&["report"]).code(2).stderr(contains(
+        "no update is in progress or finished; nothing to report",
+    ));
+    // An update in progress from an earlier release is refused by name.
+    std::fs::write(
+        dir.join("state.json"),
+        r#"{"version": 1, "config": {"integration": "main", "publish": "origin"}}"#,
+    )
+    .unwrap();
+    f.tool(&["status"]).code(2).stderr(contains(
+        "the update in progress was started by a release that keeps its state in format 1",
+    ));
 }

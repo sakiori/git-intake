@@ -5,20 +5,35 @@
 //! again after an interruption or a rejected push completes the remaining
 //! moves (a branch already at its planned value counts as done), publishes
 //! exactly the planned commits, and cleans up. `--no-publish` closes the
-//! update locally without pushing.
+//! update locally without pushing. In merge-request mode publication goes
+//! through [`merge_request`](super::merge_request) instead.
 
 use std::path::Path;
 
 use anyhow::{Result, bail};
 
 use crate::Exit;
+use crate::commands::merge_request;
 use crate::commands::update::require_worktree;
+use crate::config::PublishVia;
 use crate::git::{Git, abbrev, branch_ref};
 use crate::repo::{Repo, bullet};
 use crate::state::{self, Finishing, PlannedMove, UpdateState};
 
 pub fn run(repo: &Repo, no_publish: bool) -> Result<Exit> {
-    let mut state = repo.require_state()?;
+    let state = repo.require_state()?;
+    if state.merge_request.is_some() {
+        return merge_request::complete(repo, state, no_publish);
+    }
+    let via = state.config.publish.as_ref().map(|p| p.via);
+    if via == Some(PublishVia::MergeRequest) && state.finishing.is_none() && !no_publish {
+        return merge_request::open(repo, state);
+    }
+    finish_by_push(repo, state, no_publish)
+}
+
+/// Moves the branches locally and, in push mode, pushes them.
+fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Result<Exit> {
     let finishing = match &state.finishing {
         Some(f) => {
             println!("resuming finish");
@@ -45,28 +60,19 @@ pub fn run(repo: &Repo, no_publish: bool) -> Result<Exit> {
     let branches: Vec<String> = finishing.moves.iter().map(|m| m.branch.clone()).collect();
     let mut unpublished = Vec::new();
     match state.config.publish.clone() {
-        Some(publish) if no_publish => {
+        // In merge-request mode this path is reached only by `--no-publish`
+        // (or a resumed one): the integration branch is never pushed directly.
+        Some(publish) if no_publish || publish.via == PublishVia::MergeRequest => {
             unpublished = branches.clone();
             println!(
-                "not published to '{publish}' (advanced locally only): {}",
+                "not published to '{}' (advanced locally only): {}",
+                publish.remote,
                 branches.join(", ")
             );
         }
         Some(publish) => {
-            // All or nothing, and exactly the planned commits: whatever the
-            // local branches point to now is never published by this update.
-            let mut args = vec![
-                "push".to_string(),
-                "--quiet".to_string(),
-                "--atomic".to_string(),
-                publish.clone(),
-            ];
-            for m in &finishing.moves {
-                args.push(format!("{}:{}", m.new, branch_ref(&m.branch)));
-            }
-            let out = repo.git.raw(&args)?;
-            if !out.success() {
-                let err = out.into_error().to_string();
+            let publish = publish.remote;
+            if let Err(err) = push_exact(repo, &publish, &finishing.moves)? {
                 if let Some(f) = state.finishing.as_mut() {
                     f.push_error = Some(err.clone());
                 }
@@ -84,7 +90,37 @@ pub fn run(repo: &Repo, no_publish: bool) -> Result<Exit> {
         }
         None => println!("no publish remote is configured; nothing was pushed"),
     }
+    close(repo, state, unpublished)
+}
 
+/// Pushes exactly the planned commits in one atomic push without force:
+/// whatever the local branches point to now is never published by this
+/// update. Returns git's error when the remote rejects the push.
+pub fn push_exact(
+    repo: &Repo,
+    remote: &str,
+    moves: &[PlannedMove],
+) -> Result<std::result::Result<(), String>> {
+    let mut args = vec![
+        "push".to_string(),
+        "--quiet".to_string(),
+        "--atomic".to_string(),
+        remote.to_string(),
+    ];
+    for m in moves {
+        args.push(format!("{}:{}", m.new, branch_ref(&m.branch)));
+    }
+    let out = repo.git.raw(&args)?;
+    Ok(if out.success() {
+        Ok(())
+    } else {
+        Err(out.into_error().to_string())
+    })
+}
+
+/// Completes an update: keeps it as the last update for `report` and
+/// removes the worktree, the update branch and the state.
+pub fn close(repo: &Repo, mut state: UpdateState, unpublished: Vec<String>) -> Result<Exit> {
     state.finished = true;
     if let Some(f) = state.finishing.as_mut() {
         f.push_error = None;
@@ -98,7 +134,7 @@ pub fn run(repo: &Repo, no_publish: bool) -> Result<Exit> {
 }
 
 /// Validates the update and plans every branch move; moves nothing.
-fn plan(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
+pub fn plan(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
     let git = &repo.git;
     let open: Vec<&str> = state.unmerged().iter().map(|u| u.name.as_str()).collect();
     if !open.is_empty() {
@@ -169,6 +205,15 @@ fn plan(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
         old: Some(state.base.clone()),
         new: head.clone(),
     }];
+    moves.extend(plan_mirrors(repo, state)?);
+    validate_checkouts(repo, &moves)?;
+    Ok(moves)
+}
+
+/// Plans each merged upstream's mirror move to its target; moves nothing.
+pub fn plan_mirrors(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
+    let git = &repo.git;
+    let mut moves = Vec::new();
     for q in &state.upstreams {
         let Some(mirror) = state
             .config
@@ -197,14 +242,19 @@ fn plan(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
             new: q.target.clone(),
         });
     }
-    for m in &moves {
+    Ok(moves)
+}
+
+/// Every checkout of a branch about to move must be able to follow it.
+pub fn validate_checkouts(repo: &Repo, moves: &[PlannedMove]) -> Result<()> {
+    for m in moves {
         if let Some(old) = &m.old {
             for dir in repo.checkouts_of(&m.branch)? {
                 validate_checkout(&dir, &m.branch, old, &m.new)?;
             }
         }
     }
-    Ok(moves)
+    Ok(())
 }
 
 /// A checkout of a branch that is about to move must be able to follow the
@@ -231,7 +281,7 @@ fn validate_checkout(dir: &Path, branch: &str, old: &str, new: &str) -> Result<(
 }
 
 /// Performs one planned move, or confirms it is already done.
-fn apply(repo: &Repo, m: &PlannedMove) -> Result<()> {
+pub fn apply(repo: &Repo, m: &PlannedMove) -> Result<()> {
     let git = &repo.git;
     let current = git.commit(&branch_ref(&m.branch))?;
     if current.as_deref() == Some(m.new.as_str()) {

@@ -250,6 +250,19 @@ impl Fork {
     }
 
     pub fn with_checks(checks: &[&str]) -> Self {
+        Self::build(checks, "push")
+    }
+
+    /// A fork that publishes through merge requests. Its publish remote
+    /// accepts push options and records them, as a forge that opens the
+    /// merge request would.
+    pub fn merge_request() -> Self {
+        let f = Self::build(&["test -f app.txt"], "merge-request");
+        accept_push_options(&f.env, &f.publish);
+        f
+    }
+
+    fn build(checks: &[&str], via: &str) -> Self {
         let env = Env::new();
         let up = env.upstream("upstream", &[(FORK_FILE, FORK_CONTENT)]);
         let publish = env.bare("publish");
@@ -275,7 +288,8 @@ impl Fork {
             .collect::<Vec<_>>()
             .join(", ");
         let config = format!(
-            "integration = \"main\"\npublish = \"origin\"\ninstall = \"true\"\nchecks = [{checks}]\n\n\
+            "integration = \"main\"\ninstall = \"true\"\nchecks = [{checks}]\n\n\
+             [publish]\nremote = \"origin\"\nvia = \"{via}\"\n\n\
              [[upstream]]\nname = \"upstream\"\nremote = \"upstream\"\nbranch = \"main\"\nurl = {:?}\nmirror = \"upstream-main\"\n",
             up.url()
         );
@@ -296,6 +310,53 @@ impl Fork {
     pub fn tool(&self, args: &[&str]) -> Assert {
         self.env.tool(&self.down, args)
     }
+}
+
+/// File in a bare repository where [`accept_push_options`] records the push
+/// options of the last push.
+pub const PUSH_OPTIONS_FILE: &str = "push-options";
+
+/// The number of the merge request the remote of [`accept_push_options`]
+/// names in its reply.
+pub const MERGE_REQUEST_NUMBER: u64 = 7;
+
+/// Makes a bare repository accept push options and record those of each
+/// push in [`PUSH_OPTIONS_FILE`], one per line.
+pub fn accept_push_options(env: &Env, bare: &Path) {
+    env.git(bare, &["config", "receive.advertisePushOptions", "true"]);
+    let hook = bare.join("hooks").join("pre-receive");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    // The hook runs in the bare repository and rejects nothing. Like GitLab,
+    // it answers a push that asks for a merge request with its address.
+    let script = format!(
+        r#"#!/bin/sh
+: > push-options
+create=
+i=0
+while [ "$i" -lt "${{GIT_PUSH_OPTION_COUNT:-0}}" ]; do
+    eval "option=\"\$GIT_PUSH_OPTION_$i\""
+    printf '%s\n' "$option" >> push-options
+    [ "$option" = merge_request.create ] && create=1
+    i=$((i + 1))
+done
+if [ -n "$create" ]; then
+    while read -r old new ref; do
+        echo "View merge request for ${{ref#refs/heads/}}:" >&2
+        echo "  https://example.com/team/fork/-/merge_requests/{MERGE_REQUEST_NUMBER}" >&2
+    done
+fi
+"#
+    );
+    fs::write(&hook, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The push options recorded by [`accept_push_options`] for the last push.
+pub fn recorded_push_options(bare: &Path) -> Vec<String> {
+    fs::read_to_string(bare.join(PUSH_OPTIONS_FILE))
+        .map(|t| t.lines().map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 /// A monorepo with path upstreams `app-a` at `apps/a` (mirror `mirror-a`) and

@@ -755,3 +755,31 @@ fn cloned_fork_without_records_shows_history_sourced_last_synced() {
     assert_eq!(u["last_synced_source"], "record");
     assert_eq!(u["state"], "current");
 }
+
+#[test]
+fn abort_removes_logs_and_names_only_configured_branches() {
+    let f = Fork::new();
+    let env = &f.env;
+    let cfg = std::fs::read_to_string(f.down.join(".git-intake.toml"))
+        .unwrap()
+        .replace("mirror = \"upstream-main\"\n", "");
+    env.commit(
+        &f.down,
+        &[(".git-intake.toml", &cfg)],
+        "fork: no mirror branch",
+    );
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    let logs = env.intake_dir(&f.down).join("logs");
+    assert!(logs.join("01-install.log").exists());
+
+    let abort = f.tool(&["abort"]).success();
+    let out = stdout(&abort);
+    assert!(out.contains("update aborted; 'main' is unchanged"), "{out}");
+    assert!(!out.contains("mirror"), "{out}");
+    assert!(out.contains("removed logs"), "{out}");
+    assert!(!logs.exists(), "the update's logs remain");
+    env.assert_no_update(&f.down);
+}

@@ -240,6 +240,17 @@ impl Repo {
     /// Removes the update worktree and branch if they exist. Resolutions made
     /// in an unfinished merge are recorded first so a retry reapplies them.
     pub fn remove_update_artifacts(&self) -> Result<Vec<String>> {
+        let mut removed = self.remove_update_worktree()?;
+        if self.update_branch_exists()? {
+            self.git
+                .run(&["branch", "-D", "--quiet", state::UPDATE_BRANCH])?;
+            removed.push(format!("branch {}", state::UPDATE_BRANCH));
+        }
+        Ok(removed)
+    }
+
+    /// Removes the update worktree if it exists, keeping the update branch.
+    pub fn remove_update_worktree(&self) -> Result<Vec<String>> {
         let mut removed = Vec::new();
         let wt = &self.paths.worktree;
         if self.update_worktree_registered()? {
@@ -259,17 +270,22 @@ impl Repo {
         }
         if wt.exists() {
             fs::remove_dir_all(wt).with_context(|| format!("cannot remove {}", wt.display()))?;
-            if !removed.iter().any(|r| r.starts_with("worktree")) {
+            if removed.is_empty() {
                 removed.push(format!("worktree {}", wt.display()));
             }
         }
         self.git.run(&["worktree", "prune"])?;
-        if self.update_branch_exists()? {
-            self.git
-                .run(&["branch", "-D", "--quiet", state::UPDATE_BRANCH])?;
-            removed.push(format!("branch {}", state::UPDATE_BRANCH));
-        }
         Ok(removed)
+    }
+
+    /// Removes the update's logs: the verification logs and saved merge output.
+    pub fn remove_logs(&self) -> Result<Vec<String>> {
+        let logs = &self.paths.logs;
+        if !logs.exists() {
+            return Ok(Vec::new());
+        }
+        fs::remove_dir_all(logs).with_context(|| format!("cannot remove {}", logs.display()))?;
+        Ok(vec![format!("logs {}", logs.display())])
     }
 }
 

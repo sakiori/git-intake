@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 
 use crate::Exit;
-use crate::commands::update::require_worktree;
+use crate::commands::update::{require_merging, require_worktree};
 use crate::config;
 use crate::git::{Git, abbrev};
 use crate::repo::{Repo, bullet};
@@ -15,6 +15,7 @@ use crate::state::{CheckOutcome, CheckResult, UpstreamStep, Verification};
 
 pub fn run(repo: &Repo) -> Result<Exit> {
     let mut state = repo.require_state()?;
+    require_merging(&state)?;
     require_worktree(repo, &state)?;
     let open: Vec<String> = state
         .unmerged()
@@ -33,9 +34,6 @@ pub fn run(repo: &Repo) -> Result<Exit> {
             "cannot verify before every queued upstream is merged; these still need `git intake continue`:\n{}",
             bullet(&open)
         );
-    }
-    if state.finishing.is_some() {
-        bail!("`finish` is in progress; run `git intake finish` to complete it");
     }
     let wt = Git::worktree(&state.worktree);
     if wt.merge_in_progress()? {

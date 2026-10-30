@@ -1,6 +1,7 @@
 //! `git intake`: merge-based, verified, resumable updates of a downstream
 //! repository from one or more upstreams.
 
+mod cli;
 mod commands;
 mod config;
 mod drift;
@@ -13,7 +14,9 @@ mod sync_record;
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
+
+use cli::{Cli, Command};
 
 /// The outcome of a command that ran to completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,81 +30,6 @@ pub enum Exit {
 
 /// Exit status for errors: invalid configuration, refused command, git failure.
 const ERROR_STATUS: u8 = 2;
-
-#[derive(Parser)]
-#[command(
-    name = "git-intake",
-    bin_name = "git intake",
-    version,
-    about = "Merge-based, verified, resumable updates of a repository from its upstreams"
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Fetch the named upstreams, or all of them, adding missing remotes
-    Fetch {
-        /// Upstream names; all upstreams when none is given
-        upstreams: Vec<String>,
-    },
-    /// Start an update: fix targets and merge each upstream with new commits
-    Start {
-        /// Upstream names; all upstreams when none is given
-        upstreams: Vec<String>,
-    },
-    /// Conclude a resolved merge and merge the remaining queued upstreams
-    Continue,
-    /// Remove the update worktree, branch and state
-    Abort,
-    /// Run the install command and checks on the merged update
-    Verify,
-    /// Fast-forward and publish the verified update
-    Finish {
-        /// Complete the local moves and close the update without pushing
-        #[arg(long)]
-        no_publish: bool,
-    },
-    /// Show each upstream's drift and the update in progress
-    Status {
-        /// Fetch every upstream, predict conflicts, and fail unless all are current
-        #[arg(long)]
-        check: bool,
-        /// Write one JSON document to standard output
-        #[arg(long)]
-        json: bool,
-    },
-    /// Summarise the update in progress or the one just finished
-    Report {
-        /// Write one JSON document to standard output
-        #[arg(long)]
-        json: bool,
-    },
-    /// List upstream commits the integration branch does not contain
-    Log {
-        /// Upstream names; all upstreams when none is given
-        upstreams: Vec<String>,
-        /// Write one JSON document to standard output
-        #[arg(long)]
-        json: bool,
-    },
-    /// List upstream branches holding commits the integration branch lacks
-    Branches {
-        /// Upstream names; all upstreams when none is given
-        upstreams: Vec<String>,
-        /// Write one JSON document to standard output
-        #[arg(long)]
-        json: bool,
-    },
-    /// Check the configuration, remotes, history and update state
-    Doctor {
-        /// Write one JSON document to standard output
-        #[arg(long)]
-        json: bool,
-    },
-}
 
 fn run(command: Command) -> anyhow::Result<Exit> {
     let repo = repo::Repo::open()?;

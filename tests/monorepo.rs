@@ -192,8 +192,13 @@ fn abort_restores_everything() {
     m.tool(&["abort"])
         .success()
         .stdout(contains("removed worktree"))
-        .stdout(contains("removed branch git-intake/update"));
+        .stdout(contains("removed branch git-intake/update"))
+        .stdout(contains("removed logs"))
+        .stdout(contains(
+            "update aborted; 'main' and 'mirror-a' are unchanged",
+        ));
     env.assert_no_update(&m.down);
+    assert!(!env.intake_dir(&m.down).join("logs").exists());
     assert_eq!(env.rev(&m.down, "main"), main);
     assert_eq!(env.rev(&m.down, "mirror-a"), mirror);
     assert!(env.git(&m.down, &["status", "--porcelain"]).is_empty());
