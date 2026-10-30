@@ -16,7 +16,7 @@ Please do not open a public issue or pull request for a vulnerability before a f
 
 ### Configuration runs code
 
-The install command and the checks of `.git-intake.toml` are shell commands. `verify`, and `finish` and `sync` when they verify, run each of them through `sh -c` in the update worktree, with the user's privileges and the process environment, apart from git's location variables and the tool's own `GIT_INTAKE_` variables, which are replaced by those of the update. Anyone who can change those commands, or the files they run, can run code wherever the tool runs.
+The install command and the checks of `.git-intake.toml` are shell commands. `verify`, and `finish` and `sync` when they verify, run each of them through `sh -c` in the update worktree, with the user's privileges and the process environment. Two kinds of variables differ: git's location variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_PREFIX`, `GIT_COMMON_DIR`) are removed, and the `GIT_INTAKE_` variables the tool inherited are replaced by those of the update. Anyone who can change those commands, or the files they run, can run code wherever the tool runs.
 
 That includes upstreams:
 
@@ -31,7 +31,7 @@ The checks are not shielded from credentials: a forge token in `GITLAB_TOKEN`, `
 ### What the tool protects
 
 - **Only a verified tree is published.** In push mode, the integration branch moves only to a commit `verify` passed, by fast-forward, and only while that commit is the worktree head and the base is still the integration tip. In merge-request mode, the tool pushes only to a forge whose settings require a successful pipeline and merge exactly the tree it tested, and it reads those settings before every push.
-- **History is never rewritten.** The tool never force-pushes; local branches and the update branch only fast-forward, and a branch the tool did not leave is never deleted or overwritten.
+- **History is never rewritten.** The tool never force-pushes; local branches and the update branch only fast-forward, and a branch the tool did not leave is never deleted or overwritten. A remote update branch is deleted only under a lease on the commit the tool read (`--force-with-lease`), so a branch someone else moved meanwhile stays.
 - **Nothing is pushed to an upstream.** The publish remote may not be fetched from or pushed to an upstream's URL, and the tool keeps no remote for an upstream.
 - **Forge tokens stay private.** A token is read from the environment only, sent only to the API of the publish remote's own host, not to the host of a redirect, and never printed, stored or logged. A github.com token is not sent to a GitHub Enterprise Server, except the token an Actions job of that server is given. The publication setting that chooses the forge is read from the integration branch tip, never from an update's head, so an upstream cannot point the token at another host. URLs in messages carry no password, nor the user of an `http` or `https` URL.
 - **Targets are fixed.** Each upstream's target is fixed when the update starts, so what is merged or copied, verified and published is the same commit, and a rewritten upstream is detected and not taken.
