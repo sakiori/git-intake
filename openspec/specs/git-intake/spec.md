@@ -451,19 +451,22 @@ The tool SHALL fetch an upstream by its configured URL, in the main worktree and
 - **THEN** `status` reports that upstream as unavailable with git's error, reports the others, and exits with a failure status, and `start` refuses and creates nothing
 
 ### Requirement: Lifetime of upstream references
-A command SHALL fetch upstreams into references of its own that no other command uses, and SHALL remove them before it exits, whatever its outcome. An update SHALL hold `refs/git-intake/upstreams/<name>` for each queued upstream at the tip `start` or `sync` fetched, or, for an update carried on from a merge request, at the upstream's target or, for a port upstream, at the newest commit the update takes or decides on; only `start` and `sync` SHALL write it and only `finish`, `abort` and `sync` SHALL remove it. A command that acts on the update in progress SHALL restore such a reference that is missing, from the update state, when its commit is in the repository.
+A command SHALL fetch upstreams into references of its own that no other command uses, and SHALL remove them before it exits, whatever its outcome. A command that acts on the update in progress SHALL restore a reference the update holds that is missing, from the update state, when its commit is in the repository.
 
 #### Scenario: Reading command leaves nothing behind
 - **WHEN** `status` runs on a repository with no update in progress
 - **THEN** it reports every upstream from a fresh fetch, and afterwards the repository holds no reference under `refs/git-intake/`, no remote and no branch it did not hold before
 
-#### Scenario: Update keeps its references
-- **WHEN** an update stops on a conflict and the repository is later garbage-collected
-- **THEN** every target and planned commit of the update is still present, and `continue` proceeds without fetching
-
 #### Scenario: Start interrupted before holding its references
 - **WHEN** `start` saved the update but stopped before writing the update's references, leaving the fetched commits held only by its own references
 - **THEN** `status`, `continue`, `verify` and `finish` restore the update's references from the update state before they go on
+
+### Requirement: References an update holds
+An update SHALL hold `refs/git-intake/upstreams/<name>` for each queued upstream at the tip `start` or `sync` fetched, or, for an update carried on from a merge request, at the upstream's target or, for a port upstream, at the newest commit the update takes or decides on; only `start` and `sync` SHALL write it and only `finish`, `abort` and `sync` SHALL remove it.
+
+#### Scenario: Update keeps its references
+- **WHEN** an update stops on a conflict and the repository is later garbage-collected
+- **THEN** every target and planned commit of the update is still present, and `continue` proceeds without fetching
 
 #### Scenario: Reading command during an update
 - **WHEN** `status` runs while an update is in progress and the upstream has moved since `start`
@@ -888,7 +891,7 @@ The tool SHALL record the tip it catches up with in the update state before it m
 - **THEN** the tool moves no branch, refuses, and names both commits
 
 ### Requirement: Catch-up preconditions
-The tool SHALL make a catch-up merge only when the new tip contains the base and not the update head. It SHALL refuse and merge nothing, naming `abort`, or `finish --no-publish` once `finish` moved the integration branch, or for `sync` naming the merge request, `abort --merge-request` with the warning that withdrawing declines its targets, and `start` and `finish` to publish them again, when the new tip does not contain the base, or when the commits it adds carry a sync record or a copy of a queued upstream, change the journal of a queued port upstream, or change the configuration other than its install command and checks.
+The tool SHALL make a catch-up merge only when the new tip contains the base and not the update head. It SHALL refuse and merge nothing when the new tip does not contain the base, or when the commits it adds carry a sync record or a copy of a queued upstream, change the journal of a queued port upstream, or change the configuration other than its install command and checks, naming the way on that "Way on from a refused catch-up" gives.
 
 #### Scenario: Rewritten integration branch
 - **WHEN** the integration branch moves to a commit that does not contain the update's base
@@ -901,6 +904,13 @@ The tool SHALL make a catch-up merge only when the new tip contains the base and
 #### Scenario: Configuration changed
 - **WHEN** a commit that landed on the integration branch changes an upstream or the publication setting in `.git-intake.toml`
 - **THEN** the tool makes no catch-up merge, names the change, and names `abort`
+
+### Requirement: Way on from a refused catch-up
+A refused catch-up SHALL name `abort`, or `finish --no-publish` once `finish` moved the integration branch, or for `sync` the merge request, `abort --merge-request` with the warning that withdrawing declines its targets, and `start` and `finish` to publish them again.
+
+#### Scenario: Refused catch-up of an open merge request
+- **WHEN** `sync` refuses the catch-up of an open merge request because a commit that landed on the integration branch carries a sync record of one of its upstreams
+- **THEN** it names the merge request, `abort --merge-request` with the warning that withdrawing declines its targets, and `start` and `finish`
 
 ### Requirement: Configuration after a catch-up
 After a catch-up merge, the tool SHALL read the configuration at the merge and run the install command and the checks of that configuration whenever it verifies the update.
@@ -924,12 +934,15 @@ A conflicted catch-up merge SHALL stop the tool with exit status 1 in a catch-up
 - **WHEN** `abort` runs in a catch-up step that a rejected push led to, after `finish` moved the integration branch
 - **THEN** it refuses and names `finish` and `finish --no-publish`, and `finish --no-publish` records the resolutions made so far, drops the conflicted catch-up merge, and closes the update at the planned commit
 
-### Requirement: Catch-up in status, report and doctor
-`status` SHALL show a catch-up step with the tip caught up with and the next command, and `status --json` SHALL give it as the update step `catch_up_conflict` or `catch_up`. `report` SHALL list each catch-up merge with the tip it took in and its conflicted files with their resolution source, and measure upstream ranges and the repository's own changes from the base the update started from, or, for an update carried on from a merge request, from the base it was carried on at. `doctor` SHALL accept a catch-up step.
+### Requirement: Catch-up in status and doctor
+`status` SHALL show a catch-up step with the tip caught up with and the next command, and `status --json` SHALL give it as the update step `catch_up_conflict` or `catch_up`. `doctor` SHALL accept a catch-up step.
 
 #### Scenario: Status during a catch-up
 - **WHEN** a catch-up merge stopped on a conflict and an agent runs `status --json`
 - **THEN** the update step is `catch_up_conflict`, the tip caught up with is named, and the next command is `continue`
+
+### Requirement: Catch-up in report
+`report` SHALL list each catch-up merge with the tip it took in and its conflicted files with their resolution source, and measure upstream ranges and the repository's own changes from the base the update started from, or, for an update carried on from a merge request, from the base it was carried on at.
 
 #### Scenario: Report after a catch-up
 - **WHEN** `report` runs on an update that caught up once with a conflict
