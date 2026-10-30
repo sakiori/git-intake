@@ -14,10 +14,10 @@ The tool runs the installed `git` for every repository operation. Each repositor
 
 ## How it differs from other tools
 
-- **GitHub's *Sync fork* and `gh repo sync`** update one branch of a fork from its parent repository. `gh repo sync` fast-forwards the branch, or with `--force` resets it hard to the source; on conflicts it refuses, and the web interface offers a pull request instead. git intake takes any number of upstreams by URL, at the root or under their own paths, merges each at a fixed target with a merge commit that records it, has a conflict resolved in a separate worktree, and moves the integration branch only to a tree its checks passed or a pull request's required pipeline tested.
+- **GitHub's *Sync fork* and `gh repo sync`** update one branch of a fork from another repository: the fork's parent, or with `gh repo sync --source` another repository. `gh repo sync` fast-forwards the branch, or with `--force` resets it hard to the source; on conflicts it refuses, and the web interface offers a pull request instead. git intake takes any number of upstreams by URL, at the root or under their own paths, merges each at a fixed target with a merge commit that records it, has a conflict resolved in a separate worktree, and moves the integration branch only to a tree its checks passed or a pull request's required pipeline tested.
 - **The Pull app** keeps a fork current through pull requests from upstreams in the same fork network on GitHub, merged by a configured method: `merge`, `squash`, `rebase`, `hardreset` or none. git intake is a command-line tool rather than a hosted app, takes upstreams from any URL on any host, never squashes, rebases or resets the integration branch, and can also take chosen upstream commits one by one (port mode).
 - **Copybara** moves code between repositories through transformations, such as moving and rewriting files, and creates new commits in the destination: one squashed commit, one commit per origin change, or a change request, with the origin's revision in a label of the commit message. git intake transforms nothing: in follow mode the upstream's own commits arrive in the merge, and in port mode each copy keeps the upstream commit's author and message.
-- **git subtree** merges a repository into a subdirectory, with its history or squashed, and records `git-subtree-dir` and `git-subtree-split` in commit messages. It is a local merge command; git intake adds fixed targets, recorded conflict resolutions, checks, publication by push or merge request and drift reports on top of the same kind of subtree merge, and takes over a path that `git subtree add` imported.
+- **git subtree** merges a repository into a subdirectory, with its history or squashed, and records `git-subtree-dir` and `git-subtree-split` in commit messages. It is a local merge command; git intake adds fixed targets, recorded conflict resolutions, checks, publication by push or merge request and drift reports on top of the same kind of subtree merge, and takes over a path imported by `git subtree add` without `--squash`, where the upstream history stays reachable.
 - **Renovate and Dependabot** propose pull requests that change version references in manifests and lockfiles, and the commit a git submodule points at. They bring no upstream source history into the repository; git intake is for upstream code the repository holds and changes itself.
 
 ## Installation
@@ -40,10 +40,13 @@ mise's GitLab backend picks the release asset for the running platform by its ta
 
 ### Direct download
 
-Each release lists its archives, `git-intake-vX.Y.Z-<target>.tar.gz`, with a `.sha256` checksum next to each. The binary sits at the archive root, and the manual pages under `man/man1/`:
+Each release lists its archives, `git-intake-vX.Y.Z-<target>.tar.gz`, with a `.sha256` checksum next to each. The binary sits at the archive root with its license and the notices of the third-party code it links, and the manual pages under `man/man1/`:
 
 ```
 git-intake
+LICENSE
+THIRD-PARTY-NOTICES.txt
+RUST-LIBRARY-COPYRIGHT.html
 man/man1/git-intake.1
 man/man1/git-intake-<command>.1
 ```
@@ -289,7 +292,7 @@ When `start` runs, it does the following:
    - a root upstream: `git merge --no-ff`;
    - a path upstream, first import (no sync record for it yet, and the path is absent): an `ours` merge followed by `git read-tree --prefix=<path>/`. This keeps the upstream's full history. History shared through a common ancestor, such as a template both repositories started from, does not count as imported. The import is all or nothing: if any step fails, the merge is undone and the upstream stays pending;
    - a path upstream, later updates (it has a sync record): `git merge --no-ff -X subtree=<path>`;
-   - a path upstream imported by other means, such as `git subtree add` (no sync record, but a merge on the integration line, described below, brought the upstream's history into its path): the same subtree merge, which writes the first sync record. A path that holds content no such merge brought in is refused, even when it shares a common template with the upstream.
+   - a path upstream imported by other means, such as `git subtree add` without `--squash`, where the upstream history stays reachable (no sync record, but a merge on the integration line, described below, brought the upstream's history into its path): the same subtree merge, which writes the first sync record. A path that holds content no such merge brought in is refused, even when it shares a common template with the upstream. A `git subtree add --squash` import is such content: its merge brings in a squashed commit instead of the upstream's history, so `status` shows the upstream as `not imported` and `start` refuses it.
 
    Merges run with `--no-log` so that git configuration cannot push the trailers out of the last paragraph. Before an upstream counts as merged, the tool checks that the commit carries its sync record for the target, that the target is merged, and that a path upstream's path exists. If a hook rewrote the message, the tool stops and says so. Each step can be repeated: after an interruption, `continue` recognises a merge that is already committed and carries its record.
 
@@ -367,7 +370,7 @@ A check that compares the tree with a baseline, such as a ratchet that may not g
 | `GIT_INTAKE_INTEGRATION` | The name of the integration branch. |
 | `GIT_INTAKE_UPSTREAMS` | The names of the upstreams the update takes, separated by spaces, in the order they were merged or carried out. An upstream that was current at `start` is not among them. |
 | `GIT_INTAKE_UPSTREAM_<NAME>_MODE` | `follow` or `port`. |
-| `GIT_INTAKE_UPSTREAM_<NAME>_TARGET` | Follow mode: the target the update merges. Port mode: the newest upstream commit this update takes or decides on; this does not advance the journal's base. Commits the plan leaves `later` stay pending, and an update that takes and decides none has no target. A port target is not merged, so it is not an ancestor of `GIT_INTAKE_HEAD`. |
+| `GIT_INTAKE_UPSTREAM_<NAME>_TARGET` | Follow mode: the target the update merges. Port mode: the newest upstream commit this update takes or decides on; this does not advance the journal's base. Commits the plan leaves `later` stay pending, and an update that takes and decides none has no target. A port target is not merged, so it is not necessarily an ancestor of `GIT_INTAKE_HEAD`. |
 | `GIT_INTAKE_UPSTREAM_<NAME>_PREVIOUS` | Follow mode only: the last synced commit before the update; absent on a first import or when the history names none. A port upstream has no such commit; its journal names the commit the port started from. |
 
 `<NAME>` is the upstream's name in upper case, with every character other than a letter or a digit replaced by `_`: `app-a` gives `GIT_INTAKE_UPSTREAM_APP_A_TARGET`. Two upstream names that give the same `<NAME>`, such as `app-a` and `app.a`, are refused when the configuration is read. Every commit named stays in the repository while `verify` runs: the base and the head are on the update branch, and an upstream's commits are in the history of `refs/git-intake/upstreams/<name>`, which the update holds. Variables with the `GIT_INTAKE_` prefix that `git intake` itself inherits are not passed on, so a check sees only those of the update it verifies; git commands the tool runs itself never see them.
@@ -387,14 +390,14 @@ A script that the repository's own CI also runs can fall back to its usual basel
 
 ### Choosing a target
 
-By default an update takes each follow upstream at the tip it just fetched. To take an upstream at a reviewed point instead, such as a release tag, name it with a revision:
+By default an update takes each follow upstream without `tags` at the tip it just fetched, and one with `tags` at the newest release on that branch (see *Release tags*). To take an upstream at a reviewed point instead, such as a release tag, name it with a revision:
 
 ```sh
 git intake start upstream=v2.3              # a fork: take the upstream's tag v2.3
-git intake start app-a=1a2b3c4d app-b       # app-a at a commit, app-b at its fetched tip
+git intake start app-a=1a2b3c4d app-b       # app-a at a commit, app-b at its fetched tip (without `tags`)
 ```
 
-The name ends at the first `=`, since an upstream name cannot contain one, and the rest is the revision. Upstreams named without a revision take their fetched tip, and naming an upstream twice is refused. The revision is resolved as follows:
+The name ends at the first `=`, since an upstream name cannot contain one, and the rest is the revision. Upstreams named without a revision take their fetched tip, or with `tags` their newest release, and naming an upstream twice is refused. The revision is resolved as follows:
 
 - If the upstream's repository has a tag of that name, the tag's commit is the target, peeled through an annotated tag. A leading `refs/tags/` or `tags/` is dropped first, so `v2.3`, `tags/v2.3` and `refs/tags/v2.3` name the same tag. Looking the tag up contacts the upstream: after the fetch, `start` lists the upstream's tags with `git ls-remote --tags`, as it does for every follow upstream to name the target's tag in the sync record. No tag is fetched, so the repository's own tags never clash with the upstream's. If the URL cannot be asked, `start` refuses and names the upstream, its URL and git's error.
 - Otherwise the revision is resolved in the repository, like any argument to `git rev-parse`: a full or abbreviated commit id, or an expression such as `1a2b3c4d~2`. `start` fetches before it resolves the revision, so commits of the fetched branch resolve even when the repository did not have them before. A revision that resolves through one of the repository's own tags, by itself or at the start of an expression such as `v2.3~1`, is refused: the repository's tags are not the upstream's, so a tag `v2.3` in the repository never stands in for an upstream tag `v2.3`, even when the upstream has none. The tool looks for that tag by name, so it is found even when a branch has the same name.
@@ -408,7 +411,7 @@ The commit, however it was named, must be on the fetched upstream branch: the to
 - a target that does not contain `L`, such as a commit of a side branch that the upstream merged after `L`, is refused, because the last synced commit only moves forward;
 - otherwise the upstream is queued at that target.
 
-The rest of the update does not change: the sync record names the target and an upstream tag that points at it, if any, and `status` and `report` show the upstream tag next to the target, or otherwise the revision unless it is the target's own commit id; `report` also names the revision. Afterwards `status` shows the upstream as `behind`, by the commits between the target and the fetched tip.
+The rest of the update does not change: the sync record names the target and an upstream tag that points at it, if any, and `status` and `report` show the upstream tag next to the target, or otherwise the revision unless it is the target's own commit id; `report` also names the revision. Afterwards `status` shows the upstream as `behind`: without `tags`, by the commits between the target and the fetched tip; with `tags`, by those between the target and the newest release, and `current` when the target contains that release.
 
 A revision overrides `tags`: `start <name>=<rev>` takes any commit of the fetched branch, released or not.
 
@@ -938,7 +941,7 @@ Earlier releases kept a git remote per upstream, its remote-tracking branches, a
 ## Monorepo migration
 
 1. Commit a configuration that lists one `[[upstream]]` per source repository, each with its own `path` and `url`.
-2. Run `git intake start`. Each source is imported under its path with its full history, then verified and finished like any update. A path imported earlier with `git subtree add` is adopted by its first update. A path that holds content unrelated to the source's history is refused, and so is an import that would replace a file.
+2. Run `git intake start`. Each source is imported under its path with its full history, then verified and finished like any update. A path imported earlier by `git subtree add` without `--squash`, where the upstream history stays reachable, is adopted by its first update; a squashed import is not. A path that holds content unrelated to the source's history is refused, and so is an import that would replace a file.
 3. Until cutover, keep taking the sources in with the same cycle. Conflicts against the monorepo's new layout are resolved once and recorded. Files moved within an upstream's path merge as renames. Files moved out of the path may conflict or arrive at their old location; resolve them like any other conflict.
 4. Run `git intake status --check` on a schedule. It fails whenever a source has moved on and lists the files that would conflict. Zero drift, meaning every upstream is current, is the cutover gate.
 5. Before freezing the sources, run `git intake branches` to find work left on other branches of each source. It reports when no upstream holds unmerged work.

@@ -834,7 +834,7 @@ For upstreams in `follow` mode, `start` SHALL accept upstream names, each option
 For upstreams in `follow` mode, `start` SHALL fetch the selected upstreams, record as each upstream's target the commit its revision names, or, when no revision is given, the newest release of an upstream with a `tags` pattern and the fetched upstream tip of any other, record the current integration tip as the base, and queue, in configuration order, the selected upstreams whose target the base does not yet contain.
 
 #### Scenario: Several upstreams at chosen points
-- **WHEN** `start` names one upstream with a revision and another without
+- **WHEN** `start` names one upstream with a revision and another without, which has no `tags` pattern
 - **THEN** the first is merged at the commit its revision names and the second at its fetched tip, in one update
 
 #### Scenario: Nothing to update
