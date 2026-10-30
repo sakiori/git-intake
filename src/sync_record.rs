@@ -11,6 +11,8 @@ use crate::integration_line;
 
 pub const UPSTREAM_TRAILER: &str = "Intake-Upstream";
 pub const TARGET_TRAILER: &str = "Intake-Target";
+/// Names the upstream tag that points at the target of a sync merge.
+pub const TAG_TRAILER: &str = "Intake-Tag";
 /// Names the upstream commit a copy took.
 pub const TAKEN_TRAILER: &str = "Intake-Taken";
 
@@ -23,13 +25,27 @@ pub struct Record {
     pub commit: String,
     pub upstream: String,
     pub target: String,
+    /// The upstream tag that points at the target, when the merge names one.
+    pub tag: Option<String>,
 }
 
-/// The commit message of a sync merge.
-pub fn message(name: &str, source: &str, short_target: &str, target: &str) -> String {
-    format!(
-        "sync({name}): merge {source} at {short_target}\n\n{UPSTREAM_TRAILER}: {name}\n{TARGET_TRAILER}: {target}\n"
-    )
+/// The commit message of a sync merge, naming the upstream tag `tag` of the
+/// target when one points at it.
+pub fn message(
+    name: &str,
+    source: &str,
+    short_target: &str,
+    target: &str,
+    tag: Option<&str>,
+) -> String {
+    match tag {
+        None => format!(
+            "sync({name}): merge {source} at {short_target}\n\n{UPSTREAM_TRAILER}: {name}\n{TARGET_TRAILER}: {target}\n"
+        ),
+        Some(tag) => format!(
+            "sync({name}): merge {source} at {short_target} ({tag})\n\n{UPSTREAM_TRAILER}: {name}\n{TARGET_TRAILER}: {target}\n{TAG_TRAILER}: {tag}\n"
+        ),
+    }
 }
 
 /// The trailers a copy of `taken` from upstream `name` carries, as
@@ -42,7 +58,9 @@ pub fn copy_trailers(name: &str, taken: &str) -> [String; 2] {
 }
 
 fn log_format() -> String {
-    trailer_format(TARGET_TRAILER)
+    format!(
+        "--format=%H%x1f%(trailers:key={UPSTREAM_TRAILER},valueonly,separator=%x2C)%x1f%(trailers:key={TARGET_TRAILER},valueonly,separator=%x2C)%x1f%(trailers:key={TAG_TRAILER},valueonly,separator=%x2C)%x1e"
+    )
 }
 
 fn trailer_format(second: &str) -> String {
@@ -175,6 +193,7 @@ pub fn parse_log(out: &str) -> Vec<Record> {
             let commit = fields.next()?.trim();
             let upstream = first_value(fields.next()?);
             let target = first_value(fields.next()?);
+            let tag = fields.next().map(first_value).unwrap_or_default();
             if commit.is_empty() || upstream.is_empty() || target.is_empty() {
                 return None;
             }
@@ -182,6 +201,7 @@ pub fn parse_log(out: &str) -> Vec<Record> {
                 commit: commit.to_string(),
                 upstream: upstream.to_string(),
                 target: target.to_string(),
+                tag: (!tag.is_empty()).then(|| tag.to_string()),
             })
         })
         .collect()
@@ -263,19 +283,32 @@ mod tests {
 
     #[test]
     fn message_has_subject_and_trailers() {
-        let m = message("app-a", "app-a/main", "abc1234", "abc1234ffff");
+        let m = message("app-a", "app-a/main", "abc1234", "abc1234ffff", None);
         assert_eq!(
             m,
             "sync(app-a): merge app-a/main at abc1234\n\nIntake-Upstream: app-a\nIntake-Target: abc1234ffff\n"
+        );
+        let m = message(
+            "app-a",
+            "app-a/main",
+            "abc1234",
+            "abc1234ffff",
+            Some("v1.2.0"),
+        );
+        assert_eq!(
+            m,
+            "sync(app-a): merge app-a/main at abc1234 (v1.2.0)\n\nIntake-Upstream: app-a\nIntake-Target: abc1234ffff\nIntake-Tag: v1.2.0\n"
         );
     }
 
     #[test]
     fn parses_records_in_order() {
-        let out = "c3\u{1f}a\u{1f}t3\u{1e}\nc2\u{1f}b\u{1f}t2\u{1e}\nc1\u{1f}a\u{1f}t1\u{1e}\nc0\u{1f}\u{1f}\u{1e}\n";
+        let out = "c3\u{1f}a\u{1f}t3\u{1f}v3\u{1e}\nc2\u{1f}b\u{1f}t2\u{1f}\u{1e}\nc1\u{1f}a\u{1f}t1\u{1f}\u{1e}\nc0\u{1f}\u{1f}\u{1f}\u{1e}\n";
         let recs = parse_log(out);
         assert_eq!(recs.len(), 3);
         assert_eq!(recs[0].target, "t3");
+        assert_eq!(recs[0].tag.as_deref(), Some("v3"));
         assert_eq!(recs[1].upstream, "b");
+        assert_eq!(recs[1].tag, None);
     }
 }

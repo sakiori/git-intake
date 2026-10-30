@@ -12,6 +12,7 @@ mod port;
 mod repo;
 mod state;
 mod sync_record;
+mod tags;
 mod target;
 mod upstreams;
 

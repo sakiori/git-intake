@@ -31,6 +31,7 @@ struct RawUpstream {
     #[serde(default)]
     mode: Mode,
     path: Option<String>,
+    tags: Option<String>,
     /// Settings of earlier releases, read only to name what replaces them.
     remote: Option<toml::Value>,
     mirror: Option<toml::Value>,
@@ -114,6 +115,10 @@ pub struct Upstream {
     pub mode: Mode,
     /// Normalised path inside the repository; `None` is the root.
     pub path: Option<String>,
+    /// Follow mode: a glob over the upstream's tag names that makes `start`
+    /// take the newest release tag on the branch instead of its tip.
+    #[serde(default)]
+    pub tags: Option<String>,
 }
 
 impl Upstream {
@@ -261,12 +266,22 @@ pub fn parse(text: &str) -> Result<Config> {
                 "{label}: an upstream in `port` mode is taken at the repository root and cannot have a path"
             ));
         }
+        if let Some(tags) = &up.tags {
+            if up.mode == Mode::Port {
+                problems.push(format!(
+                    "{label}: `tags` selects the target of a follow upstream; an upstream in `port` mode cannot have it"
+                ));
+            } else if let Err(why) = crate::tags::TagPattern::parse(tags) {
+                problems.push(format!("{label} tags '{tags}': {why}"));
+            }
+        }
         upstreams.push(Upstream {
             name: up.name,
             url,
             branch: up.branch,
             mode: up.mode,
             path,
+            tags: up.tags,
         });
     }
 
@@ -610,6 +625,39 @@ via = "merge-request"
         ));
         assert!(
             e.contains("upstream 'a': an upstream in `port` mode is taken at the repository root"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn release_tags_are_a_valid_pattern_of_a_follow_upstream() {
+        let cfg = parse(&format!(
+            "integration = \"main\"\n{}",
+            UP_A.replace("branch", "tags = \"v*\"\nbranch")
+        ))
+        .unwrap();
+        assert_eq!(cfg.upstreams[0].tags.as_deref(), Some("v*"));
+        let e = err(&format!(
+            "integration = \"main\"\n{}",
+            UP_A.replace("branch", "tags = \"refs/tags/v*\"\nbranch")
+        ));
+        assert!(
+            e.contains("upstream 'a' tags 'refs/tags/v*': the pattern matches tag names"),
+            "{e}"
+        );
+        let e = err(&format!(
+            "integration = \"main\"\n{}",
+            UP_A.replace("branch", "tags = \"v[\"\nbranch")
+        ));
+        assert!(
+            e.contains("upstream 'a' tags 'v[': not a valid glob"),
+            "{e}"
+        );
+        let e = err(
+            "integration = \"main\"\n[[upstream]]\nname = \"a\"\nurl = \"u\"\nbranch = \"main\"\nmode = \"port\"\ntags = \"v*\"\n",
+        );
+        assert!(
+            e.contains("upstream 'a': `tags` selects the target of a follow upstream"),
             "{e}"
         );
     }

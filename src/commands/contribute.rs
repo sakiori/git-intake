@@ -7,6 +7,7 @@ use crate::Exit;
 use crate::cli::UpstreamTarget;
 use crate::git::{abbrev, branch_ref};
 use crate::repo::Repo;
+use crate::tags::UpstreamTags;
 use crate::target;
 use crate::upstreams::Fetches;
 
@@ -43,10 +44,16 @@ pub fn run(repo: &Repo, upstream: &UpstreamTarget, branch: &str) -> Result<Exit>
     };
     let (commit, named) = match &upstream.rev {
         None => (tip, "its fetched tip".to_string()),
-        Some(rev) => match target::resolve(git, &repo.here, up, rev, &tip)? {
-            Ok(commit) => (commit, format!("'{rev}'")),
-            Err(why) => bail!("{why}"),
-        },
+        Some(rev) => {
+            let tags = match UpstreamTags::list(git, up)? {
+                Ok(tags) => tags,
+                Err(why) => bail!("{why}"),
+            };
+            match target::resolve(git, &repo.here, up, &tags, rev, &tip)? {
+                Ok(resolved) => (resolved.commit, format!("'{rev}'")),
+                Err(why) => bail!("{why}"),
+            }
+        }
     };
     // An empty old value creates the branch only where none exists.
     git.run(&[

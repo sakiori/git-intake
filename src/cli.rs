@@ -33,11 +33,16 @@ pub enum Command {
     /// Start an update: fix targets and merge, or plan the commits to port
     ///
     /// Fetches the selected upstreams. A follow upstream gets a fixed target: its fetched branch
-    /// tip, or, for an upstream named as `UPSTREAM=REV`, the commit REV names. REV is a tag of the
-    /// upstream's repository (its URL is asked for it), a commit id, or anything else git resolves,
+    /// tip, or, with `tags` in its configuration, the newest release tag on that branch: of the
+    /// upstream's tags that match the pattern and are a semantic version without a prerelease
+    /// part or build metadata after the pattern's literal prefix and an optional `v` or `V`, the
+    /// highest version. For an upstream named as
+    /// `UPSTREAM=REV`, the target is the commit REV names. REV is a tag of the upstream's
+    /// repository (its URL is asked for its tags), a commit id, or anything else git resolves,
     /// but not one of the repository's own tags; its commit must be on the fetched upstream branch
     /// and contain the upstream's last synced commit. Each follow upstream whose target the
-    /// integration branch lacks is merged in the update worktree with its own merge commit.
+    /// integration branch lacks is merged in the update worktree with its own merge commit, whose
+    /// sync record names the upstream tag of the target, if any, in an `Intake-Tag` trailer.
     ///
     /// A port upstream gets a plan of its pending commits, limited to those REV contains when one
     /// is named; the update stops for the plan to be edited, and `continue` carries it out.
@@ -95,6 +100,9 @@ pub enum Command {
     /// unless `finish` has begun. Run again after an interruption, it completes the migration.
     Migrate,
     /// Fetch every upstream and show its drift, and the update in progress
+    ///
+    /// A follow upstream with `tags` is compared with its newest release tag instead of its
+    /// branch tip, and shows the state `no release` while its branch has none.
     Status {
         /// Predict conflicts, and fail unless every upstream is current
         #[arg(long)]

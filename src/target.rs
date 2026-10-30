@@ -5,33 +5,43 @@ use anyhow::Result;
 
 use crate::config::Upstream;
 use crate::git::{Git, abbrev};
+use crate::tags::UpstreamTags;
+
+/// The commit a revision names, with the upstream tag it named, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub commit: String,
+    /// The tag of the upstream's repository the revision named.
+    pub tag: Option<String>,
+}
 
 /// Resolves `rev` to a commit of the fetched upstream branch at `tip`, or
-/// returns why it cannot be the commit named. `git` asks the upstream's URL
-/// and checks the ancestry; `here`, bound to the directory the tool was
-/// started in, resolves the revision as the user typed it there, so that
-/// `HEAD~1`, `@{-1}` or `ORIG_HEAD` mean that worktree's.
+/// returns why it cannot be the commit named. `tags` are the tags of the
+/// upstream's repository, and `git` checks the ancestry; `here`, bound to
+/// the directory the tool was started in, resolves the revision as the user
+/// typed it there, so that `HEAD~1`, `@{-1}` or `ORIG_HEAD` mean that
+/// worktree's.
 ///
-/// A tag of the upstream's repository takes precedence; its URL is asked
-/// for it. Any other revision is resolved in the repository, except one that
-/// goes through one of the repository's own tags: those belong to the
-/// repository, not to the upstream, so they cannot stand in for an upstream
-/// tag. Either way the commit must be contained in the fetched upstream
-/// branch.
+/// A tag of the upstream's repository takes precedence. Any other revision
+/// is resolved in the repository, except one that goes through one of the
+/// repository's own tags: those belong to the repository, not to the
+/// upstream, so they cannot stand in for an upstream tag. Either way the
+/// commit must be contained in the fetched upstream branch.
 pub fn resolve(
     git: &Git,
     here: &Git,
     up: &Upstream,
+    tags: &UpstreamTags,
     rev: &str,
     tip: &str,
-) -> Result<std::result::Result<String, String>> {
+) -> Result<std::result::Result<Resolved, String>> {
     let tag = tag_name(rev);
-    let upstream_tag = match upstream_tag(git, up, tag)? {
-        Ok(found) => found,
-        Err(why) => return Ok(Err(why)),
-    };
-    let (oid, named) = match upstream_tag {
-        Some(oid) => (oid, format!("tag '{tag}' of {}", up.url)),
+    let (oid, named, upstream_tag) = match tags.get(tag) {
+        Some(oid) => (
+            oid.to_string(),
+            format!("tag '{tag}' of {}", up.url),
+            Some(tag.to_string()),
+        ),
         None => {
             let Some(commit) = here.commit(rev)? else {
                 return Ok(Err(format!(
@@ -46,7 +56,7 @@ pub fn resolve(
                     up.name, up.url
                 )));
             }
-            (commit, format!("'{rev}'"))
+            (commit, format!("'{rev}'"), None)
         }
     };
     // A tagged commit that is not in the repository is not on the fetched
@@ -55,15 +65,20 @@ pub fn resolve(
         Some(commit) if git.is_ancestor(&commit, tip)? => Some(commit),
         _ => None,
     };
-    Ok(on_branch.ok_or_else(|| {
-        format!(
-            "upstream '{}': {named} at {} is not in the history of {} as fetched; \
-             name a commit of the upstream branch the tool takes from",
-            up.name,
-            abbrev(&oid),
-            up.source()
-        )
-    }))
+    Ok(on_branch
+        .map(|commit| Resolved {
+            commit,
+            tag: upstream_tag,
+        })
+        .ok_or_else(|| {
+            format!(
+                "upstream '{}': {named} at {} is not in the history of {} as fetched; \
+                 name a commit of the upstream branch the tool takes from",
+                up.name,
+                abbrev(&oid),
+                up.source()
+            )
+        }))
 }
 
 /// The tag name a revision would name in the upstream's repository: the
@@ -93,61 +108,6 @@ fn own_tag(git: &Git, rev: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// The object the tag `tag` of the upstream's repository points at, peeled
-/// to the object an annotated tag names, or `None` when it has no such tag.
-/// Only the tag list at the upstream's URL is read; no tag is fetched. When
-/// the URL cannot be asked, returns why.
-fn upstream_tag(
-    git: &Git,
-    up: &Upstream,
-    tag: &str,
-) -> Result<std::result::Result<Option<String>, String>> {
-    let name = format!("refs/tags/{tag}");
-    if !git.raw(&["check-ref-format", &name])?.success() {
-        return Ok(Ok(None));
-    }
-    // A pattern matches only the ref it names, so the peeled entry of an
-    // annotated tag is asked for by its own name.
-    let peeled = format!("{name}^{{}}");
-    let out = git.raw(&[
-        "ls-remote",
-        "--tags",
-        "--end-of-options",
-        &up.url,
-        &name,
-        &peeled,
-    ])?;
-    if !out.success() {
-        return Ok(Err(format!(
-            "upstream '{}': cannot ask {} whether it has a tag '{tag}': {}",
-            up.name,
-            up.url,
-            out.stderr.trim()
-        )));
-    }
-    Ok(Ok(peeled_tag(&out.stdout, &name)))
-}
-
-/// Picks the tag `name` from `git ls-remote` output: the peeled entry
-/// (`<name>^{}`) of an annotated tag, or the entry itself for a lightweight
-/// tag.
-fn peeled_tag(listing: &str, name: &str) -> Option<String> {
-    let peeled_name = format!("{name}^{{}}");
-    let mut direct = None;
-    for line in listing.lines() {
-        let Some((oid, refname)) = line.split_once('\t') else {
-            continue;
-        };
-        if refname == peeled_name {
-            return Some(oid.to_string());
-        }
-        if refname == name {
-            direct = Some(oid.to_string());
-        }
-    }
-    direct
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,19 +117,5 @@ mod tests {
         assert_eq!(tag_name("refs/tags/v2.3"), "v2.3");
         assert_eq!(tag_name("tags/v2.3"), "v2.3");
         assert_eq!(tag_name("v2.3"), "v2.3");
-    }
-
-    #[test]
-    fn annotated_tags_are_peeled_and_other_refs_ignored() {
-        let listing = "aaaa\trefs/tags/v1\nbbbb\trefs/tags/v1^{}\ncccc\trefs/tags/x/refs/tags/v1\n";
-        assert_eq!(peeled_tag(listing, "refs/tags/v1").as_deref(), Some("bbbb"));
-        assert_eq!(
-            peeled_tag("dddd\trefs/tags/v2\n", "refs/tags/v2").as_deref(),
-            Some("dddd")
-        );
-        assert_eq!(
-            peeled_tag("cccc\trefs/tags/x/refs/tags/v1\n", "refs/tags/v1"),
-            None
-        );
     }
 }

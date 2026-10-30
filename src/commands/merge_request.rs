@@ -937,8 +937,13 @@ fn push_options(
                         None => format!("up to {}", abbrev(&f.target)),
                     },
                 };
+                let tag = f
+                    .tag
+                    .as_deref()
+                    .map(|t| format!(", tag {t}"))
+                    .unwrap_or_default();
                 ranges.push(format!(
-                    "{} from {source}: {range} ({} commit{})",
+                    "{} from {source}: {range} ({} commit{}{tag})",
                     q.name,
                     f.commits,
                     plural(f.commits)

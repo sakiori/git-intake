@@ -21,6 +21,7 @@ use crate::state::{
     Resolution, UPDATE_BRANCH, UpdateState, UpstreamStep, Work,
 };
 use crate::sync_record::{self, Record};
+use crate::tags::{self, TagPattern, UpstreamTags};
 use crate::target;
 use crate::upstreams::{self, Fetches};
 
@@ -120,14 +121,28 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
             .iter()
             .find(|t| t.name == up.name)
             .and_then(|t| t.rev.clone());
+        // A follow target is named by the upstream's tags, and a revision
+        // may be one of them.
+        let tags = if up.mode == Mode::Follow || rev.is_some() {
+            match UpstreamTags::list(git, up)? {
+                Ok(tags) => tags,
+                Err(why) => {
+                    refusals.push(why);
+                    continue;
+                }
+            }
+        } else {
+            UpstreamTags::default()
+        };
+        let fetched = Fetched { tip, tags: &tags };
         let queued = match up.mode {
-            Mode::Follow => queue_follow(repo, &base, up, latest.get(&up.name), tip, rev)?,
+            Mode::Follow => queue_follow(repo, &base, up, latest.get(&up.name), fetched, rev)?,
             Mode::Port => queue_port(
                 repo,
                 &base,
                 up,
                 latest.get(&up.name),
-                tip,
+                fetched,
                 &fetched_tips,
                 rev,
             )?,
@@ -190,7 +205,7 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
             Work::Follow(f) => println!(
                 "{}: queued at {} ({} new commit{})",
                 q.name,
-                described(&f.target, q.rev.as_deref()),
+                described(&f.target, f.named_by(q)),
                 f.commits,
                 plural(f.commits)
             ),
@@ -211,6 +226,14 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
     advance(repo, &mut state)
 }
 
+/// What `start` fetched of one selected upstream: its branch tip, and the
+/// tags of its repository when it needs them.
+#[derive(Clone, Copy)]
+struct Fetched<'a> {
+    tip: &'a str,
+    tags: &'a UpstreamTags,
+}
+
 /// What `start` makes of one selected upstream.
 enum Queued {
     Work(Box<QueuedUpstream>),
@@ -220,12 +243,16 @@ enum Queued {
 }
 
 /// Fixes a follow upstream's target and decides how it is merged.
+///
+/// The target is the commit `rev` names, the newest release tag on the
+/// fetched branch when the upstream has a `tags` pattern, or the fetched
+/// tip. The upstream tag that names it goes into the sync record.
 fn queue_follow(
     repo: &Repo,
     base: &str,
     up: &Upstream,
     last: Option<&Record>,
-    tip: &str,
+    Fetched { tip, tags }: Fetched,
     rev: Option<String>,
 ) -> Result<Queued> {
     let git = &repo.git;
@@ -237,13 +264,41 @@ fn queue_follow(
             d.detail.unwrap_or_default()
         )));
     }
-    let target = match &rev {
-        None => tip.to_string(),
-        Some(rev) => match target::resolve(git, &repo.here, up, rev, tip)? {
-            Ok(commit) => commit,
+    let pattern = match up.tags.as_deref().map(TagPattern::parse).transpose() {
+        Ok(pattern) => pattern,
+        Err(why) => bail!("upstream '{}' tags: {why}", up.name),
+    };
+    let (target, tag) = match (&rev, &pattern) {
+        (Some(rev), _) => match target::resolve(git, &repo.here, up, tags, rev, tip)? {
+            Ok(resolved) => {
+                let tag = resolved
+                    .tag
+                    .filter(|t| tags::recordable(t))
+                    .or_else(|| tags.naming(pattern.as_ref(), &resolved.commit));
+                (resolved.commit, tag)
+            }
             Err(why) => return Ok(Queued::Refused(why)),
         },
+        (None, Some(pattern)) => match tags.release(git, pattern, tip)? {
+            Some(release) => {
+                // The newest release is already taken in, even when the
+                // branch went past it by a revision named before.
+                if matches!(d.state, DriftState::Current | DriftState::Behind)
+                    && git.is_ancestor(&release.commit, base)?
+                {
+                    return Ok(Queued::Current(format!(
+                        "{}: current at {}",
+                        up.name,
+                        described(&release.commit, Some(&release.tag))
+                    )));
+                }
+                (release.commit, Some(release.tag))
+            }
+            None => return Ok(Queued::Refused(no_release(up))),
+        },
+        (None, None) => (tip.to_string(), tags.naming(None, tip)),
     };
+    let named = tag.as_deref().or(rev.as_deref());
     if let Some(last) = &d.last_synced
         && *last != target
         && git.is_ancestor(&target, last)?
@@ -252,7 +307,7 @@ fn queue_follow(
             "upstream '{}': the target {} is older than the last synced commit {}; \
              an update never moves an upstream back",
             up.name,
-            described(&target, rev.as_deref()),
+            described(&target, named),
             abbrev(last)
         )));
     }
@@ -262,7 +317,7 @@ fn queue_follow(
         return Ok(Queued::Current(format!(
             "{}: current at {}",
             up.name,
-            described(&target, rev.as_deref())
+            described(&target, named)
         )));
     }
     if let Some(last) = &d.last_synced
@@ -272,7 +327,7 @@ fn queue_follow(
             "upstream '{}': the target {} does not contain the last synced commit {}; \
              name a commit of {} that contains it",
             up.name,
-            described(&target, rev.as_deref()),
+            described(&target, named),
             abbrev(last),
             up.source()
         )));
@@ -287,6 +342,7 @@ fn queue_follow(
             work: Work::Follow(FollowMerge {
                 commits: git.count(base, &target)?,
                 target,
+                tag,
                 previous: d.last_synced.clone(),
                 kind,
                 head_before: None,
@@ -298,6 +354,19 @@ fn queue_follow(
     })
 }
 
+/// Why `start` cannot take a follow upstream at a release.
+pub fn no_release(up: &Upstream) -> String {
+    format!(
+        "upstream '{}': no tag of {} matching '{}' is a release version on {} as fetched; \
+         name the target with `git intake start {}=<rev>`",
+        up.name,
+        up.url,
+        up.tags.as_deref().unwrap_or_default(),
+        up.source(),
+        up.name
+    )
+}
+
 /// Plans a port upstream: its pending commits, limited to those the named
 /// revision contains.
 fn queue_port(
@@ -305,7 +374,7 @@ fn queue_port(
     base: &str,
     up: &Upstream,
     last: Option<&Record>,
-    tip: &str,
+    Fetched { tip, tags }: Fetched,
     upstream_tips: &[String],
     rev: Option<String>,
 ) -> Result<Queued> {
@@ -319,8 +388,8 @@ fn queue_port(
     let pending = accounting.pending();
     let limit = match &rev {
         None => None,
-        Some(rev) => match target::resolve(git, &repo.here, up, rev, tip)? {
-            Ok(commit) => Some(commit),
+        Some(rev) => match target::resolve(git, &repo.here, up, tags, rev, tip)? {
+            Ok(resolved) => Some(resolved.commit),
             Err(why) => return Ok(Queued::Refused(why)),
         },
     };
@@ -515,14 +584,15 @@ pub fn advance(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
 fn merge_follow(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Option<Exit>> {
     let wt = Git::worktree(&state.worktree);
     let up = upstream_of(state, i)?;
-    let (target, kind) = {
+    let (target, tag, kind) = {
         let f = follow_of(state, i)?;
-        (f.target.clone(), f.kind)
+        (f.target.clone(), f.tag.clone(), f.kind)
     };
+    let tag = tag.as_deref();
 
     // A merge that completed before the state could be saved.
-    if carries_record(&wt, &up, &target)? {
-        let commit = confirm_merged(&wt, &up, &target)?;
+    if carries_record(&wt, &up, &target, tag)? {
+        let commit = confirm_merged(&wt, &up, &target, tag)?;
         mark_merged(repo, state, i, commit)?;
         return Ok(None);
     }
@@ -540,7 +610,7 @@ fn merge_follow(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Option
         wt.run(&["merge", "--abort"])?;
     }
 
-    let msg = merge_message(&repo.git, &up, &target)?;
+    let msg = merge_message(&repo.git, &up, &target, tag)?;
     let head_before = wt.line(&["rev-parse", "HEAD"])?;
     follow_mut(state, i)?.head_before = Some(head_before);
     repo.save_state(state)?;
@@ -578,7 +648,7 @@ fn merge_follow(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Option
 
     match failure {
         None => {
-            let commit = confirm_merged(&wt, &up, &target)?;
+            let commit = confirm_merged(&wt, &up, &target, tag)?;
             mark_merged(repo, state, i, commit)?;
             Ok(None)
         }
@@ -735,23 +805,24 @@ fn import(wt: &Git, up: &Upstream, target: &str, msg: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether HEAD is a merge carrying this upstream's sync record for `target`.
-fn carries_record(wt: &Git, up: &Upstream, target: &str) -> Result<bool> {
+/// Whether HEAD is a merge carrying this upstream's sync record for
+/// `target`, naming its upstream tag `tag`.
+fn carries_record(wt: &Git, up: &Upstream, target: &str, tag: Option<&str>) -> Result<bool> {
     Ok(sync_record::record_of(wt, "HEAD")?
-        .is_some_and(|r| r.upstream == up.name && r.target == target))
+        .is_some_and(|r| r.upstream == up.name && r.target == target && r.tag.as_deref() == tag))
 }
 
 /// Checks that HEAD is a complete merge of the upstream before it is counted
 /// as merged: the sync record names the upstream and target, the target is
 /// merged, and a path upstream's path exists. Returns HEAD.
-fn confirm_merged(wt: &Git, up: &Upstream, target: &str) -> Result<String> {
+fn confirm_merged(wt: &Git, up: &Upstream, target: &str, tag: Option<&str>) -> Result<String> {
     let head = wt.line(&["rev-parse", "HEAD"])?;
     let mut problems = Vec::new();
-    if !carries_record(wt, up, target)? {
+    if !carries_record(wt, up, target, tag)? {
         problems.push(format!(
             "the commit message does not end with the sync record trailers for upstream '{}' and target {}",
             up.name,
-            abbrev(target)
+            described(target, tag)
         ));
     }
     if !wt.is_ancestor(target, &head)? {
@@ -771,7 +842,7 @@ fn confirm_merged(wt: &Git, up: &Upstream, target: &str) -> Result<String> {
             abbrev(&head),
             wt.dir().display(),
             bullet(&problems),
-            sync_record::message(&up.name, &up.source(), abbrev(target), target)
+            sync_record::message(&up.name, &up.source(), abbrev(target), target, tag)
         );
     }
     Ok(head)
@@ -786,9 +857,15 @@ pub fn upstream_of(state: &UpdateState, i: usize) -> Result<Upstream> {
         .with_context(|| format!("the update state names unknown upstream '{name}'"))
 }
 
-fn merge_message(git: &Git, up: &Upstream, target: &str) -> Result<String> {
+fn merge_message(git: &Git, up: &Upstream, target: &str, tag: Option<&str>) -> Result<String> {
     let short = git.short(target)?;
-    Ok(sync_record::message(&up.name, &up.source(), &short, target))
+    Ok(sync_record::message(
+        &up.name,
+        &up.source(),
+        &short,
+        target,
+        tag,
+    ))
 }
 
 fn print_conflict(state: &UpdateState, i: usize, stderr: &str) {
@@ -884,10 +961,11 @@ pub fn resume(repo: &Repo) -> Result<Exit> {
 fn conclude_merge(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<()> {
     let wt = Git::worktree(&state.worktree);
     let up = upstream_of(state, i)?;
-    let (target, head_before) = {
+    let (target, tag, head_before) = {
         let f = follow_of(state, i)?;
-        (f.target.clone(), f.head_before.clone())
+        (f.target.clone(), f.tag.clone(), f.head_before.clone())
     };
+    let tag = tag.as_deref();
     if wt.merge_in_progress()? {
         if wt.commit("MERGE_HEAD")?.as_deref() != Some(target.as_str()) {
             bail!(
@@ -905,7 +983,7 @@ fn conclude_merge(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<()> 
                 bullet(&unmerged)
             );
         }
-        let msg = merge_message(&repo.git, &up, &target)?;
+        let msg = merge_message(&repo.git, &up, &target, tag)?;
         wt.run(&["commit", "--no-edit", "-m", &msg])?;
     } else {
         let head = wt.line(&["rev-parse", "HEAD"])?;
@@ -919,7 +997,7 @@ fn conclude_merge(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<()> 
             );
         }
     }
-    let commit = confirm_merged(&wt, &up, &target)?;
+    let commit = confirm_merged(&wt, &up, &target, tag)?;
     mark_merged(repo, state, i, commit)
 }
 

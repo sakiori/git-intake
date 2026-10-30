@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::Exit;
 use crate::commands::update::{
-    blocking_prefix, described, next_step, plural, step_name, unrelated_content,
+    blocking_prefix, described, next_step, no_release, plural, step_name, unrelated_content,
 };
 use crate::config::{Mode, Upstream};
 use crate::drift::{self, Drift, DriftState, SyncSource};
@@ -17,6 +17,7 @@ use crate::port::{self, OffLine, Standing, Verb};
 use crate::repo::Repo;
 use crate::state::{ConflictFile, CopyStep, MergeKind, UpdateState, UpstreamStep, Work};
 use crate::sync_record::{self, Record};
+use crate::tags::{TagPattern, UpstreamTags};
 use crate::upstreams::Fetches;
 
 #[derive(Serialize)]
@@ -52,7 +53,20 @@ pub struct UpstreamStatus {
     pub last_synced: Option<String>,
     /// Follow mode: `record` or `history`; `null` when nothing is synced.
     pub last_synced_source: Option<SyncSource>,
-    /// Follow mode: commits of the tip the integration branch lacks.
+    /// Follow mode: the upstream tag the newest sync record names.
+    pub last_synced_tag: Option<String>,
+    /// Follow mode: the configured pattern of release tags.
+    pub tags: Option<String>,
+    /// Follow mode with `tags`: the commit of the newest release tag on the
+    /// fetched branch; `null` when there is none.
+    pub release: Option<String>,
+    /// Follow mode with `tags`: the name of that tag.
+    pub release_tag: Option<String>,
+    /// Follow mode with `tags`: commits of the fetched tip after the
+    /// newest release.
+    pub commits_after_release: Option<u64>,
+    /// Follow mode: commits of the tip, or with `tags` of the newest
+    /// release, that the integration branch lacks.
     pub commits_behind: Option<u64>,
     /// Port mode: the journal's base, or the last synced commit a new
     /// journal would start from.
@@ -86,6 +100,11 @@ impl UpstreamStatus {
             detail: None,
             last_synced: None,
             last_synced_source: None,
+            last_synced_tag: None,
+            tags: None,
+            release: None,
+            release_tag: None,
+            commits_after_release: None,
             commits_behind: None,
             base: None,
             journal: None,
@@ -143,6 +162,8 @@ pub struct QueuedView {
     pub fetched: String,
     /// Follow mode: the fixed target.
     pub target: Option<String>,
+    /// Follow mode: the upstream tag that names the target.
+    pub tag: Option<String>,
     /// The revision `start` was given: the target of a follow upstream, the
     /// limit of a port plan; `null` for the fetched tip.
     pub rev: Option<String>,
@@ -192,18 +213,30 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
 
     let mut fetches = Fetches::new(repo);
     let mut fetched = Vec::new();
+    let mut tag_lists = Vec::new();
     for up in &config.upstreams {
-        fetched.push(fetches.upstream(up)?);
+        let mut result = fetches.upstream(up)?;
+        // An upstream taken at its release tags needs them as much as its
+        // branch.
+        let mut tags = None;
+        if result.is_ok() && up.tags.is_some() {
+            match UpstreamTags::list(git, up)? {
+                Ok(list) => tags = Some(list),
+                Err(why) => result = Err(why),
+            }
+        }
+        fetched.push(result);
+        tag_lists.push(tags);
     }
     let fetch_failed = fetched.iter().any(|f| f.is_err());
     let tips: Vec<String> = fetched.iter().filter_map(|f| f.clone().ok()).collect();
     let latest = sync_record::latest(git, &sync_record::records(git, &tip, &tips)?)?;
     let mut upstreams = Vec::new();
-    for (up, fetched) in config.upstreams.iter().zip(&fetched) {
+    for ((up, fetched), tags) in config.upstreams.iter().zip(&fetched).zip(&tag_lists) {
         let fetched = fetched.as_deref().map_err(String::as_str);
         let last = latest.get(&up.name);
         upstreams.push(match up.mode {
-            Mode::Follow => follow_status(git, &tip, up, last, fetched, check)?,
+            Mode::Follow => follow_status(git, &tip, up, last, fetched, tags.as_ref(), check)?,
             Mode::Port => port_status(git, &tip, up, last, fetched, &tips),
         });
     }
@@ -247,14 +280,42 @@ fn follow_status(
     up: &Upstream,
     last: Option<&Record>,
     fetched: std::result::Result<&str, &str>,
+    tags: Option<&UpstreamTags>,
     check: bool,
 ) -> Result<UpstreamStatus> {
     let mut d: Drift = drift::evaluate(git, tip, up, last, fetched)?;
     if let Err(why) = fetched {
         d.detail = Some(format!("fetch failed: {why}"));
     }
+    // With release tags, the newest release stands where the tip stands
+    // otherwise: what the integration branch lacks is counted up to it.
+    let mut release = None;
+    if let (Some(text), Some(tags), Some(upstream_tip)) = (&up.tags, tags, &d.tip) {
+        let pattern = TagPattern::parse(text)
+            .map_err(|why| anyhow::anyhow!("upstream '{}' tags: {why}", up.name))?;
+        release = tags.release(git, &pattern, upstream_tip)?;
+        if matches!(d.state, DriftState::Current | DriftState::Behind) {
+            match &release {
+                Some(r) => {
+                    let behind = git.count(tip, &r.commit)?;
+                    d.commits_behind = Some(behind);
+                    d.state = if behind == 0 {
+                        DriftState::Current
+                    } else {
+                        DriftState::Behind
+                    };
+                }
+                None => {
+                    d.commits_behind = None;
+                    d.state = DriftState::NoRelease;
+                    d.detail = Some(no_release(up));
+                }
+            }
+        }
+    }
     let conflicts = if check {
-        Some(predicted(git, tip, up, &mut d)?)
+        let target = release.as_ref().map(|r| r.commit.clone()).or(d.tip.clone());
+        Some(predicted(git, tip, up, target.as_deref(), &mut d)?)
     } else {
         None
     };
@@ -262,6 +323,15 @@ fn follow_status(
     status.detail = d.detail;
     status.last_synced = d.last_synced;
     status.last_synced_source = d.last_synced_source;
+    status.last_synced_tag = last.and_then(|r| r.tag.clone());
+    status.tags = up.tags.clone();
+    if let Some(r) = release {
+        if let Some(upstream_tip) = &status.tip {
+            status.commits_after_release = Some(git.count(&r.commit, upstream_tip)?);
+        }
+        status.release = Some(r.commit);
+        status.release_tag = Some(r.tag);
+    }
     status.commits_behind = d.commits_behind;
     status.conflicts = conflicts;
     Ok(status)
@@ -323,14 +393,20 @@ fn port_status(
     s
 }
 
-/// Predicted conflicts for one follow upstream; may add a detail when a
-/// merge could not run at all.
-fn predicted(git: &Git, tip: &str, up: &Upstream, d: &mut Drift) -> Result<Vec<String>> {
-    let Some(upstream_tip) = d.tip.clone() else {
+/// Predicted conflicts of a merge of `target` for one follow upstream; may
+/// add a detail when a merge could not run at all.
+fn predicted(
+    git: &Git,
+    tip: &str,
+    up: &Upstream,
+    target: Option<&str>,
+    d: &mut Drift,
+) -> Result<Vec<String>> {
+    let Some(target) = target else {
         return Ok(Vec::new());
     };
     match d.state {
-        DriftState::Behind => drift::predict_conflicts(git, tip, &upstream_tip, up.path.as_deref()),
+        DriftState::Behind => drift::predict_conflicts(git, tip, target, up.path.as_deref()),
         DriftState::NotImported => {
             if let Some(path) = &up.path {
                 if git.path_exists(tip, path)? {
@@ -365,6 +441,7 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
                     mode: Mode::Follow,
                     fetched: q.fetched.clone(),
                     target: None,
+                    tag: None,
                     rev: q.rev.clone(),
                     kind: None,
                     step: q.step,
@@ -377,6 +454,7 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
                 match &q.work {
                     Work::Follow(f) => {
                         view.target = Some(f.target.clone());
+                        view.tag = f.tag.clone();
                         view.kind = Some(f.kind);
                         view.merge_commit = f.merge_commit.clone();
                     }
@@ -426,6 +504,14 @@ fn opt_abbrev(oid: &Option<String>) -> String {
     oid.as_deref().map(abbrev).unwrap_or("-").to_string()
 }
 
+/// A commit with the tag that names it, or `-`.
+fn shown(oid: &Option<String>, tag: &Option<String>) -> String {
+    match oid {
+        Some(oid) => described(oid, tag.as_deref()),
+        None => "-".to_string(),
+    }
+}
+
 fn config_lines(doc: &StatusDoc, out: &mut String) {
     out.push_str(&format!(
         "integration: {} at {}\n",
@@ -467,8 +553,11 @@ impl Render for StatusDoc {
                     u.path.clone().unwrap_or_else(|| "/".into()),
                     u.mode.as_str().to_string(),
                     u.branch.clone(),
-                    opt_abbrev(&u.last_synced),
-                    opt_abbrev(&u.tip),
+                    shown(&u.last_synced, &u.last_synced_tag),
+                    match &u.tags {
+                        Some(_) => shown(&u.release, &u.release_tag),
+                        None => opt_abbrev(&u.tip),
+                    },
                     u.commits_behind
                         .map(|n| n.to_string())
                         .unwrap_or("-".into()),
@@ -498,6 +587,24 @@ impl Render for StatusDoc {
                     u.name,
                     abbrev(base)
                 ));
+            }
+            if let (Some(pattern), Some(tip)) = (&u.tags, &u.tip) {
+                match (&u.release, &u.release_tag) {
+                    (Some(release), Some(tag)) if release != tip => {
+                        let past = u.commits_after_release.unwrap_or_default();
+                        out.push_str(&format!(
+                            "{}: takes release tags '{pattern}'; the branch tip {} is {past} commit{} past {tag}\n",
+                            u.name,
+                            abbrev(tip),
+                            plural(past)
+                        ));
+                    }
+                    (Some(_), Some(tag)) => out.push_str(&format!(
+                        "{}: takes release tags '{pattern}'; the branch tip is {tag}\n",
+                        u.name
+                    )),
+                    _ => {}
+                }
             }
             if u.last_synced_source == Some(SyncSource::History) {
                 out.push_str(&format!(
@@ -575,7 +682,7 @@ pub fn render_update(u: &UpdateView) -> String {
             (Some(target), _, _) => out.push_str(&format!(
                 "  {}: target {}, {step}\n",
                 q.name,
-                described(target, q.rev.as_deref())
+                described(target, q.tag.as_deref().or(q.rev.as_deref()))
             )),
             (None, Some(plan), Some(commits)) => {
                 let n = commits.len() as u64;

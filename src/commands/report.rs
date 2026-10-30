@@ -42,6 +42,8 @@ pub struct UpstreamReport {
     pub range_start: Option<String>,
     /// Follow mode: the target.
     pub target: Option<String>,
+    /// Follow mode: the upstream tag that names the target.
+    pub tag: Option<String>,
     /// Follow mode: upstream commits merged.
     pub commits: Option<u64>,
     pub merge_commit: Option<String>,
@@ -155,6 +157,7 @@ fn build(git: &Git, state: &UpdateState, in_progress: bool) -> Result<ReportDoc>
             kind: None,
             range_start: None,
             target: None,
+            tag: None,
             commits: None,
             merge_commit: None,
             conflicts: Vec::new(),
@@ -247,6 +250,7 @@ fn follow_report(
     report.kind = Some(f.kind);
     report.range_start = range_start;
     report.target = Some(f.target.clone());
+    report.tag = f.tag.clone();
     report.commits = Some(f.commits);
     report.merge_commit = f.merge_commit.clone();
     report.conflicts = live(&f.conflicts, step == UpstreamStep::Conflict, live_unmerged);
@@ -414,6 +418,9 @@ fn render_follow(u: &UpstreamReport, out: &mut String) {
     ));
     if let Some(rev) = &u.rev {
         out.push_str(&format!("  target named by: {rev}\n"));
+    }
+    if let Some(tag) = &u.tag {
+        out.push_str(&format!("  target tag: {tag}\n"));
     }
     if let Some(m) = &u.merge_commit {
         out.push_str(&format!("  merge commit: {}\n", abbrev(m)));

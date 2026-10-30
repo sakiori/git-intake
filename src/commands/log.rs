@@ -5,13 +5,14 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::Exit;
-use crate::commands::update::plural;
+use crate::commands::update::{no_release, plural};
 use crate::config::Mode;
 use crate::git::{abbrev, branch_ref};
 use crate::output::{Render, emit};
 use crate::port::{self, Standing};
 use crate::repo::Repo;
 use crate::sync_record;
+use crate::tags::{TagPattern, UpstreamTags};
 use crate::upstreams::Fetches;
 
 #[derive(Serialize)]
@@ -27,6 +28,11 @@ pub struct UpstreamLog {
     pub branch: String,
     pub mode: Mode,
     pub tip: Option<String>,
+    /// Follow mode with `tags`: the commit of the newest release tag on the
+    /// fetched branch, up to which the commits are listed.
+    pub release: Option<String>,
+    /// Follow mode with `tags`: the name of that tag.
+    pub release_tag: Option<String>,
     /// Whether the commits could be listed: the upstream was fetched and,
     /// for a port upstream, its journal is valid and its history not
     /// rewritten.
@@ -60,7 +66,7 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
     for up in &selected {
         fetched.push(fetches.upstream(up)?);
     }
-    let fetch_failed = fetched.iter().any(|f| f.is_err());
+    let mut fetch_failed = fetched.iter().any(|f| f.is_err());
     let tips: Vec<String> = fetched.iter().filter_map(|f| f.clone().ok()).collect();
     let latest = sync_record::latest(git, &sync_record::records(git, &integration, &tips)?)?;
     let mut upstreams = Vec::new();
@@ -71,6 +77,8 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
             branch: up.source(),
             mode: up.mode,
             tip: None,
+            release: None,
+            release_tag: None,
             available: false,
             detail: None,
             commits: Vec::new(),
@@ -86,10 +94,38 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
         entry.tip = Some(tip.clone());
         match up.mode {
             Mode::Follow => {
+                // With release tags, the commits up to the newest release.
+                let mut target = tip.clone();
+                if let Some(text) = &up.tags {
+                    let tags = match UpstreamTags::list(git, up)? {
+                        Ok(tags) => tags,
+                        Err(why) => {
+                            fetch_failed = true;
+                            entry.detail = Some(why);
+                            upstreams.push(entry);
+                            continue;
+                        }
+                    };
+                    let pattern = TagPattern::parse(text)
+                        .map_err(|why| anyhow::anyhow!("upstream '{}' tags: {why}", up.name))?;
+                    match tags.release(git, &pattern, &tip)? {
+                        Some(release) => {
+                            target = release.commit.clone();
+                            entry.release = Some(release.commit);
+                            entry.release_tag = Some(release.tag);
+                        }
+                        None => {
+                            entry.detail = Some(no_release(up));
+                            entry.available = true;
+                            upstreams.push(entry);
+                            continue;
+                        }
+                    }
+                }
                 let out = git.run(&[
                     "log",
                     "--format=%H%x1f%s",
-                    &format!("{integration}..{tip}"),
+                    &format!("{integration}..{target}"),
                     "--",
                 ])?;
                 entry.commits = out
@@ -160,11 +196,15 @@ impl Render for LogDoc {
             let n = u.commits.len() as u64;
             match u.mode {
                 Mode::Follow => out.push_str(&format!(
-                    "{} ({path}, {}): {n} commit{} not in {}\n",
+                    "{} ({path}, {}): {n} commit{} not in {}{}\n",
                     u.name,
                     u.branch,
                     plural(n),
-                    self.integration
+                    self.integration,
+                    u.release_tag
+                        .as_deref()
+                        .map(|t| format!(" up to {t}"))
+                        .unwrap_or_default()
                 )),
                 Mode::Port => out.push_str(&format!(
                     "{} ({path}, {}): {n} pending commit{}, oldest first\n",
@@ -172,6 +212,9 @@ impl Render for LogDoc {
                     u.branch,
                     plural(n)
                 )),
+            }
+            if let Some(detail) = &u.detail {
+                out.push_str(&format!("  {detail}\n"));
             }
             for c in &u.commits {
                 out.push_str(&format!("  {}  {}\n", abbrev(&c.commit), c.subject));
