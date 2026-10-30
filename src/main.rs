@@ -87,6 +87,10 @@ fn main() -> ExitCode {
     // A panic's message goes the same way as every other.
     std::panic::set_hook(Box::new(|info| {
         eprintln!("{}", redact::redacted(&info.to_string()));
+        let backtrace = std::backtrace::Backtrace::capture();
+        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+            eprintln!("{}", redact::redacted(&backtrace.to_string()));
+        }
     }));
     match run(cli.command) {
         Ok(Exit::Success) => ExitCode::SUCCESS,
