@@ -473,8 +473,8 @@ fn refusal(state: &UpdateState, mr: &MergeRequest, landing: &Landing) -> String 
             "'{remote_branch}' at {} holds the update's changes but not the verified commit {verified}: the merge request was \
              merged by squash or rebase, which replaces the verified commit with commits that were never verified. No branch moved. \
              A merge request of git intake must be merged {MERGE_METHOD}; set the project's merge method accordingly. \
-             The tool opens it {SQUASH_OFF}, but a project whose squash setting requires squashing squashes every \
-             merge request regardless; such a project cannot take updates through merge requests until that setting \
+             The tool opens it {SQUASH_OFF}, but a project whose own or target branch rule's squash setting \
+             requires squashing squashes every merge request regardless; such a project cannot take updates through merge requests until that setting \
              allows merging without squashing. \
              To take the upstreams in properly, run `git intake abort`, bring '{integration}' up to date with '{remote_branch}', \
              and run `git intake start`",
@@ -519,14 +519,30 @@ pub fn complete(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Result
             repo.save_state(&state)?;
             let (tip, unattributed) = match landing {
                 Landing::Landed { tip, unattributed } => (tip, unattributed),
+                Landing::Waiting { .. } if no_publish => bail!(
+                    "the update waits for the merge request from '{}' into '{integration}' on '{}'; \
+                     `--no-publish` cannot close it before the merge request is merged, because the \
+                     verified commit is already published on that branch. Merge the merge request \
+                     {MERGE_METHOD}, then run `git intake finish --no-publish` to move only the local \
+                     branch, or `git intake finish` to delete the merge request branch as well; \
+                     `git intake abort` withdraws it",
+                    mr.branch,
+                    mr.remote
+                ),
                 Landing::Waiting {
                     head,
                     from_merge_request,
                 } => {
+                    report_waiting(&state, &mr, &head, from_merge_request);
                     // Waiting is the expected state, not a failure; `status
-                    // --check` reports the upstreams as pending meanwhile.
-                    report_waiting(&state, &mr, &head, from_merge_request, no_publish);
-                    return Ok(Exit::Success);
+                    // --check` reports the upstreams as pending meanwhile. A
+                    // head that moved off the verified commit needs someone
+                    // to act before the update can complete.
+                    return Ok(if head == mr.commit {
+                        Exit::Success
+                    } else {
+                        Exit::Negative
+                    });
                 }
                 other => bail!("{}", refusal(&state, &mr, &other)),
             };
@@ -582,13 +598,7 @@ pub fn complete(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Result
     finish::close(repo, state, Vec::new())
 }
 
-fn report_waiting(
-    state: &UpdateState,
-    mr: &MergeRequest,
-    head: &str,
-    from_merge_request: bool,
-    no_publish: bool,
-) {
+fn report_waiting(state: &UpdateState, mr: &MergeRequest, head: &str, from_merge_request: bool) {
     let integration = &state.config.integration;
     println!(
         "the update waits for the merge request from '{}' into '{integration}' on '{}'",
@@ -611,12 +621,6 @@ fn report_waiting(
         println!("if the merge request is not open yet, open it {SQUASH_OFF}");
     }
     println!("merge it {MERGE_METHOD}, then run `git intake finish` again");
-    if no_publish {
-        println!(
-            "`--no-publish` moves no branch before the merge request is merged; \
-             to withdraw the merge request, run `git intake abort`"
-        );
-    }
 }
 
 /// The commit on the first-parent line of `tip` that brought `verified` in:

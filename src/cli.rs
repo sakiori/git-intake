@@ -19,8 +19,8 @@ use clap::{Parser, Subcommand};
         gets published, and the integration branch moves only by fast-forward. The repository \
         describes itself in a .git-intake.toml committed on its integration branch.",
     after_long_help = "Exit status: 0 on success; 1 on a negative result (drift found by status --check, \
-        a failed doctor check, a failed verify, an upstream that could not be fetched, or a stop on \
-        conflicts); 2 on an error (invalid configuration, \
+        a failed doctor check, a failed verify, an upstream that could not be fetched, a stop on \
+        conflicts, or a merge request that no longer holds the verified commit); 2 on an error (invalid configuration, \
         a refused command, a git failure, or invalid usage)."
 )]
 pub struct Cli {
@@ -67,8 +67,9 @@ pub enum Command {
     /// integration branch with squashing off, and moves no local branch; the update then waits.
     /// Once the merge request is merged with a merge commit or by fast-forward, `finish`
     /// fast-forwards the integration branch to the remote one and deletes the merge request
-    /// branch. While the merge request waits, `finish` reports so and exits with status 0;
-    /// `status --check` fails until the update completes.
+    /// branch. While the merge request waits, `finish` reports so and exits with status 0, or
+    /// with status 1 when the merge request no longer holds the verified commit; `status --check`
+    /// fails until the update completes, and `--no-publish` is refused until the merge.
     Finish {
         /// Complete only the local moves and close the update without pushing
         #[arg(long)]

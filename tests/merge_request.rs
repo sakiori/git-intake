@@ -247,7 +247,9 @@ fn squash_merge_is_refused_and_moves_nothing() {
     // A project that squashes every merge request overrides the request to
     // leave squashing off; the refusal names that setting.
     assert!(
-        err.contains("a project whose squash setting requires squashing"),
+        err.contains(
+            "a project whose own or target branch rule's squash setting requires squashing"
+        ),
         "{err}"
     );
     assert_eq!(env.rev(&f.down, "main"), base);
@@ -417,10 +419,25 @@ fn no_publish_keeps_its_meaning_in_merge_request_mode() {
     let (commit, target) = verified(&f);
     let branch = mr_branch(&commit);
     f.tool(&["finish"]).success();
-    f.tool(&["finish", "--no-publish"]).code(0).stdout(contains(
-        "`--no-publish` moves no branch before the merge request is merged",
-    ));
+    // `--no-publish` cannot close an update whose merge request is published
+    // but not merged: it refuses and says what to do instead.
+    let refused = f.tool(&["finish", "--no-publish"]).code(2);
+    let err = stderr(&refused);
+    assert!(
+        err.contains(&format!(
+            "the update waits for the merge request from '{branch}' into 'main' on 'origin'"
+        )),
+        "{err}"
+    );
+    assert!(
+        err.contains("`--no-publish` cannot close it before the merge request is merged"),
+        "{err}"
+    );
+    assert!(err.contains("`git intake abort` withdraws it"), "{err}");
     assert_eq!(env.rev(&f.down, "main"), base);
+    assert_eq!(env.rev(&f.publish, &format!("refs/heads/{branch}")), commit);
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["step"], "waiting_for_merge_request");
 
     // After the merge: the local move only; the merge request branch stays
     // as it is on the remote.
@@ -486,7 +503,8 @@ fn merge_request_branch_changed_before_the_merge_is_refused() {
     let extra = env.commit(&forge, &[("review.txt", "r\n")], "review: unverified");
     env.git(&forge, &["push", "-q", "origin", &format!("HEAD:{branch}")]);
     env.git(&forge, &["checkout", "-q", "main"]);
-    let waiting = stdout(&f.tool(&["finish"]).code(0));
+    // The update cannot complete until someone acts: a negative result.
+    let waiting = stdout(&f.tool(&["finish"]).code(1));
     assert!(
         waiting.contains(&format!(
             "no longer points at the verified commit {} but at {}",
@@ -926,7 +944,7 @@ fn branch_as_last_seen_judges_once_it_is_gone() {
 
     let extra = add_to_merge_request_branch(&f, &branch);
     // `finish` sees the changed branch while waiting.
-    f.tool(&["finish"]).code(0).stdout(contains(
+    f.tool(&["finish"]).code(1).stdout(contains(
         "the merge request branch no longer points at the verified commit",
     ));
     env.git(&f.publish, &["update-ref", "refs/heads/main", &extra]);
