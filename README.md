@@ -118,7 +118,7 @@ Validation rules. The tool refuses to run when any of them is broken, and it nam
 - A path is normalised: no leading or trailing slash, no empty, `.` or `..` segment, no `.git` segment in any letter case, and it may not be empty. Omit `path` for the root.
 - Paths may not nest; one upstream's path cannot lie inside another's.
 - An upstream at the root must be the only upstream.
-- `[publish]` is a table: `remote` is required, and `via` is `push` or `merge-request`. The string form `publish = "origin"` is rejected with the table to write instead.
+- `publish` is a table: `remote` is required, and `via` is `push` or `merge-request`. Write it as the `[publish]` section shown above, after the top-level keys (a section header ends the top level, so keys written below it belong to the section), or inline as `publish = { remote = "origin", via = "merge-request" }`. The string form `publish = "origin"` is rejected with the form to write instead.
 - The publish remote may not be an upstream's remote, because the tool never pushes to an upstream.
 - A mirror may be neither the integration branch nor `git-intake/update`.
 
@@ -191,26 +191,34 @@ If the push is rejected, nothing is published, the local branches stay advanced,
 With `via = "merge-request"`, nobody needs to push to the integration branch, so it can stay protected. `finish` applies the same checks as above and then publishes the verified commit itself, without moving any local branch:
 
 1. It pushes the verified commit, without force, to a new branch `git-intake/update-<commit>` on the publish remote, where `<commit>` is the first twelve hex digits of the verified commit.
-2. With the same push it requests a merge request from that branch into the integration branch through git push options (`merge_request.create`, `merge_request.target`, `merge_request.title`, `merge_request.description`, `merge_request.remove_source_branch`), which GitLab applies while it receives the push. The title names the merged upstreams, and the description lists each upstream's merged range and the verified commit. The tool shows what the remote replies, such as the address of the new merge request.
+2. With the same push it asks the remote to open a merge request from that branch into the integration branch, through git push options (`merge_request.create`, `merge_request.target`, `merge_request.title`, `merge_request.description`, `merge_request.remove_source_branch`), which GitLab applies while it receives the push. The title names the merged upstreams, and the description lists each upstream's merged range and the verified commit. The tool shows what the remote replies, such as the address of the new merge request.
 3. It removes the update worktree and keeps the update in the step `waiting_for_merge_request`. `status` shows the merge request branch and the next command; `start`, `continue` and `verify` refuse while the update waits.
 
-A remote that does not support push options refuses them before anything is written (`the receiving end does not support push options`). The tool then pushes the branch without options and names the merge request to open: from `git-intake/update-<commit>` into the integration branch.
+A remote applies push options only to a push that updates the branch. When the branch is already on the remote with the verified commit, as after an interrupted `finish`, the push changes nothing and asks for no merge request; the tool then says so and names the merge request to open unless one is open. A remote that does not support push options refuses them before anything is written (`the receiving end does not support push options`); the tool then pushes the branch without options and names the merge request to open: from `git-intake/update-<commit>` into the integration branch.
 
-Merge the merge request **with a merge commit or by fast-forward**. A squash or a rebase replaces the verified commit with commits that were never verified, and a rebase also rewrites the upstream merges, so the update cannot complete after one. In GitLab, set the project's merge method to *Merge commit*, *Merge commit with semi-linear history* or *Fast-forward merge*, and leave squashing off for these merge requests. With semi-linear history or fast-forward merges, GitLab requires the source branch to contain the target branch; if the integration branch moves first, the update has to be started again anyway (below).
+Merge the merge request **with a merge commit or by fast-forward**, and leave its branch as it is. What lands must be the verified commit itself, or a merge of it whose tree is the verified tree. A squash or a rebase replaces the verified commit with commits that were never verified, and a rebase also rewrites the upstream merges. A commit added to the merge request branch, or a merge commit made after other work landed on the integration branch, gives a tree that was never verified. In GitLab, set the project's merge method to *Merge commit with semi-linear history* or *Fast-forward merge*, which merge only a branch that contains the current target, and leave squashing off for these merge requests. With the plain *Merge commit* method, merge only while the integration branch is still where the update started.
 
-Then run `finish` again. It looks up the merge request branch, fetches the publish remote's integration branch, and acts on what it finds:
+Then run `finish` again. It looks up the merge request branch, fetches the publish remote's integration branch, finds on its first-parent line the commit that brought the verified commit in, and acts on what it finds:
 
-- **It contains the verified commit.** `finish` fast-forwards the local integration branch to the remote one, with the same care for its checkouts as in push mode, fast-forwards each merged upstream's mirror branch to its target and pushes the mirrors without force in one atomic push, deletes the merge request branch if it still exists, and removes the update. If the mirror push is rejected, the update stays in its `finishing` step: run `finish` again to retry, or `finish --no-publish` to close the update locally and publish the mirrors by hand.
-- **It does not contain the verified commit yet, and the merge request branch exists.** `finish` reports that the update waits for the merge request, changes nothing, and exits with status 1.
-- **It carries this update's sync records but not the verified commit.** The merge request was merged by squash or rebase. `finish` refuses and moves no branch. Run `abort`, bring the local integration branch up to date with the remote one, and run `start`: the upstreams are merged again on the new tip and recorded properly.
-- **It moved, so that the verified commit no longer contains its tip.** Someone merged other work first, and the merge request cannot be merged as it is. `finish` refuses and moves no branch; run `abort` and `start` again on the new tip.
-- **The merge request branch is gone and the verified commit is not merged.** The merge request was closed or its branch deleted; `finish` refuses, and `abort` ends the update.
+- **The verified tree landed.** That commit is the verified commit itself (a fast-forward), or a merge whose tree is the verified tree and whose parents the verified commit contains. `finish` fast-forwards the local integration branch to the remote one, with the same care for its checkouts as in push mode, fast-forwards each merged upstream's mirror branch to its target and pushes the mirrors without force in one atomic push, deletes the merge request branch if it still exists, and removes the update. If the mirror push is rejected, the update stays in its `finishing` step: run `finish` again to retry, or `finish --no-publish` to close the update locally and publish the mirrors by hand.
+- **Nothing landed yet, and the merge request branch exists.** `finish` reports that the update waits for the merge request, changes nothing, and exits with status 1. If the merge request branch no longer points at the verified commit, it says so: merging it would not land the verified tree.
+- **What landed differs from the verified tree.** The integration branch contains the verified commit, but through a merge with another tree. `finish` refuses and moves no branch; that merge was never verified. `abort` then ends the update (below).
+- **The integration branch changed without receiving the verified commit.** When a commit with the verified tree landed instead, the merge request was merged by squash or rebase; otherwise another change landed first, or the merge request was merged by squash or rebase after other changes. `finish` refuses and moves no branch. Run `abort`, bring the local integration branch up to date with the remote one, and run `start`: the upstreams are merged again on the new tip and recorded properly.
+- **The merge request branch is gone and nothing landed.** The merge request was closed or its branch deleted; `finish` refuses, and `abort` ends the update.
 
 `finish --no-publish` keeps its meaning in this mode: it makes the local moves and pushes nothing. Before the merge request is opened, it closes the update locally as in push mode. While the update waits, it moves no branch before the merge request is merged, and reports that the update waits. After the merge, it fast-forwards the local integration and mirror branches, leaves the mirrors unpublished and the merge request branch in place, and removes the update.
 
 ### Abort
 
-`abort` removes the worktree, the update branch, the update's logs and the state at any step before `finish` moves a branch. The integration and mirror branches stay exactly as they were, and the message names the branches the configuration has. Resolutions already made by hand are recorded first, so a retry reapplies them. While the update waits for its merge request, `abort` first deletes the merge request branch from the publish remote, only while it still points at the verified commit, and names the merge request that is left to close on the forge. A branch that is already gone counts as deleted; a branch that received other commits is left alone.
+`abort` removes the worktree, the update branch, the update's logs and the state at any step before `finish` moves a branch. The integration and mirror branches stay exactly as they were, and the message names the branches the configuration has. Resolutions already made by hand are recorded first, so a retry reapplies them.
+
+While the update waits for its merge request, `abort` first checks the publish remote's integration branch as `finish` does:
+
+- If the verified tree landed, `abort` refuses and names `finish`, which completes the update.
+- If a merge that did not land the verified tree is there, `abort` removes the update, leaves the mirror branches unchanged, and says that the integration branch holds an unverified merge.
+- Otherwise it removes the update and names the merge request that is left to close on the forge.
+
+In each case where it proceeds, it deletes the merge request branch from the publish remote only while that branch still points at the verified commit. A branch that is already gone counts as deleted; a branch that received other commits is left alone.
 
 ## The sync record
 
@@ -245,7 +253,7 @@ An upstream's **last synced commit** is the target in the newest such commit on 
 
 ### JSON output
 
-`status`, `report`, `log`, `branches` and `doctor` accept `--json`. They then write one JSON document to standard output, with the same facts as the text form under stable snake_case field names, and exit with the same status. Notes and errors go to standard error. For example, `status --json` carries `publish` (the publish remote or null) and `publish_via` (`push`, `merge_request` or null); while an update waits for its merge request, its `update` carries `step` `waiting_for_merge_request` and `merge_request` with `remote`, `source_branch`, `target_branch`, `commit` and `requested` (whether the remote accepted the push options). Every entry of `status --json` `upstreams` carries `name`, `path`, `remote`, `branch`, `url`, `mirror`, `last_synced`, `last_synced_source` (`record`, `history` or null), `tip`, `commits_behind`, `state` (`current`, `behind`, `not_imported`, `path_removed`, `rewritten`, `unavailable`), `detail`, and, with `--check`, `conflicts`.
+`status`, `report`, `log`, `branches` and `doctor` accept `--json`. They then write one JSON document to standard output, with the same facts as the text form under stable snake_case field names, and exit with the same status. Notes and errors go to standard error. For example, `status --json` carries `publish` (the publish remote or null) and `publish_via` (`push`, `merge_request` or null); while an update waits for its merge request, its `update` carries `step` `waiting_for_merge_request` and `merge_request` with `remote`, `source_branch`, `target_branch`, `commit` and `requested` (whether the push that asked the remote to open the merge request transferred the branch; when false, the merge request is opened by hand). Every entry of `status --json` `upstreams` carries `name`, `path`, `remote`, `branch`, `url`, `mirror`, `last_synced`, `last_synced_source` (`record`, `history` or null), `tip`, `commits_behind`, `state` (`current`, `behind`, `not_imported`, `path_removed`, `rewritten`, `unavailable`), `detail`, and, with `--check`, `conflicts`.
 
 ## Exit status
 
@@ -253,7 +261,7 @@ An upstream's **last synced commit** is the target in the newest such commit on 
 | --- | --- |
 | 0 | Success. |
 | 1 | A negative result: `status --check` found drift, a `doctor` check failed, `verify` failed, an upstream could not be fetched or its remote was refused, `start`/`continue` stopped on conflicts, or `finish` found that the update still waits for its merge request. |
-| 2 | An error: invalid configuration, a refused command (for example `finish` on an unverified update, or on a merge request merged by squash), a git failure (including a push rejected by the publish remote, after which `finish` retries the same push and `finish --no-publish` closes the update locally), or invalid usage. |
+| 2 | An error: invalid configuration, a refused command (for example `finish` on an unverified update, or on a merge request merged by squash or without the verified tree), a git failure (including a push rejected by the publish remote, after which `finish` retries the same push and `finish --no-publish` closes the update locally), or invalid usage. |
 
 ## Monorepo migration
 
@@ -272,7 +280,7 @@ An upstream's **last synced commit** is the target in the newest such commit on 
 - Each target is fixed when the update starts. What is merged, verified and published is the same commit.
 - `finish` moves no ref unless the verified commit is the worktree head, the base is still the integration tip, and every move is a fast-forward. It validates every move before making any, and it can be resumed.
 - Publication by push is a single atomic push of exactly the planned commits. If any branch is rejected, none moves on the remote; nothing unverified is ever published by a retry, and `finish --no-publish` closes an update that cannot be published.
-- Publication through a merge request pushes only the verified commit, to a branch of its own. The local integration branch moves only after the publish remote's integration branch contains the verified commit, and the mirror branches follow only then; a merge by squash or rebase is refused.
+- Publication through a merge request pushes only the verified commit, to a branch of its own. The local integration branch moves only after the publish remote's integration branch received the verified commit, by fast-forward or by a merge whose tree is the verified tree, and the mirror branches follow only then; a merge by squash or rebase, or of a tree that was never verified, is refused.
 - An existing remote is never retargeted.
 - A rewritten upstream is detected from the sync record and is not merged.
 - The configuration is read from the committed integration tip, never from a working copy or from the tree being merged.

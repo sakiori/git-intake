@@ -240,7 +240,9 @@ pub fn parse(text: &str) -> Result<Config> {
 fn parse_publish(value: toml::Value) -> std::result::Result<Publish, String> {
     if let toml::Value::String(remote) = &value {
         return Err(format!(
-            "publish: expected a table, not a string; write\n      [publish]\n      remote = {remote:?}\n    and add `via = \"merge-request\"` to publish through a merge request"
+            "publish: expected a table, not a string; write `publish = {{ remote = {remote:?} }}`, \
+             adding `via = \"merge-request\"` to publish through a merge request, or a `[publish]` table \
+             with the same keys placed after the top-level keys"
         ));
     }
     let raw: RawPublish = value
@@ -592,8 +594,8 @@ via = "merge-request"
         let e = err(&format!(
             "integration = \"main\"\npublish = \"origin\"\n{UP_A}"
         ));
-        assert!(e.contains("[publish]"), "{e}");
-        assert!(e.contains("remote = \"origin\""), "{e}");
+        assert!(e.contains("publish = { remote = \"origin\" }"), "{e}");
+        assert!(e.contains("placed after the top-level keys"), "{e}");
     }
 
     #[test]

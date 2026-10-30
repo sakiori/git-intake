@@ -5,7 +5,7 @@ use std::fs;
 use anyhow::{Context, Result, bail};
 
 use crate::Exit;
-use crate::commands::merge_request;
+use crate::commands::merge_request::{self, Landing};
 use crate::config::Upstream;
 use crate::drift::{self, DriftState};
 use crate::git::{Git, abbrev, branch_ref, tracking_ref};
@@ -656,7 +656,23 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
         }
     }
     let merge_request = state.as_ref().and_then(|s| s.merge_request.clone());
-    if let Some(mr) = &merge_request {
+    let mut unverified = None;
+    if let (Some(state), Some(mr)) = (&state, &merge_request) {
+        let landing = if state.finishing.is_some() {
+            // `finish` plans its moves only once the verified tree landed.
+            None
+        } else {
+            Some(merge_request::inspect(repo, state, mr)?)
+        };
+        match landing {
+            None | Some(Landing::Landed { .. }) => bail!(
+                "the merge request from '{}' was merged with the verified commit; the update can no longer be aborted. \
+                 Run `git intake finish` to complete it",
+                mr.branch
+            ),
+            Some(Landing::Unverified { tip, landing }) => unverified = Some((tip, landing)),
+            Some(_) => {}
+        }
         merge_request::delete_branch(&repo.git, mr)?;
     }
     let mut removed = repo.remove_update_artifacts()?;
@@ -672,7 +688,17 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
     match state {
         Some(state) => {
             println!("update aborted; {}", unchanged_branches(&state));
-            if let Some(mr) = merge_request {
+            if let (Some(mr), Some((tip, landing))) = (&merge_request, &unverified) {
+                let integration = &state.config.integration;
+                println!(
+                    "'{}/{integration}' at {} holds an unverified merge: {} brought in '{}' without the verified tree; \
+                     review it before building on it",
+                    mr.remote,
+                    abbrev(tip),
+                    abbrev(landing),
+                    mr.branch
+                );
+            } else if let Some(mr) = merge_request {
                 let integration = &state.config.integration;
                 if mr.requested {
                     println!(

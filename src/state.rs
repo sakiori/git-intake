@@ -169,8 +169,9 @@ pub struct MergeRequest {
     pub branch: String,
     /// The verified commit the branch points at.
     pub commit: String,
-    /// Whether the remote accepted the push options that open the merge
-    /// request; when it did not, the user opens it.
+    /// Whether the push that carried the options asking the remote to open
+    /// the merge request transferred the branch; when it did not, the user
+    /// opens the merge request.
     pub requested: bool,
 }
 
@@ -230,8 +231,37 @@ impl UpdateState {
     }
 }
 
-/// Reads a state file, or `None` when it does not exist.
+/// Reads the state of the update in progress, or `None` when there is none.
+/// A state written by a release with another state format is refused: its
+/// update has to be finished or aborted with that release.
 pub fn load(path: &Path) -> Result<Option<UpdateState>> {
+    match read(path)? {
+        None => Ok(None),
+        Some(Versioned::Current(state)) => Ok(Some(*state)),
+        Some(Versioned::Other(version)) => anyhow::bail!(
+            "the update in progress was started by a release that keeps its state in format {version}; \
+             this release understands format {STATE_VERSION}. Finish or abort the update with the release \
+             that started it ({})",
+            path.display()
+        ),
+    }
+}
+
+/// Reads the record of the last finished update, or `None` when there is
+/// none or it was written in another state format; it only feeds `report`.
+pub fn load_finished(path: &Path) -> Result<Option<UpdateState>> {
+    Ok(match read(path)? {
+        Some(Versioned::Current(state)) => Some(*state),
+        _ => None,
+    })
+}
+
+enum Versioned {
+    Current(Box<UpdateState>),
+    Other(String),
+}
+
+fn read(path: &Path) -> Result<Option<Versioned>> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -242,15 +272,13 @@ pub fn load(path: &Path) -> Result<Option<UpdateState>> {
     // The version is checked before the shape, so that a state written by
     // another release is named as such rather than as unreadable.
     let version = value.get("version").and_then(serde_json::Value::as_u64);
-    anyhow::ensure!(
-        version == Some(u64::from(STATE_VERSION)),
-        "the update state in {} has version {}, this tool understands version {STATE_VERSION}; \
-         finish or abort the update with the release that started it",
-        path.display(),
-        version.map_or("unknown".to_string(), |v| v.to_string())
-    );
+    if version != Some(u64::from(STATE_VERSION)) {
+        return Ok(Some(Versioned::Other(
+            version.map_or("unknown".to_string(), |v| v.to_string()),
+        )));
+    }
     let state: UpdateState = serde_json::from_value(value).with_context(unreadable)?;
-    Ok(Some(state))
+    Ok(Some(Versioned::Current(Box::new(state))))
 }
 
 /// Writes a state file atomically.
@@ -326,8 +354,9 @@ mod tests {
         .unwrap();
         let err = format!("{:#}", load(&path).unwrap_err());
         assert!(
-            err.contains("has version 1, this tool understands version 2"),
+            err.contains("keeps its state in format 1; this release understands format 2"),
             "{err}"
         );
+        assert!(load_finished(&path).unwrap().is_none());
     }
 }

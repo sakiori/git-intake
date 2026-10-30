@@ -139,10 +139,8 @@ fn publish_setting_is_a_table_with_a_mode() {
         err.contains("publish: expected a table, not a string"),
         "{err}"
     );
-    assert!(
-        err.contains("[publish]\n      remote = \"origin\""),
-        "{err}"
-    );
+    assert!(err.contains("publish = { remote = \"origin\" }"), "{err}");
+    assert!(err.contains("placed after the top-level keys"), "{err}");
 
     let unknown = committed.replace("via = \"push\"", "via = \"pull-request\"");
     env.commit(
@@ -421,4 +419,30 @@ fn running_outside_a_repository_is_an_error() {
     env.tool(&env.path("home"), &["status"])
         .code(2)
         .stderr(contains("not inside a git repository"));
+}
+
+#[test]
+fn state_files_of_another_format_are_named_or_ignored() {
+    let f = Fork::new();
+    let env = &f.env;
+    let dir = env.intake_dir(&f.down);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A finished update recorded by an earlier release only feeds `report`.
+    std::fs::write(
+        dir.join("last-update.json"),
+        r#"{"version": 1, "config": {"integration": "main", "publish": "origin"}}"#,
+    )
+    .unwrap();
+    f.tool(&["report"]).code(2).stderr(contains(
+        "no update is in progress or finished; nothing to report",
+    ));
+    // An update in progress from an earlier release is refused by name.
+    std::fs::write(
+        dir.join("state.json"),
+        r#"{"version": 1, "config": {"integration": "main", "publish": "origin"}}"#,
+    )
+    .unwrap();
+    f.tool(&["status"]).code(2).stderr(contains(
+        "the update in progress was started by a release that keeps its state in format 1",
+    ));
 }

@@ -74,8 +74,8 @@ pub struct MergeRequestView {
     pub source_branch: String,
     pub target_branch: String,
     pub commit: String,
-    /// Whether the remote accepted the push options that open the merge
-    /// request; when it did not, the merge request is opened by hand.
+    /// Whether the push that carried the options asking the remote to open
+    /// the merge request transferred the branch; when not, it is opened by hand.
     pub requested: bool,
 }
 
@@ -368,7 +368,7 @@ pub fn render_update(u: &UpdateView) -> String {
             if mr.requested {
                 ""
             } else {
-                " (the remote did not accept push options; open it by hand)"
+                " (the remote was not asked to open it; open it unless it is open)"
             }
         )),
         None => out.push_str(&format!("  worktree: {}\n", u.worktree.display())),

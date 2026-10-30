@@ -65,7 +65,7 @@ fn merge_request_opened_waits_and_completes_after_a_merge_commit() {
     let out = stdout(&open);
     assert!(
         out.contains(&format!(
-            "requested a merge request from '{branch}' into 'main' on 'origin'"
+            "asked 'origin' to open a merge request from '{branch}' into 'main'"
         )),
         "{out}"
     );
@@ -167,7 +167,7 @@ fn merge_request_opened_waits_and_completes_after_a_merge_commit() {
 
     let done = f.tool(&["finish"]).success();
     let out = stdout(&done);
-    assert!(out.contains("contains the verified commit"), "{out}");
+    assert!(out.contains("received the verified commit"), "{out}");
     assert!(out.contains("pushed upstream-main to 'origin'"), "{out}");
     assert!(
         out.contains(&format!(
@@ -224,26 +224,17 @@ fn squash_merge_is_refused_and_moves_nothing() {
     let branch = mr_branch(&commit);
     f.tool(&["finish"]).success();
 
-    // A squash: one new commit with the verified tree whose message joins
-    // the messages of the squashed commits, sync record included.
+    // A squash with GitLab's default message, the merge request title: one
+    // new commit with the verified tree and no sync record.
     let forge = forge(&f);
     env.git(&forge, &["fetch", "-q", "origin"]);
     env.git(
         &forge,
         &["merge", "-q", "--squash", &format!("origin/{branch}")],
     );
-    let message = env.git(
-        &forge,
-        &["log", "-1", "--format=%B", &format!("origin/{branch}")],
-    );
     env.git(
         &forge,
-        &[
-            "commit",
-            "-q",
-            "-m",
-            &format!("Squashed update\n\n{message}"),
-        ],
+        &["commit", "-q", "-m", "Merge upstream update: upstream"],
     );
     push_forge_main(&f, &forge);
     let squashed = env.rev(&f.publish, "main");
@@ -251,10 +242,13 @@ fn squash_merge_is_refused_and_moves_nothing() {
     let refused = f.tool(&["finish"]).code(2);
     let err = stderr(&refused);
     assert!(
-        err.contains("carries the sync records of this update (upstream)"),
+        err.contains("holds the update's changes but not the verified commit"),
         "{err}"
     );
-    assert!(err.contains("merged by squash or rebase"), "{err}");
+    assert!(
+        err.contains("the merge request was merged by squash or rebase"),
+        "{err}"
+    );
     assert!(
         err.contains("with a merge commit or by fast-forward"),
         "{err}"
@@ -393,11 +387,11 @@ fn remote_without_push_options_gets_the_branch_and_names_the_merge_request() {
             .as_str()
             .unwrap()
             .starts_with(&format!(
-                "open a merge request from '{branch}' into 'main' on 'origin'"
+                "unless a merge request from '{branch}' into 'main' is open on 'origin', open one"
             ))
     );
     let text = stdout(&f.tool(&["status"]).success());
-    assert!(text.contains("open it by hand"), "{text}");
+    assert!(text.contains("open it unless it is open"), "{text}");
     f.tool(&["abort"]).success().stdout(contains(format!(
         "if a merge request from '{branch}' into 'main' was opened on 'origin', close it"
     )));
@@ -508,4 +502,156 @@ fn merge_request_closed_without_merging_is_refused() {
     assert_eq!(env.rev(&f.down, "main"), base);
     f.tool(&["abort"]).success();
     env.assert_no_update(&f.down);
+}
+
+/// The forge merges the merge request branch with a merge commit.
+fn merge_on_forge(f: &Fork, branch: &str) -> String {
+    let env = &f.env;
+    let forge = forge(f);
+    env.git(&forge, &["fetch", "-q", "origin"]);
+    env.git(
+        &forge,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge branch into main",
+            &format!("origin/{branch}"),
+        ],
+    );
+    push_forge_main(f, &forge);
+    env.rev(&f.publish, "main")
+}
+
+#[test]
+fn merge_request_branch_changed_before_the_merge_is_refused() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let base = env.rev(&f.down, "main");
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    f.tool(&["finish"]).success();
+
+    // A reviewer adds a commit to the merge request branch.
+    let forge = forge(&f);
+    env.git(&forge, &["fetch", "-q", "origin"]);
+    env.git(
+        &forge,
+        &[
+            "checkout",
+            "-q",
+            "-b",
+            "review",
+            &format!("origin/{branch}"),
+        ],
+    );
+    let extra = env.commit(&forge, &[("review.txt", "r\n")], "review: unverified");
+    env.git(&forge, &["push", "-q", "origin", &format!("HEAD:{branch}")]);
+    env.git(&forge, &["checkout", "-q", "main"]);
+    let waiting = stdout(&f.tool(&["finish"]).code(1));
+    assert!(
+        waiting.contains(&format!(
+            "no longer points at the verified commit {} but at {}",
+            &commit[..12],
+            &extra[..12]
+        )),
+        "{waiting}"
+    );
+
+    let merged = merge_on_forge(&f, &branch);
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(err.contains("differs from the verified tree"), "{err}");
+    assert_eq!(env.rev(&f.down, "main"), base);
+    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
+    assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
+
+    let out = stdout(&f.tool(&["abort"]).success());
+    assert!(
+        out.contains(&format!(
+            "'origin/main' at {} holds an unverified merge",
+            &merged[..12]
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("update aborted; 'main' and 'upstream-main' are unchanged"),
+        "{out}"
+    );
+    assert!(!out.contains("close the merge request"), "{out}");
+    // The branch moved beyond the verified commit, so it is left alone.
+    assert!(out.contains("left the merge request branch"), "{out}");
+    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
+    assert_eq!(env.rev(&f.down, "main"), base);
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn merged_after_the_integration_branch_moved_is_refused() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let base = env.rev(&f.down, "main");
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    f.tool(&["finish"]).success();
+
+    // Other work lands first; the forge still merges with a merge commit.
+    let forge = forge(&f);
+    env.commit(&forge, &[("other.txt", "o\n")], "other: lands first");
+    push_forge_main(&f, &forge);
+    merge_on_forge(&f, &branch);
+
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(err.contains("differs from the verified tree"), "{err}");
+    assert_eq!(env.rev(&f.down, "main"), base);
+    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
+    assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
+}
+
+#[test]
+fn abort_after_a_valid_merge_is_refused() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, target) = verified(&f);
+    let branch = mr_branch(&commit);
+    f.tool(&["finish"]).success();
+    merge_on_forge(&f, &branch);
+
+    f.tool(&["abort"])
+        .code(2)
+        .stderr(contains("was merged with the verified commit"))
+        .stderr(contains("Run `git intake finish` to complete it"));
+    assert!(env.has_rev(&f.publish, &format!("refs/heads/{branch}")));
+    f.tool(&["finish"]).success();
+    assert_eq!(env.rev(&f.down, "upstream-main"), target);
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn interrupted_opening_does_not_claim_a_merge_request() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    // An earlier `finish` pushed the branch and stopped before saving the state.
+    env.git(
+        &f.down,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{commit}:refs/heads/{branch}"),
+        ],
+    );
+
+    f.tool(&["finish"]).success().stdout(contains(format!(
+        "'{branch}' was already on 'origin', so this push asked for no merge request; \
+         if none is open, open one from '{branch}' into 'main'"
+    )));
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["step"], "waiting_for_merge_request");
+    assert_eq!(status["update"]["merge_request"]["requested"], false);
+    f.tool(&["finish"])
+        .code(1)
+        .stdout(contains("open the merge request if it is not open yet"));
 }
