@@ -76,7 +76,7 @@ The tool SHALL keep the state of an update in the repository's common git direct
 ## ADDED Requirements
 
 ### Requirement: Publication through a merge request
-When the publication mode is `merge-request`, `finish` SHALL apply the same checks as in push mode, then push the verified commit without force to a new branch `git-intake/update-<short verified commit>` on the publish remote, requesting through git push options a merge request from that branch into the integration branch whose title names the merged upstreams and whose description lists each upstream's merged range. It SHALL move no local branch, remove the update worktree, and keep the update in a step that waits for the merge request. When the remote does not accept push options, the tool SHALL push the branch without them and name the merge request to open. A later `finish` SHALL fetch the publish remote and, once its integration branch contains the verified commit, fast-forward the local integration branch to the remote one, fast-forward each merged upstream's mirror branch to its target and push the mirrors without force, delete the merge request branch if it remains, and remove the update. While the merge request is open it SHALL report that the update waits for it. It SHALL refuse to complete, and explain why, when the integration branch carries the update's sync records without containing the verified commit, or when the integration branch moved so that the verified commit no longer contains its tip.
+When the publication mode is `merge-request`, `finish` SHALL apply the same checks as in push mode, then push the verified commit without force to a new branch `git-intake/update-<short verified commit>` on the publish remote, requesting through git push options a merge request from that branch into the integration branch whose title names the merged upstreams and whose description lists each upstream's merged range. It SHALL move no local branch, remove the update worktree, and keep the update in a step that waits for the merge request. When the remote does not accept push options, the tool SHALL push the branch without them and name the merge request to open. A later `finish` SHALL fetch the publish remote and, once its integration branch received the verified commit itself by fast-forward or a merge whose tree equals the verified commit's tree, fast-forward the local integration branch to the remote one, fast-forward each merged upstream's mirror branch to its target and push the mirrors without force, delete the merge request branch if it remains, and remove the update. While the merge request is open it SHALL report that the update waits for it, exit with the status of a negative result, and say so when the merge request branch no longer points at the verified commit. It SHALL count a merge request as requested only when the push that carried the options transferred the branch. It SHALL refuse to complete, and explain why, when the integration branch changed without receiving the verified commit (as by a squash or rebase merge), when what it received differs from the verified tree, when the integration branch moved so that the verified commit no longer contains its tip, or when the merge request branch disappeared without a merge. `abort` while waiting SHALL refuse when the integration branch received the verified commit as required and name `finish`; after a merge that did not land the verified tree it SHALL remove the update, leave the mirror branches unchanged, and say that the integration branch holds an unverified merge.
 
 #### Scenario: Merge request opened
 - **WHEN** `finish` runs on a verified update in merge-request mode against a remote that accepts push options
@@ -101,3 +101,27 @@ When the publication mode is `merge-request`, `finish` SHALL apply the same chec
 #### Scenario: Remote without push options
 - **WHEN** the publish remote does not accept push options
 - **THEN** the tool pushes the branch without them and names the source and target branches of the merge request to open
+
+#### Scenario: Merge request branch changed before the merge
+- **WHEN** a commit is added to the merge request branch and the merge request is merged with a merge commit
+- **THEN** `finish` refuses because the merged tree is not the verified one, moves no branch, and `abort` removes the update, leaves the mirrors unchanged and names the unverified merge
+
+#### Scenario: Merged after the integration branch moved
+- **WHEN** the merge request is merged with a merge commit after another commit landed on the integration branch
+- **THEN** `finish` refuses because the merged tree is not the verified one and moves no branch
+
+#### Scenario: Abort after a valid merge
+- **WHEN** `abort` runs after the merge request was merged with the verified commit
+- **THEN** it refuses and names `finish` to complete the update
+
+#### Scenario: Interrupted opening of the merge request
+- **WHEN** `finish` stops after pushing the merge request branch and is run again
+- **THEN** the tool does not claim that a merge request was requested, and names the merge request to open if none exists
+
+#### Scenario: No publication while waiting
+- **WHEN** `finish --no-publish` runs while the update waits for its merge request
+- **THEN** it moves no branch and reports that the update waits
+
+#### Scenario: Merge request closed without merging
+- **WHEN** the merge request branch disappears while the integration branch did not receive the verified commit
+- **THEN** `finish` refuses and names `abort`
