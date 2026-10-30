@@ -356,6 +356,41 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_upstream_without_a_revision_is_read() {
+        let cfg = config::parse(
+            "integration = \"main\"\n[[upstream]]\nname = \"up\"\nremote = \"up\"\nbranch = \"main\"\n",
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut queued = QueuedUpstream {
+            name: "up".into(),
+            target: "a".repeat(40),
+            rev: Some("v1.0".into()),
+            previous: None,
+            commits: 1,
+            kind: MergeKind::Root,
+            step: UpstreamStep::Pending,
+            head_before: None,
+            merge_commit: None,
+            conflicts: Vec::new(),
+        };
+        let state = UpdateState::new(
+            cfg,
+            "b".repeat(40),
+            dir.path().join("wt"),
+            vec![queued.clone()],
+        );
+        // A state written before queued upstreams carried their revision.
+        let mut value = serde_json::to_value(&state).unwrap();
+        value["upstreams"][0].as_object_mut().unwrap().remove("rev");
+        fs::write(&path, value.to_string()).unwrap();
+        let loaded = load(&path).unwrap().unwrap();
+        queued.rev = None;
+        assert_eq!(loaded.upstreams, vec![queued]);
+    }
+
+    #[test]
     fn a_state_of_another_version_is_named_as_such() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");

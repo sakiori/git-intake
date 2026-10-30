@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::fs;
+
 use common::{FORK_FILE, Fork, Mono, stderr, stdout};
 use predicates::str::contains;
 
@@ -250,6 +252,11 @@ fn conflict_at_a_chosen_target_resumes_and_records_that_target() {
         &c1[..12]
     )));
 
+    // The tag moves on the remote during the update; the target stays the
+    // commit `start` resolved.
+    env.git(&f.up.work, &["tag", "-f", "v2.0", &later]);
+    env.git(&f.up.work, &["push", "-q", "-f", "origin", "v2.0"]);
+
     let wt = env.update_worktree(&f.down);
     std::fs::write(wt.join(FORK_FILE), "one\nTWO-both\nthree\n").unwrap();
     env.git(&wt, &["add", FORK_FILE]);
@@ -332,4 +339,166 @@ fn malformed_or_repeated_upstream_operands_are_refused() {
         .code(2)
         .stderr(contains("unknown upstream 'nope'"));
     f.env.assert_no_update(&f.down);
+}
+
+#[test]
+fn tag_prefixes_name_the_upstream_tag() {
+    let f = Fork::new();
+    let env = &f.env;
+    let [c1, c2, _] = three_upstream_commits(&f);
+    env.git(&f.up.work, &["tag", "-a", "-m", "release 1.1", "v1.1", &c1]);
+    env.git(&f.up.work, &["tag", "v1.2", &c2]);
+    env.git(&f.up.work, &["push", "-q", "origin", "v1.1", "v1.2"]);
+    // The repository's own tags of the same names point elsewhere.
+    env.git(&f.down, &["tag", "v1.1", "main"]);
+    env.git(&f.down, &["tag", "v1.2", "main"]);
+
+    f.tool(&["start", "upstream=refs/tags/v1.1"])
+        .success()
+        .stdout(contains(format!(
+            "upstream: queued at {} (refs/tags/v1.1)",
+            &c1[..12]
+        )));
+    f.tool(&["abort"]).success();
+    f.tool(&["start", "upstream=tags/v1.2"])
+        .success()
+        .stdout(contains(format!(
+            "upstream: queued at {} (tags/v1.2)",
+            &c2[..12]
+        )));
+}
+
+#[test]
+fn own_tag_does_not_stand_in_for_a_missing_upstream_tag() {
+    let f = Fork::new();
+    let env = &f.env;
+    let [c1, c2, _] = three_upstream_commits(&f);
+    // The repository tags an upstream commit; the upstream has no such tag.
+    env.git(&f.down, &["fetch", "-q", "upstream"]);
+    env.git(&f.down, &["tag", "v2.3", &c2]);
+    env.git(&f.down, &["tag", "-a", "-m", "own", "own-1", &c1]);
+
+    for rev in ["v2.3", "refs/tags/v2.3", "tags/v2.3", "v2.3~1", "own-1"] {
+        let refused = f.tool(&["start", &format!("upstream={rev}")]).code(2);
+        let err = stderr(&refused);
+        assert!(
+            err.contains("resolves through the repository's own tag refs/tags/"),
+            "{rev}: {err}"
+        );
+        assert!(err.contains("remote 'upstream' has no tag"), "{rev}: {err}");
+    }
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn mirror_ahead_of_the_target_is_refused_at_start() {
+    let f = Fork::new();
+    let env = &f.env;
+    let [_, c2, c3] = three_upstream_commits(&f);
+    env.git(&f.down, &["fetch", "-q", "upstream"]);
+    env.git(&f.down, &["branch", "upstream-main", &c3]);
+
+    f.tool(&["start", &format!("upstream={c2}")])
+        .code(2)
+        .stderr(contains(format!(
+            "upstream 'upstream': the mirror branch 'upstream-main' at {} is not contained in the target {}",
+            &c3[..12],
+            &c2[..12]
+        )));
+    env.assert_no_update(&f.down);
+    assert_eq!(env.rev(&f.down, "upstream-main"), c3);
+
+    // A target that contains the mirror is taken.
+    f.tool(&["start", &format!("upstream={c3}")]).success();
+}
+
+#[test]
+fn revision_expression_on_the_fetched_branch_is_resolved() {
+    let f = Fork::new();
+    let env = &f.env;
+    let [_, c2, _] = three_upstream_commits(&f);
+    // `start` fetches first, so the expression sees the new tip.
+    f.tool(&["start", "upstream=upstream/main~1"])
+        .success()
+        .stdout(contains(format!(
+            "upstream: queued at {} (upstream/main~1)",
+            &c2[..12]
+        )));
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+    assert_eq!(env.rev(&f.down, "main^2"), c2);
+}
+
+#[test]
+fn first_import_of_a_path_upstream_at_a_chosen_revision() {
+    let m = Mono::new();
+    let env = &m.env;
+    // Only app-a is imported, so only its check runs.
+    let cfg = fs::read_to_string(m.down.join(".git-intake.toml"))
+        .unwrap()
+        .replace(", \"test -f apps/b/b.txt\"", "");
+    env.commit(
+        &m.down,
+        &[(".git-intake.toml", &cfg)],
+        "mono: check app-a only",
+    );
+    let a0 = env.rev(&m.a.work, "HEAD");
+    let a1 = env.push_upstream(&m.a, &[("a.txt", "a1\na2\na3\na4\n")], "app-a: a4");
+
+    m.tool(&["start", &format!("app-a={a0}")])
+        .success()
+        .stdout(contains(format!("app-a: queued at {} ({a0})", &a0[..12])));
+    let status = env.tool_json(&m.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["upstreams"][0]["kind"], "import");
+    m.tool(&["verify"]).success();
+    m.tool(&["finish"]).success();
+    assert_eq!(
+        fs::read_to_string(m.down.join("apps/a/a.txt")).unwrap(),
+        "a1\na2\na3\n"
+    );
+    assert_eq!(env.rev(&m.down, "mirror-a"), a0);
+    let status = env.tool_json(&m.down, &["status", "--json"], 0);
+    let a = &status["upstreams"][0];
+    assert_eq!(a["last_synced"], a0.as_str());
+    assert_eq!(a["tip"], a1.as_str());
+    assert_eq!(a["state"], "behind");
+    assert_eq!(a["commits_behind"], 1);
+}
+
+#[test]
+fn unreachable_remote_during_tag_lookup_is_refused_clearly() {
+    let f = Fork::new();
+    let env = &f.env;
+    let [c1, _, _] = three_upstream_commits(&f);
+    // The upstream's remote serves the fetch of `start`, then fails.
+    let count = env.path("upload-pack-count");
+    let script = env.path("upload-pack.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nn=$(cat {count:?} 2>/dev/null || echo 0)\necho $((n + 1)) > {count:?}\n\
+             [ \"$n\" -ge 1 ] && {{ echo 'remote unavailable' >&2; exit 1; }}\nexec git-upload-pack \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    env.git(
+        &f.down,
+        &[
+            "config",
+            "remote.upstream.uploadpack",
+            &script.to_string_lossy(),
+        ],
+    );
+
+    let refused = f.tool(&["start", &format!("upstream={c1}")]).code(2);
+    let err = stderr(&refused);
+    assert!(
+        err.contains(&format!(
+            "upstream 'upstream': cannot ask remote 'upstream' whether it has a tag '{c1}'"
+        )),
+        "{err}"
+    );
+    env.assert_no_update(&f.down);
 }

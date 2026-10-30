@@ -172,6 +172,21 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
             ));
             continue;
         }
+        // `finish` fast-forwards the mirror to the target; a mirror the target
+        // does not contain would only be refused there, after the merges.
+        if let Some(mirror) = &up.mirror
+            && let Some(at) = git.commit(&branch_ref(mirror))?
+            && !git.is_ancestor(&at, &target)?
+        {
+            refusals.push(format!(
+                "upstream '{}': the mirror branch '{mirror}' at {} is not contained in the target {}, \
+                 so it could not be fast-forwarded to it; name a target that contains it",
+                up.name,
+                abbrev(&at),
+                described(&target, rev.as_deref())
+            ));
+            continue;
+        }
         let has_record = d.last_synced_source == Some(drift::SyncSource::Record);
         match merge_kind(git, &base, up, &target, has_record)? {
             Ok(kind) => queue.push(QueuedUpstream {

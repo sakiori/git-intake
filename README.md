@@ -140,7 +140,8 @@ git intake finish       # fast-forward, publish, clean up
 - the main checkout or a checkout of the integration branch has uncommitted changes to tracked files;
 - the integration branch is behind its counterpart on the publish remote;
 - a selected upstream is unknown, named more than once, unavailable or rewritten;
-- a revision named for an upstream is refused, as described under *Choosing a target* below;
+- a revision named for an upstream is refused, as described under *Choosing a target* below, or the upstream's remote cannot be asked for its tag;
+- a queued upstream's mirror branch holds a commit its target does not contain, so `finish` could not fast-forward the mirror;
 - a path upstream that has no sync record yet finds its path holding content unrelated to the upstream's history, or finds a file where a directory of its path would go;
 - a path upstream that was imported before finds its path removed on the integration branch.
 
@@ -198,14 +199,15 @@ git intake start app-a=1a2b3c4d app-b       # app-a at a commit, app-b at its fe
 
 The name ends at the first `=`, since an upstream name cannot contain one, and the rest is the revision. Upstreams named without a revision take their fetched tip, and naming an upstream twice is refused. The revision is resolved as follows:
 
-- If the upstream's remote has a tag of that name, the tag's commit is the target, peeled through an annotated tag. The tool reads the remote's tag list with `git ls-remote` and fetches no tag, so the repository's own tags never clash with the upstream's: a tag `v2.3` in the repository does not stand in for the upstream's `v2.3`.
-- Otherwise the revision is resolved in the repository, like any argument to `git rev-parse`: a full or abbreviated commit id, or an expression such as `upstream/main~3`.
+- If the upstream's remote has a tag of that name, the tag's commit is the target, peeled through an annotated tag. A leading `refs/tags/` or `tags/` is dropped first, so `v2.3`, `tags/v2.3` and `refs/tags/v2.3` name the same tag. Looking the tag up contacts the upstream's remote: the tool asks it for that one tag with `git ls-remote`, after the fetch, whenever the revision is a valid tag name, including a commit id. No tag is fetched, so the repository's own tags never clash with the upstream's. If the remote cannot be asked, `start` refuses and names the upstream, the remote and git's error.
+- Otherwise the revision is resolved in the repository, like any argument to `git rev-parse`: a full or abbreviated commit id, or an expression such as `upstream/main~3`. A revision that resolves through one of the repository's own tags, by itself or at the start of an expression such as `v2.3~1`, is refused: the repository's tags are not the upstream's, so a tag `v2.3` in the repository never stands in for an upstream tag `v2.3`, even when the upstream has none.
 
 The commit, however it was named, must be on the fetched upstream branch: the tool syncs a branch, not arbitrary commits. With `L` the upstream's last synced commit, `start` then decides:
 
 - a target older than `L` is refused, because an update never moves an upstream back;
 - a target the integration branch already contains, such as `L` itself, is reported as current;
 - a target that does not contain `L`, such as a commit of a side branch that the upstream merged after `L`, is refused, because the last synced commit and the mirror branch only move forward;
+- a target that does not contain the upstream's mirror branch, where one exists, is refused for the same reason: `finish` could only fast-forward the mirror to a target that contains it. This also holds for an update without a revision;
 - otherwise the upstream is queued at that target.
 
 The rest of the update does not change: the sync record names the target, `finish` fast-forwards the mirror branch to it, and `status` and `report` show the revision next to the target. Afterwards `status` shows the upstream as `behind`, by the commits between the target and the fetched tip.

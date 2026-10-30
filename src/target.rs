@@ -1,6 +1,6 @@
 //! The target of an upstream that `start` names with a revision.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::config::Upstream;
 use crate::git::{Git, abbrev};
@@ -8,27 +8,41 @@ use crate::git::{Git, abbrev};
 /// Resolves `rev` to a commit of the fetched upstream branch at `tip`, or
 /// returns why it cannot be the upstream's target.
 ///
-/// A tag of the upstream's remote takes precedence, so that a tag of the
-/// repository with the same name cannot stand in for it; any other revision
-/// is resolved in the repository. Either way the commit must be contained in
-/// the fetched upstream branch.
+/// A tag of the upstream's remote takes precedence; the remote is asked for
+/// it. Any other revision is resolved in the repository, except one that
+/// goes through one of the repository's own tags: those belong to the
+/// repository, not to the upstream, so they cannot stand in for an upstream
+/// tag. Either way the commit must be contained in the fetched upstream
+/// branch.
 pub fn resolve(
     git: &Git,
     up: &Upstream,
     rev: &str,
     tip: &str,
 ) -> Result<std::result::Result<String, String>> {
-    let (oid, named) = match remote_tag(git, up, rev)? {
-        Some(oid) => (oid, format!("tag '{rev}' of remote '{}'", up.remote)),
-        None => match git.commit(rev)? {
-            Some(commit) => (commit, format!("'{rev}'")),
-            None => {
+    let tag = tag_name(rev);
+    let remote = match remote_tag(git, up, tag)? {
+        Ok(found) => found,
+        Err(why) => return Ok(Err(why)),
+    };
+    let (oid, named) = match remote {
+        Some(oid) => (oid, format!("tag '{tag}' of remote '{}'", up.remote)),
+        None => {
+            let Some(commit) = git.commit(rev)? else {
                 return Ok(Err(format!(
                     "upstream '{}': '{rev}' names no commit and no tag of remote '{}'",
                     up.name, up.remote
                 )));
+            };
+            if let Some(local) = own_tag(git, rev)? {
+                return Ok(Err(format!(
+                    "upstream '{}': remote '{}' has no tag '{tag}', and '{rev}' resolves through \
+                     the repository's own tag {local}; name a tag of the upstream's remote or a commit",
+                    up.name, up.remote
+                )));
             }
-        },
+            (commit, format!("'{rev}'"))
+        }
     };
     // A tagged commit that is not in the repository is not on the fetched
     // branch either; tags are never fetched.
@@ -47,26 +61,62 @@ pub fn resolve(
     }))
 }
 
-/// The object a tag of the upstream's remote points at, peeled to the object
-/// an annotated tag names, or `None` when the remote has no such tag. Only
-/// the remote's tag list is read; no tag is fetched.
-fn remote_tag(git: &Git, up: &Upstream, rev: &str) -> Result<Option<String>> {
-    let name = format!("refs/tags/{rev}");
+/// The tag name a revision would name on the upstream's remote: the
+/// revision without a leading `refs/tags/` or `tags/`.
+fn tag_name(rev: &str) -> &str {
+    rev.strip_prefix("refs/tags/")
+        .or_else(|| rev.strip_prefix("tags/"))
+        .unwrap_or(rev)
+}
+
+/// The repository's own tag that `rev` resolves through, as a full ref name:
+/// the revision itself, or the name an expression such as `v2.3~1` starts
+/// from.
+fn own_tag(git: &Git, rev: &str) -> Result<Option<String>> {
+    let start = rev.split(['~', '^', '@', ':']).next().unwrap_or_default();
+    for name in [rev, start] {
+        if name.is_empty() {
+            continue;
+        }
+        let out = git.raw(&["rev-parse", "--symbolic-full-name", name])?;
+        if let Some(full) = out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("refs/tags/"))
+        {
+            return Ok(Some(full.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// The object the tag `tag` of the upstream's remote points at, peeled to the
+/// object an annotated tag names, or `None` when the remote has no such tag.
+/// Only the remote's tag list is read; no tag is fetched. When the remote
+/// cannot be asked, returns why.
+fn remote_tag(
+    git: &Git,
+    up: &Upstream,
+    tag: &str,
+) -> Result<std::result::Result<Option<String>, String>> {
+    let name = format!("refs/tags/{tag}");
     if !git.raw(&["check-ref-format", &name])?.success() {
-        return Ok(None);
+        return Ok(Ok(None));
     }
     // A pattern matches only the ref it names, so the peeled entry of an
     // annotated tag is asked for by its own name.
     let peeled = format!("{name}^{{}}");
-    let listing = git
-        .run(&["ls-remote", "--tags", &up.remote, &name, &peeled])
-        .with_context(|| {
-            format!(
-                "cannot list the tags of remote '{}' for upstream '{}'",
-                up.remote, up.name
-            )
-        })?;
-    Ok(peeled_tag(&listing, &name))
+    let out = git.raw(&["ls-remote", "--tags", &up.remote, &name, &peeled])?;
+    if !out.success() {
+        return Ok(Err(format!(
+            "upstream '{}': cannot ask remote '{}' whether it has a tag '{tag}': {}",
+            up.name,
+            up.remote,
+            out.stderr.trim()
+        )));
+    }
+    Ok(Ok(peeled_tag(&out.stdout, &name)))
 }
 
 /// Picks the tag `name` from `git ls-remote` output: the peeled entry
@@ -92,6 +142,13 @@ fn peeled_tag(listing: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tag_prefixes_are_stripped() {
+        assert_eq!(tag_name("refs/tags/v2.3"), "v2.3");
+        assert_eq!(tag_name("tags/v2.3"), "v2.3");
+        assert_eq!(tag_name("v2.3"), "v2.3");
+    }
 
     #[test]
     fn annotated_tags_are_peeled_and_other_refs_ignored() {

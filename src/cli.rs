@@ -36,9 +36,10 @@ pub enum Command {
     ///
     /// Fetches the selected upstreams and fixes each one's target: its fetched branch tip, or, for an
     /// upstream named as `UPSTREAM=REV`, the commit REV names. REV is a tag of the upstream's
-    /// remote, a commit id, or anything else git resolves; its commit must be on the fetched
-    /// upstream branch and contain the upstream's last synced commit. Each upstream whose target the
-    /// integration branch lacks is merged in the update worktree with its own merge commit.
+    /// remote (contacted to look it up), a commit id, or anything else git resolves, but not one of
+    /// the repository's own tags; its commit must be on the fetched upstream branch and contain the
+    /// upstream's last synced commit and mirror branch. Each upstream whose target the integration
+    /// branch lacks is merged in the update worktree with its own merge commit.
     Start {
         /// Upstream names, each optionally with the revision to take it at; all upstreams at their
         /// fetched tips when none is given
