@@ -39,10 +39,10 @@ man/man1/git-intake-<command>.1
 To download an archive and its checksum directly:
 
 ```sh
-version=0.1.0
+tag=vX.Y.Z  # the release to install
 target=x86_64-unknown-linux-musl
-file="git-intake-v$version-$target.tar.gz"
-base="https://gitlab.com/sakiori-oss/git-intake/-/releases/v$version/downloads/binaries"
+file="git-intake-$tag-$target.tar.gz"
+base="https://gitlab.com/sakiori-oss/git-intake/-/releases/$tag/downloads/binaries"
 curl --fail --location --remote-name "$base/$file"
 curl --fail --location --remote-name "$base/$file.sha256"
 sha256sum -c "$file.sha256"
@@ -59,7 +59,7 @@ Contributors with a Rust toolchain can build any revision:
 cargo install --locked --git https://gitlab.com/sakiori-oss/git-intake.git --tag v0.1.0
 ```
 
-From a checkout, `cargo install --locked --path .` installs the working tree. `cargo run --locked -p xtask -- man <dir>` writes the manual pages into `<dir>`.
+From a checkout, `cargo install --locked --path .` installs the working tree. `cargo run --locked -p xtask -- man <dir>` writes the manual pages into `<dir>`. A build from source reports the version `0.0.0`: only a release build carries its tag's version.
 
 ### Help and the manual page
 
@@ -75,19 +75,13 @@ After a direct download, extracting the pages into `/usr/local/share` puts them 
 
 ## Releasing
 
-Versions follow the Conventional Commits on the default branch. In `0.x`, a breaking change raises the minor version and every other change the patch version; from `1.0` on, the usual SemVer rules apply. `CHANGELOG.md` keeps one section per release in the Keep a Changelog format.
+A release is the pipeline of a protected tag `vX.Y.Z` on a commit of `main`; nothing else publishes. The tag, the release guard and the GitLab Release come from shared release components, which `.gitlab-ci.yml` includes at a pinned commit.
 
-1. On an up-to-date `main` with a clean working tree, run `ci/prepare-release.sh`. It needs git-cliff, pinned in `mise.toml`; run `mise install` once. The script does the following:
-   - computes the next version from the commits since the last release;
-   - sets that version in `Cargo.toml` and `Cargo.lock`;
-   - adds the release's section to `CHANGELOG.md`;
-   - commits `chore(release): vX.Y.Z` on a new branch `release/vX.Y.Z`.
-
-   It then prints the command that pushes the branch and opens the merge request. Run the script with `--push` to do that directly.
-2. Review the release merge request, edit its changelog section if needed, and merge it. Its pipeline builds the binaries for every target.
-3. The pipeline of the default branch finds that `vX.Y.Z` has no tag yet. It builds the binaries and their manual pages, uploads the archives to the generic package registry, and creates the release and its tag `vX.Y.Z` at the merged commit, with the changelog section as the release notes. A merge that leaves the version unchanged releases nothing.
-
-Creating the tag requires the person who merges to be allowed to create `v*` tags.
+- A daily pipeline schedule on `main` cuts the tag. Its pipeline holds only the tagging job, which tags the tip of `main` with the next version unless a release tag already points at it. git-cliff computes the version from the Conventional Commits since the last release: in `0.x` a breaking change raises the minor version and a feature, fix, performance change or revert the patch version; other commits, such as documentation, ask for no release. Nobody picks a version or pushes a release tag by hand.
+- An off-cycle release is the same schedule run by hand; it cuts the next version by the same rules.
+- The tag's pipeline starts with the guard, which every build waits for. It refuses a tag that is malformed, does not point at a commit of `main`, does not sort after every other release, or whose release is published completely. The builds stamp the tag's version into `Cargo.toml` and `Cargo.lock` in the job's working tree only, so the binaries and their manual pages report it; the committed version stays `0.0.0`. The publish job uploads the archives and their `.sha256` files to the generic package registry, package `git-intake`, version `vX.Y.Z`, and last a `SHA256SUMS` over the archives, which marks the release complete. The GitLab Release follows, with notes git-cliff writes from the commits since the previous release and links to the archives.
+- A failed release is finished, not cut again: retry its failed jobs or run its tag's pipeline again. The schedule cuts no second tag for a commit that already has one. Rollback is forward, by a revert and an off-cycle release.
+- A pipeline started by hand on `main` (`glab ci run --branch main`) is a rehearsal: it builds every target as a release does and publishes nothing. Rehearse after a change to the build before the next scheduled release; merge request pipelines also build when a change can affect the build.
 
 ## Configuration
 
