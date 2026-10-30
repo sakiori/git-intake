@@ -227,51 +227,67 @@ pub fn describe(git: &Git, config: &Config, head: &str, base: &str) -> Result<Hi
 }
 
 /// The newest of the upstream commits a port update takes or decides,
-/// given oldest first in the order the update recorded them: by ancestry
-/// when the repository has them all, since they lie on the upstream's
-/// first-parent line, and otherwise the last one recorded.
+/// given oldest first in the order the update recorded them: by their
+/// position on the upstream's first-parent line when the repository has
+/// them all, and otherwise the last one recorded.
 pub fn newest(git: &Git, recorded: &[String]) -> Result<Option<String>> {
-    let mut present = true;
-    for c in recorded {
-        present &= git.object_exists(c)?;
-    }
-    if !present || recorded.len() < 2 {
-        return Ok(recorded.last().cloned());
-    }
-    let mut args = vec!["merge-base".to_string(), "--independent".to_string()];
-    args.extend(recorded.iter().cloned());
-    let independent = lines(&git.run(&args)?);
-    Ok(recorded
-        .iter()
-        .rev()
-        .find(|c| independent.contains(c))
-        .or(recorded.last())
-        .cloned())
+    Ok(ordered(git, recorded)?.last().cloned())
 }
 
-/// The upstream commits a port update takes or decides, oldest first where
-/// the repository can tell, as [`newest`] orders them.
+/// The upstream commits a port update takes or decides, oldest first by
+/// their position on the upstream's first-parent line, or in the order the
+/// update recorded them when the repository lacks one of them or they do
+/// not lie on one first-parent line.
 pub fn ordered(git: &Git, recorded: &[String]) -> Result<Vec<String>> {
-    let mut present = true;
-    for c in recorded {
-        present &= git.object_exists(c)?;
-    }
-    if !present {
+    let Some(positions) = line_positions(git, recorded)? else {
         return Ok(recorded.to_vec());
-    }
+    };
     let mut sorted = recorded.to_vec();
-    // Commits of one first-parent line: one that contains another is newer.
-    let mut swapped = true;
-    while swapped {
-        swapped = false;
-        for i in 1..sorted.len() {
-            if git.is_ancestor(&sorted[i], &sorted[i - 1])? && sorted[i] != sorted[i - 1] {
-                sorted.swap(i, i - 1);
-                swapped = true;
-            }
-        }
-    }
+    // Positions count from the newest commit.
+    sorted.sort_by_key(|c| std::cmp::Reverse(positions[c]));
     Ok(sorted)
+}
+
+/// Each of `commits` with its position on the first-parent line of the
+/// newest of them, the newest at 0, read with one `git rev-list`; `None`
+/// when the repository lacks one of them or one is off that line.
+fn line_positions(git: &Git, commits: &[String]) -> Result<Option<HashMap<String, usize>>> {
+    if commits.len() < 2 {
+        return Ok(Some(commits.iter().map(|c| (c.clone(), 0)).collect()));
+    }
+    let input: String = commits.iter().map(|c| format!("{c}\n")).collect();
+    let types = git.run_with_input(&["cat-file", "--batch-check=%(objecttype)"], input)?;
+    if types.lines().any(|t| t.trim() != "commit") {
+        return Ok(None);
+    }
+    let mut args = vec!["merge-base".to_string(), "--independent".to_string()];
+    args.extend(commits.iter().cloned());
+    let newest = lines(&git.run(&args)?);
+    let [newest] = newest.as_slice() else {
+        return Ok(None);
+    };
+    let mut args = vec!["merge-base".to_string(), "--octopus".to_string()];
+    args.extend(commits.iter().cloned());
+    let Some(oldest) = lines(&git.run(&args)?).into_iter().next() else {
+        return Ok(None);
+    };
+    let line = lines(&git.run(&[
+        "rev-list",
+        "--first-parent",
+        newest,
+        "--not",
+        &format!("{oldest}^@"),
+        "--",
+    ])?);
+    let index: HashMap<&str, usize> = line
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.as_str(), i))
+        .collect();
+    Ok(commits
+        .iter()
+        .map(|c| index.get(c.as_str()).map(|i| (c.clone(), *i)))
+        .collect())
 }
 
 struct Entry {
@@ -379,5 +395,47 @@ mod tests {
         // parent, which ends the line.
         let parents = graph(&[("s", &["b", "u"]), ("u", &[])]);
         assert_eq!(line("s", &parents, &HashSet::new(), true), ["s"]);
+    }
+
+    #[test]
+    fn port_commits_are_ordered_by_the_upstream_s_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "a")
+                .env("GIT_AUTHOR_EMAIL", "a@example.com")
+                .env("GIT_COMMITTER_NAME", "a")
+                .env("GIT_COMMITTER_EMAIL", "a@example.com")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        let mut c = Vec::new();
+        for i in 0..4 {
+            run(&["commit", "-q", "--allow-empty", "-m", &format!("c{i}")]);
+            c.push(run(&["rev-parse", "HEAD"]));
+        }
+        let git = Git::worktree(dir.path());
+        let recorded = vec![c[3].clone(), c[0].clone(), c[2].clone()];
+        assert_eq!(
+            ordered(&git, &recorded).unwrap(),
+            [c[0].clone(), c[2].clone(), c[3].clone()]
+        );
+        assert_eq!(newest(&git, &recorded).unwrap(), Some(c[3].clone()));
+        // A commit the repository lacks leaves the recorded order.
+        let missing = vec![c[3].clone(), "f".repeat(40), c[0].clone()];
+        assert_eq!(ordered(&git, &missing).unwrap(), missing);
+        assert_eq!(newest(&git, &missing).unwrap(), Some(c[0].clone()));
     }
 }
