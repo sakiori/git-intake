@@ -103,7 +103,7 @@ For an upstream in `follow` mode, the tool SHALL derive the last synced commit f
 - **THEN** `status` still shows the newer target as the last synced commit, and nothing between the two targets counts as pending
 
 ### Requirement: Last synced commit without a sync record
-For an upstream in `follow` mode that carries no sync record, the last synced commit SHALL come from the history, and the tool SHALL show that it does. The last synced commit taken from the history SHALL depend only on the integration branch and the upstream's own branch, never on other upstreams.
+For an upstream in `follow` mode that carries no sync record, the last synced commit SHALL come from the history, as "Last synced commit from the history" defines it, and the tool SHALL show that it does. The last synced commit taken from the history SHALL depend only on the integration branch and the upstream's own branch, never on other upstreams.
 
 #### Scenario: Root upstream without a sync record
 - **WHEN** the integration branch contains commits of a root `follow` upstream and carries no sync record of it
@@ -268,7 +268,7 @@ A full run SHALL run every one of the update's checks, and only a full run SHALL
 - **THEN** the install command and every check receive the base, the head, the integration branch, the upstream's name, its mode, its target and its last synced commit, and each commit exists and is contained in a reference
 
 ### Requirement: Commits named to the checks
-Every commit that a `GIT_INTAKE_` variable names SHALL be reachable from a reference while the commands run.
+Every commit that a `GIT_INTAKE_` variable names SHALL be reachable from a reference while the install command and the checks run.
 
 #### Scenario: Commits of a port upstream
 - **WHEN** the checks run on an update that carries out a port plan
@@ -303,7 +303,7 @@ A catch-up merge SHALL change none of the upstream variables. The verification t
 - **THEN** `GIT_INTAKE_BASE` is the integration tip the update caught up with, `GIT_INTAKE_HEAD` is the catch-up merge, and every upstream variable is as before the catch-up
 
 ### Requirement: Inherited check variables
-Variables with the `GIT_INTAKE_` prefix that the tool inherits SHALL NOT reach the commands, and the tool SHALL NOT set these variables for the git commands it runs itself.
+Variables with the `GIT_INTAKE_` prefix that the tool inherits SHALL NOT reach the install command and the checks, and the tool SHALL NOT set these variables for the git commands it runs itself.
 
 #### Scenario: Inherited variables
 - **WHEN** `verify` is run with `GIT_INTAKE_BASE` or another `GIT_INTAKE_` variable already set
@@ -328,7 +328,7 @@ In `push` mode, unless `--no-publish` is given, `finish` SHALL first fetch the p
 - **THEN** `finish` refuses with git's reason and moves no branch, and `finish --no-publish` closes the update locally without fetching
 
 ### Requirement: Remote integration branch in finish
-After `finish` fetches the publish remote, when the remote's integration branch holds commits the local one lacks and the local one holds none the remote lacks, `finish` SHALL bring the local integration branch up to date as `start` does, which does not count as `finish` moving it; when each holds commits the other lacks, it SHALL refuse before moving anything and say that the local commits must be published or reconciled first.
+In `push` mode, unless `--no-publish` is given, after `finish` fetches the publish remote, when the remote's integration branch holds commits the local one lacks and the local one holds none the remote lacks, `finish` SHALL bring the local integration branch up to date as `start` does, which does not count as `finish` moving it; when each holds commits the other lacks, it SHALL refuse before moving anything and say that the local commits must be published or reconciled first.
 
 #### Scenario: Remote moved
 - **WHEN** the publish remote's integration branch is ahead of the local one, which holds no commit the remote lacks, and `finish` runs in push mode
@@ -372,7 +372,7 @@ In push mode and with `--no-publish`, before moving any branch `finish` SHALL co
 - **THEN** `finish` moves no branch
 
 ### Requirement: Moving the integration branch in finish
-In push mode and with `--no-publish`, `finish` SHALL record the planned move, fast-forward the integration branch to the verified commit, push exactly the planned commit without force when the publication mode is `push`, and only after publication succeeds remove the worktree, the update branch, the update's upstream references and the state.
+In push mode and with `--no-publish`, `finish` SHALL record the planned move, fast-forward the integration branch to the verified commit, push exactly the planned commit without force when the publication mode is `push` and `--no-publish` is not given, and only after that publication succeeds, or at once with `--no-publish`, remove the worktree, the update branch, the update's upstream references and the state.
 
 #### Scenario: No publish remote
 - **WHEN** no publish remote is configured
@@ -819,12 +819,16 @@ Where the tool compares a URL with an upstream's URL, URLs that name the same re
 ### Requirement: Selecting follow upstreams
 For upstreams in `follow` mode, `start` SHALL accept upstream names, each optionally followed by `=` and a revision, and select every configured upstream when none is named.
 
-#### Scenario: Several upstreams at chosen points
-- **WHEN** `start` names one upstream with a revision and another without
-- **THEN** the first is merged at the commit its revision names and the second at its fetched tip, in one update
+#### Scenario: No upstream named
+- **WHEN** `start` runs without naming an upstream
+- **THEN** every configured `follow` upstream is selected
 
 ### Requirement: Follow update with a fixed target
 For upstreams in `follow` mode, `start` SHALL fetch the selected upstreams, record as each upstream's target the commit its revision names, or, when no revision is given, the newest release of an upstream with a `tags` pattern and the fetched upstream tip of any other, record the current integration tip as the base, and queue, in configuration order, the selected upstreams whose target the base does not yet contain.
+
+#### Scenario: Several upstreams at chosen points
+- **WHEN** `start` names one upstream with a revision and another without
+- **THEN** the first is merged at the commit its revision names and the second at its fetched tip, in one update
 
 #### Scenario: Nothing to update
 - **WHEN** the integration branch already contains every selected target
@@ -889,7 +893,7 @@ The newest release of a `follow` upstream with a `tags` pattern SHALL be, of the
 - **THEN** `start` ignores them and takes the newest release among the rest
 
 ### Requirement: Upstream without a new release
-When the integration branch already contains the newest release of a `follow` upstream with a `tags` pattern, `start` SHALL report the upstream as current. When there is no release, `start` SHALL refuse, name the upstream, its URL and the pattern, and say to name the target as a revision.
+When a `follow` upstream with a `tags` pattern is named to `start` without a revision and the integration branch already contains its newest release, `start` SHALL report the upstream as current. When such an upstream has no release, `start` SHALL refuse, name the upstream, its URL and the pattern, and say to name the target as a revision.
 
 #### Scenario: Release already taken
 - **WHEN** the integration branch contains the newest release, including after an earlier update took a later commit by naming it
@@ -1479,14 +1483,14 @@ When an update changes the forge's CI definition, `.github/workflows/` on GitHub
 - **THEN** `sync` names the change in its output and in the merge request's description
 
 ### Requirement: Changed checks by name
-When an update changes the checks of `.git-intake.toml`, `finish` and `sync` SHALL name each check added, removed or given another command by its name, and say when only their order changed; a renamed check SHALL count as one removed and one added.
+When an update changes the checks of `.git-intake.toml`, `finish` and `sync` SHALL, in their output and in the merge request's description, name each check added, removed or given another command by its name, and say when only their order changed; a renamed check SHALL count as one removed and one added.
 
 #### Scenario: Upstream changes a check
 - **WHEN** a root upstream's update adds the check `audit` and changes the command of the check `test` in `.git-intake.toml`
 - **THEN** `finish` names the checks `audit` as added and `test` as changed in its output and in the merge request's description
 
 ### Requirement: Unreadable configuration in the update's own checks
-When `.git-intake.toml` differs between the base and the head and either side cannot be read, its install command and checks SHALL be named as changed without names.
+When `.git-intake.toml` differs between the base and the head and either side cannot be read, `finish` and `sync` SHALL name its install command and checks as changed without names, in their output and in the merge request's description.
 
 #### Scenario: Configuration that cannot be read
 - **WHEN** an update's head holds a `.git-intake.toml` that differs from the base's and cannot be read
