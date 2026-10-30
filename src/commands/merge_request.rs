@@ -23,7 +23,7 @@ use crate::git::{Git, abbrev, branch_ref, redacted, split_z, tracking_ref};
 use crate::port::Verb;
 use crate::repo::{Repo, bullet};
 use crate::state::{
-    self, CopyStep, EarlierMergeRequest, MergeKind, UPDATE_BRANCH, UpdateState, Waiting, Work,
+    CopyStep, EarlierMergeRequest, MergeKind, UPDATE_BRANCH, UpdateState, Waiting, Work,
 };
 use crate::sync_record;
 use crate::update_line::{self, History};
@@ -957,7 +957,7 @@ pub fn hand_over(repo: &Repo, waiting: &Waiting) -> Result<Exit> {
         .map(|r| format!("reference {r}")),
     );
     removed.extend(repo.remove_logs()?);
-    state::remove(&repo.paths.state)?;
+    repo.paths.remove(&repo.paths.state)?;
     for r in &removed {
         println!("removed {r}");
     }

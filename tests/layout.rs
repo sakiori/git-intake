@@ -736,3 +736,141 @@ fn separate_git_dir_main_worktree_unknown_from_a_linked_worktree_is_named() {
     assert_eq!(check["status"], "warn");
     assert!(check["detail"].as_str().unwrap().contains(reason));
 }
+
+/// A directory outside the checkout with a file at `git-intake/update`,
+/// where a link named `.worktrees` to it would put the update worktree.
+/// Returns the directory and the file.
+fn outside_directory(env: &Env) -> (PathBuf, PathBuf) {
+    let victim = env.path("victim");
+    let kept = victim.join("git-intake").join("update").join("kept.txt");
+    fs::create_dir_all(kept.parent().unwrap()).unwrap();
+    fs::write(&kept, "kept\n").unwrap();
+    (victim, kept)
+}
+
+#[test]
+fn an_update_that_brings_a_worktrees_link_is_refused_before_any_branch_moves() {
+    let f = Fork::new();
+    let env = &f.env;
+    let (victim, kept) = outside_directory(env);
+    std::os::unix::fs::symlink(&victim, f.up.work.join(".worktrees")).unwrap();
+    env.push_upstream(&f.up, &[], "upstream: link .worktrees");
+    let main = env.rev(&f.down, "main");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    for args in [&["finish"][..], &["finish", "--no-publish"]] {
+        let err = stderr(&f.tool(args).code(2));
+        assert!(err.contains("'.worktrees'"), "{err}");
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(err.contains(".worktrees/git-intake/update"), "{err}");
+        assert_eq!(env.rev(&f.down, "main"), main);
+        assert_eq!(env.rev(&f.publish, "main"), main);
+    }
+    assert!(
+        fs::symlink_metadata(f.down.join(".worktrees"))
+            .unwrap()
+            .is_dir()
+    );
+    f.tool(&["abort"]).success();
+    assert_eq!(fs::read_to_string(&kept).unwrap(), "kept\n");
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn an_update_that_brings_a_file_at_the_update_worktree_is_refused_before_any_branch_moves() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.push_upstream(
+        &f.up,
+        &[(".worktrees/git-intake/update", "not a worktree\n")],
+        "upstream: a file where the update worktree lies",
+    );
+    let main = env.rev(&f.down, "main");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(err.contains("'.worktrees/git-intake/update'"), "{err}");
+    assert_eq!(env.rev(&f.down, "main"), main);
+    assert_eq!(env.rev(&f.publish, "main"), main);
+    assert!(env.update_worktree(&f.down).join(FORK_FILE).exists());
+    f.tool(&["abort"]).success();
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn cleanup_leaves_an_unregistered_update_worktree_reached_through_a_link() {
+    let f = Fork::new();
+    let env = &f.env;
+    // The publish remote rejects the push, so that `finish` stays in its
+    // finishing step with the integration branch moved.
+    let hook = f.publish.join("hooks").join("pre-receive");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).code(2);
+
+    // `.worktrees` is now a link to a directory elsewhere, and git no
+    // longer registers the update worktree.
+    let (victim, kept) = outside_directory(env);
+    fs::rename(f.down.join(".worktrees"), env.path("parked")).unwrap();
+    std::os::unix::fs::symlink(&victim, f.down.join(".worktrees")).unwrap();
+    env.git(&f.down, &["worktree", "prune", "--expire", "now"]);
+
+    let finish = f.tool(&["finish", "--no-publish"]).success();
+    let err = stderr(&finish);
+    assert!(err.contains("left"), "{err}");
+    assert!(err.contains(".worktrees/git-intake/update"), "{err}");
+    assert!(err.contains("symbolic link"), "{err}");
+    assert_eq!(fs::read_to_string(&kept).unwrap(), "kept\n");
+    assert!(!env.has_rev(&f.down, "refs/heads/git-intake/update"));
+    assert!(!env.intake_dir(&f.down).join("state.json").exists());
+}
+
+#[test]
+fn cleanup_refuses_a_registered_update_worktree_reached_through_a_link() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    f.tool(&["start"]).success();
+    // The directory holding the update worktree moves elsewhere, and a
+    // link takes its place: git still finds the worktree through it.
+    let elsewhere = env.path("elsewhere");
+    fs::rename(f.down.join(".worktrees"), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, f.down.join(".worktrees")).unwrap();
+    let moved = elsewhere.join("git-intake").join("update");
+
+    let err = stderr(&f.tool(&["abort"]).code(2));
+    assert!(err.contains("'.worktrees'"), "{err}");
+    assert!(err.contains("symbolic link"), "{err}");
+    assert!(moved.join(FORK_FILE).exists(), "the worktree was removed");
+    assert!(env.has_rev(&f.down, "refs/heads/git-intake/update"));
+}
+
+#[test]
+fn a_directory_git_does_not_register_at_the_update_worktree_is_left_and_named() {
+    let f = Fork::new();
+    let env = &f.env;
+    let wt = env.update_worktree(&f.down);
+    fs::create_dir_all(&wt).unwrap();
+    fs::write(wt.join("notes.md"), "mine\n").unwrap();
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+
+    let err = stderr(&f.tool(&["start"]).code(2));
+    assert!(err.contains(".worktrees/git-intake/update exists"), "{err}");
+    assert!(err.contains("remove it yourself"), "{err}");
+    assert!(!env.has_rev(&f.down, "refs/heads/git-intake/update"));
+
+    let err = stderr(&f.tool(&["abort"]).success());
+    assert!(err.contains("warning: left"), "{err}");
+    assert!(err.contains("git does not register it"), "{err}");
+    assert_eq!(fs::read_to_string(wt.join("notes.md")).unwrap(), "mine\n");
+
+    // An empty one holds nothing to lose, and goes.
+    fs::remove_file(wt.join("notes.md")).unwrap();
+    f.tool(&["abort"]).success();
+    assert!(!wt.exists());
+    f.tool(&["start"]).success();
+}

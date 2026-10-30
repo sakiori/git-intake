@@ -37,8 +37,8 @@ use crate::git::{Git, abbrev, branch_ref};
 use crate::port::{self, Standing, Verb};
 use crate::repo::Repo;
 use crate::state::{
-    self, CarriedMergeRequest, CopyStep, FollowMerge, MergeKind, PlannedCommit, PortPlan,
-    QueuedUpstream, UPDATE_BRANCH, UpdateState, UpstreamStep, Work,
+    CarriedMergeRequest, CopyStep, FollowMerge, MergeKind, PlannedCommit, PortPlan, QueuedUpstream,
+    UPDATE_BRANCH, UpdateState, UpstreamStep, Work,
 };
 use crate::sync_record;
 use crate::tags::UpstreamTags;
@@ -633,7 +633,7 @@ fn discard(repo: &Repo, state: &UpdateState) -> Result<()> {
     repo.remove_plan()?;
     upstreams::release(&repo.git, state)?;
     repo.remove_logs()?;
-    state::remove(&repo.paths.state)?;
+    repo.paths.remove(&repo.paths.state)?;
     Ok(())
 }
 

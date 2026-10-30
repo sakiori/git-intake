@@ -66,6 +66,8 @@ pub const WORKTREES_EXCLUDE: &str = "/.worktrees/";
 /// among them; see [`UPDATE_WORKTREE`].
 #[derive(Debug, Clone)]
 pub struct Paths {
+    /// The repository's common git directory, which holds `root`.
+    common: PathBuf,
     pub root: PathBuf,
     pub state: PathBuf,
     pub last_update: PathBuf,
@@ -92,7 +94,61 @@ impl Paths {
             logs,
             plan: root.join("plan"),
             root,
+            common: common_dir.to_path_buf(),
         }
+    }
+
+    /// Removes `path`, one of these locations or a file or directory in
+    /// them, if it exists: a directory with what it holds, anything else
+    /// itself. Returns whether something was removed. Refuses, removing
+    /// nothing, a path outside the tool's directory or reached through a
+    /// symbolic link or something other than a directory, which could lead
+    /// out of the git directory.
+    pub fn remove(&self, path: &Path) -> Result<bool> {
+        let Ok(inside) = path.strip_prefix(&self.common) else {
+            anyhow::bail!(
+                "{} lies outside the git directory {}; it was not removed",
+                path.display(),
+                self.common.display()
+            );
+        };
+        if !inside.starts_with(self.root.strip_prefix(&self.common).unwrap_or(&self.root)) {
+            anyhow::bail!(
+                "{} lies outside {}, where the tool keeps its files; it was not removed",
+                path.display(),
+                self.root.display()
+            );
+        }
+        let mut dir = self.common.clone();
+        let parents: Vec<_> = inside.components().collect();
+        for component in &parents[..parents.len().saturating_sub(1)] {
+            dir.push(component);
+            match fs::symlink_metadata(&dir) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(e).with_context(|| format!("cannot read {}", dir.display())),
+                Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => anyhow::bail!(
+                    "{} is {}, not a directory of the tool's own; {} was not removed",
+                    dir.display(),
+                    if meta.file_type().is_symlink() {
+                        "a symbolic link"
+                    } else {
+                        "not a directory"
+                    },
+                    path.display()
+                ),
+                Ok(_) => {}
+            }
+        }
+        let removed = match fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => Err(e),
+            // `remove_dir_all` removes a symbolic link itself, never what
+            // it points to.
+            Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+            Ok(_) => fs::remove_file(path),
+        };
+        removed.with_context(|| format!("cannot remove {}", path.display()))?;
+        Ok(true)
     }
 }
 
@@ -897,15 +953,6 @@ pub fn save(path: &Path, state: &UpdateState) -> Result<()> {
     Ok(())
 }
 
-/// Removes a file if it exists.
-pub fn remove(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("cannot remove {}", path.display())),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,9 +1063,37 @@ mod tests {
             assert_eq!(load_update(&path).unwrap().unwrap(), state);
             assert!(!state.all_merged());
         }
-        remove(&path).unwrap();
-        remove(&path).unwrap();
+        let paths = Paths::new(dir.path());
+        assert_eq!(paths.state, path);
+        assert!(paths.remove(&path).unwrap());
+        assert!(!paths.remove(&path).unwrap());
         assert!(load(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn only_the_tool_s_own_files_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path().join("repo.git");
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(elsewhere.join("logs")).unwrap();
+        fs::write(elsewhere.join("logs").join("kept.log"), "kept\n").unwrap();
+        fs::create_dir_all(&common).unwrap();
+        let paths = Paths::new(&common);
+        // The tool's directory is a link to another.
+        std::os::unix::fs::symlink(&elsewhere, &paths.root).unwrap();
+        let err = paths.remove(&paths.logs).unwrap_err().to_string();
+        assert!(err.contains("a symbolic link"), "{err}");
+        assert!(elsewhere.join("logs").join("kept.log").exists());
+        // Nothing outside the tool's directory.
+        fs::remove_file(&paths.root).unwrap();
+        fs::create_dir_all(&paths.root).unwrap();
+        assert!(paths.remove(&elsewhere).is_err());
+        assert!(paths.remove(&common.join("HEAD")).is_err());
+        assert!(elsewhere.exists());
+        // A link inside it is removed itself, not what it points to.
+        std::os::unix::fs::symlink(&elsewhere, &paths.logs).unwrap();
+        assert!(paths.remove(&paths.logs).unwrap());
+        assert!(elsewhere.join("logs").join("kept.log").exists());
     }
 
     #[test]

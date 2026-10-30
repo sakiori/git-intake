@@ -91,7 +91,7 @@ pub fn carry_out(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Optio
         }
         args.push(&entry.commit);
         let output_path = merge_output_path(repo, &name);
-        crate::state::remove(&output_path)?;
+        repo.paths.remove(&output_path)?;
         let out = wt.raw(&args)?;
         save_merge_output(&output_path, &out)?;
         if !out.success() {

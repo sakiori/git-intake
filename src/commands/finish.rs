@@ -23,7 +23,7 @@ use crate::commands::update::require_worktree;
 use crate::commands::{catch_up, merge_request, verify};
 use crate::config::PublishVia;
 use crate::git::{Git, abbrev, branch_ref, tracking_ref};
-use crate::repo::{Repo, bullet};
+use crate::repo::{MainWorktree, Repo, bullet};
 use crate::state::{self, Finishing, PlannedMove, Stored, UpdateState, Work};
 use crate::upstreams;
 
@@ -646,17 +646,28 @@ pub fn close(repo: &Repo, mut state: UpdateState, unpublished: Vec<String>) -> R
     repo.remove_plan()?;
     upstreams::release(&repo.git, &state)?;
     repo.remove_logs()?;
-    state::remove(&repo.paths.state)?;
+    repo.paths.remove(&repo.paths.state)?;
     println!("update finished");
     Ok(Exit::Success)
 }
 
 /// Checks that the verified update head `head` can land on the base by
 /// fast-forward: it contains the base, every merged target, and every copy
-/// and journal commit of a port. Moves nothing.
+/// and journal commit of a port, and its tree leaves the place of the
+/// update worktree in the main worktree alone. Moves nothing.
 pub fn check(repo: &Repo, state: &UpdateState, head: &str) -> Result<()> {
     let git = &repo.git;
     let integration = &state.config.integration;
+    if matches!(repo.main_worktree(), MainWorktree::At(_))
+        && let Some(why) = repo.placement_collision(head)?
+    {
+        bail!(
+            "the update head {} cannot land on '{integration}': {why}. No branch moved. Remove that path on the \
+             update branch in {}, commit, and run `git intake verify`, or run `git intake abort`",
+            abbrev(head),
+            state.worktree.display()
+        );
+    }
     if !git.is_ancestor(&state.base, head)? {
         bail!(
             "the update branch at {} does not contain the base {}; '{integration}' can only fast-forward. \
@@ -733,7 +744,7 @@ pub fn validate_checkouts(repo: &Repo, moves: &[PlannedMove]) -> Result<()> {
     for m in moves {
         if let Some(from) = move_from(&repo.git, m)? {
             for dir in repo.checkouts_of(&m.branch)? {
-                validate_checkout(&dir, &m.branch, &from, &m.new)?;
+                validate_checkout(repo, &dir, &m.branch, &from, &m.new)?;
             }
         }
     }
@@ -756,8 +767,18 @@ fn move_from(git: &Git, m: &PlannedMove) -> Result<Option<String>> {
 }
 
 /// A checkout of a branch that is about to move must be able to follow the
-/// fast-forward: no uncommitted changes and no untracked file in the way.
-fn validate_checkout(dir: &Path, branch: &str, old: &str, new: &str) -> Result<()> {
+/// fast-forward: no uncommitted changes, no untracked file in the way, and,
+/// in the main worktree, nothing put where the update worktree is placed.
+fn validate_checkout(repo: &Repo, dir: &Path, branch: &str, old: &str, new: &str) -> Result<()> {
+    if repo.main_checkout()?.as_deref() == Some(dir)
+        && let Some(why) = repo.placement_collision(new)?
+    {
+        bail!(
+            "'{branch}' is checked out in the main worktree {}, which cannot follow it to {}: {why}. No branch moved",
+            dir.display(),
+            abbrev(new)
+        );
+    }
     let git = Git::worktree(dir);
     let changes = git.tracked_changes()?;
     if !changes.is_empty() {
@@ -835,7 +856,7 @@ pub fn apply(repo: &Repo, m: &PlannedMove) -> Result<()> {
 fn move_branch(repo: &Repo, m: &PlannedMove, from: &str, reason: &str) -> Result<()> {
     match repo.checkouts_of(&m.branch)?.first() {
         Some(dir) if !from.is_empty() => {
-            validate_checkout(dir, &m.branch, from, &m.new)?;
+            validate_checkout(repo, dir, &m.branch, from, &m.new)?;
             Git::worktree(dir).run(&["merge", "--ff-only", "--quiet", &m.new])?;
         }
         _ => {

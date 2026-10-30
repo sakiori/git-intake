@@ -17,7 +17,7 @@ use crate::git::{Git, abbrev, branch_ref, tracking_ref};
 use crate::port::{self, PlanLine};
 use crate::repo::{Repo, bullet};
 use crate::state::{
-    self, CatchUpStep, ConflictFile, CopyStep, FollowMerge, MergeKind, PlannedCommit, PortPlan,
+    CatchUpStep, ConflictFile, CopyStep, FollowMerge, MergeKind, PlannedCommit, PortPlan,
     QueuedUpstream, Resolution, Stored, UPDATE_BRANCH, UpdateState, UpstreamStep, Work,
 };
 use crate::sync_record::{self, Record};
@@ -186,11 +186,18 @@ pub fn refuse_in_progress(state: &UpdateState) -> Result<()> {
 }
 
 /// Refuses when an interrupted update left its worktree at `worktree` or
-/// its branch behind.
+/// its branch behind, or something else is at `worktree`.
 pub fn refuse_leftovers(repo: &Repo, worktree: &std::path::Path) -> Result<()> {
-    if repo.update_worktree_registered()? || worktree.exists() || repo.update_branch_exists()? {
+    if repo.update_worktree_registered()? || repo.update_branch_exists()? {
         bail!(
             "an interrupted update left its worktree or the branch '{UPDATE_BRANCH}' behind; run `git intake abort` to remove them"
+        );
+    }
+    if std::fs::symlink_metadata(worktree).is_ok() {
+        bail!(
+            "{} exists, where the update worktree is placed, but git does not register it as a worktree; the tool \
+             removes only what it created. Move it away or remove it yourself, then run the command again",
+            worktree.display()
         );
     }
     Ok(())
@@ -695,7 +702,7 @@ fn merge_follow(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Option
             }
             args.extend(["-m".to_string(), msg, target.clone()]);
             let output_path = merge_output_path(repo, &up.name);
-            state::remove(&output_path)?;
+            repo.paths.remove(&output_path)?;
             let out = wt.raw(&args)?;
             save_merge_output(&output_path, &out)?;
             (!out.success()).then_some(out)
@@ -1191,7 +1198,7 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
         );
     }
     removed.extend(repo.remove_logs()?);
-    state::remove(&repo.paths.state)?;
+    repo.paths.remove(&repo.paths.state)?;
     for r in &removed {
         println!("removed {r}");
     }
