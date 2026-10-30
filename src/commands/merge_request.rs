@@ -219,7 +219,7 @@ pub enum Recreated {
     NotPushed,
     /// The push recreated the branch, which was deleted again.
     Deleted,
-    /// The push recreated the branch, which moved since and was kept.
+    /// The push recreated the branch, and deleting it failed, so it was kept.
     Kept,
 }
 
@@ -230,7 +230,7 @@ impl Recreated {
             Recreated::NotPushed => "nothing was pushed",
             Recreated::Deleted => "the branch the push recreated after it ended was deleted again",
             Recreated::Kept => {
-                "the branch the push recreated after it ended was kept, since it moved after the push; \
+                "the branch the push recreated after it ended could not be deleted, as said above; \
                  `git intake abort --merge-request` removes it once what it holds is fetched"
             }
         }

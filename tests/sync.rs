@@ -1159,7 +1159,7 @@ fn finish_keeps_a_recreated_branch_that_moved_and_says_so() {
     let err = stderr(&f.tool(&["finish"]).code(2));
     assert!(err.contains("is now merged"), "{err}");
     assert!(
-        err.contains("the branch the push recreated after it ended was kept"),
+        err.contains("the branch the push recreated after it ended could not be deleted"),
         "{err}"
     );
     assert!(err.contains("`git intake abort --merge-request`"), "{err}");
@@ -1179,7 +1179,7 @@ fn sync_keeps_a_recreated_branch_that_moved_and_says_so() {
     let main = env.rev(&f.publish, "main");
     let out = stdout(&f.tool(&["sync"]).success());
     assert!(
-        out.contains("the branch the push recreated after it ended was kept"),
+        out.contains("the branch the push recreated after it ended could not be deleted"),
         "{out}"
     );
     assert!(out.contains("`git intake abort --merge-request`"), "{out}");
