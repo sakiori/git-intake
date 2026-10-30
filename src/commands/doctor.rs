@@ -577,7 +577,13 @@ fn checkout_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
 }
 
 fn state_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
-    let registered = repo.update_worktree_registered()?;
+    let registered = match repo.update_worktree_registered() {
+        Ok(registered) => registered,
+        Err(err) => {
+            checks.add("update_state", None, CheckStatus::Fail, format!("{err:#}"));
+            return Ok(());
+        }
+    };
     let branch = repo.update_branch_exists()?;
     let state = match repo.state() {
         Ok(s) => s,
@@ -587,7 +593,8 @@ fn state_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
         }
     };
     let Some(state) = state else {
-        let leftover = registered || branch || repo.paths.worktree.exists();
+        let leftover =
+            registered || branch || repo.update_worktree()?.is_some_and(|wt| wt.exists());
         checks.pass_or_fail(
             "update_state",
             None,

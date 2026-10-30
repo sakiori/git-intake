@@ -54,10 +54,8 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
             state.worktree.display()
         );
     }
-    if repo.update_worktree_registered()?
-        || repo.paths.worktree.exists()
-        || repo.update_branch_exists()?
-    {
+    let worktree = repo.place_update_worktree()?;
+    if repo.update_worktree_registered()? || worktree.exists() || repo.update_branch_exists()? {
         bail!(
             "an interrupted update left its worktree or the branch '{UPDATE_BRANCH}' behind; run `git intake abort` to remove them"
         );
@@ -151,6 +149,7 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
         return Ok(Exit::Success);
     }
 
+    repo.exclude_update_worktree()?;
     git.run(&["config", "rerere.enabled", "true"])?;
     fs::create_dir_all(&repo.paths.root)
         .with_context(|| format!("cannot create {}", repo.paths.root.display()))?;
@@ -160,10 +159,10 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
         "--quiet",
         "-b",
         UPDATE_BRANCH,
-        &repo.paths.worktree.to_string_lossy(),
+        &worktree.to_string_lossy(),
         &base,
     ])?;
-    let mut state = UpdateState::new(config, base.clone(), repo.paths.worktree.clone(), queue);
+    let mut state = UpdateState::new(config, base.clone(), worktree, queue);
     state.main_worktree = repo.main_checkout()?;
     for q in &state.upstreams {
         if let Some(plan) = q.port() {

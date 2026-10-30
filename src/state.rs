@@ -13,22 +13,39 @@ use crate::port::Verb;
 /// The branch an update is built on.
 pub const UPDATE_BRANCH: &str = "git-intake/update";
 
-/// Version 3: upstreams are fetched by URL into references the update holds,
-/// mirror branches are gone, and an upstream is taken in `follow` or `port`
-/// mode. Version 2 made the publication setting a table and let an update
-/// wait for its merge request.
-const STATE_VERSION: u32 = 3;
+/// Version 4: the update worktree lives in the main worktree, at
+/// [`UPDATE_WORKTREE`], instead of in the git directory. Version 3 fetched
+/// upstreams by URL into references the update holds, dropped mirror
+/// branches, and took an upstream in `follow` or `port` mode. Version 2 made
+/// the publication setting a table and let an update wait for its merge
+/// request.
+const STATE_VERSION: u32 = 4;
+
+/// The update worktree, relative to the main worktree. It lives under
+/// `.worktrees/<branch>`, where these repositories keep their worktrees, and
+/// never in the git directory: tools such as compilers, bundlers and
+/// watchers ignore every path that contains `/.git`, so checks run there
+/// would not see the tree as it is.
+pub const UPDATE_WORKTREE: &str = ".worktrees/git-intake/update";
+
+/// The update worktree of a bare repository, which has no main worktree,
+/// relative to its git directory.
+pub const BARE_UPDATE_WORKTREE: &str = "git-intake/worktree";
+
+/// The line `start` adds to the repository's `info/exclude` when the update
+/// worktree is not ignored yet, so that the main checkout does not show it.
+pub const WORKTREES_EXCLUDE: &str = "/.worktrees/";
 
 /// Prefix of the branch a merge request is opened from.
 pub const MERGE_REQUEST_BRANCH_PREFIX: &str = "git-intake/update-";
 
-/// Locations under `<git-common-dir>/git-intake/`.
+/// Locations under `<git-common-dir>/git-intake/`. The update worktree is not
+/// among them; see [`UPDATE_WORKTREE`].
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub root: PathBuf,
     pub state: PathBuf,
     pub last_update: PathBuf,
-    pub worktree: PathBuf,
     pub logs: PathBuf,
     /// The plan of a port update.
     pub plan: PathBuf,
@@ -40,7 +57,6 @@ impl Paths {
         Self {
             state: root.join("state.json"),
             last_update: root.join("last-update.json"),
-            worktree: root.join("worktree"),
             logs: root.join("logs"),
             plan: root.join("plan"),
             root,
@@ -550,7 +566,7 @@ mod tests {
         .unwrap();
         let err = format!("{:#}", load(&path).unwrap_err());
         assert!(
-            err.contains("keeps its state in format 2; this release understands format 3"),
+            err.contains("keeps its state in format 2; this release understands format 4"),
             "{err}"
         );
         assert!(

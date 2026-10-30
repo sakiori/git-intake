@@ -72,7 +72,19 @@ The tool SHALL enable git's recorded conflict resolution for the repository befo
 - **THEN** git reapplies the recorded resolution and the tool reports the file as resolved by a recorded resolution
 
 ### Requirement: Resumable state
-The tool SHALL keep the state of an update in the repository's common git directory, visible from every worktree, and every command SHALL act on that state: `continue` carries out a plan, concludes a resolved merge or copy, and goes on with the remaining queued upstreams or planned commits; `status` shows the step reached, each queued upstream as merged, at its plan, in conflict or pending, and what comes next; and `abort` removes the worktree, the update branch, the plan, the update's upstream references, its logs and the state without touching the integration branch. A `follow` upstream SHALL count as merged only when the update branch head carries its sync record for its target, and a `port` upstream as carried out only when its plan has been carried out to the journal commit. Once `finish` has begun moving branches, `abort` SHALL refuse and name `finish` as the way to complete the update. While an update waits for its merge request, `abort` SHALL delete the merge request branch from the publish remote, remove the update, and name the merge request that is left to close. The tool SHALL refuse an update state written by a release whose state format it does not read, and say to finish or abort that update with the release that started it.
+The tool SHALL keep the state of an update in the repository's common git directory, visible from every worktree, and the update worktree at `.worktrees/git-intake/update` in the main worktree, never inside the git directory. Unless that path is ignored already, `start` SHALL add the line `/.worktrees/` to the repository's `info/exclude` once, without changing a committed ignore file, so that the main checkout does not show the update worktree. Every command SHALL act on that state: `continue` carries out a plan, concludes a resolved merge or copy, and goes on with the remaining queued upstreams or planned commits; `status` shows the step reached, each queued upstream as merged, at its plan, in conflict or pending, and what comes next; and `abort` removes the worktree, the update branch, the plan, the update's upstream references, its logs and the state without touching the integration branch. A `follow` upstream SHALL count as merged only when the update branch head carries its sync record for its target, and a `port` upstream as carried out only when its plan has been carried out to the journal commit. Once `finish` has begun moving branches, `abort` SHALL refuse and name `finish` as the way to complete the update. While an update waits for its merge request, `abort` SHALL delete the merge request branch from the publish remote, remove the update, and name the merge request that is left to close. The tool SHALL refuse an update state written by a release whose state format it does not read, and say to finish or abort that update with the release that started it.
+
+#### Scenario: Update worktree in the main worktree
+- **WHEN** `start` creates the update worktree
+- **THEN** it is `.worktrees/git-intake/update` in the main worktree, outside the git directory, and the main checkout shows no untracked file for it and counts as clean
+
+#### Scenario: Directory of the update worktree that is a link
+- **WHEN** `.worktrees` or `.worktrees/git-intake` in the main worktree is a symbolic link or not a directory
+- **THEN** `start` refuses before it changes anything
+
+#### Scenario: Update worktree already ignored
+- **WHEN** the main worktree already ignores `.worktrees/git-intake/update`, or `info/exclude` already holds `/.worktrees/`
+- **THEN** `start` leaves `info/exclude` unchanged
 
 #### Scenario: Resume after interruption
 - **WHEN** the user returns to an update in a new shell
@@ -86,8 +98,12 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **WHEN** the user aborts an update before `finish` has moved any branch
 - **THEN** the integration branch is as before `start`, and no worktree, update branch, plan, upstream reference or log of the update remains
 
+#### Scenario: User's worktree on the update branch
+- **WHEN** no update is in progress and a worktree other than the tool's update worktree has `git-intake/update` checked out
+- **THEN** `abort` and `start` refuse and `doctor` fails, each naming that worktree and saying to remove or switch it, and the worktree and its uncommitted changes are kept
+
 #### Scenario: State of an earlier release
-- **WHEN** an update started by the previous release is in progress
+- **WHEN** an update started by a release with another state format is in progress, such as one that kept the update worktree in the git directory
 - **THEN** every command that reads the update refuses and says to finish or abort it with that release
 
 ### Requirement: Verification of the published tree
@@ -286,7 +302,7 @@ When the publication mode is `merge-request`, `finish` SHALL apply the same chec
 - **THEN** `finish` reads the merge request's head from the remote, refuses because it is not the verified commit, and moves no branch
 
 ### Requirement: Same behaviour from every directory
-Every command SHALL behave the same whichever directory of the repository it runs in: the main checkout, a subdirectory, a linked worktree, or the update worktree, whether the git directory is `.git` in the main worktree, lies outside it, or belongs to a submodule. Only finding the integration branch from the configuration committed at `HEAD` when no update is in progress, the note about an uncommitted configuration edit, and resolving the revisions named to `start` SHALL depend on the worktree the command runs in. The tool SHALL run git operations on the repository as a whole in the main worktree, or in the git directory when the repository is bare, so that a relative remote URL means what it means in the main worktree. `start` SHALL record the main worktree with the update so that the update's later commands find it from any worktree. When the main worktree cannot be located, because the git directory lies outside it without naming it, no update is in progress and the command runs elsewhere, a command that needs the main checkout SHALL refuse and say to run it in the main worktree, `doctor` SHALL warn that it did not check the main checkout and why, and a relative remote URL SHALL resolve against the git directory. The tool SHALL prefer the worktree it runs in, when that is the main worktree, and the main worktree the update recorded over taking the parent of a git directory named `.git` for it. A command that removes the update worktree it runs in SHALL complete and, after its own output, SHALL note that the current directory was removed.
+Every command SHALL behave the same whichever directory of the repository it runs in: the main checkout, a subdirectory, a linked worktree, or the update worktree, whether the git directory is `.git` in the main worktree, lies outside it, or belongs to a submodule. Only finding the integration branch from the configuration committed at `HEAD` when no update is in progress, the note about an uncommitted configuration edit, and resolving the revisions named to `start` SHALL depend on the worktree the command runs in. The tool SHALL run git operations on the repository as a whole in the main worktree, or in the git directory when the repository is bare, so that a relative remote URL means what it means in the main worktree. A bare repository has no main worktree, so its update worktree SHALL be `git-intake/worktree` in the git directory; when that path contains `/.git`, which compilers, bundlers and watchers ignore, `start` SHALL refuse, say why, advise a clone with a checkout, and change nothing. `start` SHALL record the main worktree with the update so that the update's later commands find it from any worktree. When the main worktree cannot be located, because the git directory lies outside it without naming it, no update is in progress and the command runs elsewhere, a command that needs the main checkout SHALL refuse and say to run it in the main worktree, `doctor` SHALL warn that it did not check the main checkout and why, and a relative remote URL SHALL resolve against the git directory. The tool SHALL prefer the worktree it runs in, when that is the main worktree, and the main worktree the update recorded over taking the parent of a git directory named `.git` for it. A command that removes the update worktree it runs in SHALL complete and, after its own output, SHALL note that the current directory was removed.
 
 #### Scenario: Finish from the update worktree
 - **WHEN** `finish` runs in the update worktree, with or without a publish remote, with `--no-publish`, or opening a merge request
@@ -307,6 +323,14 @@ Every command SHALL behave the same whichever directory of the repository it run
 #### Scenario: Main worktree that cannot be located
 - **WHEN** the git directory lies outside the checkout without naming it, no update is in progress, and `start` runs in a linked worktree
 - **THEN** `start` refuses and says to run it in the main worktree, and `doctor` warns that it did not check the main checkout
+
+#### Scenario: Bare repository
+- **WHEN** an update is started in a bare repository and finished from the update worktree
+- **THEN** the update worktree lies in the git directory, and `finish` moves the integration branch and removes it
+
+#### Scenario: Bare repository at a path containing `/.git`
+- **WHEN** `start` runs in a bare repository whose update worktree path would contain `/.git`
+- **THEN** it refuses, names the reason, advises a clone with a checkout, and creates no worktree, branch or state
 
 #### Scenario: Separate git directory named `.git`
 - **WHEN** the git directory is a directory named `.git` apart from the checkout, and an update is started in the checkout and finished from the update worktree
