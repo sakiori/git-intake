@@ -89,6 +89,9 @@ impl Output {
 pub struct Git {
     dir: PathBuf,
     isolated: bool,
+    /// Whether git may find a repository only at `dir` itself, never in a
+    /// directory above it.
+    exact: bool,
 }
 
 impl Git {
@@ -98,6 +101,7 @@ impl Git {
         Self {
             dir: dir.into(),
             isolated: false,
+            exact: false,
         }
     }
 
@@ -107,6 +111,18 @@ impl Git {
         Self {
             dir: dir.into(),
             isolated: true,
+            exact: false,
+        }
+    }
+
+    /// A handle for the repository at `dir` itself, as for a local URL:
+    /// like [`Self::worktree`], and git never looks for a repository in a
+    /// directory above `dir`.
+    pub fn exactly_at(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            isolated: true,
+            exact: true,
         }
     }
 
@@ -125,6 +141,11 @@ impl Git {
             for var in REDIRECTING_ENV {
                 cmd.env_remove(var);
             }
+        }
+        if self.exact
+            && let Some(parent) = self.dir.parent()
+        {
+            cmd.env("GIT_CEILING_DIRECTORIES", parent);
         }
         cmd
     }

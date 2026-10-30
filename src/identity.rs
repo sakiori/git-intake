@@ -85,6 +85,7 @@ impl Upstreams {
             if out.success() {
                 urls.push(out.stdout.trim().to_string());
             }
+            urls.dedup();
             let ids = urls.iter().map(|u| normalise(u, &base)).collect();
             known.push(Known { name, url, ids });
         }
@@ -93,10 +94,10 @@ impl Upstreams {
 
     /// The upstream whose repository `place` names, if any.
     pub fn named_by(&self, place: &Place) -> Option<&Known> {
-        let ids = [
-            normalise(&place.configured, &self.base),
-            normalise(&place.resolved, &self.base),
-        ];
+        let mut ids = vec![normalise(&place.configured, &self.base)];
+        if place.resolved != place.configured {
+            ids.push(normalise(&place.resolved, &self.base));
+        }
         self.known
             .iter()
             .find(|known| known.ids.iter().any(|k| ids.contains(k)))
@@ -136,9 +137,24 @@ impl Upstreams {
     }
 }
 
-/// Every git remote of the repository.
+/// Every git remote of the repository: those of its configuration, and
+/// those of the `remotes` and `branches` directories of its git directory,
+/// which `git remote` does not list.
 pub fn remotes(git: &Git) -> Result<Vec<String>> {
-    Ok(lines(&git.run(&["remote"])?))
+    let mut all = lines(&git.run(&["remote"])?);
+    for kind in ["remotes", "branches"] {
+        let dir = git.line(&["rev-parse", "--path-format=absolute", "--git-path", kind])?;
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.path().is_file() && !all.contains(&name) {
+                all.push(name);
+            }
+        }
+    }
+    Ok(all)
 }
 
 /// The places git fetches `remote` from and pushes it to.
@@ -158,7 +174,10 @@ pub fn remote_places(git: &Git, remote: &str) -> Result<Vec<Place>> {
 /// The places a push to `target` goes to: a remote's push URLs, or else its
 /// URLs, as `git push` resolves them; a URL as git rewrites it for a push.
 pub fn push_places(git: &Git, target: &str) -> Result<Vec<Place>> {
-    if remotes(git)?.iter().any(|r| r == target) {
+    // A remote of the configuration or of the `remotes` directory, which
+    // `git remote` does not list.
+    let remote = git.raw(&["remote", "get-url", "--end-of-options", target])?;
+    if remote.success() {
         return pushed(git, target);
     }
     Ok(vec![Place {
@@ -270,7 +289,7 @@ fn same_repository(a: &str, b: &str, base: &Path) -> bool {
 
 /// The comparable form of a URL; see the module's documentation.
 fn normalise(url: &str, base: &Path) -> String {
-    let url = url.trim();
+    let url = address(url.trim());
     if let Some(path) = local_path(url) {
         let path = Path::new(&path);
         let full = if path.is_absolute() {
@@ -291,31 +310,67 @@ fn normalise(url: &str, base: &Path) -> String {
     }
 }
 
-/// A parsed URL by scheme, host, port and path, without credentials.
+/// Hosts whose repository paths ignore case.
+const CASELESS_HOSTS: &[&str] = &["github.com", "gitlab.com"];
+
+/// The address of git's `<transport>::<address>` form, which a remote
+/// helper reaches; any other URL itself.
+fn address(url: &str) -> &str {
+    match url.split_once("::") {
+        Some((transport, address))
+            if transport.starts_with(|c: char| c.is_ascii_alphabetic())
+                && transport
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c)) =>
+        {
+            address
+        }
+        _ => url,
+    }
+}
+
+/// A parsed URL by host, port and path: one repository is served over
+/// several schemes, so the scheme does not tell repositories apart, nor do
+/// credentials or the scheme's default port. The path loses doubled and
+/// trailing `/`, a `.git` suffix in any case, and a leading `~/`, by which an
+/// `ssh` URL names the home directory that an scp-like path starts from; on
+/// hosts that ignore the case of paths, its case.
 fn comparable(url: &Url) -> String {
-    let scheme = match url.scheme() {
-        "git+ssh" | "ssh+git" => "ssh",
-        other => other,
-    };
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    let default_port = match scheme {
-        "ssh" => Some(22),
+    let default_port = match url.scheme() {
+        "ssh" | "git+ssh" | "ssh+git" => Some(22),
         "https" => Some(443),
         "http" => Some(80),
         "git" => Some(9418),
         _ => None,
     };
+    let host = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     let port = match url.port() {
         Some(port) if Some(port) != default_port => format!(":{port}"),
         _ => String::new(),
     };
-    let path = percent_decode_str(url.path()).decode_utf8_lossy();
-    let path = path.trim_start_matches('/').trim_end_matches('/');
-    let path = path
-        .strip_suffix(".git")
-        .unwrap_or(path)
-        .trim_end_matches('/');
-    format!("{scheme}://{host}{port}/{path}")
+    let decoded = percent_decode_str(url.path()).decode_utf8_lossy();
+    let mut path = decoded
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    if let Some(home) = path.strip_prefix("~/") {
+        path = home.to_string();
+    }
+    if path.len() >= 4 && path[path.len() - 4..].eq_ignore_ascii_case(".git") {
+        path.truncate(path.len() - 4);
+    }
+    let path = path.trim_end_matches('/');
+    let path = if CASELESS_HOSTS.contains(&host.as_str()) {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    };
+    format!("{host}{port}/{path}")
 }
 
 /// The scp-like `[user@]host:path` as the `ssh://` URL it stands for.
@@ -331,8 +386,10 @@ fn scp_as_ssh(url: &str) -> String {
 
 /// The repository a local path names, as git finds it: the first of
 /// `<path>/.git`, `<path>`, `<path>.git/.git` and `<path>.git` that is a git
-/// directory, made canonical; the path itself, made canonical or cleaned,
-/// when none is.
+/// directory of its own; else, as for a linked worktree, whose `.git` is a
+/// file, or a worktree's private git directory, the common git directory
+/// git reports for `<path>` or `<path>.git`; made canonical. The path
+/// itself, made canonical or cleaned, when none is found.
 fn local_repository(path: &Path) -> PathBuf {
     let plain = path.as_os_str().to_string_lossy();
     let plain = plain.trim_end_matches('/');
@@ -344,9 +401,24 @@ fn local_repository(path: &Path) -> PathBuf {
     ] {
         let dir = Path::new(&candidate);
         if dir.join("HEAD").is_file()
+            && !dir.join("commondir").exists()
             && let Ok(found) = std::fs::canonicalize(dir)
         {
             return found;
+        }
+    }
+    for candidate in [plain.to_string(), format!("{plain}.git")] {
+        let dir = Path::new(&candidate);
+        if !dir.is_dir() {
+            continue;
+        }
+        let found =
+            Git::exactly_at(dir).raw(&["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+        if let Ok(out) = found
+            && out.success()
+            && let Ok(common) = std::fs::canonicalize(out.stdout.trim())
+        {
+            return common;
         }
     }
     std::fs::canonicalize(path).unwrap_or_else(|_| clean(path))
@@ -492,5 +564,119 @@ mod tests {
             &format!("file://localhost{}", link.display()),
             &bare_path
         ));
+    }
+
+    #[test]
+    fn network_urls_are_compared_by_host_and_path() {
+        let base = Path::new("/srv/product");
+        let same = |a: &str, b: &str| same_repository(a, b, base);
+        // The scheme does not tell repositories apart.
+        for other in [
+            "git@example.com:team/up.git",
+            "ssh://example.com/team/up",
+            "git+ssh://git@example.com:22/team/up.git",
+            "git://example.com/team/up",
+            "http://example.com:80/team/up.git",
+            "https::https://example.com/team/up",
+        ] {
+            assert!(same("https://example.com/team/up.git", other), "{other}");
+        }
+        // A port other than the default still does.
+        assert!(!same(
+            "https://example.com/team/up",
+            "https://example.com:8443/team/up"
+        ));
+        // The home directory, written either way.
+        assert!(same("example.com:team/up", "ssh://example.com/~/team/up"));
+        assert!(same("example.com:~ann/up", "ssh://example.com/~ann/up.git"));
+        // A host's trailing dot, the case of `.git`, and doubled slashes.
+        assert!(same(
+            "https://example.com./team/up.GIT",
+            "https://example.com/team//up"
+        ));
+        // Hosts that ignore the case of paths.
+        assert!(same(
+            "https://GitHub.com/Team/Up",
+            "git@github.com:team/up.git"
+        ));
+        assert!(same(
+            "https://gitlab.com/Team/Up",
+            "https://gitlab.com/team/up"
+        ));
+        assert!(!same(
+            "https://example.com/Team/up",
+            "https://example.com/team/up"
+        ));
+    }
+
+    #[test]
+    fn a_linked_worktree_names_its_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("up.git");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let b = bare.to_string_lossy().into_owned();
+        git(&["init", "-q", "--bare", "-b", "main", &b]);
+        git(&[
+            "-C",
+            &b,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit-tree",
+            "-m",
+            "x",
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        ]);
+        let linked = dir.path().join("linked");
+        let l = linked.to_string_lossy().into_owned();
+        git(&[
+            "-C", &b, "worktree", "add", "-q", "--orphan", "-b", "side", &l,
+        ]);
+        let base = dir.path().join("product");
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(same_repository(&l, &b, &base));
+        // A directory inside the repository is not the repository.
+        std::fs::create_dir_all(linked.join("sub")).unwrap();
+        assert!(!same_repository(&format!("{l}/sub"), &b, &base));
+    }
+
+    #[test]
+    fn a_remote_of_the_remotes_directory_is_pushed_to_as_a_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let out = std::process::Command::new("git")
+            .args(["init", "-q", &repo.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        std::fs::create_dir_all(repo.join(".git").join("remotes")).unwrap();
+        std::fs::write(
+            repo.join(".git").join("remotes").join("elsewhere"),
+            "URL: /srv/up.git\nPush: main\n",
+        )
+        .unwrap();
+        let git = Git::worktree(&repo);
+        assert!(remotes(&git).unwrap().contains(&"elsewhere".to_string()));
+        let places = push_places(&git, "elsewhere").unwrap();
+        assert_eq!(
+            places
+                .iter()
+                .map(|p| p.resolved.as_str())
+                .collect::<Vec<_>>(),
+            ["/srv/up.git"]
+        );
     }
 }

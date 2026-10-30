@@ -898,21 +898,47 @@ enum Alias {
     PushInsteadOf,
     /// A `file://localhost/` push URL of the upstream's repository.
     FileLocalhost,
+    /// An `ssh` push URL of the repository the upstream reaches by `https`.
+    SshForHttps,
+    /// The path of a linked worktree of the upstream's repository.
+    LinkedWorktree,
 }
 
-const ALIASES: [Alias; 4] = [
+const ALIASES: [Alias; 6] = [
     Alias::Credentials,
     Alias::InsteadOf,
     Alias::PushInsteadOf,
     Alias::FileLocalhost,
+    Alias::SshForHttps,
+    Alias::LinkedWorktree,
 ];
 
 impl Alias {
     /// What the configuration needs before an update starts: for
-    /// [`Alias::Credentials`], the upstream reached by an `https` URL that
-    /// the test's git configuration serves from its local repository.
+    /// [`Alias::Credentials`] and [`Alias::SshForHttps`], the upstream
+    /// reached by an `https` URL that the test's git configuration serves
+    /// from its local repository, which the SSH shim serves as well; for
+    /// [`Alias::LinkedWorktree`], the linked worktree.
     fn prepare(self, f: &Fork) {
-        if let Alias::Credentials = self {
+        if let Alias::LinkedWorktree = self {
+            f.env.git(
+                &f.up.bare,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "side",
+                    &f.env.path("upstream-linked").to_string_lossy(),
+                    "main",
+                ],
+            );
+        }
+        if let Alias::SshForHttps = self {
+            std::fs::create_dir_all(f.env.path("served")).unwrap();
+            std::os::unix::fs::symlink(&f.up.bare, f.env.path("served/upstream.git")).unwrap();
+        }
+        if let Alias::Credentials | Alias::SshForHttps = self {
             let config = f.env.path("gitconfig");
             let mut text = std::fs::read_to_string(&config).unwrap();
             text.push_str(&format!(
@@ -968,6 +994,26 @@ impl Alias {
                     "--push",
                     "origin",
                     &format!("file://localhost{up}"),
+                ],
+            ),
+            Alias::SshForHttps => env.git(
+                &f.down,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    "ssh://git@example.com/upstream.git",
+                ],
+            ),
+            Alias::LinkedWorktree => env.git(
+                &f.down,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    &env.path("upstream-linked").to_string_lossy(),
                 ],
             ),
         };
