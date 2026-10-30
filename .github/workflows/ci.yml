@@ -1,3 +1,9 @@
+# Pinned versions bumped by hand (Dependabot updates only the actions):
+# - cargo-deny 0.20.2 (the deny job's install-action input)
+# - git 2.43.0 and 2.47.3, with their source archives' SHA-256 (the git job's
+#   matrix)
+# The Rust toolchain is the current stable release, except in the msrv job,
+# which reads rust-version from Cargo.toml.
 name: CI
 
 on:
@@ -28,10 +34,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
-          components: rustfmt
+      - run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
       - run: cargo fmt --all --check
 
   clippy:
@@ -40,10 +45,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
-          components: clippy
+      - run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -58,9 +62,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: git --version
       - run: cargo test --workspace --locked
@@ -87,16 +91,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The build links the image's libraries, so the cache belongs to one
+      # runner image. ImageOS and ImageVersion are variables of the runner's
+      # environment, which the env context does not hold.
+      - id: image
+        run: echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
       - id: cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.GIT_PREFIX_DIR }}
-          key: git-${{ matrix.version }}-${{ runner.os }}-${{ runner.arch }}
+          key: git-${{ matrix.version }}-${{ steps.image.outputs.image }}-${{ runner.arch }}
       - name: Build git ${{ matrix.version }}
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libcurl4-openssl-dev libexpat1-dev zlib1g-dev
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential curl xz-utils \
+            libcurl4-openssl-dev libexpat1-dev libssl-dev zlib1g-dev
           src="$RUNNER_TEMP/git-src"
           mkdir -p "$src"
           archive="$src/git-$GIT_VERSION.tar.xz"
@@ -111,9 +122,9 @@ jobs:
       - run: |
           git --version
           git --version | grep -Fqx "git version $GIT_VERSION"
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --workspace --locked
 
@@ -125,14 +136,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - id: msrv
-        run: |
+      - run: |
           version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
           [ -n "$version" ] || { echo "cannot read rust-version from Cargo.toml" >&2; exit 1; }
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: ${{ steps.msrv.outputs.version }}
+          rustup toolchain install "$version" --profile minimal
+          rustup default "$version"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --workspace --all-targets --locked
 
@@ -144,9 +152,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-deny@0.20.2
