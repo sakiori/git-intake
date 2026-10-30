@@ -564,7 +564,7 @@ pub fn render_update(u: &UpdateView) -> String {
             if mr.requested {
                 ""
             } else {
-                " (the remote was not asked to open it; open it unless it is open)"
+                " (the remote was not asked to open it; open it with squashing off unless it is open)"
             }
         )),
         None => out.push_str(&format!("  worktree: {}\n", u.worktree.display())),

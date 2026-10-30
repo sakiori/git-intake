@@ -6,6 +6,7 @@ mod common;
 use std::fs;
 
 use common::{FORK_FILE, Fork, Mono, stderr, stdout};
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 /// Pushes three commits to the fork's upstream and returns them, oldest first.
@@ -26,11 +27,12 @@ fn commit_target_is_merged_published_and_shown_as_behind() {
     let base = env.rev(&f.down, "main");
     let short = &c2[..10];
 
+    // A revision that is the target's own commit id is not repeated.
     let start = f.tool(&["start", &format!("upstream={short}")]).success();
     let out = stdout(&start);
     assert!(
         out.contains(&format!(
-            "upstream: queued at {} ({short}) (2 new commits)",
+            "upstream: queued at {} (2 new commits)",
             &c2[..12]
         )),
         "{out}"
@@ -42,10 +44,9 @@ fn commit_target_is_merged_published_and_shown_as_behind() {
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["update"]["upstreams"][0]["target"], c2.as_str());
     assert_eq!(status["update"]["upstreams"][0]["rev"], short);
-    f.tool(&["status"]).success().stdout(contains(format!(
-        "upstream: target {} ({short}), merged",
-        &c2[..12]
-    )));
+    f.tool(&["status"])
+        .success()
+        .stdout(contains(format!("upstream: target {}, merged", &c2[..12])));
 
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
@@ -174,10 +175,7 @@ fn target_already_taken_in_is_current_and_an_older_one_is_refused() {
 
     f.tool(&["start", &format!("upstream={c2}")])
         .success()
-        .stdout(contains(format!(
-            "upstream: current at {} ({c2})",
-            &c2[..12]
-        )))
+        .stdout(contains(format!("upstream: current at {}\n", &c2[..12])))
         .stdout(contains(
             "every selected upstream is current; nothing to update",
         ));
@@ -186,7 +184,7 @@ fn target_already_taken_in_is_current_and_an_older_one_is_refused() {
     f.tool(&["start", &format!("upstream={c1}")])
         .code(2)
         .stderr(contains(format!(
-            "the target {} ({c1}) is older than the last synced commit {}; an update never moves an upstream back",
+            "the target {} is older than the last synced commit {}; an update never moves an upstream back",
             &c1[..12],
             &c2[..12]
         )));
@@ -432,7 +430,8 @@ fn first_import_of_a_path_upstream_at_a_chosen_revision() {
 
     m.tool(&["start", &format!("app-a={a0}")])
         .success()
-        .stdout(contains(format!("app-a: queued at {} ({a0})", &a0[..12])));
+        .stdout(contains(format!("app-a: queued at {} (", &a0[..12])))
+        .stdout(contains(format!("({a0})")).not());
     let status = env.tool_json(&m.down, &["status", "--json"], 0);
     assert_eq!(status["update"]["upstreams"][0]["kind"], "import");
     m.tool(&["verify"]).success();
