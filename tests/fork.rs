@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::fs;
+
 use common::{FORK_FILE, Fork, stderr, stdout};
 use predicates::str::contains;
 
@@ -761,4 +763,157 @@ fn a_stopped_follow_update_keeps_its_target_through_garbage_collection() {
     f.tool(&["finish"]).success();
     assert_eq!(env.rev(&f.down, "main^2"), target);
     env.assert_no_update(&f.down);
+}
+
+/// The message of a sync merge of the fork's upstream at `target`, as the
+/// tool writes it.
+fn sync_message(target: &str) -> String {
+    format!(
+        "sync(upstream): merge upstream/main at {}\n\nIntake-Upstream: upstream\nIntake-Target: {target}\n",
+        &target[..12]
+    )
+}
+
+/// Merges the fetched upstream into a new branch `name` at `main` with a
+/// sync record made by hand, and returns to `main`.
+fn record_on_branch(f: &Fork, name: &str, target: &str) {
+    let env = &f.env;
+    env.git(&f.down, &["fetch", "-q", &f.up.url(), target]);
+    env.git(&f.down, &["checkout", "-q", "-b", name, "main"]);
+    env.git(
+        &f.down,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            &sync_message(target),
+            target,
+        ],
+    );
+    env.git(&f.down, &["checkout", "-q", "main"]);
+}
+
+#[test]
+fn a_record_merged_from_a_branch_counts_one_level_deep() {
+    let f = Fork::new();
+    let env = &f.env;
+    let t1 = env.push_upstream(&f.up, &[("one.txt", "1\n")], "upstream: one");
+
+    // A branch that carries a sync record, merged with a merge commit.
+    record_on_branch(&f, "feature", &t1);
+    env.git(
+        &f.down,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge branch 'feature'",
+            "feature",
+        ],
+    );
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    let up = &status["upstreams"][0];
+    assert_eq!(up["last_synced"], t1.as_str());
+    assert_eq!(up["last_synced_source"], "record");
+
+    // A record on a branch merged into another branch before that one was
+    // merged is two merges away from the integration branch's first-parent
+    // line, and does not count.
+    let t2 = env.push_upstream(&f.up, &[("two.txt", "2\n")], "upstream: two");
+    record_on_branch(&f, "inner", &t2);
+    env.git(&f.down, &["checkout", "-q", "-b", "outer", "main"]);
+    env.commit(&f.down, &[("outer.txt", "o\n")], "fork: outer work");
+    env.git(
+        &f.down,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge branch 'inner'",
+            "inner",
+        ],
+    );
+    env.git(&f.down, &["checkout", "-q", "main"]);
+    env.git(
+        &f.down,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge branch 'outer'",
+            "outer",
+        ],
+    );
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    let up = &status["upstreams"][0];
+    assert_eq!(up["last_synced"], t1.as_str());
+    assert_eq!(up["last_synced_source"], "record");
+}
+
+#[test]
+fn records_an_upstream_carries_never_count_even_when_it_cannot_be_fetched() {
+    let f = Fork::new();
+    let env = &f.env;
+    // The upstream is itself a fork that records syncs of its own upstream.
+    let own = env.push_upstream(&f.up, &[("own.txt", "o\n")], "base: own");
+    env.push_upstream(
+        &f.up,
+        &[("synced.txt", "s\n")],
+        &format!("sync(base): merge base/main\n\nIntake-Upstream: base\nIntake-Target: {own}\n"),
+    );
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+
+    // Without the upstream's branch to exclude, its history below the sync
+    // merge still holds no record of this repository.
+    fs::rename(&f.up.bare, env.path("moved.git")).unwrap();
+    let doctor = env.tool_json(&f.down, &["doctor", "--json"], 1);
+    assert!(
+        doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["check"] != "dropped_upstream"),
+        "{doctor}"
+    );
+}
+
+#[test]
+fn an_older_record_merged_later_never_moves_the_upstream_back() {
+    let f = Fork::new();
+    let env = &f.env;
+    let t1 = env.push_upstream(&f.up, &[("one.txt", "1\n")], "upstream: one");
+    // A branch with a record of t1 starts before the update to t2 lands.
+    record_on_branch(&f, "stale", &t1);
+    let t2 = env.push_upstream(&f.up, &[("two.txt", "2\n")], "upstream: two");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+    env.git(
+        &f.down,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge branch 'stale'",
+            "stale",
+        ],
+    );
+
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    let up = &status["upstreams"][0];
+    assert_eq!(up["state"], "current");
+    assert_eq!(up["last_synced"], t2.as_str());
+    assert_eq!(up["last_synced_source"], "record");
+    let log = env.tool_json(&f.down, &["log", "--json"], 0);
+    assert_eq!(log["upstreams"][0]["commits"], serde_json::json!([]));
+    f.reconfigure("mode = \"follow\"", "mode = \"port\"");
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["upstreams"][0]["base"], t2.as_str());
 }

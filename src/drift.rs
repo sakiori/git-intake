@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::config::Upstream;
 use crate::git::{Git, abbrev};
+use crate::integration_line;
 use crate::sync_record::Record;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -153,9 +154,9 @@ pub fn evaluate(
 /// - A root upstream: the newest upstream commit the integration branch
 ///   contains (their merge base), as for a fork created by cloning.
 /// - A path upstream: the second parent of the newest merge on the
-///   integration branch's first-parent line whose second parent belongs to
-///   the upstream's branch and which changes the upstream's path, the merge
-///   `git subtree add` or `git subtree pull` leaves.
+///   integration line whose second parent belongs to the upstream's branch
+///   and which changes the upstream's path, the merge `git subtree add` or
+///   `git subtree pull` leaves.
 pub fn adopted_base(
     git: &Git,
     integration_tip: &str,
@@ -168,10 +169,12 @@ pub fn adopted_base(
     }
 }
 
-/// The second parent of the newest first-parent merge into `integration_tip`
-/// that changes `path` and whose second parent is contained in `tip`.
+/// The second parent of the newest merge on the integration line ending at
+/// `integration_tip` (see [`integration_line`]) that changes `path` and whose
+/// second parent is contained in `tip`.
 ///
-/// One walk lists the first-parent merges; one `cat-file --batch-check`
+/// The line leaves out the upstream's own history, which holds no merge of
+/// this repository. One walk lists it; one `cat-file --batch-check`
 /// compares each merge's tree at `path` with its first parent's; ancestry is
 /// checked only for the merges that change the path, newest first, stopping
 /// at the first match.
@@ -181,21 +184,16 @@ fn newest_path_merge(
     path: &str,
     tip: &str,
 ) -> Result<Option<String>> {
-    let listing = git.run(&[
-        "rev-list",
-        "--first-parent",
-        "--merges",
-        "--parents",
-        integration_tip,
-    ])?;
     // (merge, first parent, second parent), newest first.
-    let merges: Vec<(String, String, String)> = listing
-        .lines()
-        .filter_map(|l| {
-            let mut ids = l.split_whitespace();
-            Some((ids.next()?.into(), ids.next()?.into(), ids.next()?.into()))
-        })
-        .collect();
+    let merges: Vec<(String, String, String)> =
+        integration_line::walk(git, integration_tip, &[tip.to_string()])?
+            .commits
+            .into_iter()
+            .filter_map(|c| {
+                let mut parents = c.parents.into_iter();
+                Some((c.commit, parents.next()?, parents.next()?))
+            })
+            .collect();
     if merges.is_empty() {
         return Ok(None);
     }

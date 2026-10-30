@@ -62,7 +62,7 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
     }
     let fetch_failed = fetched.iter().any(|f| f.is_err());
     let tips: Vec<String> = fetched.iter().filter_map(|f| f.clone().ok()).collect();
-    let latest = sync_record::latest(&sync_record::records(git, &integration, &tips)?);
+    let latest = sync_record::latest(git, &sync_record::records(git, &integration, &tips)?)?;
     let mut upstreams = Vec::new();
     for (up, fetched) in selected.iter().zip(fetched) {
         let mut entry = UpstreamLog {

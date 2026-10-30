@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod drift;
 mod git;
+mod integration_line;
 mod output;
 mod port;
 mod repo;

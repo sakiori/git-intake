@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use crate::git::Git;
+use crate::integration_line;
 
 pub const UPSTREAM_TRAILER: &str = "Intake-Upstream";
 pub const TARGET_TRAILER: &str = "Intake-Target";
@@ -53,22 +54,39 @@ fn trailer_format(second: &str) -> String {
 /// This repository's own sync records on the integration line ending at
 /// `rev`, newest first.
 ///
-/// Only the first-parent line is walked: the tool's merges are always on it,
-/// because `finish` fast-forwards the integration branch to the update branch,
-/// whose merges take the previous head as first parent. Commits contained in a
-/// configured upstream's fetched branch are excluded as well: such records
-/// were inherited from that upstream (for example a stacked branch that starts
-/// from another fork's integration line), while a merge this repository
-/// creates is never part of its upstream. `upstream_tips` are the fetched
-/// tips of the configured upstreams.
+/// The integration line (see [`integration_line`]) holds the tool's merges
+/// however the update landed: on the first-parent line when the integration
+/// branch was fast-forwarded to the update branch, and right after the merge
+/// commit that brought the update in when a merge request was merged with
+/// one. Commits contained in a configured upstream's fetched branch are
+/// excluded: such records were inherited from that upstream (for example a
+/// stacked branch that starts from another fork's integration branch), while
+/// a merge this repository creates is never part of its upstream.
+/// `upstream_tips` are the fetched tips of the configured upstreams.
 pub fn records(git: &Git, rev: &str, upstream_tips: &[String]) -> Result<Vec<Record>> {
-    let args = log_args(
-        upstream_tips,
-        &["--first-parent".into(), log_format()],
-        UPSTREAM_TRAILER,
-        rev,
-    );
-    Ok(parse_log(&git.run(&args)?))
+    Ok(integration_line::walk(git, rev, upstream_tips)?.records)
+}
+
+/// The sync records that `commits` carry, in their order.
+pub fn read<'a>(git: &Git, commits: impl IntoIterator<Item = &'a str>) -> Result<Vec<Record>> {
+    let input: String = commits.into_iter().map(|c| format!("{c}\n")).collect();
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    // `--no-walk=unsorted` keeps the order given and only filters it.
+    let out = git.run_with_input(
+        &[
+            "log".to_string(),
+            "--no-walk=unsorted".into(),
+            "--stdin".into(),
+            "--fixed-strings".into(),
+            format!("--grep={UPSTREAM_TRAILER}: "),
+            log_format(),
+            "--".into(),
+        ],
+        input,
+    )?;
+    Ok(parse_log(&out))
 }
 
 /// The upstream commits, oldest copy first, that copies on the history
@@ -76,7 +94,7 @@ pub fn records(git: &Git, rev: &str, upstream_tips: &[String]) -> Result<Vec<Rec
 /// trailers. The whole
 /// history counts, so that a copy made by hand on a merged branch counts as
 /// well; commits contained in a configured upstream's fetched branch are
-/// excluded, as for [`records`].
+/// excluded, as in [`records`].
 pub fn taken(git: &Git, rev: &str, upstream_tips: &[String], name: &str) -> Result<Vec<String>> {
     let args = log_args(
         upstream_tips,
@@ -173,13 +191,70 @@ fn first_value(field: &str) -> &str {
     field.split(',').next().unwrap_or("").trim()
 }
 
-/// The newest record per upstream name.
-pub fn latest(records: &[Record]) -> HashMap<String, Record> {
-    let mut map = HashMap::new();
+/// The record of each upstream's last synced commit, by upstream name:
+/// of the upstream's records, newest first, the first whose target no other
+/// of its records' targets contains. A record merged in later for an older
+/// target, as from a branch that started before an update, therefore never
+/// moves an upstream back. A target git does not have is compared with
+/// none. One `cat-file` checks the targets and one `merge-base
+/// --independent` compares those of each upstream with several.
+pub fn latest(git: &Git, records: &[Record]) -> Result<HashMap<String, Record>> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut targets: Vec<String> = Vec::new();
     for r in records {
-        map.entry(r.upstream.clone()).or_insert_with(|| r.clone());
+        if !names.contains(&r.upstream.as_str()) {
+            names.push(&r.upstream);
+        }
+        let t = r.target.to_ascii_lowercase();
+        if !targets.contains(&t) {
+            targets.push(t);
+        }
     }
-    map
+    let present = present_commits(git, &targets)?;
+    let mut map = HashMap::new();
+    for name in names {
+        let own: Vec<&Record> = records.iter().filter(|r| r.upstream == name).collect();
+        let mut compared: Vec<String> = Vec::new();
+        for r in &own {
+            let t = r.target.to_ascii_lowercase();
+            if present.contains(&t) && !compared.contains(&t) {
+                compared.push(t);
+            }
+        }
+        let independent: Vec<String> = if compared.len() > 1 {
+            let mut args = vec!["merge-base".to_string(), "--independent".into()];
+            args.extend(compared.iter().cloned());
+            crate::git::lines(&git.run(&args)?)
+        } else {
+            compared.clone()
+        };
+        let chosen = own.iter().find(|r| {
+            let t = r.target.to_ascii_lowercase();
+            !present.contains(&t) || independent.contains(&t)
+        });
+        if let Some(r) = chosen {
+            map.insert(name.to_string(), (*r).clone());
+        }
+    }
+    Ok(map)
+}
+
+/// Those of `ids`, full commit ids in lower case, that name commits git has.
+fn present_commits(git: &Git, ids: &[String]) -> Result<Vec<String>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let input: String = ids.iter().map(|id| format!("{id}\n")).collect();
+    let out = git.run_with_input(
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        input,
+    )?;
+    Ok(out
+        .lines()
+        .filter_map(|l| l.strip_suffix(" commit"))
+        .map(str::to_string)
+        .filter(|id| ids.contains(id))
+        .collect())
 }
 
 #[cfg(test)]
@@ -196,13 +271,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_records_and_keeps_newest() {
+    fn parses_records_in_order() {
         let out = "c3\u{1f}a\u{1f}t3\u{1e}\nc2\u{1f}b\u{1f}t2\u{1e}\nc1\u{1f}a\u{1f}t1\u{1e}\nc0\u{1f}\u{1f}\u{1e}\n";
         let recs = parse_log(out);
         assert_eq!(recs.len(), 3);
-        let latest = latest(&recs);
-        assert_eq!(latest["a"].target, "t3");
-        assert_eq!(latest["a"].commit, "c3");
-        assert_eq!(latest["b"].target, "t2");
+        assert_eq!(recs[0].target, "t3");
+        assert_eq!(recs[1].upstream, "b");
     }
 }

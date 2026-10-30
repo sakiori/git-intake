@@ -1055,3 +1055,41 @@ fn synced_upstream_with_removed_path_is_reported_as_path_removed() {
         .git(&t.down, &["commit", "-q", "-m", "mono: remove apps/a"]);
     assert_path_removed(&t.env, &t.down, 0, "history");
 }
+
+#[test]
+fn path_imported_on_a_branch_merged_with_a_merge_commit_is_adopted() {
+    let m = Mono::new();
+    let env = &m.env;
+    let first = fetch_branch(env, &m.down, &m.a);
+    env.git(&m.down, &["checkout", "-q", "-b", "import"]);
+    subtree_add(env, &m.down, "apps/a", &first);
+    env.git(&m.down, &["checkout", "-q", "main"]);
+    env.commit(&m.down, &[("notes.txt", "n\n")], "mono: notes");
+    env.git(
+        &m.down,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge branch 'import'",
+            "import",
+        ],
+    );
+
+    let status = env.tool_json(&m.down, &["status", "--json"], 0);
+    let u = &status["upstreams"][0];
+    assert_eq!(u["state"], "current");
+    assert_eq!(u["last_synced"], first.as_str());
+    assert_eq!(u["last_synced_source"], "history");
+
+    env.push_upstream(&m.a, &[("a.txt", "a1\na2-up\na3\n")], "app-a: change");
+    m.tool(&["start", "app-a"])
+        .success()
+        .stdout(contains("app-a: queued at"));
+    let wt = env.update_worktree(&m.down);
+    assert_eq!(
+        fs::read_to_string(wt.join("apps/a/a.txt")).unwrap(),
+        "a1\na2-up\na3\n"
+    );
+}

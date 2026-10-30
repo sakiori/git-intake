@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{Mono, mono_config, stdout};
+use common::{Mono, merge_on_forge, merge_request_branch, mono_config, stdout};
 use predicates::str::contains;
 
 #[test]
@@ -375,4 +375,43 @@ fn log_lists_pending_commits() {
     assert_eq!(a["commits"][0]["commit"], commits[2].as_str());
     assert_eq!(a["commits"][0]["subject"], "app-a: change 3");
     assert_eq!(json["upstreams"][1]["commits"], serde_json::json!([]));
+}
+
+#[test]
+fn paths_imported_through_a_merge_request_merged_with_a_merge_commit_stay_imported() {
+    let m = Mono::merge_request();
+    let env = &m.env;
+    let publish = m.publish.clone().unwrap();
+    let a_tip = env.rev(&m.a.bare, "main");
+    let b_tip = env.rev(&m.b.bare, "main");
+    m.tool(&["start"]).success();
+    m.tool(&["verify"]).success();
+    let commit = env.rev(&env.update_worktree(&m.down), "HEAD");
+    m.tool(&["finish"]).success();
+    merge_on_forge(env, &publish, &merge_request_branch(&commit));
+    m.tool(&["finish"]).success();
+    assert_eq!(env.rev(&m.down, "main^2"), commit);
+
+    let status = env.tool_json(&m.down, &["status", "--json"], 0);
+    for (i, tip) in [&a_tip, &b_tip].iter().enumerate() {
+        let u = &status["upstreams"][i];
+        assert_eq!(u["state"], "current");
+        assert_eq!(u["last_synced"], tip.as_str());
+        assert_eq!(u["last_synced_source"], "record");
+    }
+    let doctor = env.tool_json(&m.down, &["doctor", "--json"], 0);
+    assert_eq!(doctor["healthy"], true);
+
+    // The next update merges into the imported path.
+    env.push_upstream(&m.a, &[("a2.txt", "x\n")], "app-a: one");
+    m.tool(&["start"])
+        .success()
+        .stdout(contains("app-a: queued at"));
+    let wt = env.update_worktree(&m.down);
+    assert!(wt.join("apps/a/a2.txt").exists());
+    let subject = env.git(&wt, &["log", "-1", "--format=%s"]);
+    assert!(
+        subject.starts_with("sync(app-a): merge app-a/main at "),
+        "{subject}"
+    );
 }

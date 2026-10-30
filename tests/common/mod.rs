@@ -409,28 +409,102 @@ pub fn recorded_push_options(bare: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The branch `finish` pushes the verified commit `commit` to in
+/// merge-request mode.
+pub fn merge_request_branch(commit: &str) -> String {
+    format!("git-intake/update-{}", &commit[..12])
+}
+
+/// A clone of the publish remote `publish` that plays the forge merging
+/// requests, at the remote's integration branch.
+pub fn forge(env: &Env, publish: &Path) -> PathBuf {
+    let dir = env.path("forge");
+    if !dir.exists() {
+        env.git(
+            &env.path(""),
+            &[
+                "clone",
+                "-q",
+                &publish.to_string_lossy(),
+                &dir.to_string_lossy(),
+            ],
+        );
+    } else {
+        env.git(&dir, &["fetch", "-q", "origin"]);
+        env.git(&dir, &["reset", "-q", "--hard", "origin/main"]);
+    }
+    dir
+}
+
+/// The forge merges `branch` of the publish remote `publish` into its
+/// integration branch with a merge commit, as GitLab's merge commit methods
+/// do; returns the new tip of the integration branch.
+pub fn merge_on_forge(env: &Env, publish: &Path, branch: &str) -> String {
+    let forge = forge(env, publish);
+    env.git(
+        &forge,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge branch into main",
+            &format!("origin/{branch}"),
+        ],
+    );
+    env.git(&forge, &["push", "-q", "origin", "HEAD:main"]);
+    env.rev(publish, "main")
+}
+
 /// A monorepo with path upstreams `app-a` at `apps/a` and `app-b` at
-/// `apps/b`, not yet imported, and no publish remote.
+/// `apps/b`, not yet imported, and no publish remote unless built by
+/// [`Mono::merge_request`].
 pub struct Mono {
     pub env: Env,
     pub a: Upstream,
     pub b: Upstream,
     pub down: PathBuf,
+    pub publish: Option<PathBuf>,
 }
 
 impl Mono {
     pub fn new() -> Self {
+        Self::build("")
+    }
+
+    /// A monorepo that publishes through merge requests to the remote
+    /// `origin`, which accepts push options as in [`Fork::merge_request`].
+    pub fn merge_request() -> Self {
+        let mut m = Self::build("\n[publish]\nremote = \"origin\"\nvia = \"merge-request\"\n");
+        let publish = m.env.bare("publish");
+        accept_push_options(&m.env, &publish);
+        m.env.git(
+            &m.down,
+            &["remote", "add", "origin", &publish.to_string_lossy()],
+        );
+        m.env.git(&m.down, &["push", "-q", "origin", "main"]);
+        m.publish = Some(publish);
+        m
+    }
+
+    fn build(extra: &str) -> Self {
         let env = Env::new();
         let a = env.upstream("app-a", &[("a.txt", "a1\na2\na3\n")]);
         let b = env.upstream("app-b", &[("b.txt", "b1\nb2\nb3\n")]);
         let down = env.work("mono");
-        let config = mono_config(&a, &b, "");
+        let config = mono_config(&a, &b, extra);
         env.commit(
             &down,
             &[("README.md", "monorepo\n"), (".git-intake.toml", &config)],
             "mono: initial layout",
         );
-        Self { env, a, b, down }
+        Self {
+            env,
+            a,
+            b,
+            down,
+            publish: None,
+        }
     }
 
     pub fn tool(&self, args: &[&str]) -> Assert {
