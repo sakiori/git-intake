@@ -14,6 +14,8 @@ The tool runs the installed `git` for every repository operation. Each repositor
 
 Requires Git 2.43 or later (`git merge-tree -X` is used for conflict prediction) and a POSIX `sh`. The tool is a single binary named `git-intake`; with it on the `PATH`, git runs it as `git intake`.
 
+The tool runs on Linux and macOS; Windows is not supported. While the version is `0.x`, the formats of `.git-intake.toml` and of the update state may change between releases; a release that changes them says how to move to it, as *The update state* and *Upgrading to named checks* do for the current ones.
+
 Releases provide prebuilt binaries for the targets `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. They are statically linked and run on any Linux distribution and in minimal CI images. On macOS, install from source (below): the tool verifies the forge's TLS certificate against the keychain through the system's Security framework, so its macOS binary is built on macOS.
 
 ### With mise
@@ -799,3 +801,7 @@ Earlier releases kept a git remote per upstream, its remote-tracking branches, a
 - The tool never adds or changes a git remote, and never fetches an upstream through one.
 - A rewritten upstream is detected from the sync record or the port journal and copies, and is not taken.
 - The configuration and a port's journal are read from the committed integration tip, never from a working copy or from the tree being taken in.
+
+## License
+
+git-intake is released under the MIT license; see [LICENSE](LICENSE).
