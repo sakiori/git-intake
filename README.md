@@ -52,16 +52,19 @@ From a checkout, `cargo install --locked --path .` installs the working tree.
 
 ## Releasing
 
-1. Set the new version in `Cargo.toml`, run `cargo build` so that `Cargo.lock` follows, and merge the change.
-2. Tag that commit `vX.Y.Z` with the same version and push the tag.
+Versions follow the Conventional Commits on the default branch. In `0.x`, a breaking change raises the minor version and every other change the patch version; from `1.0` on, the usual SemVer rules apply. `CHANGELOG.md` keeps one section per release in the Keep a Changelog format.
 
-Every pipeline builds the release archives for all targets. On a tag, the pipeline also does the following:
+1. On an up-to-date `main` with a clean working tree, run `ci/prepare-release.sh`. It needs git-cliff, pinned in `mise.toml`; run `mise install` once. The script does the following:
+   - computes the next version from the commits since the last release;
+   - sets that version in `Cargo.toml` and `Cargo.lock`;
+   - adds the release's section to `CHANGELOG.md`;
+   - commits `chore(release): vX.Y.Z` on a new branch `release/vX.Y.Z`.
 
-1. It refuses a tag that differs from `v` plus the crate version.
-2. It uploads the archives and checksums to the project's generic package registry.
-3. It creates the release with links to them.
+   It then prints the command that pushes the branch and opens the merge request. Run the script with `--push` to do that directly.
+2. Review the release merge request, edit its changelog section if needed, and merge it. Its pipeline builds the binaries for every target.
+3. The pipeline of the default branch finds that `vX.Y.Z` has no tag yet. It builds the binaries, uploads them to the generic package registry, and creates the release and its tag `vX.Y.Z` at the merged commit, with the changelog section as the release notes. A merge that leaves the version unchanged releases nothing.
 
-`git intake --version` reports the crate version, so a released binary always names its release.
+Creating the tag requires the person who merges to be allowed to create `v*` tags.
 
 ## Configuration
 
