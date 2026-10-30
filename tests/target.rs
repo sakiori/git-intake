@@ -356,14 +356,14 @@ fn tag_prefixes_name_the_upstream_tag() {
     f.tool(&["start", "upstream=refs/tags/v1.1"])
         .success()
         .stdout(contains(format!(
-            "upstream: queued at {} (refs/tags/v1.1)",
+            "upstream: queued at {} (v1.1)",
             &c1[..12]
         )));
     f.tool(&["abort"]).success();
     f.tool(&["start", "upstream=tags/v1.2"])
         .success()
         .stdout(contains(format!(
-            "upstream: queued at {} (tags/v1.2)",
+            "upstream: queued at {} (v1.2)",
             &c2[..12]
         )));
 }
@@ -449,7 +449,7 @@ fn first_import_of_a_path_upstream_at_a_chosen_revision() {
 }
 
 #[test]
-fn unreachable_upstream_during_tag_lookup_is_refused_clearly() {
+fn unreachable_upstream_during_the_tag_listing_is_refused_clearly() {
     let f = Fork::new();
     let env = &f.env;
     let [c1, _, _] = three_upstream_commits(&f);
@@ -492,7 +492,7 @@ fn unreachable_upstream_during_tag_lookup_is_refused_clearly() {
     let err = stderr(&refused);
     assert!(
         err.contains(&format!(
-            "upstream 'upstream': cannot ask {url} whether it has a tag '{c1}'"
+            "upstream 'upstream': cannot list the tags of {url}"
         )),
         "{err}"
     );

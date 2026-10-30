@@ -19,6 +19,9 @@ pub enum DriftState {
     /// one from.
     NoBase,
     NotImported,
+    /// A follow upstream taken at its release tags without a release tag
+    /// on its fetched branch.
+    NoRelease,
     /// A synced path upstream whose path no longer exists on the integration branch.
     PathRemoved,
     Rewritten,
@@ -33,6 +36,7 @@ impl DriftState {
             DriftState::Pending => "pending",
             DriftState::NoBase => "no base",
             DriftState::NotImported => "not imported",
+            DriftState::NoRelease => "no release",
             DriftState::PathRemoved => "path removed",
             DriftState::Rewritten => "rewritten",
             DriftState::Unavailable => "unavailable",

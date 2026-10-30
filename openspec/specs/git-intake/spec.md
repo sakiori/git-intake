@@ -7,7 +7,7 @@ Keep a repository current with one or more upstreams, each fetched by its URL on
 ## Requirements
 
 ### Requirement: Fork configuration
-The tool SHALL read a repository's settings from a `.git-intake.toml` file committed on the integration branch: the integration branch, an optional publication setting with the publish remote and the mode `push` or `merge-request`, an install command, an ordered list of check commands, and an ordered list of upstreams. Each upstream SHALL have a unique name, a URL, a branch, a mode `follow` or `port` with `follow` as the default, and optionally a path inside the repository. No two upstreams SHALL have the same URL and branch. An upstream without a path is taken at the repository root. The tool SHALL read the committed file from the integration branch tip, not from a working tree, and SHALL refuse to run when the file is missing or invalid, naming the problem. It SHALL refuse the settings `remote` and `mirror`, naming what replaces them, an upstream in `port` mode with a path, and a publish remote whose fetch or push URL names a configured upstream's repository.
+The tool SHALL read a repository's settings from a `.git-intake.toml` file committed on the integration branch: the integration branch, an optional publication setting with the publish remote and the mode `push` or `merge-request`, an install command, an ordered list of check commands, and an ordered list of upstreams. Each upstream SHALL have a unique name, a URL, a branch, a mode `follow` or `port` with `follow` as the default, optionally a path inside the repository, and, in `follow` mode, optionally a `tags` pattern: a glob over the upstream's tag names that selects its release tags. No two upstreams SHALL have the same URL and branch. An upstream without a path is taken at the repository root. The tool SHALL read the committed file from the integration branch tip, not from a working tree, and SHALL refuse to run when the file is missing or invalid, naming the problem. It SHALL refuse the settings `remote` and `mirror`, naming what replaces them, an upstream in `port` mode with a path or a `tags` pattern, a `tags` pattern that is not a valid glob or that starts with `refs/` or `tags/`, and a publish remote whose fetch or push URL names a configured upstream's repository.
 
 #### Scenario: Valid configuration
 - **WHEN** the integration branch carries a valid configuration
@@ -41,12 +41,16 @@ The tool SHALL read a repository's settings from a `.git-intake.toml` file commi
 - **WHEN** an upstream in `port` mode has a path
 - **THEN** the tool refuses to run and names the upstream
 
+#### Scenario: Invalid release tag pattern
+- **WHEN** an upstream's `tags` pattern is not a valid glob, starts with `refs/tags/`, or belongs to an upstream in `port` mode
+- **THEN** the tool refuses to run and names the upstream and the pattern
+
 #### Scenario: Publish remote at an upstream's URL
 - **WHEN** the publish remote's fetch or push URL names a configured upstream's repository
 - **THEN** the tool refuses to run and names the remote and the upstream
 
 ### Requirement: Sync record in history
-Every merge commit the tool creates SHALL name the upstream and its target commit in commit trailers, and every commit it copies from an upstream in `port` mode SHALL name the upstream and the upstream commit it took in the trailers `Intake-Upstream` and `Intake-Taken`. For an upstream in `follow` mode, the tool SHALL derive the last synced commit from its sync records on the integration line, as the target of the newest record whose target no other of its records' targets contains, and SHALL NOT store it in the configuration or outside the history. For such an upstream that carries no sync record, the last synced commit SHALL come from the history, and the tool SHALL show that it does: for a root upstream it is the newest upstream commit the integration branch contains; for a path upstream it is the second parent of the newest merge on the integration line whose second parent belongs to the upstream's branch and which changes the upstream's path, as an import by `git subtree add` or `git subtree pull` leaves. This decision SHALL depend only on the integration branch and the upstream's own branch, never on other upstreams. When a `follow` upstream's last synced commit is no longer contained in its branch, the tool SHALL report that upstream's history as rewritten and SHALL refuse to update it.
+Every merge commit the tool creates SHALL name the upstream and its target commit in commit trailers, and, when a tag of the upstream's repository points at the target, that tag in the trailer `Intake-Tag`: the tag a revision named, the release a `tags` pattern selected, or otherwise, of the tags at the target, the one with the highest version among those matching the upstream's `tags` pattern whose name is a version after the pattern's literal prefix, or, without such a tag, among those whose name is a semantic version with an optional `v` or `V`; a tag whose name is no version SHALL NOT be recorded this way, even when it matches the pattern. A tag whose name contains a comma SHALL NOT be recorded. The tag SHALL be fixed when `start` fixes the target. Every commit the tool copies from an upstream in `port` mode SHALL name the upstream and the upstream commit it took in the trailers `Intake-Upstream` and `Intake-Taken`. For an upstream in `follow` mode, the tool SHALL derive the last synced commit from its sync records on the integration line, as the target of the newest record whose target no other of its records' targets contains, and SHALL NOT store it in the configuration or outside the history. For such an upstream that carries no sync record, the last synced commit SHALL come from the history, and the tool SHALL show that it does: for a root upstream it is the newest upstream commit the integration branch contains; for a path upstream it is the second parent of the newest merge on the integration line whose second parent belongs to the upstream's branch and which changes the upstream's path, as an import by `git subtree add` or `git subtree pull` leaves. This decision SHALL depend only on the integration branch and the upstream's own branch, never on other upstreams. When a `follow` upstream's last synced commit is no longer contained in its branch, the tool SHALL report that upstream's history as rewritten and SHALL refuse to update it.
 
 #### Scenario: Last synced commit
 - **WHEN** the integration line contains a merge of a `follow` upstream
@@ -59,6 +63,14 @@ Every merge commit the tool creates SHALL name the upstream and its target commi
 #### Scenario: Upstream force-pushed
 - **WHEN** a `follow` upstream's branch no longer contains the last synced commit
 - **THEN** `status` reports the upstream as rewritten and `start` refuses to update it
+
+#### Scenario: Target named by a tag
+- **WHEN** an update merges a target that a tag of the upstream's repository points at, chosen by a release pattern, by naming the tag, or by naming the commit
+- **THEN** the merge commit carries `Intake-Tag` with that tag, `report` names it, and `status` shows it as the tag of the last synced commit
+
+#### Scenario: Target without a tag
+- **WHEN** an update merges a target that no tag of the upstream's repository points at
+- **THEN** the merge commit carries no `Intake-Tag` trailer
 
 #### Scenario: Copied commit
 - **WHEN** a port update copies an upstream commit
@@ -219,7 +231,7 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **THEN** `finish` publishes as the merge request publication requires and moves no local branch before the merge request is merged
 
 ### Requirement: Update report
-`report` SHALL summarise an update in progress or just merged, per upstream. For a `follow` upstream it SHALL give the number of upstream commits merged, the conflicted files and whether each was resolved by hand or by a recorded resolution, and how the repository's own changes relative to that upstream grew or shrank. For a `port` upstream it SHALL give the taken commits in the order they were copied, each with its conflicted files and their resolution source, the commits recorded as `have` because their copy changed nothing, the `skip` and `have` decisions with their notes, the number of commits left pending, and, for each taken commit, the earlier upstream commits still pending that changed any of the same files.
+`report` SHALL summarise an update in progress or just merged, per upstream. For a `follow` upstream it SHALL give the number of upstream commits merged, the upstream tag of the target when one points at it, the conflicted files and whether each was resolved by hand or by a recorded resolution, and how the repository's own changes relative to that upstream grew or shrank. For a `port` upstream it SHALL give the taken commits in the order they were copied, each with its conflicted files and their resolution source, the commits recorded as `have` because their copy changed nothing, the `skip` and `have` decisions with their notes, the number of commits left pending, and, for each taken commit, the earlier upstream commits still pending that changed any of the same files.
 
 #### Scenario: Report after merge
 - **WHEN** the user runs `report` after resolving conflicts in a `follow` update
@@ -230,7 +242,7 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **THEN** the output lists the taken commit with its conflicts and names the earlier pending commit beside it
 
 ### Requirement: Upstream status
-`status` SHALL fetch every upstream and report, for each, its path, its branch, its mode and its fetched tip. For a `follow` upstream it SHALL report its last synced commit, the number of commits the integration branch lacks, and one state: current, behind, not imported, path removed when a synced path upstream's path no longer exists, rewritten, or unavailable when its URL cannot be fetched or its branch is missing. For a `port` upstream it SHALL report its journal's base, the numbers of taken, decided and pending commits, and one state: current, pending, no base, rewritten, or unavailable. `status --check` SHALL additionally list the files a merge of each behind `follow` upstream's tip would conflict in, create no worktree, branch or state, and exit with a failure status unless every upstream is current, so that it can run on a schedule and gate a cutover or a port review.
+`status` SHALL fetch every upstream and report, for each, its path, its branch, its mode and its fetched tip. For a `follow` upstream it SHALL report its last synced commit with the upstream tag its sync record names, the number of commits the integration branch lacks, and one state: current, behind, not imported, no release when it has a `tags` pattern and its fetched branch has no release tag, path removed when a synced path upstream's path no longer exists, rewritten, or unavailable when its URL cannot be fetched, its branch is missing, or the tags of an upstream with a `tags` pattern cannot be listed. For a `follow` upstream with a `tags` pattern, the newest release takes the place of the tip: `status` SHALL show it as the tip, count the commits the integration branch lacks up to it, predict the conflicts of merging it, and show the fetched branch tip and the number of commits it lies past the release separately. For a `port` upstream it SHALL report its journal's base, the numbers of taken, decided and pending commits, and one state: current, pending, no base, rewritten, or unavailable. `status --check` SHALL additionally list the files a merge of each behind `follow` upstream's tip would conflict in, create no worktree, branch or state, and exit with a failure status unless every upstream is current, so that it can run on a schedule and gate a cutover or a port review.
 
 #### Scenario: Several upstreams
 - **WHEN** `status` runs on a repository with three upstreams, two of them behind
@@ -247,6 +259,18 @@ The tool SHALL keep the state of an update in the repository's common git direct
 #### Scenario: Synced to a chosen target
 - **WHEN** the last update of a `follow` upstream merged a chosen target that lies three commits before the fetched branch tip
 - **THEN** `status` shows that target as the last synced commit, the tip, the state behind and three commits
+
+#### Scenario: Development commits after a release
+- **WHEN** a `follow` upstream with a `tags` pattern has merged its newest release, and its branch holds commits after it
+- **THEN** `status` reports the upstream as current, shows the release as the tip and the branch tip with the number of commits past the release, and `status --check` succeeds
+
+#### Scenario: Newer release
+- **WHEN** a `follow` upstream with a `tags` pattern has a release newer than its last synced commit
+- **THEN** `status` reports the upstream as behind by the commits up to that release, not up to the branch tip
+
+#### Scenario: No release
+- **WHEN** a `follow` upstream with a `tags` pattern has no release tag on its fetched branch
+- **THEN** `status` reports the state no release and `status --check` exits with a failure status
 
 #### Scenario: Port with pending commits
 - **WHEN** `status --check` runs for a `port` upstream with twelve first-parent commits after its base, of which three were taken, two skipped and seven are undecided
@@ -622,7 +646,7 @@ Where the tool compares a URL with an upstream's URL, URLs that name the same re
 - **THEN** it refuses and changes nothing
 
 ### Requirement: Follow update with a fixed target
-For upstreams in `follow` mode, `start` SHALL accept upstream names, each optionally followed by `=` and a revision, and select every configured upstream when none is named. It SHALL fetch the selected upstreams, record as each upstream's target the commit its revision names, or the fetched upstream tip when no revision is given, record the current integration tip as the base, and queue, in configuration order, the selected upstreams whose target the base does not yet contain.
+For upstreams in `follow` mode, `start` SHALL accept upstream names, each optionally followed by `=` and a revision, and select every configured upstream when none is named. It SHALL fetch the selected upstreams, record as each upstream's target the commit its revision names, or, when no revision is given, the newest release of an upstream with a `tags` pattern and the fetched upstream tip of any other, record the current integration tip as the base, and queue, in configuration order, the selected upstreams whose target the base does not yet contain.
 
 #### Scenario: Nothing to update
 - **WHEN** the integration branch already contains every selected target
@@ -672,6 +696,33 @@ For upstreams in `follow` mode, `start` SHALL accept upstream names, each option
 - **WHEN** `start` names one upstream with a revision and another without
 - **THEN** the first is merged at the commit its revision names and the second at its fetched tip, in one update
 
+### Requirement: Release tags as follow targets
+For a `follow` upstream with a `tags` pattern named without a revision, `start` SHALL take as the target the newest release: of the tags of the upstream's repository, listed from its URL, those whose name matches the pattern, is a semantic version without a prerelease part or build metadata once the pattern's literal prefix, and one `v` or `V` after it unless the prefix ends in one, are removed, and points at a commit of the fetched upstream branch, the one with the highest version by semantic versioning precedence. The tool SHALL fetch no tag into the repository. When the integration branch already contains the release, `start` SHALL report the upstream as current. When there is no release, `start` SHALL refuse, name the upstream, its URL and the pattern, and say to name the target as a revision. A revision named for the upstream SHALL override the pattern.
+
+#### Scenario: Newest release by version
+- **WHEN** an upstream with the pattern `v*` has the tags `v0.9.0` and `v0.10.0` on its branch, `v0.9.0` on the newer commit, and commits after both
+- **THEN** `start` takes the commit of `v0.10.0`, and the sync record names the tag `v0.10.0`
+
+#### Scenario: Tags that are not releases
+- **WHEN** an upstream's newest matching tags are a prerelease such as `v1.0.0-rc.1`, a version with build metadata such as `v1.0.0+build.5`, a name that is no semantic version, or a tag on a branch the fetched branch does not contain
+- **THEN** `start` ignores them and takes the newest release among the rest
+
+#### Scenario: Repository tags untouched
+- **WHEN** an update takes an upstream at a release tag
+- **THEN** the repository's tags are the same before and after the update
+
+#### Scenario: Release already taken
+- **WHEN** the integration branch contains the newest release, including after an earlier update took a later commit by naming it
+- **THEN** `start` reports the upstream as current at that release and creates nothing for it
+
+#### Scenario: No release on the branch
+- **WHEN** no tag of the upstream's repository is a release on its fetched branch
+- **THEN** `start` refuses, names the upstream, its URL and the pattern, and creates nothing
+
+#### Scenario: Revision overrides the pattern
+- **WHEN** `start` names an upstream with a `tags` pattern together with a revision of an untagged commit after its newest release
+- **THEN** that commit is the target, and the sync record carries no `Intake-Tag`
+
 ### Requirement: Isolated merge
 A follow update SHALL create a dedicated worktree on a new branch from the base and merge each queued target in turn with its own merge commit: at the repository root for an upstream without a path, and under the upstream's path otherwise.
 
@@ -684,14 +735,14 @@ A follow update SHALL create a dedicated worktree on a new branch from the base 
 - **THEN** the tool names the upstream, lists the conflicted files, leaves the merge in progress in the worktree, reports which upstreams are merged and which are still pending, and tells the user to resolve the conflicts and run `continue`
 
 ### Requirement: Fixed follow target
-A target SHALL NOT change for the rest of the update, and `status` and `report` SHALL show the revision a target was named by. Where the target is shown as its abbreviated commit, a revision that is that commit's own id, full or abbreviated, SHALL NOT be repeated next to it.
+A target and its upstream tag SHALL NOT change for the rest of the update, and `status` and `report` SHALL show the upstream tag of a target, or otherwise the revision it was named by, and `report` SHALL name the revision. Where the target is shown as its abbreviated commit, a revision that is that commit's own id, full or abbreviated, SHALL NOT be repeated next to it.
 
 #### Scenario: Upstream moved during the update
 - **WHEN** an upstream receives new commits after `start`
 - **THEN** the update still merges, verifies and publishes the recorded target
 
 ### Requirement: Revision of a follow target
-A revision named to `start` for a `follow` upstream, without a leading `refs/tags/` or `tags/`, SHALL name a tag of the upstream's repository when it has a tag of that name, and otherwise resolve as a revision of the repository. The tool SHALL fetch no tag into the repository, and SHALL refuse a revision that resolves through one of the repository's own tags, or whose tag it cannot look up on the upstream's URL.
+A revision named to `start` for a `follow` upstream, without a leading `refs/tags/` or `tags/`, SHALL name a tag of the upstream's repository when it has a tag of that name, and otherwise resolve as a revision of the repository. The tool SHALL fetch no tag into the repository, and SHALL refuse a revision that resolves through one of the repository's own tags. `start` SHALL list the tags of every selected `follow` upstream from its URL, and refuse when it cannot.
 
 #### Scenario: Chosen tag
 - **WHEN** the revision is a tag of the upstream's repository on the upstream's branch, and the repository holds a tag of the same name on another commit
@@ -710,7 +761,7 @@ A revision named to `start` for a `follow` upstream, without a leading `refs/tag
 - **THEN** `start` refuses because the revision names no commit in the repository, and creates nothing
 
 #### Scenario: Upstream unreachable for the tag lookup
-- **WHEN** the upstream's URL cannot be asked for the tag after the fetch
+- **WHEN** the upstream's URL cannot be asked for its tags after the fetch
 - **THEN** `start` refuses, names the upstream and its URL with git's error, and creates nothing
 
 ### Requirement: Follow target on the upstream branch

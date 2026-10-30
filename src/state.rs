@@ -205,6 +205,11 @@ pub struct FollowMerge {
     /// The fixed target: the upstream tip fetched by `start`, or the commit
     /// of the revision named for the upstream.
     pub target: String,
+    /// The upstream tag that points at the target, which the sync record
+    /// names: the tag the revision named, the release `tags` selected, or
+    /// another tag of the target.
+    #[serde(default)]
+    pub tag: Option<String>,
     /// The last synced commit before this update, if any.
     pub previous: Option<String>,
     /// Upstream commits the base did not contain.
@@ -214,6 +219,14 @@ pub struct FollowMerge {
     pub head_before: Option<String>,
     pub merge_commit: Option<String>,
     pub conflicts: Vec<ConflictFile>,
+}
+
+impl FollowMerge {
+    /// What the target is shown as named by: its upstream tag, or else the
+    /// revision `start` was given.
+    pub fn named_by<'a>(&'a self, q: &'a QueuedUpstream) -> Option<&'a str> {
+        self.tag.as_deref().or(q.rev.as_deref())
+    }
 }
 
 /// The plan of a port upstream and how far it is carried out.
@@ -664,6 +677,7 @@ mod tests {
             step: UpstreamStep::Conflict,
             work: Work::Follow(FollowMerge {
                 target: "a".repeat(40),
+                tag: Some("v1.0".into()),
                 previous: None,
                 commits: 3,
                 kind: MergeKind::Root,
@@ -718,6 +732,43 @@ mod tests {
         remove(&path).unwrap();
         remove(&path).unwrap();
         assert!(load(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_state_without_tags_reads_without_them() {
+        // Releases before upstream tags were recorded write neither the
+        // `tags` setting nor a follow target's tag.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state = UpdateState::new(
+            config(),
+            "b".repeat(40),
+            dir.path().join("wt"),
+            vec![QueuedUpstream {
+                name: "up".into(),
+                fetched: "c".repeat(40),
+                rev: None,
+                step: UpstreamStep::Pending,
+                work: Work::Follow(FollowMerge {
+                    target: "a".repeat(40),
+                    tag: None,
+                    previous: None,
+                    commits: 1,
+                    kind: MergeKind::Root,
+                    head_before: None,
+                    merge_commit: None,
+                    conflicts: Vec::new(),
+                }),
+            }],
+        );
+        let mut value = serde_json::to_value(&state).unwrap();
+        value["upstreams"][0].as_object_mut().unwrap().remove("tag");
+        value["config"]["upstreams"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("tags");
+        fs::write(&path, value.to_string()).unwrap();
+        assert_eq!(load(&path).unwrap().unwrap(), state);
     }
 
     #[test]

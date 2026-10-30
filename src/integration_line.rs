@@ -184,6 +184,7 @@ mod tests {
             commit: commit.into(),
             upstream: "up".into(),
             target: target.into(),
+            tag: None,
         };
         let records = vec![record("g", "x"), record("s", "t"), record("t", "y")];
         let line = without_upstream_history(line(listing), records);
