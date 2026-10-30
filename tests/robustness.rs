@@ -19,7 +19,7 @@ fn hook(repo: &Path, name: &str, body: &str) {
 }
 
 fn edit_state(repo: &Path, f: impl FnOnce(&mut serde_json::Value)) {
-    let path = repo.join(".git").join("fork-sync").join("state.json");
+    let path = repo.join(".git").join("git-intake").join("state.json");
     let mut state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     f(&mut state);
@@ -73,7 +73,7 @@ fn git_directory_path_segment_is_rejected() {
     let env = &m.env;
     let cfg =
         common::mono_config(&m.a, &m.b, "").replace("path = \"apps/a\"", "path = \"vendor/.Git\"");
-    env.commit(&m.down, &[(".fork-sync.toml", &cfg)], "bad: .git path");
+    env.commit(&m.down, &[(".git-intake.toml", &cfg)], "bad: .git path");
     m.tool(&["status"]).code(2).stderr(contains(
         "path 'vendor/.Git': the path may not contain a '.git' segment",
     ));
@@ -119,7 +119,7 @@ fn finish_never_moves_integration_backwards_or_without_targets() {
 
     // A verified head that does not contain the base.
     env.git(&wt, &["reset", "-q", "--hard", "HEAD^1^"]);
-    env.git(&wt, &["checkout", &base, "--", ".fork-sync.toml"]);
+    env.git(&wt, &["checkout", &base, "--", ".git-intake.toml"]);
     env.git(&wt, &["commit", "-q", "-m", "elsewhere"]);
     f.tool(&["verify"]).success();
     f.tool(&["finish"])
@@ -172,8 +172,8 @@ fn finish_validates_every_checkout_before_moving_anything() {
     fs::remove_file(mirror_wt.join("n.txt")).unwrap();
     f.tool(&["finish"]).success();
     assert_eq!(fs::read_to_string(mirror_wt.join("n.txt")).unwrap(), "n\n");
-    assert!(!env.has_rev(&f.down, "refs/heads/fork-sync/update"));
-    assert!(!env.fork_sync_dir(&f.down).join("state.json").exists());
+    assert!(!env.has_rev(&f.down, "refs/heads/git-intake/update"));
+    assert!(!env.intake_dir(&f.down).join("state.json").exists());
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn interrupted_finish_resumes_and_blocks_abort() {
 
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["update"]["step"], "finishing");
-    assert_eq!(status["update"]["next"], "git fork-sync finish");
+    assert_eq!(status["update"]["next"], "git intake finish");
     f.tool(&["status"])
         .success()
         .stdout(contains("update in progress: finishing"));
@@ -236,7 +236,7 @@ fn merge_log_configuration_does_not_break_the_record() {
     let msg = env.git(&f.down, &["log", "-1", "--format=%B", "main"]);
     assert!(
         msg.trim_end()
-            .ends_with(&format!("Fork-Sync-Target: {target}")),
+            .ends_with(&format!("Intake-Target: {target}")),
         "{msg}"
     );
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
@@ -282,7 +282,7 @@ fn template_pair() -> (Env, common::Upstream, std::path::PathBuf) {
         "integration = \"main\"\nchecks = [\"test -f apps/a/a.txt\"]\n\n[[upstream]]\nname = \"app-a\"\nremote = \"app-a\"\nbranch = \"main\"\nurl = {:?}\npath = \"apps/a\"\n",
         up.url()
     );
-    env.commit(&down, &[(".fork-sync.toml", &cfg)], "mono: configuration");
+    env.commit(&down, &[(".git-intake.toml", &cfg)], "mono: configuration");
     (env, up, down)
 }
 
@@ -374,7 +374,7 @@ fn continue_recognises_a_merge_completed_before_the_state_was_saved() {
     m.tool(&["continue"])
         .success()
         .stdout(contains("app-b: merged as"))
-        .stdout(contains("next: git fork-sync verify"));
+        .stdout(contains("next: git intake verify"));
     m.tool(&["verify"]).success();
 }
 
@@ -385,16 +385,16 @@ fn verify_rejects_an_invalid_merged_configuration() {
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
     let wt = env.update_worktree(&f.down);
-    let good = fs::read_to_string(wt.join(".fork-sync.toml")).unwrap();
+    let good = fs::read_to_string(wt.join(".git-intake.toml")).unwrap();
 
     env.commit(
         &wt,
-        &[(".fork-sync.toml", &format!("{good}\nbogus = 1\n"))],
+        &[(".git-intake.toml", &format!("{good}\nbogus = 1\n"))],
         "bad config",
     );
     let v = f.tool(&["verify"]).code(1);
     assert!(
-        stdout(&v).contains("the merged .fork-sync.toml is invalid"),
+        stdout(&v).contains("the merged .git-intake.toml is invalid"),
         "{}",
         stdout(&v)
     );
@@ -407,7 +407,7 @@ fn verify_rejects_an_invalid_merged_configuration() {
     env.commit(
         &wt,
         &[(
-            ".fork-sync.toml",
+            ".git-intake.toml",
             &good.replace("integration = \"main\"", "integration = \"develop\""),
         )],
         "other integration",
@@ -417,7 +417,7 @@ fn verify_rejects_an_invalid_merged_configuration() {
     ));
     f.tool(&["finish"]).code(2);
 
-    env.commit(&wt, &[(".fork-sync.toml", &good)], "restore config");
+    env.commit(&wt, &[(".git-intake.toml", &good)], "restore config");
     f.tool(&["verify"]).success();
     let _ = stderr(&f.tool(&["finish"]).success());
 }
@@ -539,7 +539,7 @@ fn path_imported_by_subtree_add_is_adopted() {
         "integration = \"main\"\nchecks = [\"test -f apps/a/a.txt\"]\n\n[[upstream]]\nname = \"app-a\"\nremote = \"app-a\"\nbranch = \"main\"\nurl = {:?}\npath = \"apps/a\"\n",
         up.url()
     );
-    env.commit(&down, &[(".fork-sync.toml", &cfg)], "mono: configuration");
+    env.commit(&down, &[(".git-intake.toml", &cfg)], "mono: configuration");
     env.tool(&down, &["fetch"]).success();
     let first = env.rev(&down, "refs/remotes/app-a/main");
     // What `git subtree add --prefix=apps/a` does: no sync record.
@@ -680,7 +680,7 @@ fn twins() -> Twins {
         a.url(),
         b.url()
     );
-    env.commit(&down, &[(".fork-sync.toml", &cfg)], "mono: configuration");
+    env.commit(&down, &[(".git-intake.toml", &cfg)], "mono: configuration");
     Twins { env, a, b, down }
 }
 
@@ -888,7 +888,7 @@ fn recovered_conflict_keeps_recorded_resolution_labels() {
     // Without the saved output, nothing is claimed as a recorded resolution.
     edit_state(&f.down, forget);
     fs::remove_file(
-        env.fork_sync_dir(&f.down)
+        env.intake_dir(&f.down)
             .join("logs")
             .join("merge-upstream.out"),
     )

@@ -133,7 +133,7 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
                 name,
                 CheckStatus::Fail,
                 format!(
-                    "remote '{}' does not exist; `git fork-sync fetch` adds it from {url}",
+                    "remote '{}' does not exist; `git intake fetch` adds it from {url}",
                     up.remote
                 ),
             ),
@@ -314,7 +314,7 @@ fn state_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
             !leftover,
             if leftover {
                 format!(
-                    "no update is in progress, but its worktree or the branch '{UPDATE_BRANCH}' remains; run `git fork-sync abort`"
+                    "no update is in progress, but its worktree or the branch '{UPDATE_BRANCH}' remains; run `git intake abort`"
                 )
             } else {
                 "no update is in progress".to_string()
@@ -361,7 +361,7 @@ fn state_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
             )
         } else {
             format!(
-                "{}; run `git fork-sync abort` to remove the update",
+                "{}; run `git intake abort` to remove the update",
                 problems.join("; ")
             )
         },

@@ -39,13 +39,13 @@ fn status_shows_configuration_values() {
 #[test]
 fn uncommitted_configuration_edit_is_ignored_with_a_notice() {
     let f = Fork::new();
-    let path = f.down.join(".fork-sync.toml");
+    let path = f.down.join(".git-intake.toml");
     let edited = std::fs::read_to_string(&path)
         .unwrap()
         .replace("test -f app.txt", "edited check");
     std::fs::write(&path, edited).unwrap();
     let status = f.tool(&["status"]).success();
-    assert!(stderr(&status).contains("the working copy of .fork-sync.toml differs from the version committed on 'main'; using the committed version"));
+    assert!(stderr(&status).contains("the working copy of .git-intake.toml differs from the version committed on 'main'; using the committed version"));
     assert!(stdout(&status).contains("test -f app.txt"));
     assert!(!stdout(&status).contains("edited check"));
     let json = f.env.tool_json(&f.down, &["status", "--json"], 0);
@@ -59,12 +59,12 @@ fn configuration_is_read_from_the_integration_tip() {
     let env = &f.env;
     // A feature branch with a different committed configuration does not steer the tool.
     env.git(&f.down, &["checkout", "-q", "-b", "feature"]);
-    let cfg = std::fs::read_to_string(f.down.join(".fork-sync.toml"))
+    let cfg = std::fs::read_to_string(f.down.join(".git-intake.toml"))
         .unwrap()
         .replace("test -f app.txt", "feature check");
     env.commit(
         &f.down,
-        &[(".fork-sync.toml", &cfg)],
+        &[(".git-intake.toml", &cfg)],
         "feature: edit config",
     );
     let json = env.tool_json(&f.down, &["status", "--json"], 0);
@@ -79,7 +79,7 @@ fn invalid_configuration_is_refused() {
     let unknown = mono_config(&m.a, &m.b, "").replace("checks =", "squash = true\nchecks =");
     env.commit(
         &m.down,
-        &[(".fork-sync.toml", &unknown)],
+        &[(".git-intake.toml", &unknown)],
         "bad: unknown key",
     );
     m.tool(&["status"])
@@ -87,13 +87,13 @@ fn invalid_configuration_is_refused() {
         .stderr(contains("unknown field `squash`"));
 
     let nested = mono_config(&m.a, &m.b, "").replace("path = \"apps/b\"", "path = \"apps/a/b\"");
-    env.commit(&m.down, &[(".fork-sync.toml", &nested)], "bad: nested");
+    env.commit(&m.down, &[(".git-intake.toml", &nested)], "bad: nested");
     m.tool(&["start"]).code(2).stderr(contains(
         "upstream 'app-b' path 'apps/a/b' lies inside upstream 'app-a' path 'apps/a'",
     ));
 
     let dup = mono_config(&m.a, &m.b, "").replace("remote = \"app-b\"", "remote = \"app-a\"");
-    env.commit(&m.down, &[(".fork-sync.toml", &dup)], "bad: shared remote");
+    env.commit(&m.down, &[(".git-intake.toml", &dup)], "bad: shared remote");
     m.tool(&["fetch"])
         .code(2)
         .stderr(contains("2 upstreams share the remote 'app-a'"));
@@ -101,7 +101,7 @@ fn invalid_configuration_is_refused() {
     let root = mono_config(&m.a, &m.b, "").replace("path = \"apps/b\"\n", "");
     env.commit(
         &m.down,
-        &[(".fork-sync.toml", &root)],
+        &[(".git-intake.toml", &root)],
         "bad: root with others",
     );
     m.tool(&["log"])
@@ -113,11 +113,11 @@ fn invalid_configuration_is_refused() {
     assert_eq!(doctor["checks"][0]["check"], "configuration");
     assert_eq!(doctor["checks"][0]["status"], "fail");
 
-    std::fs::remove_file(m.down.join(".fork-sync.toml")).unwrap();
+    std::fs::remove_file(m.down.join(".git-intake.toml")).unwrap();
     env.git(&m.down, &["commit", "-q", "-am", "remove config"]);
     m.tool(&["status"])
         .code(2)
-        .stderr(contains("no .fork-sync.toml is committed at HEAD"));
+        .stderr(contains("no .git-intake.toml is committed at HEAD"));
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn missing_remote_without_url_is_refused() {
         &format!("url = {:?}\npath = \"apps/b\"", m.b.url()),
         "path = \"apps/b\"",
     );
-    env.commit(&m.down, &[(".fork-sync.toml", &cfg)], "mono: no url for b");
+    env.commit(&m.down, &[(".git-intake.toml", &cfg)], "mono: no url for b");
     m.tool(&["fetch"])
         .code(1)
         .stdout(contains("app-a: fetched app-a/main"))
@@ -200,7 +200,7 @@ fn first_fetch_adds_remotes_and_one_unreachable_upstream_fails() {
         &["remote", "set-url", "app-b", &gone.to_string_lossy()],
     );
     let cfg = mono_config(&m.a, &m.b, "").replace(&m.b.url(), &gone.to_string_lossy());
-    env.commit(&m.down, &[(".fork-sync.toml", &cfg)], "mono: b moved");
+    env.commit(&m.down, &[(".git-intake.toml", &cfg)], "mono: b moved");
     let a2 = env.push_upstream(&m.a, &[("x.txt", "x\n")], "app-a: x");
     let failed = m.tool(&["fetch"]).code(1);
     let out = stdout(&failed);
@@ -274,7 +274,7 @@ fn doctor_healthy_and_dropped_upstream() {
     let cut = cfg.find("\n[[upstream]]\nname = \"app-b\"").unwrap();
     env.commit(
         &m.down,
-        &[(".fork-sync.toml", &cfg[..cut])],
+        &[(".git-intake.toml", &cfg[..cut])],
         "mono: drop app-b",
     );
     let json = env.tool_json(&m.down, &["doctor", "--json"], 0);
@@ -312,7 +312,7 @@ fn doctor_fails_on_dirty_checkout_and_inconsistent_state() {
     std::fs::remove_dir_all(env.update_worktree(&m.down)).unwrap();
     m.tool(&["doctor"])
         .code(1)
-        .stdout(contains("is missing; run `git fork-sync abort`"));
+        .stdout(contains("is missing; run `git intake abort`"));
     m.tool(&["verify"]).code(2).stderr(contains("is missing"));
     m.tool(&["abort"]).success();
     env.assert_no_update(&m.down);

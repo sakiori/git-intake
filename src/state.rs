@@ -10,11 +10,11 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 
 /// The branch an update is built on.
-pub const UPDATE_BRANCH: &str = "fork-sync/update";
+pub const UPDATE_BRANCH: &str = "git-intake/update";
 
 const STATE_VERSION: u32 = 1;
 
-/// Locations under `<git-common-dir>/fork-sync/`.
+/// Locations under `<git-common-dir>/git-intake/`.
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub root: PathBuf,
@@ -26,7 +26,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn new(common_dir: &Path) -> Self {
-        let root = common_dir.join("fork-sync");
+        let root = common_dir.join("git-intake");
         Self {
             state: root.join("state.json"),
             last_update: root.join("last-update.json"),
@@ -258,7 +258,7 @@ mod tests {
         )
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fork-sync").join("state.json");
+        let path = dir.path().join("git-intake").join("state.json");
         assert!(load(&path).unwrap().is_none());
         let state = UpdateState::new(
             cfg,

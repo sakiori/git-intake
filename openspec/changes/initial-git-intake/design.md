@@ -10,7 +10,7 @@ The tool runs the installed `git` for every repository operation instead of link
 
 ## Rust, one binary
 
-The tool serves forks in any language, on developer machines and in scheduled CI jobs. A single static binary needs no runtime on the machine and none in the forks; installing it as `git-fork-sync` on the path makes it available as `git fork-sync`.
+The tool serves forks in any language, on developer machines and in scheduled CI jobs. A single static binary needs no runtime on the machine and none in the forks; installing it as `git-intake` on the path makes it available as `git intake`.
 
 ## Configuration on the integration branch
 
@@ -49,3 +49,13 @@ Upstream URLs are facts about the repository and are committed with it, so a new
 ## Output for agents
 
 Reporting commands produce a JSON document with stable field names alongside the text, and the same exit status. Agents and scheduled jobs act on drift, conflicts and doctor failures without parsing prose, and `status --check` failing on any drift gives a cutover a single gate.
+
+## Distribution
+
+The tool is delivered as prebuilt binaries attached to releases of its own repository, so neither developer machines nor CI jobs of the repositories that use it need a Rust toolchain.
+
+A release is cut by pushing a tag `vX.Y.Z` that matches the crate version. The release pipeline builds static binaries for `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` and `aarch64-apple-darwin`, packs each as `git-intake-vX.Y.Z-<target>.tar.gz` with a SHA-256 checksum, uploads them to the project's generic package registry, and creates a release whose asset links point at them. Musl targets give binaries that run on any Linux distribution and in minimal CI images. Every pipeline, not only a tagged one, builds all targets, so a release never meets a broken build for the first time.
+
+Developers and CI jobs install a pinned version with mise through its GitLab backend, which picks the asset for the running platform by its target triple. On developer machines mise authenticates to the private project with the user's GitLab credentials. In other projects' CI, mise needs an access token with `read_api` scope, because it sends tokens as bearer credentials, which GitLab does not accept for CI job tokens; a job may instead download the release asset directly with its job token once the project's job token allowlist admits it. The pinned version sits in the consuming repository's tool configuration, so an update of the tool is a reviewed change there. `cargo install --git` remains available for contributors who build from source.
+
+The release asset names follow the Rust target triples because both mise's asset selection and human readers recognise them; the crate version and the tag are checked against each other so that a binary never reports a version other than the one it was released as.

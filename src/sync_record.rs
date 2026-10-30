@@ -8,8 +8,8 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::git::{Git, tracking_ref};
 
-pub const UPSTREAM_TRAILER: &str = "Fork-Sync-Upstream";
-pub const TARGET_TRAILER: &str = "Fork-Sync-Target";
+pub const UPSTREAM_TRAILER: &str = "Intake-Upstream";
+pub const TARGET_TRAILER: &str = "Intake-Target";
 
 const FIELD: char = '\u{1f}';
 const RECORD: char = '\u{1e}';
@@ -117,7 +117,7 @@ mod tests {
         let m = message("app-a", "app-a/main", "abc1234", "abc1234ffff");
         assert_eq!(
             m,
-            "sync(app-a): merge app-a/main at abc1234\n\nFork-Sync-Upstream: app-a\nFork-Sync-Target: abc1234ffff\n"
+            "sync(app-a): merge app-a/main at abc1234\n\nIntake-Upstream: app-a\nIntake-Target: abc1234ffff\n"
         );
     }
 

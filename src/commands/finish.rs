@@ -73,8 +73,8 @@ pub fn run(repo: &Repo, no_publish: bool) -> Result<Exit> {
                 repo.save_state(&state)?;
                 bail!(
                     "the local branches are advanced, but pushing to '{publish}' was rejected: {err}\n\
-                     Nothing was published, and the update stays in its finishing step. Run `git fork-sync finish` \
-                     to retry the same push, or `git fork-sync finish --no-publish` to close the update locally. \
+                     Nothing was published, and the update stays in its finishing step. Run `git intake finish` \
+                     to retry the same push, or `git intake finish --no-publish` to close the update locally. \
                      If '{publish}' holds work the local branches lack, close the update with `finish --no-publish`, \
                      merge that work, and publish the result through a new verified update or the repository's usual review. \
                      Never force-push."
@@ -103,14 +103,14 @@ fn plan(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
     let open: Vec<&str> = state.unmerged().iter().map(|u| u.name.as_str()).collect();
     if !open.is_empty() {
         bail!(
-            "upstreams are not merged yet: {}; run `git fork-sync continue`",
+            "upstreams are not merged yet: {}; run `git intake continue`",
             open.join(", ")
         );
     }
     let verification = match &state.verification {
-        None => bail!("the update is not verified; run `git fork-sync verify`"),
+        None => bail!("the update is not verified; run `git intake verify`"),
         Some(v) if !v.passed => bail!(
-            "verification of {} failed; fix the update and run `git fork-sync verify` again",
+            "verification of {} failed; fix the update and run `git intake verify` again",
             abbrev(&v.commit)
         ),
         Some(v) => v.clone(),
@@ -118,14 +118,14 @@ fn plan(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
     let wt = Git::worktree(&state.worktree);
     if wt.merge_in_progress()? || !wt.tracked_changes()?.is_empty() {
         bail!(
-            "the update worktree {} has uncommitted changes or a merge in progress; commit or discard them and run `git fork-sync verify` again",
+            "the update worktree {} has uncommitted changes or a merge in progress; commit or discard them and run `git intake verify` again",
             state.worktree.display()
         );
     }
     let head = wt.line(&["rev-parse", "HEAD"])?;
     if head != verification.commit {
         bail!(
-            "the update branch is at {} but {} was verified; run `git fork-sync verify` for the new commit",
+            "the update branch is at {} but {} was verified; run `git intake verify` for the new commit",
             abbrev(&head),
             abbrev(&verification.commit)
         );
@@ -135,7 +135,7 @@ fn plan(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
     if tip.as_deref() != Some(state.base.as_str()) {
         bail!(
             "'{integration}' moved from {} to {} since the update started; the update must merge the new integration tip and be verified again: \
-             run `git fork-sync abort`, then `git fork-sync start` (recorded resolutions are reapplied), `verify` and `finish`",
+             run `git intake abort`, then `git intake start` (recorded resolutions are reapplied), `verify` and `finish`",
             abbrev(&state.base),
             tip.as_deref().map(abbrev).unwrap_or("nothing")
         );
@@ -145,7 +145,7 @@ fn plan(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
     if !git.is_ancestor(&state.base, &head)? {
         bail!(
             "the update branch at {} does not contain the base {}; '{integration}' can only fast-forward. \
-             Run `git fork-sync abort` and start again",
+             Run `git intake abort` and start again",
             abbrev(&head),
             abbrev(&state.base)
         );
@@ -158,7 +158,7 @@ fn plan(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
         .collect();
     if !missing.is_empty() {
         bail!(
-            "the update branch at {} does not contain the targets of:\n{}\nrun `git fork-sync abort` and start again",
+            "the update branch at {} does not contain the targets of:\n{}\nrun `git intake abort` and start again",
             abbrev(&head),
             bullet(&missing)
         );
@@ -222,7 +222,7 @@ fn validate_checkout(dir: &Path, branch: &str, old: &str, new: &str) -> Result<(
     let out = git.raw(&["read-tree", "-n", "-m", "-u", old, new])?;
     if !out.success() {
         bail!(
-            "'{branch}' is checked out in {} and cannot follow the fast-forward: {}\nmove those files away, then run `git fork-sync finish` again",
+            "'{branch}' is checked out in {} and cannot follow the fast-forward: {}\nmove those files away, then run `git intake finish` again",
             dir.display(),
             out.stderr.trim()
         );
@@ -254,7 +254,7 @@ fn apply(repo: &Repo, m: &PlannedMove) -> Result<()> {
     if current != m.old {
         bail!(
             "'{}' is at {}, neither its value before finish ({}) nor the planned {}; it was moved outside the update. \
-             Restore it or move it to {} by hand, then run `git fork-sync finish` again",
+             Restore it or move it to {} by hand, then run `git intake finish` again",
             m.branch,
             current.as_deref().map(abbrev).unwrap_or("nothing"),
             m.old.as_deref().map(abbrev).unwrap_or("nothing"),
@@ -271,7 +271,7 @@ fn apply(repo: &Repo, m: &PlannedMove) -> Result<()> {
             git.run(&[
                 "update-ref",
                 "-m",
-                "fork-sync: finish",
+                "git-intake: finish",
                 &branch_ref(&m.branch),
                 &m.new,
                 m.old.as_deref().unwrap_or(""),

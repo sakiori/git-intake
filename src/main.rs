@@ -1,4 +1,4 @@
-//! `git fork-sync`: merge-based, verified, resumable updates of a downstream
+//! `git intake`: merge-based, verified, resumable updates of a downstream
 //! repository from one or more upstreams.
 
 mod commands;
@@ -30,8 +30,8 @@ const ERROR_STATUS: u8 = 2;
 
 #[derive(Parser)]
 #[command(
-    name = "git-fork-sync",
-    bin_name = "git fork-sync",
+    name = "git-intake",
+    bin_name = "git intake",
     version,
     about = "Merge-based, verified, resumable updates of a repository from its upstreams"
 )]

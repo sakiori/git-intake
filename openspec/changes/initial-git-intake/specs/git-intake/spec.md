@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Fork configuration
-The tool SHALL read a repository's settings from a `.fork-sync.toml` file committed on the integration branch: the integration branch, an optional publish remote, an install command, an ordered list of check commands, and an ordered list of upstreams. Each upstream SHALL have a unique name, a remote, a branch, and optionally a remote URL, a path inside the repository, and a mirror branch. An upstream without a path is merged at the repository root. The tool SHALL read the committed file from the integration branch tip, not from a working tree, and SHALL refuse to run when the file is missing or invalid, naming the problem.
+The tool SHALL read a repository's settings from a `.git-intake.toml` file committed on the integration branch: the integration branch, an optional publish remote, an install command, an ordered list of check commands, and an ordered list of upstreams. Each upstream SHALL have a unique name, a remote, a branch, and optionally a remote URL, a path inside the repository, and a mirror branch. An upstream without a path is merged at the repository root. The tool SHALL read the committed file from the integration branch tip, not from a working tree, and SHALL refuse to run when the file is missing or invalid, naming the problem.
 
 #### Scenario: Valid configuration
 - **WHEN** the integration branch carries a valid configuration

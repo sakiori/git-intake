@@ -161,7 +161,7 @@ fn conflict_then_continue_merges_the_next_upstream() {
         .success()
         .stdout(contains("app-a: merged as"))
         .stdout(contains("app-b: merged as"))
-        .stdout(contains("next: git fork-sync verify"));
+        .stdout(contains("next: git intake verify"));
     m.tool(&["verify"]).success();
     m.tool(&["finish"]).success();
     assert_eq!(
@@ -171,7 +171,7 @@ fn conflict_then_continue_merges_the_next_upstream() {
     assert_eq!(env.rev(&m.down, "main^2"), b2);
     assert!(m.down.join("apps/b/b2.txt").exists());
     let msg = env.git(&m.down, &["log", "-1", "--format=%B", "main^1"]);
-    assert!(msg.contains("Fork-Sync-Upstream: app-a"), "{msg}");
+    assert!(msg.contains("Intake-Upstream: app-a"), "{msg}");
 }
 
 #[test]
@@ -192,7 +192,7 @@ fn abort_restores_everything() {
     m.tool(&["abort"])
         .success()
         .stdout(contains("removed worktree"))
-        .stdout(contains("removed branch fork-sync/update"));
+        .stdout(contains("removed branch git-intake/update"));
     env.assert_no_update(&m.down);
     assert_eq!(env.rev(&m.down, "main"), main);
     assert_eq!(env.rev(&m.down, "mirror-a"), mirror);
@@ -253,7 +253,7 @@ fn status_reports_three_upstreams_with_counts() {
     );
     env.commit(
         &m.down,
-        &[(".fork-sync.toml", &mono_config(&m.a, &m.b, &extra))],
+        &[(".git-intake.toml", &mono_config(&m.a, &m.b, &extra))],
         "mono: add app-c",
     );
     m.import_all();

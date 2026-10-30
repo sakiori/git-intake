@@ -1,27 +1,71 @@
-# fork-sync
+# git-intake
 
-`git fork-sync` keeps a downstream repository current with one or more upstreams. It takes upstream changes by merge commits, never rewrites history and never force-pushes. The merges happen in a separate worktree. A conflict is resolved once, and the repository's own checks run on exactly the tree that gets published. The integration branch moves only by fast-forward, after verification.
+`git intake` keeps a downstream repository current with one or more upstreams. It takes upstream changes by merge commits, never rewrites history and never force-pushes. The merges happen in a separate worktree. A conflict is resolved once, and the repository's own checks run on exactly the tree that gets published. The integration branch moves only by fast-forward, after verification.
 
 It covers two cases:
 
 - **A fork**: one upstream merged at the repository root. A branch stacked on another fork's integration branch is a fork too, with that branch as its upstream.
 - **A monorepo assembled from several repositories**: each source repository is an upstream merged under its own path. They keep being taken in until cutover, and `status --check` gates the cutover.
 
-The tool runs the installed `git` for every repository operation. Each repository describes itself in a committed `.fork-sync.toml`.
+The tool runs the installed `git` for every repository operation. Each repository describes itself in a committed `.git-intake.toml`.
 
-## Install
+## Installation
 
-Requires Git 2.43 or later (`git merge-tree -X` is used for conflict prediction) and a POSIX `sh`.
+Requires Git 2.43 or later (`git merge-tree -X` is used for conflict prediction) and a POSIX `sh`. The tool is a single binary named `git-intake`; with it on the `PATH`, git runs it as `git intake`.
+
+Releases provide prebuilt binaries for the targets `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` and `aarch64-apple-darwin`. The musl binaries are statically linked and run on any Linux distribution and in minimal CI images.
+
+### With mise
+
+Pin the version in the repository's tool configuration, so that an update of the tool is a reviewed change:
 
 ```sh
-cargo install --path .
+mise use gitlab:sakiori-oss/git-intake@0.1.0
 ```
 
-This installs the `git-fork-sync` binary. With it on the `PATH`, git runs it as `git fork-sync`.
+mise's GitLab backend picks the release asset for the running platform by its target triple.
+
+### Direct download
+
+Each release lists its archives, `git-intake-vX.Y.Z-<target>.tar.gz`, with a `.sha256` checksum next to each. The binary sits at the archive root. They can be downloaded directly:
+
+```sh
+version=0.1.0
+target=x86_64-unknown-linux-musl
+file="git-intake-v$version-$target.tar.gz"
+base="https://gitlab.com/sakiori-oss/git-intake/-/releases/v$version/downloads/binaries"
+curl --fail --location --remote-name "$base/$file"
+curl --fail --location --remote-name "$base/$file.sha256"
+sha256sum -c "$file.sha256"
+tar -xzf "$file" -C /usr/local/bin git-intake
+```
+
+### From source
+
+Contributors with a Rust toolchain can build any revision:
+
+```sh
+cargo install --locked --git https://gitlab.com/sakiori-oss/git-intake.git --tag v0.1.0
+```
+
+From a checkout, `cargo install --locked --path .` installs the working tree.
+
+## Releasing
+
+1. Set the new version in `Cargo.toml`, run `cargo build` so that `Cargo.lock` follows, and merge the change.
+2. Tag that commit `vX.Y.Z` with the same version and push the tag.
+
+Every pipeline builds the release archives for all targets. On a tag, the pipeline also does the following:
+
+1. It refuses a tag that differs from `v` plus the crate version.
+2. It uploads the archives and checksums to the project's generic package registry.
+3. It creates the release with links to them.
+
+`git intake --version` reports the crate version, so a released binary always names its release.
 
 ## Configuration
 
-`.fork-sync.toml` lives at the repository root and is committed on the integration branch. The tool always reads the version committed at the integration branch tip. An uncommitted edit in the working copy is ignored, and the tool prints a note that the working copy differs. The tool finds the integration branch from the configuration committed at `HEAD`, or from the update in progress, so run it from a checkout of the integration branch or of a branch that carries the configuration.
+`.git-intake.toml` lives at the repository root and is committed on the integration branch. The tool always reads the version committed at the integration branch tip. An uncommitted edit in the working copy is ignored, and the tool prints a note that the working copy differs. The tool finds the integration branch from the configuration committed at `HEAD`, or from the update in progress, so run it from a checkout of the integration branch or of a branch that carries the configuration.
 
 ```toml
 integration = "main"                  # the branch that receives upstream merges
@@ -47,16 +91,16 @@ Validation rules. The tool refuses to run when any of them is broken, and it nam
 - Paths may not nest; one upstream's path cannot lie inside another's.
 - An upstream at the root must be the only upstream.
 - `publish` may not be an upstream's remote, because the tool never pushes to an upstream.
-- A mirror may be neither the integration branch nor `fork-sync/update`.
+- A mirror may be neither the integration branch nor `git-intake/update`.
 
 ## The update cycle
 
 ```sh
-git fork-sync start        # fetch, fix targets, merge each upstream with new commits
+git intake start        # fetch, fix targets, merge each upstream with new commits
 # on conflict: resolve in the update worktree, `git add`, then
-git fork-sync continue     # conclude the merge, merge the remaining upstreams
-git fork-sync verify       # run install and checks on the merged result
-git fork-sync finish       # fast-forward, publish, clean up
+git intake continue     # conclude the merge, merge the remaining upstreams
+git intake verify       # run install and checks on the merged result
+git intake finish       # fast-forward, publish, clean up
 ```
 
 `start` refuses to begin if any of these hold:
@@ -73,7 +117,7 @@ When `start` runs, it does the following:
 1. Fetches the selected upstreams. With no names it selects all of them.
 2. Records each fetched tip as that upstream's **target** and the integration tip as the **base**. Targets never change during the update, even if the upstream moves on.
 3. Queues, in configuration order, the upstreams whose target the base does not contain yet. The others are reported as current. If nothing is queued, nothing is created.
-4. Creates the worktree `<git-common-dir>/fork-sync/worktree` on the branch `fork-sync/update` from the base. The main checkout is never touched.
+4. Creates the worktree `<git-common-dir>/git-intake/worktree` on the branch `git-intake/update` from the base. The main checkout is never touched.
 5. Enables `rerere.enabled` for the repository. A resolution recorded in one attempt is reapplied when the same conflict recurs, and the tool reports such files as *resolved by a recorded resolution*. Review those files and stage them like any other resolution.
 6. Merges each queued target with its own merge commit:
    - a root upstream: `git merge --no-ff`;
@@ -85,9 +129,9 @@ When `start` runs, it does the following:
 
 On a conflict the tool stops with exit status 1. It names the upstream, lists the conflicted files, and reports which upstreams are merged and which are pending. A file is labelled *resolved by a recorded resolution* only when git's rerere reports that it resolved it (including files `rerere.autoupdate` already staged); every other conflicted file waits for a resolution by hand. Resolve the files in the worktree, stage them, and run `continue`. If one upstream cannot be resolved now, `abort` and run `start` again with only the other upstreams named. Recorded resolutions make the repeated merges cheap.
 
-`verify` runs `install` and then every check through `sh -c` in the update worktree. Each command's output goes to its own log under `<git-common-dir>/fork-sync/logs/`. If `install` fails, the checks are skipped. Verification fails in any of these cases:
+`verify` runs `install` and then every check through `sh -c` in the update worktree. Each command's output goes to its own log under `<git-common-dir>/git-intake/logs/`. If `install` fails, the checks are skipped. Verification fails in any of these cases:
 
-- the merged `.fork-sync.toml` is missing or invalid, or names a different integration branch (the commands are then skipped);
+- the merged `.git-intake.toml` is missing or invalid, or names a different integration branch (the commands are then skipped);
 
 - a command fails or is skipped;
 - the commands change tracked files;
@@ -120,8 +164,8 @@ Every merge commit the tool creates looks like this:
 ```
 sync(app-a): merge app-a/main at 1a2b3c4
 
-Fork-Sync-Upstream: app-a
-Fork-Sync-Target: <full commit id>
+Intake-Upstream: app-a
+Intake-Target: <full commit id>
 ```
 
 An upstream's **last synced commit** is the target in the newest such commit on the integration branch's first-parent line. It is not stored anywhere else. An upstream without a record has its last synced commit taken from the history instead, and the decision depends only on the integration branch and that upstream's own branch, never on other upstreams or on which of them are fetched. For a root upstream, such as a fork created by cloning, it is the newest upstream commit the integration branch contains. For a path upstream, it is the second parent of the newest merge on the integration branch's first-parent line whose second parent belongs to the upstream's branch and which changes the upstream's path. That is the merge `git subtree add` or `git subtree pull` leaves, so ancestry shared through a template does not count, and the import still counts when another upstream later merges this one's history. `status` says so in text, and `status --json` marks the source as `history` instead of `record`. The first update writes a record. Only this repository's own records count. Records inside a configured upstream's fetched branch are skipped; this happens, for example, when a stacked branch starts from another fork's integration line that carries that fork's records. The tool's merges always stay on the first-parent line because `finish` only fast-forwards to the update branch, where each merge takes the previous head as its first parent. If an upstream's branch no longer contains its last synced commit, the upstream was rewritten: `status` reports it and `start` refuses to update it.
@@ -159,17 +203,17 @@ An upstream's **last synced commit** is the target in the newest such commit on 
 ## Monorepo migration
 
 1. Commit a configuration that lists one `[[upstream]]` per source repository, each with its own `path` and `url`.
-2. Run `git fork-sync start`. Each source is imported under its path with its full history, then verified and finished like any update. A path imported earlier with `git subtree add` is adopted by its first update. A path that holds content unrelated to the source's history is refused, and so is an import that would replace a file.
+2. Run `git intake start`. Each source is imported under its path with its full history, then verified and finished like any update. A path imported earlier with `git subtree add` is adopted by its first update. A path that holds content unrelated to the source's history is refused, and so is an import that would replace a file.
 3. Until cutover, keep taking the sources in with the same cycle. Conflicts against the monorepo's new layout are resolved once and recorded. Files moved within an upstream's path merge as renames. Files moved out of the path may conflict or arrive at their old location; resolve them like any other conflict.
-4. Run `git fork-sync status --check` on a schedule. It fails whenever a source has moved on and lists the files that would conflict. Zero drift, meaning every upstream is current, is the cutover gate.
-5. Before freezing the sources, run `git fork-sync branches` to find work left on other branches of each source. It reports when no upstream holds unmerged work.
+4. Run `git intake status --check` on a schedule. It fails whenever a source has moved on and lists the files that would conflict. Zero drift, meaning every upstream is current, is the cutover gate.
+5. Before freezing the sources, run `git intake branches` to find work left on other branches of each source. It reports when no upstream holds unmerged work.
 6. After cutover, remove an upstream from the configuration. `doctor` keeps warning about upstreams that are dropped but still have sync records, so the removal is visible.
 
 ## Safety properties
 
 - The tool never rewrites history and never force-pushes. Local branches only fast-forward.
 - It never pushes to an upstream remote. `publish` may not be an upstream's remote.
-- Nothing is written to the main working tree. The update lives in its own worktree, on `fork-sync/update`, with its state in `<git-common-dir>/fork-sync/`, which every worktree shares and no commit can carry.
+- Nothing is written to the main working tree. The update lives in its own worktree, on `git-intake/update`, with its state in `<git-common-dir>/git-intake/`, which every worktree shares and no commit can carry.
 - Each target is fixed when the update starts. What is merged, verified and published is the same commit.
 - `finish` moves no ref unless the verified commit is the worktree head, the base is still the integration tip, and every move is a fast-forward. It validates every move before making any, and it can be resumed.
 - Publication is a single atomic push of exactly the planned commits. If any branch is rejected, none moves on the remote; nothing unverified is ever published by a retry, and `finish --no-publish` closes an update that cannot be published.

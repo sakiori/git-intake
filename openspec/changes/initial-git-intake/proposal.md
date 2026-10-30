@@ -8,7 +8,7 @@ The same procedure applies to a monorepo assembled from several repositories tha
 
 ## What changes
 
-A single command-line tool, `git fork-sync`, drives the update of any repository that describes itself in a committed configuration file. The tool owns the procedure; each repository owns its facts: its integration branch, its upstreams (for each, the remote, branch, optional URL, optional path inside the repository and optional mirror branch), where to publish, and how to install and check the result. A fork has one upstream at the repository root; a monorepo in migration has one upstream per source repository, each under its own path.
+A single command-line tool, `git intake`, drives the update of any repository that describes itself in a committed configuration file. The tool owns the procedure; each repository owns its facts: its integration branch, its upstreams (for each, the remote, branch, optional URL, optional path inside the repository and optional mirror branch), where to publish, and how to install and check the result. A fork has one upstream at the repository root; a monorepo in migration has one upstream per source repository, each under its own path.
 
 The model is merge-based. The integration branch takes upstream by a merge commit, its history is never rewritten, and nothing is force-pushed. A downstream branch stacked on another fork's integration branch is updated by the same tool and model, with that branch as its upstream.
 
@@ -18,7 +18,7 @@ One update takes every selected upstream that has new commits, each by its own m
 
 ### New capabilities
 
-- `fork-sync`: configured, resumable updates of a repository from one or more upstreams, each at the root or under its own path, with fixed targets, isolated merges, recorded verification, guarded publication and per-upstream status.
+- `git-intake`: configured, resumable updates of a repository from one or more upstreams, each at the root or under its own path, with fixed targets, isolated merges, recorded verification, guarded publication and per-upstream status.
 
 ### Modified capabilities
 

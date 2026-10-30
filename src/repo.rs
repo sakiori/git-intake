@@ -60,7 +60,7 @@ impl Repo {
     pub fn require_state(&self) -> Result<UpdateState> {
         match self.state()? {
             Some(s) => Ok(s),
-            None => bail!("no update is in progress; run `git fork-sync start` to begin one"),
+            None => bail!("no update is in progress; run `git intake start` to begin one"),
         }
     }
 

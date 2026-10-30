@@ -1,4 +1,4 @@
-//! The repository's committed `.fork-sync.toml`: parsing and validation.
+//! The repository's committed `.git-intake.toml`: parsing and validation.
 
 use std::collections::HashMap;
 
@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// File name of the configuration at the repository root.
-pub const FILE_NAME: &str = ".fork-sync.toml";
+pub const FILE_NAME: &str = ".git-intake.toml";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

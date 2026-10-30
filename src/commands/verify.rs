@@ -30,12 +30,12 @@ pub fn run(repo: &Repo) -> Result<Exit> {
         .collect();
     if !open.is_empty() {
         bail!(
-            "cannot verify before every queued upstream is merged; these still need `git fork-sync continue`:\n{}",
+            "cannot verify before every queued upstream is merged; these still need `git intake continue`:\n{}",
             bullet(&open)
         );
     }
     if state.finishing.is_some() {
-        bail!("`finish` is in progress; run `git fork-sync finish` to complete it");
+        bail!("`finish` is in progress; run `git intake finish` to complete it");
     }
     let wt = Git::worktree(&state.worktree);
     if wt.merge_in_progress()? {
@@ -142,11 +142,11 @@ pub fn run(repo: &Repo) -> Result<Exit> {
     });
     repo.save_state(&state)?;
     if passed {
-        println!("verified {}; next: git fork-sync finish", abbrev(&head));
+        println!("verified {}; next: git intake finish", abbrev(&head));
         Ok(Exit::Success)
     } else {
         println!(
-            "verification failed; fix it on the update branch in {}, commit, and run `git fork-sync verify` again",
+            "verification failed; fix it on the update branch in {}, commit, and run `git intake verify` again",
             state.worktree.display()
         );
         Ok(Exit::Negative)

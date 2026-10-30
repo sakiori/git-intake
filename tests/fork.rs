@@ -18,7 +18,7 @@ fn full_cycle_merges_verifies_and_publishes() {
 
     let start = f.tool(&["start"]).success();
     assert!(stdout(&start).contains("upstream: queued at"));
-    assert!(stdout(&start).contains("next: git fork-sync verify"));
+    assert!(stdout(&start).contains("next: git intake verify"));
     let wt = env.update_worktree(&f.down);
     assert!(wt.join("new.txt").exists());
     assert_eq!(
@@ -37,18 +37,18 @@ fn full_cycle_merges_verifies_and_publishes() {
     let status = f.tool(&["status"]).success();
     let text = stdout(&status);
     assert!(text.contains("update in progress: merged"), "{text}");
-    assert!(text.contains("next: git fork-sync verify"), "{text}");
+    assert!(text.contains("next: git intake verify"), "{text}");
     assert!(text.contains(&format!("target {}", &t1[..12])), "{text}");
 
     f.tool(&["verify"]).success().stdout(contains("verified"));
     assert!(
-        env.fork_sync_dir(&f.down)
+        env.intake_dir(&f.down)
             .join("logs")
             .join("01-install.log")
             .exists()
     );
     assert!(
-        env.fork_sync_dir(&f.down)
+        env.intake_dir(&f.down)
             .join("logs")
             .join("02-check.log")
             .exists()
@@ -70,8 +70,8 @@ fn full_cycle_merges_verifies_and_publishes() {
         )),
         "{msg}"
     );
-    assert!(msg.contains("Fork-Sync-Upstream: upstream"), "{msg}");
-    assert!(msg.contains(&format!("Fork-Sync-Target: {t1}")), "{msg}");
+    assert!(msg.contains("Intake-Upstream: upstream"), "{msg}");
+    assert!(msg.contains(&format!("Intake-Target: {t1}")), "{msg}");
     assert_eq!(env.rev(&f.down, "upstream-main"), t1);
     assert!(!env.is_ancestor(&f.down, &t2, "main"));
     // The main checkout followed the fast-forward.
@@ -170,7 +170,7 @@ fn commit_after_verify_blocks_finish() {
     env.commit(&wt, &[("fix.txt", "fix\n")], "fork: adapt to upstream");
     f.tool(&["finish"])
         .code(2)
-        .stderr(contains("run `git fork-sync verify` for the new commit"));
+        .stderr(contains("run `git intake verify` for the new commit"));
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["update"]["step"], "merged");
     f.tool(&["verify"]).success();
@@ -202,12 +202,12 @@ fn failed_install_skips_checks() {
     let f = Fork::with_checks(&env_checks);
     let env = &f.env;
     // Replace the install command with a failing one.
-    let cfg = std::fs::read_to_string(f.down.join(".fork-sync.toml"))
+    let cfg = std::fs::read_to_string(f.down.join(".git-intake.toml"))
         .unwrap()
         .replace("install = \"true\"", "install = \"exit 3\"");
     env.commit(
         &f.down,
-        &[(".fork-sync.toml", &cfg)],
+        &[(".git-intake.toml", &cfg)],
         "fork: failing install",
     );
     env.git(&f.down, &["push", "-q", "origin", "main"]);
@@ -266,7 +266,7 @@ fn remote_moved_rejects_push_without_force() {
     let err = stderr(&finish);
     assert!(err.contains("the local branches are advanced"), "{err}");
     assert!(
-        err.contains("`git fork-sync finish --no-publish` to close the update locally"),
+        err.contains("`git intake finish --no-publish` to close the update locally"),
         "{err}"
     );
     assert!(
@@ -276,7 +276,7 @@ fn remote_moved_rejects_push_without_force() {
         "{err}"
     );
     assert!(
-        !err.contains("run the checks, then run `git fork-sync finish`"),
+        !err.contains("run the checks, then run `git intake finish`"),
         "{err}"
     );
     assert_eq!(
@@ -300,10 +300,10 @@ fn remote_moved_rejects_push_without_force() {
             .contains("finish --no-publish")
     );
     f.tool(&["abort"]).code(2).stderr(contains(
-        "can no longer be aborted. Run `git fork-sync finish`",
+        "can no longer be aborted. Run `git intake finish`",
     ));
     f.tool(&["start"]).code(2).stderr(contains(
-        "`git fork-sync finish --no-publish` to close it locally",
+        "`git intake finish --no-publish` to close it locally",
     ));
 
     // Merging the remote's work locally does not get it published by this update.
@@ -391,7 +391,7 @@ fn status_check_reports_drift_and_conflicts_without_changes() {
     );
     env.assert_no_update(&f.down);
     assert!(
-        !env.fork_sync_dir(&f.down).exists(),
+        !env.intake_dir(&f.down).exists(),
         "status --check wrote state"
     );
     let refs_after = env.git(&f.down, &["for-each-ref"]);
@@ -447,7 +447,7 @@ fn recorded_resolution_is_reapplied_after_abort() {
         "{out}"
     );
     assert!(out.contains("app.txt  (unresolved)"), "{out}");
-    assert!(out.contains("run `git fork-sync continue`"), "{out}");
+    assert!(out.contains("run `git intake continue`"), "{out}");
 
     let wt = env.update_worktree(&f.down);
     f.tool(&["continue"])
@@ -521,7 +521,7 @@ fn stacked_downstream_branch_follows_another_fork() {
     );
     env.commit(
         &stacked,
-        &[(".fork-sync.toml", &config)],
+        &[(".git-intake.toml", &config)],
         "stacked: configuration",
     );
 
@@ -535,7 +535,7 @@ fn stacked_downstream_branch_follows_another_fork() {
         &[
             "log",
             "-1",
-            "--format=%(trailers:key=Fork-Sync-Upstream,valueonly)",
+            "--format=%(trailers:key=Intake-Upstream,valueonly)",
             "develop^",
         ],
     );
@@ -549,7 +549,7 @@ fn stacked_downstream_branch_follows_another_fork() {
         &[
             "log",
             "-1",
-            "--format=%(trailers:key=Fork-Sync-Target,valueonly)",
+            "--format=%(trailers:key=Intake-Target,valueonly)",
             "develop^",
         ],
     );
@@ -640,7 +640,7 @@ fn atomic_push_publishes_nothing_when_one_ref_is_rejected() {
     let err = stderr(&finish);
     assert!(err.contains("pushing to 'origin' was rejected"), "{err}");
     assert!(
-        err.contains("`git fork-sync finish --no-publish` to close the update locally"),
+        err.contains("`git intake finish --no-publish` to close the update locally"),
         "{err}"
     );
     assert!(
@@ -650,7 +650,7 @@ fn atomic_push_publishes_nothing_when_one_ref_is_rejected() {
         "{err}"
     );
     assert!(
-        !err.contains("run the checks, then run `git fork-sync finish`"),
+        !err.contains("run the checks, then run `git intake finish`"),
         "{err}"
     );
     assert_eq!(
@@ -697,7 +697,7 @@ fn merge_concluded_by_hand_is_accepted_by_continue() {
         &[
             "log",
             "-1",
-            "--format=%(trailers:key=Fork-Sync-Target,valueonly)",
+            "--format=%(trailers:key=Intake-Target,valueonly)",
         ],
     );
     assert_eq!(trailer, target);

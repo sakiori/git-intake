@@ -20,12 +20,12 @@ pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
     if let Some(state) = repo.state()? {
         if state.finishing.is_some() {
             bail!(
-                "the previous update is finishing; run `git fork-sync finish` to publish it, \
-                 or `git fork-sync finish --no-publish` to close it locally"
+                "the previous update is finishing; run `git intake finish` to publish it, \
+                 or `git intake finish --no-publish` to close it locally"
             );
         }
         bail!(
-            "an update is already in progress (worktree {}); run `git fork-sync status` to see it, then `continue`, `verify`, `finish` or `abort`",
+            "an update is already in progress (worktree {}); run `git intake status` to see it, then `continue`, `verify`, `finish` or `abort`",
             state.worktree.display()
         );
     }
@@ -34,7 +34,7 @@ pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
         || repo.update_branch_exists()?
     {
         bail!(
-            "an interrupted update left its worktree or the branch '{UPDATE_BRANCH}' behind; run `git fork-sync abort` to remove them"
+            "an interrupted update left its worktree or the branch '{UPDATE_BRANCH}' behind; run `git intake abort` to remove them"
         );
     }
     let config = repo.load_config()?.config;
@@ -339,7 +339,7 @@ fn merge_pending(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
             }
         }
     }
-    println!("every queued upstream is merged; next: git fork-sync verify");
+    println!("every queued upstream is merged; next: git intake verify");
     Ok(Exit::Success)
 }
 
@@ -456,7 +456,7 @@ fn import(wt: &Git, up: &Upstream, target: &str, msg: &str) -> Result<()> {
         }
         return Err(err.context(format!(
             "importing upstream '{}' under '{path}' failed; the import was undone and the upstream is still pending. \
-             Fix the cause, then run `git fork-sync continue`, or run `git fork-sync abort`",
+             Fix the cause, then run `git intake continue`, or run `git intake abort`",
             up.name
         )));
     }
@@ -494,7 +494,7 @@ fn confirm_merged(wt: &Git, up: &Upstream, target: &str) -> Result<String> {
         bail!(
             "the merge of upstream '{}' at {} in {} is not a complete sync merge:\n{}\n\
              a hook or configuration may have changed the merge; correct the commit (expected message below) \
-             and run `git fork-sync continue`, or run `git fork-sync abort`:\n\n{}",
+             and run `git intake continue`, or run `git intake abort`:\n\n{}",
             up.name,
             abbrev(&head),
             wt.dir().display(),
@@ -561,7 +561,7 @@ fn print_conflict(state: &UpdateState, i: usize, stderr: &str) {
     println!("merged: {}", list_or_none(&merged));
     println!("pending: {}", list_or_none(&pending));
     println!(
-        "resolve the conflicts in {}, stage them with `git add`, then run `git fork-sync continue`",
+        "resolve the conflicts in {}, stage them with `git add`, then run `git intake continue`",
         state.worktree.display()
     );
 }
@@ -570,7 +570,7 @@ fn print_conflict(state: &UpdateState, i: usize, stderr: &str) {
 pub fn resume(repo: &Repo) -> Result<Exit> {
     let mut state = repo.require_state()?;
     if state.finishing.is_some() {
-        bail!("`finish` is in progress; run `git fork-sync finish` to complete it");
+        bail!("`finish` is in progress; run `git intake finish` to complete it");
     }
     require_worktree(repo, &state)?;
     let wt = Git::worktree(&state.worktree);
@@ -584,7 +584,7 @@ pub fn resume(repo: &Repo) -> Result<Exit> {
         if wt.merge_in_progress()? {
             if wt.commit("MERGE_HEAD")?.as_deref() != Some(target.as_str()) {
                 bail!(
-                    "the merge in progress in {} is not the merge of upstream '{}'; conclude or abort it by hand, or run `git fork-sync abort`",
+                    "the merge in progress in {} is not the merge of upstream '{}'; conclude or abort it by hand, or run `git intake abort`",
                     state.worktree.display(),
                     up.name
                 );
@@ -592,7 +592,7 @@ pub fn resume(repo: &Repo) -> Result<Exit> {
             let unmerged = wt.unmerged_files()?;
             if !unmerged.is_empty() {
                 bail!(
-                    "upstream '{}' still has unresolved conflicts in {}:\n{}\nresolve them, stage them with `git add`, then run `git fork-sync continue`",
+                    "upstream '{}' still has unresolved conflicts in {}:\n{}\nresolve them, stage them with `git add`, then run `git intake continue`",
                     up.name,
                     state.worktree.display(),
                     bullet(&unmerged)
@@ -606,7 +606,7 @@ pub fn resume(repo: &Repo) -> Result<Exit> {
                 && wt.commit("HEAD^2")?.as_deref() == Some(target.as_str());
             if !concluded {
                 bail!(
-                    "the merge of upstream '{}' is no longer in progress in {}; run `git fork-sync abort` and start again",
+                    "the merge of upstream '{}' is no longer in progress in {}; run `git intake abort` and start again",
                     up.name,
                     state.worktree.display()
                 );
@@ -636,8 +636,8 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
         }
         if !moved.is_empty() {
             bail!(
-                "`finish` has already moved {}; the update can no longer be aborted. Run `git fork-sync finish` to complete it, \
-                 or `git fork-sync finish --no-publish` to close it without publishing",
+                "`finish` has already moved {}; the update can no longer be aborted. Run `git intake finish` to complete it, \
+                 or `git intake finish --no-publish` to close it without publishing",
                 moved.join(", ")
             );
         }
@@ -666,7 +666,7 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
 pub fn require_worktree(repo: &Repo, state: &UpdateState) -> Result<()> {
     if !state.worktree.exists() || !repo.update_worktree_registered()? {
         bail!(
-            "the update worktree {} is missing; run `git fork-sync abort` and start again",
+            "the update worktree {} is missing; run `git intake abort` and start again",
             state.worktree.display()
         );
     }
@@ -699,20 +699,20 @@ pub fn step_name(state: &UpdateState, wt: &Git) -> Result<&'static str> {
 pub fn next_step(state: &UpdateState, wt: &Git) -> Result<String> {
     Ok(match step_name(state, wt)? {
         "conflict" => format!(
-            "resolve the conflicts in {}, stage them, then run `git fork-sync continue`",
+            "resolve the conflicts in {}, stage them, then run `git intake continue`",
             state.worktree.display()
         ),
-        "merging" => "git fork-sync continue".to_string(),
-        "verified" => "git fork-sync finish".to_string(),
+        "merging" => "git intake continue".to_string(),
+        "verified" => "git intake finish".to_string(),
         "finishing" => match state.finishing.as_ref().and_then(|f| f.push_error.as_ref()) {
-            Some(_) => "`git fork-sync finish` to retry the same push, or `git fork-sync finish --no-publish` to close the update locally".to_string(),
-            None => "git fork-sync finish".to_string(),
+            Some(_) => "`git intake finish` to retry the same push, or `git intake finish --no-publish` to close the update locally".to_string(),
+            None => "git intake finish".to_string(),
         },
         "verification_failed" => format!(
-            "fix the failures on the update branch in {}, commit, then run `git fork-sync verify`",
+            "fix the failures on the update branch in {}, commit, then run `git intake verify`",
             state.worktree.display()
         ),
-        _ => "git fork-sync verify".to_string(),
+        _ => "git intake verify".to_string(),
     })
 }
 

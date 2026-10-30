@@ -165,22 +165,22 @@ impl Env {
 
     /// Runs the tool in `cwd`.
     pub fn tool(&self, cwd: &Path, args: &[&str]) -> Assert {
-        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("git-fork-sync"));
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("git-intake"));
         cmd.current_dir(cwd).args(args);
         self.apply_env(&mut cmd);
-        let output = cmd.output().expect("run git-fork-sync");
+        let output = cmd.output().expect("run git-intake");
         Assert::new(output)
     }
 
     /// Runs the tool in `cwd` with extra environment variables.
     pub fn tool_env(&self, cwd: &Path, args: &[&str], vars: &[(&str, &str)]) -> Assert {
-        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("git-fork-sync"));
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("git-intake"));
         cmd.current_dir(cwd).args(args);
         self.apply_env(&mut cmd);
         for (k, v) in vars {
             cmd.env(k, v);
         }
-        Assert::new(cmd.output().expect("run git-fork-sync"))
+        Assert::new(cmd.output().expect("run git-intake"))
     }
 
     /// Runs the tool with `--json` style output and parses stdout.
@@ -196,22 +196,22 @@ impl Env {
         })
     }
 
-    /// The `<git-common-dir>/fork-sync` directory of a repository.
-    pub fn fork_sync_dir(&self, repo: &Path) -> PathBuf {
-        repo.join(".git").join("fork-sync")
+    /// The `<git-common-dir>/git-intake` directory of a repository.
+    pub fn intake_dir(&self, repo: &Path) -> PathBuf {
+        repo.join(".git").join("git-intake")
     }
 
     pub fn update_worktree(&self, repo: &Path) -> PathBuf {
-        self.fork_sync_dir(repo).join("worktree")
+        self.intake_dir(repo).join("worktree")
     }
 
     /// Asserts that no update worktree, branch or state exists.
     pub fn assert_no_update(&self, repo: &Path) {
-        let dir = self.fork_sync_dir(repo);
+        let dir = self.intake_dir(repo);
         assert!(!dir.join("worktree").exists(), "update worktree remains");
         assert!(!dir.join("state.json").exists(), "update state remains");
         assert!(
-            !self.has_rev(repo, "refs/heads/fork-sync/update"),
+            !self.has_rev(repo, "refs/heads/git-intake/update"),
             "update branch remains"
         );
         let list = self.git(repo, &["worktree", "list", "--porcelain"]);
@@ -281,8 +281,8 @@ impl Fork {
         );
         env.commit(
             &down,
-            &[(".fork-sync.toml", &config)],
-            "fork: add fork-sync configuration",
+            &[(".git-intake.toml", &config)],
+            "fork: add git-intake configuration",
         );
         env.git(&down, &["push", "-q", "origin", "main"]);
         Self {
@@ -316,7 +316,7 @@ impl Mono {
         let config = mono_config(&a, &b, "");
         env.commit(
             &down,
-            &[("README.md", "monorepo\n"), (".fork-sync.toml", &config)],
+            &[("README.md", "monorepo\n"), (".git-intake.toml", &config)],
             "mono: initial layout",
         );
         Self { env, a, b, down }
