@@ -372,14 +372,54 @@ fn copyright_lines(source: &Path) -> Result<BTreeMap<String, Vec<String>>> {
             continue;
         };
         let shown = parts.join("/");
-        for line in content.lines().filter(|l| is_copyright_line(l)) {
-            let files = lines.entry(normalized(line)).or_default();
+        for notice in copyright_notices(&content) {
+            let files = lines.entry(notice).or_default();
             if !files.contains(&shown) {
                 files.push(shown.clone());
             }
         }
     }
     Ok(lines)
+}
+
+/// The copyright notices of a file, each the copyright line with the lines
+/// that continue its list of holders, without comment markers and joined by
+/// newlines. A line continues the notice while the notice's last line ends
+/// with `,`, `;`, `&`, `and` or `\\`, and it is not empty and not a copyright
+/// line of its own, as in clap_derive's header, whose copyright line ends
+/// with `,` and is followed by two more holders.
+fn copyright_notices(content: &str) -> Vec<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut notices = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !is_copyright_line(lines[i]) {
+            i += 1;
+            continue;
+        }
+        let mut notice = vec![normalized(lines[i])];
+        i += 1;
+        while i < lines.len() {
+            let last = notice.last().map(String::as_str).unwrap_or_default();
+            let continues = last.ends_with([',', ';', '&', '\\'])
+                || last.ends_with(" and")
+                || last.eq_ignore_ascii_case("and");
+            let next = normalized(lines[i]);
+            if !continues || next.is_empty() || is_copyright_line(lines[i]) {
+                break;
+            }
+            notice.push(next);
+            i += 1;
+        }
+        notices.push(notice.join("\n"));
+    }
+    notices
+}
+
+/// A notice's lines joined as `normalized` text joins the lines of the
+/// notices, for a search in them.
+fn flattened(notice: &str) -> String {
+    notice.split('\n').collect::<Vec<_>>().join(" ")
 }
 
 /// The section of the notices that carries, for every crate, the copyright
@@ -422,14 +462,18 @@ fn additional_notices(
         notices.push_str(carried);
         let missing: Vec<_> = copyright_lines(source)?
             .into_iter()
-            .filter(|(line, _)| !notices.contains(line.as_str()))
+            .filter(|(notice, _)| !notices.contains(&flattened(notice)))
             .collect();
         if missing.is_empty() {
             continue;
         }
         section.push_str(&format!("\n{name} {version}\n"));
         for (line, files) in missing {
-            section.push_str(&format!("\n  {line}\n    in {}\n", files.join(", ")));
+            section.push('\n');
+            for text in line.split('\n') {
+                section.push_str(&format!("  {text}\n"));
+            }
+            section.push_str(&format!("    in {}\n", files.join(", ")));
         }
     }
     if section.is_empty() {
@@ -451,7 +495,7 @@ fn check_copyright_lines(crates: &[(String, String, PathBuf)], text: &str) -> Re
     let mut missing = Vec::new();
     for (name, version, source) in crates {
         for (line, files) in copyright_lines(source)? {
-            if !notices.contains(&line) {
+            if !notices.contains(&flattened(&line)) {
                 missing.push(format!("{name} {version}, {}: {line}", files.join(", ")));
             }
         }
@@ -469,7 +513,7 @@ fn check_copyright_lines(crates: &[(String, String, PathBuf)], text: &str) -> Re
 ///
 /// - `SPDX-FileCopyrightText`, anywhere in the line;
 /// - the word `copyright`, in any letter case, followed by a year, `©`, `ⓒ`
-///   or `(c)` in either case, as in `Copyright ⓒ 2015-2016 Kevin B. Knapp`;
+///   or `(c)` in either case, as in clap's `Copyright ⓒ 2015-2016 …`;
 /// - a line that starts, past its comment markers and an optional
 ///   `Portions`, with `Copyright` or `COPYRIGHT`, an optional `:`, and a
 ///   holder, a word that starts with a capital letter, as in
@@ -515,14 +559,11 @@ fn is_copyright_line(line: &str) -> bool {
         return true;
     }
     let text = normalized(line);
-    let text = text.strip_prefix("Portions ").unwrap_or(&text);
+    let text = strip_prefix_ignore_case(&text, "portions ").unwrap_or(&text);
     if text.starts_with('©') || text.starts_with('ⓒ') {
         return true;
     }
-    let Some(rest) = text
-        .strip_prefix("Copyright")
-        .or_else(|| text.strip_prefix("COPYRIGHT"))
-    else {
+    let Some(rest) = strip_prefix_ignore_case(text, "copyright") else {
         return false;
     };
     if !rest.starts_with([' ', ':']) {
@@ -531,6 +572,13 @@ fn is_copyright_line(line: &str) -> bool {
     let holder = rest.trim_start_matches([' ', ':']);
     let word: String = holder.chars().take_while(|c| c.is_alphanumeric()).collect();
     word.starts_with(char::is_uppercase) && !PROSE.contains(&word.to_lowercase().as_str())
+}
+
+/// `text` without the ASCII `prefix`, compared in ASCII case.
+fn strip_prefix_ignore_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
 }
 
 /// A line without the comment markers before it, with its whitespace
@@ -857,18 +905,20 @@ mod tests {
     #[test]
     fn copyright_lines_are_recognised_in_every_common_form() {
         for line in [
-            // clap 4.6.7 and clap_builder 4.6.7, src/lib.rs, line 1.
-            "// Copyright ⓒ 2015-2016 Kevin B. Knapp and [`clap-rs` contributors](https://github.com/clap-rs/clap/graphs/contributors).",
-            "// Copyright 2016 Brian Smith.",
+            // The form of clap 4.6.7's and clap_builder 4.6.7's src/lib.rs.
+            "// Copyright ⓒ 2015-2016 Example Authors and [`example` contributors](https://example.invalid/).",
+            "// Copyright 2016 Example Authors.",
             "/* Copyright (c) 2014, Intel Corporation.",
             "# Copyright (C) 2019 Example Authors",
-            "Copyright © 2005-2020 Rich Felker, et al.",
+            "Copyright © 2005-2020 Example Authors, et al.",
             "© 2014 Unicode, Inc.",
             "// Copyright The Rust Project Developers",
             "Copyright: Example Project contributors",
             "// Portions Copyright (c) 2016, Google Inc.",
             "// SPDX-FileCopyrightText: 2023 Example Authors",
             "COPYRIGHT 2001 EXAMPLE CORP.",
+            // The form of serde_json 1.0.151's src/lexical/mod.rs, line 9.
+            "// copyright Example Author.",
         ] {
             assert!(is_copyright_line(line), "{line}");
         }
@@ -880,9 +930,71 @@ mod tests {
             "Copyright and related rights waived via CC0",
             "// characters such as '#' and '©'.",
             "let copyright = read();",
+            "// copyright notice and this permission notice appear in all copies.",
         ] {
             assert!(!is_copyright_line(line), "{line}");
         }
+    }
+
+    #[test]
+    fn a_notice_keeps_the_lines_that_continue_its_holders() {
+        let header = "// Copyright 2018 Example Author A (@a),\n\
+                      // Example Author B (@b), and\n\
+                      // Example Author C (@c)\n\
+                      //\n\
+                      // Licensed under the Apache License, Version 2.0\n\
+                      // Copyright 2019 D.\n\
+                      fn main() {}\n";
+        assert_eq!(
+            copyright_notices(header),
+            [
+                "Copyright 2018 Example Author A (@a),\n\
+                 Example Author B (@b), and\n\
+                 Example Author C (@c)",
+                "Copyright 2019 D.",
+            ]
+        );
+    }
+
+    /// The locked serde_json's lowercase notice and clap_derive's notice of
+    /// three lines are among the copyright notices of their sources, whole.
+    #[test]
+    fn the_locked_lowercase_and_multi_line_notices_are_kept() {
+        let source = |name: &str| {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            let out = Process::new(cargo)
+                .current_dir(root)
+                .args(["metadata", "--locked", "--format-version", "1"])
+                .output()
+                .unwrap();
+            let metadata: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            let manifest = metadata["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == name)
+                .and_then(|p| p["manifest_path"].as_str())
+                .unwrap()
+                .to_string();
+            PathBuf::from(manifest).parent().unwrap().to_path_buf()
+        };
+        let line = |dir: &Path, file: &str, number: usize| {
+            let text = fs::read_to_string(dir.join(file)).unwrap();
+            normalized(text.lines().nth(number - 1).unwrap())
+        };
+        let serde_json = source("serde_json");
+        let notice = line(&serde_json, "src/lexical/mod.rs", 9);
+        assert!(notice.starts_with("copyright "), "{notice}");
+        let notices = copyright_lines(&serde_json).unwrap();
+        assert!(notices.contains_key(&notice), "{notices:?}");
+        let clap_derive = source("clap_derive");
+        let header = (1..=3)
+            .map(|n| line(&clap_derive, "src/lib.rs", n))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notices = copyright_lines(&clap_derive).unwrap();
+        assert!(notices.contains_key(&header), "{header}\n{notices:?}");
     }
 
     /// The locked clap's header, which writes `Copyright ⓒ`, is among the
