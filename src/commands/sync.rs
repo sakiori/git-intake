@@ -37,8 +37,8 @@ use crate::git::{Git, abbrev, branch_ref};
 use crate::port::{self, Standing, Verb};
 use crate::repo::Repo;
 use crate::state::{
-    self, CarriedMergeRequest, CopyStep, FollowMerge, MergeKind, PlannedCommit, PortPlan,
-    QueuedUpstream, UPDATE_BRANCH, UpdateState, UpstreamStep, Work,
+    CarriedMergeRequest, CopyStep, FollowMerge, MergeKind, PlannedCommit, PortPlan, QueuedUpstream,
+    UPDATE_BRANCH, UpdateState, UpstreamStep, Work,
 };
 use crate::sync_record;
 use crate::tags::UpstreamTags;
@@ -209,7 +209,11 @@ fn plan(repo: &Repo, config: &Config, base: &str, fetches: &mut Fetches) -> Resu
                     up.name,
                     port::no_base_advice(&up.name)
                 ),
-                Err(err) => println!("{}: port upstream not taken by sync: {err:#}", up.name),
+                Err(err) => println!(
+                    "{}: port upstream not taken by sync: {}",
+                    up.name,
+                    crate::redact::redacted(&format!("{err:#}"))
+                ),
             },
             Mode::Follow => {
                 let tags = match UpstreamTags::list(git, up)? {
@@ -235,7 +239,7 @@ fn plan(repo: &Repo, config: &Config, base: &str, fetches: &mut Fetches) -> Resu
         }
     }
     for why in &plan.left_out {
-        println!("left out: {why}");
+        println!("left out: {}", crate::redact::redacted(why));
     }
     Ok(plan)
 }
@@ -343,7 +347,13 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
                     "the branch '{UPDATE_BRANCH}' on '{remote}' holds nothing but what landed or what a closed or \
                      merged {term} held; deleting it"
                 );
-                if delete_branch(git, &remote, UPDATE_BRANCH, &at)? {
+                if delete_branch(
+                    git,
+                    &remote,
+                    UPDATE_BRANCH,
+                    &at,
+                    &crate::identity::Upstreams::new(git, &config.upstreams)?,
+                )? {
                     bail!(
                         "the branch '{UPDATE_BRANCH}' remains on '{remote}'; nothing was pushed. Run `git intake sync` again"
                     );
@@ -604,7 +614,10 @@ fn carry_and_publish(
         };
         let outcome = match open {
             Some(open) => {
-                let mut guard = merge_request::guard(repo, forge, remote, open, head, tip);
+                let upstreams =
+                    crate::identity::Upstreams::new(&repo.git, &state.config.upstreams)?;
+                let mut guard =
+                    merge_request::guard(repo, forge, remote, open, head, tip, &upstreams);
                 publish(
                     repo,
                     &mut state,
@@ -633,7 +646,7 @@ fn discard(repo: &Repo, state: &UpdateState) -> Result<()> {
     repo.remove_plan()?;
     upstreams::release(&repo.git, state)?;
     repo.remove_logs()?;
-    state::remove(&repo.paths.state)?;
+    repo.paths.remove(&repo.paths.state)?;
     Ok(())
 }
 

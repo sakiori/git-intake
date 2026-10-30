@@ -17,7 +17,7 @@ use crate::git::{Git, abbrev, branch_ref, tracking_ref};
 use crate::port::{self, PlanLine};
 use crate::repo::{Repo, bullet};
 use crate::state::{
-    self, CatchUpStep, ConflictFile, CopyStep, FollowMerge, MergeKind, PlannedCommit, PortPlan,
+    CatchUpStep, ConflictFile, CopyStep, FollowMerge, MergeKind, PlannedCommit, PortPlan,
     QueuedUpstream, Resolution, Stored, UPDATE_BRANCH, UpdateState, UpstreamStep, Work,
 };
 use crate::sync_record::{self, Record};
@@ -186,11 +186,18 @@ pub fn refuse_in_progress(state: &UpdateState) -> Result<()> {
 }
 
 /// Refuses when an interrupted update left its worktree at `worktree` or
-/// its branch behind.
+/// its branch behind, or something else is at `worktree`.
 pub fn refuse_leftovers(repo: &Repo, worktree: &std::path::Path) -> Result<()> {
-    if repo.update_worktree_registered()? || worktree.exists() || repo.update_branch_exists()? {
+    if repo.update_worktree_registered()? || repo.update_branch_exists()? {
         bail!(
             "an interrupted update left its worktree or the branch '{UPDATE_BRANCH}' behind; run `git intake abort` to remove them"
+        );
+    }
+    if std::fs::symlink_metadata(worktree).is_ok() {
+        bail!(
+            "{} exists, where the update worktree is placed, but git does not register it as a worktree; the tool \
+             removes only what it created. Move it away or remove it yourself, then run the command again",
+            worktree.display()
         );
     }
     Ok(())
@@ -427,7 +434,7 @@ pub fn no_release(up: &Upstream) -> String {
         "upstream '{}': no tag of {} matching '{}' is a release version on {} as fetched; \
          name the target with `git intake start {}=<rev>`",
         up.name,
-        crate::git::redacted(&up.url),
+        crate::redact::redacted(&up.url),
         up.tags.as_deref().unwrap_or_default(),
         up.source(),
         up.name
@@ -695,7 +702,7 @@ fn merge_follow(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Option
             }
             args.extend(["-m".to_string(), msg, target.clone()]);
             let output_path = merge_output_path(repo, &up.name);
-            state::remove(&output_path)?;
+            repo.paths.remove(&output_path)?;
             let out = wt.raw(&args)?;
             save_merge_output(&output_path, &out)?;
             (!out.success()).then_some(out)
@@ -1148,18 +1155,27 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
     // The forge is reached before anything is removed, so that a missing
     // token or setting refuses with the update intact.
     let withdrawal = if withdraw {
-        let (publish, integration) = match (&state, &waiting) {
+        // The branches it deletes are never deleted from an upstream.
+        let (publish, integration, upstreams) = match (&state, &waiting) {
             (Some(s), _) => (
                 merge_request::publication(repo, s.config.publish.as_ref()),
                 s.config.integration.clone(),
+                crate::identity::Upstreams::new(&repo.git, &s.config.upstreams)?,
             ),
+            // An earlier release recorded no upstream's URL, and the
+            // configuration may be in a form this release refuses.
             (_, Some(w)) => (
                 merge_request::publication(repo, w.publish.as_ref()),
                 w.integration.clone(),
+                crate::identity::Upstreams::named(
+                    &repo.git,
+                    repo.committed_upstream_urls(&w.integration)?,
+                )?,
             ),
             (None, None) => {
                 let config = repo.load_config()?.config;
-                (config.publish, config.integration)
+                let upstreams = crate::identity::Upstreams::new(&repo.git, &config.upstreams)?;
+                (config.publish, config.integration, upstreams)
             }
         };
         let publish = publish.context(
@@ -1173,7 +1189,7 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
             );
         }
         merge_request::connect(repo, &publish)?;
-        Some((publish, integration))
+        Some((publish, integration, upstreams))
     } else {
         None
     };
@@ -1191,7 +1207,7 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
         );
     }
     removed.extend(repo.remove_logs()?);
-    state::remove(&repo.paths.state)?;
+    repo.paths.remove(&repo.paths.state)?;
     for r in &removed {
         println!("removed {r}");
     }
@@ -1201,9 +1217,9 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
         None if withdrawal.is_none() => println!("no update is in progress; nothing to abort"),
         None => {}
     }
-    if let Some((publish, integration)) = withdrawal {
+    if let Some((publish, integration, upstreams)) = withdrawal {
         let earlier = waiting.map(|w| &w.merge_request);
-        merge_request::withdraw(repo, &publish, &integration, earlier)?;
+        merge_request::withdraw(repo, &publish, &integration, earlier, &upstreams)?;
         return Ok(Exit::Success);
     }
     if let Some(carried) = state.and_then(|s| s.carried_from.as_ref()) {
@@ -1240,7 +1256,10 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
             ),
             Ok((_, None)) => {}
             Err(err) => {
-                println!("could not read the forge for the update's merge request: {err:#}")
+                println!(
+                    "could not read the forge for the update's merge request: {}",
+                    crate::redact::redacted(&format!("{err:#}"))
+                )
             }
         }
     }

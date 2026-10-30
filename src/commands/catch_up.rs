@@ -29,7 +29,7 @@ use crate::config::{self, Config};
 use crate::git::{Git, abbrev, branch_ref};
 use crate::port;
 use crate::repo::{Repo, bullet};
-use crate::state::{self, CatchUp, CatchUpStep, UPDATE_BRANCH, UpdateState};
+use crate::state::{CatchUp, CatchUpStep, UPDATE_BRANCH, UpdateState};
 use crate::sync_record;
 
 /// Where a catch-up merge's output is kept, beside the upstreams' merges'.
@@ -291,7 +291,7 @@ fn merge(repo: &Repo, state: &mut UpdateState) -> Result<Option<Exit>> {
     }
     let msg = sync_record::catch_up_message(&integration, &repo.git.short(&c.tip)?);
     let output_path = output_path(repo);
-    state::remove(&output_path)?;
+    repo.paths.remove(&output_path)?;
     let out = wt.raw(&[
         "merge",
         "--no-ff",

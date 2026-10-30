@@ -8,9 +8,11 @@ mod description;
 mod drift;
 mod forge;
 mod git;
+mod identity;
 mod integration_line;
 mod output;
 mod port;
+mod redact;
 mod repo;
 mod state;
 mod sync_record;
@@ -76,12 +78,26 @@ fn run(command: Command) -> anyhow::Result<Exit> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // No message shows a token the tool may read, whatever quotes it.
+    for name in forge::TOKEN_VARIABLES {
+        if let Ok(value) = std::env::var(name) {
+            redact::hold(value.trim());
+        }
+    }
+    // A panic's message goes the same way as every other.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("{}", redact::redacted(&info.to_string()));
+        let backtrace = std::backtrace::Backtrace::capture();
+        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+            eprintln!("{}", redact::redacted(&backtrace.to_string()));
+        }
+    }));
     match run(cli.command) {
         Ok(Exit::Success) => ExitCode::SUCCESS,
         Ok(Exit::Negative) => ExitCode::from(1),
         Ok(Exit::Code(code)) => ExitCode::from(code),
         Err(err) => {
-            eprintln!("error: {err:#}");
+            eprintln!("error: {}", redact::redacted(&format!("{err:#}")));
             ExitCode::from(ERROR_STATUS)
         }
     }

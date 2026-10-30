@@ -372,21 +372,22 @@ fn credentials_in_urls_never_reach_the_output() {
         !out.contains("s3cret") && !err.contains("s3cret"),
         "{out}{err}"
     );
-    // An upstream whose URL carries a credential and cannot be fetched.
+    // An upstream whose URL carries a credential is refused, and its
+    // refusal shows the URL without it.
     let g = Fork::new();
     g.reconfigure(
         &format!("url = {:?}", g.up.url()),
         "url = \"https://user:s3cret-word@127.0.0.1:9/team/up.git\"",
     );
-    let status = g.tool(&["status"]).code(1);
-    let (out, err) = (stdout(&status), stderr(&status));
-    assert!(out.contains("https://127.0.0.1:9/team/up.git"), "{out}");
-    assert!(
-        !out.contains("s3cret") && !err.contains("s3cret"),
-        "{out}{err}"
-    );
-    let json = g.env.tool_json(&g.down, &["status", "--json"], 1);
-    assert!(!json.to_string().contains("s3cret"), "{json}");
+    for args in [&["status"][..], &["status", "--json"]] {
+        let status = g.tool(args).code(2);
+        let (out, err) = (stdout(&status), stderr(&status));
+        assert!(err.contains("https://127.0.0.1:9/team/up.git"), "{err}");
+        assert!(
+            !out.contains("s3cret") && !err.contains("s3cret"),
+            "{out}{err}"
+        );
+    }
 }
 
 #[test]
@@ -468,4 +469,34 @@ fn a_renamed_github_repository_keeps_its_pull_requests() {
     );
     let status = f.env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["merge_request"]["number"], 1);
+}
+
+#[test]
+fn a_forge_message_that_echoes_the_token_is_shown_without_it() {
+    let f = Fork::merge_request();
+    f.forge().fail(
+        "GET",
+        "/projects/team%2Fapp",
+        401,
+        &format!("401 Unauthorized: the token {TOKEN} is not valid"),
+    );
+    let shown = |args: &[&str], code: i32| {
+        let run = f.tool(args).code(code);
+        format!("{}{}", stdout(&run), stderr(&run))
+    };
+    behind(&f);
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    for (args, code) in [
+        (&["doctor"][..], 1),
+        (&["doctor", "--json"], 1),
+        (&["finish"], 2),
+    ] {
+        let out = shown(args, code);
+        assert!(
+            out.contains("401 Unauthorized: the token"),
+            "{args:?}: {out}"
+        );
+        assert!(!out.contains(TOKEN), "{args:?}: {out}");
+    }
 }

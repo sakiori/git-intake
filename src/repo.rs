@@ -475,6 +475,39 @@ impl Repo {
         }
     }
 
+    /// The name and URL of each upstream of the configuration committed on
+    /// `integration`, read without validating the rest, as for an update of
+    /// an earlier release whose configuration this release may refuse.
+    pub fn committed_upstream_urls(&self, integration: &str) -> Result<Vec<(String, String)>> {
+        let text = self
+            .git
+            .show_file(&branch_ref(integration), config::FILE_NAME)?
+            .with_context(|| {
+                format!(
+                    "no {} is committed on '{integration}', so the upstreams' URLs are unknown",
+                    config::FILE_NAME
+                )
+            })?;
+        let table: toml::Table = toml::from_str(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid {} on '{integration}', so the upstreams' URLs are unknown: {}",
+                config::FILE_NAME,
+                e.message()
+            )
+        })?;
+        Ok(table
+            .get("upstream")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|up| {
+                let name = up.get("name")?.as_str()?.to_string();
+                let url = up.get("url")?.as_str()?.to_string();
+                Some((name, url))
+            })
+            .collect())
+    }
+
     /// Reads and validates the configuration committed on the integration
     /// branch tip. A working copy that differs is reported on stderr.
     pub fn load_config(&self) -> Result<Loaded> {
@@ -512,28 +545,23 @@ impl Repo {
     }
 
     /// The tool never pushes to an upstream: a publish remote fetched from
-    /// or pushed to a URL that names an upstream's repository is refused.
+    /// or pushed to a URL that names an upstream's repository, as git
+    /// resolves both, is refused.
     fn refuse_publishing_to_an_upstream(&self, config: &Config) -> Result<()> {
         let Some(publish) = &config.publish else {
             return Ok(());
         };
-        let urls = crate::upstreams::remote_urls(&self.git, &publish.remote)?;
-        let base = self.git.dir();
+        let upstreams = crate::identity::Upstreams::new(&self.git, &config.upstreams)?;
         let mut problems = Vec::new();
-        for up in &config.upstreams {
-            if let Some(url) = urls
-                .iter()
-                .find(|u| crate::upstreams::same_repository(u, &up.url, base))
-            {
-                problems.push(format!(
-                    "publish remote '{}' has the URL {}, which names the repository of upstream '{}' ({}); \
-                     the tool never pushes to an upstream",
-                    publish.remote,
-                    crate::git::redacted(url),
-                    up.name,
-                    crate::git::redacted(&up.url)
-                ));
-            }
+        for (place, up) in upstreams.named_by_remote(&self.git, &publish.remote)? {
+            problems.push(format!(
+                "publish remote '{}' has the URL {}, which names the repository of upstream '{}' ({}); \
+                 the tool never pushes to an upstream",
+                publish.remote,
+                place.shown(),
+                up.name,
+                crate::redact::redacted(&up.url)
+            ));
         }
         if !problems.is_empty() {
             bail!(
@@ -578,6 +606,14 @@ impl Repo {
 
     /// Removes the update worktree if it exists, keeping the update branch,
     /// and the directories that held it once they are empty.
+    ///
+    /// Only what the tool can tell it created is removed: the worktree git
+    /// registers for the update, at one of the tool's placements, reached
+    /// from the main worktree or the git directory through directories alone.
+    /// A registered worktree reached through a symbolic link, or through
+    /// something else that is not a directory, may lie anywhere: it is
+    /// refused, and nothing is removed. A directory git does not register is
+    /// left where it is, and said so, unless it is empty.
     pub fn remove_update_worktree(&self) -> Result<Vec<String>> {
         let started_inside = self.started_in_update_worktree()?;
         let mut removed = Vec::new();
@@ -585,8 +621,24 @@ impl Repo {
             self.git.run(&["worktree", "prune"])?;
             return Ok(removed);
         };
+        let unplaced = self.unplaced(&wt)?;
         if self.update_worktree_registered()? {
-            if wt.exists() {
+            if let Some(why) = &unplaced {
+                bail!(
+                    "the update worktree {} is not removed: {why}, so it may lie outside the repository. \
+                     Nothing was removed. Replace what leads there with the directory it stands for, \
+                     then run the command again",
+                    wt.display()
+                );
+            }
+            if fs::symlink_metadata(&wt).is_ok() {
+                if !self.is_registered_worktree(&wt)? {
+                    bail!(
+                        "the update worktree {} is not removed: it is not the worktree git registers there for \
+                         this repository. Nothing was removed. Run `git worktree repair`, then run the command again",
+                        wt.display()
+                    );
+                }
                 // Best effort: record resolutions already made by hand in a
                 // stopped merge or copy; with nothing pending, rerere does
                 // nothing.
@@ -600,16 +652,27 @@ impl Repo {
                 &wt.to_string_lossy(),
             ])?;
             removed.push(format!("worktree {}", wt.display()));
-        }
-        if wt.exists() {
-            fs::remove_dir_all(&wt).with_context(|| format!("cannot remove {}", wt.display()))?;
-            if removed.is_empty() {
+        } else if fs::symlink_metadata(&wt).is_ok() {
+            // Not a worktree of the repository: an empty directory inside it
+            // is the only thing removed, as nothing can be lost with it.
+            let empty = unplaced.is_none() && fs::remove_dir(&wt).is_ok();
+            if empty {
                 removed.push(format!("worktree {}", wt.display()));
+            } else {
+                let why = unplaced.unwrap_or_else(|| {
+                    "git does not register it as a worktree, so the tool cannot tell that it created it".to_string()
+                });
+                eprintln!(
+                    "warning: left {}: {why}; the tool removes only the update worktree it created. \
+                     Remove it yourself if nothing in it is needed",
+                    wt.display()
+                );
             }
         }
         // `.worktrees/git-intake`, then `.worktrees` in the main worktree;
-        // either may hold other worktrees or files, which keep it.
-        if self.is_main_placement(&wt)? {
+        // either may hold other worktrees or files, which keep it, and
+        // neither is touched when it is not a directory of the checkout.
+        if self.is_main_placement(&wt)? && self.unplaced(&wt)?.is_none() {
             for dir in wt.ancestors().skip(1).take(2) {
                 let _ = fs::remove_dir(dir);
             }
@@ -619,6 +682,136 @@ impl Repo {
             self.left_removed_directory.set(true);
         }
         Ok(removed)
+    }
+
+    /// Why `wt` is not one of the tool's placements of the update worktree
+    /// reached through directories alone: [`state::UPDATE_WORKTREE`] in the
+    /// main worktree, or [`state::BARE_UPDATE_WORKTREE`] in the git
+    /// directory, each directory on the way neither a symbolic link nor
+    /// anything else. `None` when it is; the update worktree itself need not
+    /// exist.
+    fn unplaced(&self, wt: &Path) -> Result<Option<String>> {
+        let (root, rel, place) = if self.is_main_placement(wt)? {
+            let depth = Path::new(state::UPDATE_WORKTREE).components().count();
+            let main = wt.ancestors().nth(depth).unwrap_or(wt);
+            (
+                main.to_path_buf(),
+                state::UPDATE_WORKTREE,
+                "the main worktree",
+            )
+        } else if wt == self.common.join(state::BARE_UPDATE_WORKTREE) {
+            (
+                self.common.clone(),
+                state::BARE_UPDATE_WORKTREE,
+                "the git directory",
+            )
+        } else {
+            return Ok(Some(format!(
+                "it is neither {} in the main worktree nor {} in the git directory, where the tool places it",
+                state::UPDATE_WORKTREE,
+                state::BARE_UPDATE_WORKTREE
+            )));
+        };
+        let mut path = root;
+        let mut shown = String::new();
+        for part in rel.split('/') {
+            path.push(part);
+            if !shown.is_empty() {
+                shown.push('/');
+            }
+            shown.push_str(part);
+            match fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Ok(Some(format!("'{shown}' in {place} is a symbolic link")));
+                }
+                Ok(meta) if !meta.is_dir() => {
+                    return Ok(Some(format!("'{shown}' in {place} is not a directory")));
+                }
+                Ok(_) => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether `wt` is a worktree of this repository, as its own `.git`
+    /// says, with its top at `wt`.
+    fn is_registered_worktree(&self, wt: &Path) -> Result<bool> {
+        let out = Git::worktree(wt).raw(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--show-toplevel",
+        ])?;
+        let mut lines = out.stdout.lines();
+        Ok(out.success()
+            && lines.next().map(|l| canonical(Path::new(l))).as_deref() == Some(&self.common)
+            && lines.next().map(|l| canonical(Path::new(l))) == Some(canonical(wt)))
+    }
+
+    /// What the tree of `rev`, checked out in the main worktree, would put
+    /// where the update worktree is placed: `.worktrees` or
+    /// `.worktrees/git-intake` as anything but a directory, which would
+    /// replace the directory holding the update worktree, or anything at
+    /// [`state::UPDATE_WORKTREE`] itself. Names are compared under full
+    /// Unicode case folding whatever `core.ignoreCase` says, as a file
+    /// system or directory that ignores case would take them for the same
+    /// name. `None` when nothing collides.
+    pub fn placement_collision(&self, rev: &str) -> Result<Option<String>> {
+        let parts: Vec<&str> = state::UPDATE_WORKTREE.split('/').collect();
+        self.collision_below(&format!("{rev}^{{tree}}"), &parts, "")
+    }
+
+    /// [`Self::placement_collision`] in `tree`, at `path`, for the rest
+    /// `parts` of the placement.
+    fn collision_below(&self, tree: &str, parts: &[&str], path: &str) -> Result<Option<String>> {
+        let Some((part, rest)) = parts.split_first() else {
+            return Ok(None);
+        };
+        let listing = self.git.run(&["ls-tree", "-z", "--end-of-options", tree])?;
+        let wanted = unicase::UniCase::unicode(*part);
+        // `<mode> SP <type> SP <object> TAB <name>`
+        for entry in listing.split('\0') {
+            let Some((meta, name)) = entry.split_once('\t') else {
+                continue;
+            };
+            if unicase::UniCase::unicode(name) != wanted {
+                continue;
+            }
+            let meta: Vec<&str> = meta.split(' ').collect();
+            let at = if path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{path}/{name}")
+            };
+            let kind = match meta.as_slice() {
+                ["120000", ..] => "a symbolic link",
+                ["160000", ..] => "a submodule",
+                [_, "tree", _] => "a directory",
+                _ => "a file",
+            };
+            if rest.is_empty() {
+                return Ok(Some(format!(
+                    "it has {kind} at '{at}', where the tool keeps the update worktree"
+                )));
+            }
+            match meta.as_slice() {
+                [_, "tree", oid] => {
+                    if let Some(found) = self.collision_below(oid, rest, &at)? {
+                        return Ok(Some(found));
+                    }
+                }
+                _ => {
+                    return Ok(Some(format!(
+                        "it has '{at}' as {kind}, where the tool keeps the update worktree, at {} in the main \
+                         worktree; checked out there, it would replace the directory that holds the worktree",
+                        state::UPDATE_WORKTREE
+                    )));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Notes that the command removed the update worktree it was started in.
@@ -646,33 +839,27 @@ impl Repo {
     /// Removes the plan of a port update, if any.
     pub fn remove_plan(&self) -> Result<Vec<String>> {
         let plan = &self.paths.plan;
-        if !plan.exists() {
-            return Ok(Vec::new());
-        }
-        fs::remove_file(plan).with_context(|| format!("cannot remove {}", plan.display()))?;
-        Ok(vec![format!("plan {}", plan.display())])
+        Ok(match self.paths.remove(plan)? {
+            true => vec![format!("plan {}", plan.display())],
+            false => Vec::new(),
+        })
     }
 
     /// Removes the update's logs: those of the verification and of the
     /// partial run, and saved merge output.
     pub fn remove_logs(&self) -> Result<Vec<String>> {
         let logs = &self.paths.logs;
-        if !logs.exists() {
-            return Ok(Vec::new());
-        }
-        fs::remove_dir_all(logs).with_context(|| format!("cannot remove {}", logs.display()))?;
-        Ok(vec![format!("logs {}", logs.display())])
+        Ok(match self.paths.remove(logs)? {
+            true => vec![format!("logs {}", logs.display())],
+            false => Vec::new(),
+        })
     }
 
     /// Drops the partial run of the update with its logs, as a full run and
     /// a catch-up merge do.
     pub fn drop_partial_run(&self, state: &mut UpdateState) -> Result<()> {
         state.partial_run = None;
-        let logs = &self.paths.partial_logs;
-        if logs.exists() {
-            fs::remove_dir_all(logs)
-                .with_context(|| format!("cannot remove {}", logs.display()))?;
-        }
+        self.paths.remove(&self.paths.partial_logs)?;
         Ok(())
     }
 }

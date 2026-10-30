@@ -11,15 +11,13 @@ pub mod gitlab;
 pub mod http;
 pub mod locate;
 
-use std::process::{Command, Stdio};
-
 use anyhow::{Result, bail};
 use url::Url;
 
 use crate::config::Publish;
 use crate::git::Git;
 
-pub use locate::Location;
+pub use locate::{Location, TOKEN_VARIABLES};
 
 /// A kind of forge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,22 +192,7 @@ pub fn fetch_url(git: &Git, remote: &str) -> Result<Option<String>> {
 /// The host an SSH host alias stands for, as `ssh -G` resolves the client's
 /// configuration; `None` without an `ssh` that answers.
 fn ssh_host(alias: &str) -> Option<String> {
-    if alias.starts_with('-') {
-        return None;
-    }
-    let out = Command::new("ssh")
-        .args(["-G", alias])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find_map(|l| l.strip_prefix("hostname "))
-        .map(|h| h.trim().to_string())
+    crate::identity::ssh_destination(alias).map(|(host, _)| host)
 }
 
 /// `base` with `segments` appended, each encoded as one path segment, and
