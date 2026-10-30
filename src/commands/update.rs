@@ -694,8 +694,8 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
                 let integration = &state.config.integration;
                 let how = match head {
                     Some(head) => format!(
-                        "the merge request's head {} landed instead of the verified commit",
-                        abbrev(head)
+                        "{}, and it landed instead of the verified commit",
+                        head.describe()
                     ),
                     None => format!(
                         "{} brought in '{}' without the verified tree",

@@ -564,7 +564,7 @@ fn merge_request_branch_changed_before_the_merge_is_refused() {
     let err = stderr(&f.tool(&["finish"]).code(2));
     assert!(
         err.contains(&format!(
-            "the merge request's head is {}, not the verified commit",
+            "the merge request branch is at {}, not the verified commit",
             &extra[..12]
         )),
         "{err}"
@@ -741,7 +741,7 @@ fn fast_forward_of_a_changed_merge_request_is_refused_by_its_head() {
     assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
     assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
     f.tool(&["abort"]).success().stdout(contains(format!(
-        "holds an unverified merge: the merge request's head {} landed instead of the verified commit",
+        "holds an unverified merge: the merge request's head is {}, and it landed instead of the verified commit",
         &extra[..12]
     )));
     assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
@@ -764,7 +764,7 @@ fn fast_forward_of_a_changed_branch_is_refused_without_the_merge_request_head() 
     let err = stderr(&f.tool(&["finish"]).code(2));
     assert!(
         err.contains(&format!(
-            "the merge request's head is {}, not the verified commit",
+            "the merge request branch is at {}, not the verified commit",
             &extra[..12]
         )),
         "{err}"
@@ -792,7 +792,7 @@ fn branch_as_last_seen_judges_once_it_is_gone() {
         &["update-ref", "-d", &format!("refs/heads/{branch}")],
     );
     f.tool(&["finish"]).code(2).stderr(contains(format!(
-        "the merge request's head is {}, not the verified commit",
+        "the merge request branch was at {}, not the verified commit",
         &extra[..12]
     )));
 }
@@ -872,4 +872,75 @@ fn missing_merge_request_head_falls_back_to_the_branch() {
         .stdout(contains("later: other work"));
     assert_eq!(env.rev(&f.down, "main"), later);
     env.assert_no_update(&f.down);
+}
+
+#[test]
+fn a_matching_merge_request_head_does_not_clear_a_changed_branch() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let base = env.rev(&f.down, "main");
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    f.tool(&["finish"]).success();
+    // The remote's merge request head stays at the verified commit while
+    // the branch gains a commit that is fast-forwarded onto main.
+    set_merge_request_head(&f, &commit);
+    let extra = add_to_merge_request_branch(&f, &branch);
+    env.git(&f.publish, &["update-ref", "refs/heads/main", &extra]);
+
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(
+        err.contains(&format!(
+            "the merge request branch is at {}, not the verified commit",
+            &extra[..12]
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("the merge request's head is"), "{err}");
+    assert_eq!(env.rev(&f.down, "main"), base);
+    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
+    assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
+}
+
+#[test]
+fn only_the_link_for_the_pushed_branch_names_the_merge_request() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    // The remote's reply carries an unrelated merge request link first.
+    let hook = f.publish.join("hooks").join("pre-receive");
+    let script = fs::read_to_string(&hook).unwrap().replacen(
+        "if [ -n \"$create\" ]; then\n",
+        "echo \"See https://example.com/team/fork/-/merge_requests/3\" >&2\nif [ -n \"$create\" ]; then\n",
+        1,
+    );
+    fs::write(&hook, script).unwrap();
+    verified(&f);
+    f.tool(&["finish"])
+        .success()
+        .stdout(contains("opened merge request !7"));
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(
+        status["update"]["merge_request"]["number"],
+        MERGE_REQUEST_NUMBER
+    );
+}
+
+#[test]
+fn a_reply_without_the_pushed_branch_names_no_merge_request() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    // The reply links a merge request, but not under the pushed branch.
+    let hook = f.publish.join("hooks").join("pre-receive");
+    let script = fs::read_to_string(&hook)
+        .unwrap()
+        .replace("View merge request for ${ref#refs/heads/}:", "See also:");
+    fs::write(&hook, script).unwrap();
+    verified(&f);
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(!out.contains("opened merge request !"), "{out}");
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(
+        status["update"]["merge_request"]["number"],
+        serde_json::Value::Null
+    );
 }

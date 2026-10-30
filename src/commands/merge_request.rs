@@ -49,7 +49,7 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     let mut number = None;
     let (requested, options_refused) = if out.success() {
         relay_remote_messages(&out.stderr);
-        number = merge_request_number(&out.stderr);
+        number = merge_request_number(&out.stderr, &branch);
         // The remote applies push options only to a push that updates a ref:
         // a branch already in place, as after an interrupted `finish`, opens
         // no merge request.
@@ -117,18 +117,27 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     Ok(Exit::Success)
 }
 
-/// The number of the merge request the remote's reply links to, as GitLab
-/// prints it (`https://<host>/<project>/-/merge_requests/<number>`). A link
-/// to create one (`.../-/merge_requests/new?...`) names no number.
-fn merge_request_number(stderr: &str) -> Option<u64> {
+/// The number of the merge request the remote's reply names for `branch`.
+/// GitLab answers `View merge request for <branch>:` followed by a line with
+/// its address, `https://<host>/<project>/-/merge_requests/<number>`; only
+/// that line counts, so other links in the reply cannot supply a number. A
+/// link to create one (`.../-/merge_requests/new?...`) names no number.
+fn merge_request_number(stderr: &str, branch: &str) -> Option<u64> {
     const MARKER: &str = "/-/merge_requests/";
-    stderr.lines().find_map(|line| {
-        let rest = &line[line.find(MARKER)? + MARKER.len()..];
-        let rest = rest.trim_end();
-        (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| rest.parse().ok())
-            .flatten()
-    })
+    let heading = format!("View merge request for {branch}:");
+    let text = |line: &str| {
+        line.strip_prefix("remote:")
+            .unwrap_or(line)
+            .trim()
+            .to_string()
+    };
+    let lines: Vec<String> = stderr.lines().map(text).collect();
+    let at = lines.iter().position(|l| *l == heading)?;
+    let url = lines.get(at + 1)?;
+    let rest = &url[url.find(MARKER)? + MARKER.len()..];
+    (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| rest.parse().ok())
+        .flatten()
 }
 
 /// Whether `git push --porcelain` output reports that the push updated the
@@ -160,7 +169,7 @@ pub enum Landing {
     Unverified {
         tip: String,
         landing: String,
-        head: Option<String>,
+        head: Option<ChangedHead>,
     },
     /// It changed without receiving the verified commit; `squash` when a
     /// commit with the verified tree, or the update's sync records, landed.
@@ -173,6 +182,35 @@ pub enum Landing {
         head: String,
         from_merge_request: bool,
     },
+}
+
+/// A head of the merge request other than the verified commit, and where the
+/// tool saw it.
+pub struct ChangedHead {
+    pub commit: String,
+    pub seen: HeadSource,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HeadSource {
+    /// The merge request's head as the remote keeps it.
+    MergeRequest,
+    /// The merge request branch as listed now.
+    Branch,
+    /// The merge request branch as the tool last saw it.
+    LastSeenBranch,
+}
+
+impl ChangedHead {
+    /// Names the head, such as "the merge request's head is X".
+    pub fn describe(&self) -> String {
+        let c = abbrev(&self.commit);
+        match self.seen {
+            HeadSource::MergeRequest => format!("the merge request's head is {c}"),
+            HeadSource::Branch => format!("the merge request branch is at {c}"),
+            HeadSource::LastSeenBranch => format!("the merge request branch was at {c}"),
+        }
+    }
 }
 
 /// Fetches the publish remote's integration branch and classifies it.
@@ -197,7 +235,6 @@ pub fn inspect(repo: &Repo, state: &mut UpdateState) -> Result<Landing> {
     if let (Some(b), Some(m)) = (&branch, state.merge_request.as_mut()) {
         m.last_seen_head = Some(b.clone());
     }
-    let seen_branch = branch.clone().or(mr.last_seen_head.clone());
 
     let out = git.raw(&[
         "fetch",
@@ -228,14 +265,32 @@ pub fn inspect(repo: &Repo, state: &mut UpdateState) -> Result<Landing> {
         // land the verified tree, whichever merge method was used. Without
         // its head, the branch as last seen stands in for it when the
         // integration branch took it in.
-        let mut changed_head = mr_head.clone().filter(|h| *h != mr.commit);
+        let mut changed_head =
+            mr_head
+                .clone()
+                .filter(|h| *h != mr.commit)
+                .map(|commit| ChangedHead {
+                    commit,
+                    seen: HeadSource::MergeRequest,
+                });
+        // The branch counts as well: a merge request head that matches does
+        // not clear a branch the integration branch took in at another commit.
+        let seen = match &branch {
+            Some(b) => Some((b, HeadSource::Branch)),
+            None => mr
+                .last_seen_head
+                .as_ref()
+                .map(|h| (h, HeadSource::LastSeenBranch)),
+        };
         if changed_head.is_none()
-            && mr_head.is_none()
-            && let Some(h) = seen_branch.as_ref().filter(|h| **h != mr.commit)
+            && let Some((h, source)) = seen.filter(|(h, _)| **h != mr.commit)
             && git.object_exists(h)?
             && git.is_ancestor(h, &tip)?
         {
-            changed_head = Some(h.clone());
+            changed_head = Some(ChangedHead {
+                commit: h.clone(),
+                seen: source,
+            });
         }
         if changed_head.is_some() {
             return Ok(Landing::Unverified {
@@ -313,11 +368,11 @@ fn refusal(state: &UpdateState, mr: &MergeRequest, landing: &Landing) -> String 
             head: Some(head),
             ..
         } => format!(
-            "'{remote_branch}' at {} contains the verified commit {verified}, but the merge request's head is {}, \
+            "'{remote_branch}' at {} contains the verified commit {verified}, but {}, \
              not the verified commit: the merge request carried commits that were never verified. No branch moved. \
              Run `git intake abort` to end this update, then bring '{integration}' up to date and run `git intake start`",
             abbrev(tip),
-            abbrev(head)
+            head.describe()
         ),
         Landing::Unverified { tip, landing, .. } => format!(
             "'{remote_branch}' at {} contains the verified commit {verified}, but what the integration branch received \
@@ -797,13 +852,22 @@ mod tests {
 
     #[test]
     fn reads_the_merge_request_number_from_the_reply() {
+        let b = "git-intake/update-0123456789ab";
         let reply = "remote: \nremote: View merge request for git-intake/update-0123456789ab:\n\
                      remote:   https://gitlab.example.com/group/project/-/merge_requests/42        \n";
-        assert_eq!(merge_request_number(reply), Some(42));
+        assert_eq!(merge_request_number(reply, b), Some(42));
+        let decoy_first = "remote: See https://gitlab.example.com/group/project/-/merge_requests/9\n\
+                           remote: View merge request for git-intake/update-0123456789ab:\n\
+                           remote:   https://gitlab.example.com/group/project/-/merge_requests/42\n";
+        assert_eq!(merge_request_number(decoy_first, b), Some(42));
+        let decoy_only = "remote: See https://gitlab.example.com/group/project/-/merge_requests/9\n\
+                          remote: View merge request for another-branch:\n\
+                          remote:   https://gitlab.example.com/group/project/-/merge_requests/8\n";
+        assert_eq!(merge_request_number(decoy_only, b), None);
         let create = "remote: To create a merge request for git-intake/update-0123456789ab, visit:\n\
                       remote:   https://gitlab.example.com/group/project/-/merge_requests/new?merge_request%5Bsource_branch%5D=x\n";
-        assert_eq!(merge_request_number(create), None);
-        assert_eq!(merge_request_number(""), None);
+        assert_eq!(merge_request_number(create, b), None);
+        assert_eq!(merge_request_number("", b), None);
     }
 
     #[test]
