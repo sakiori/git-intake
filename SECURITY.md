@@ -10,6 +10,17 @@ Report a vulnerability privately through GitHub's private vulnerability reportin
 
 Please do not open a public issue or pull request for a vulnerability before a fix is released. Include the release (`git intake --version`), the git version, the platform, and the steps or a repository that shows the problem.
 
+## Verifying a release
+
+Every archive of a release has a `.sha256` file next to it and a build provenance attestation made by the release workflow. Check both before installing:
+
+```sh
+sha256sum -c git-intake-vX.Y.Z-<target>.tar.gz.sha256
+gh attestation verify git-intake-vX.Y.Z-<target>.tar.gz --repo sakiori/git-intake
+```
+
+The second command needs the GitHub CLI; it confirms that the archive was built by this repository's workflows. [RELEASING.md](RELEASING.md#checking-a-release) shows how to tie it to the tag's commit as well.
+
 ## Threat model
 
 `git intake` merges or copies commits from upstream repositories into a downstream repository, runs the downstream's checks on the result and publishes it. The README's *Safety properties* and *Code from upstreams in CI* sections describe the guarantees in full; this section summarises what they cover and what they leave to the repository's owner.
