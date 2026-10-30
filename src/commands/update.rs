@@ -5,6 +5,7 @@ use std::fs;
 use anyhow::{Context, Result, bail};
 
 use crate::Exit;
+use crate::cli::UpstreamTarget;
 use crate::commands::merge_request::{self, Landing};
 use crate::config::Upstream;
 use crate::drift::{self, DriftState};
@@ -16,8 +17,12 @@ use crate::state::{
     UpstreamStep,
 };
 use crate::sync_record;
+use crate::target;
 
-pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
+/// `start`: fetches the selected upstreams, fixes their targets and merges
+/// each one the integration branch lacks. An upstream named with a revision
+/// takes the commit it names as its target instead of the fetched tip.
+pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
     if let Some(state) = repo.state()? {
         if let Some(mr) = state
             .merge_request
@@ -51,8 +56,23 @@ pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
             "an interrupted update left its worktree or the branch '{UPDATE_BRANCH}' behind; run `git intake abort` to remove them"
         );
     }
+    let names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
+    let mut repeated: Vec<&str> = names
+        .iter()
+        .enumerate()
+        .filter(|(i, n)| names[..*i].contains(n))
+        .map(|(_, n)| n.as_str())
+        .collect();
+    repeated.sort_unstable();
+    repeated.dedup();
+    if !repeated.is_empty() {
+        bail!(
+            "each upstream may be named once; named more than once: {}",
+            repeated.join(", ")
+        );
+    }
     let config = repo.load_config()?.config;
-    let selected = config.select(names)?;
+    let selected = config.select(&names)?;
     repo.require_clean(&config.integration)?;
     let git = &repo.git;
 
@@ -87,7 +107,7 @@ pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
     let mut current = Vec::new();
     for up in &selected {
         let d = drift::evaluate(git, &base, up, latest.get(&up.name))?;
-        let target = match (d.state, &d.tip) {
+        let tip = match (d.state, &d.tip) {
             (DriftState::Rewritten, _) => {
                 refusals.push(format!(
                     "upstream '{}' was rewritten: {}",
@@ -106,16 +126,74 @@ pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
                 continue;
             }
         };
-        if d.state == DriftState::Current {
-            current.push((up.name.clone(), target));
+        let rev = targets
+            .iter()
+            .find(|t| t.name == up.name)
+            .and_then(|t| t.rev.clone());
+        let target = match &rev {
+            None => tip,
+            Some(rev) => match target::resolve(git, up, rev, &tip)? {
+                Ok(commit) => commit,
+                Err(why) => {
+                    refusals.push(why);
+                    continue;
+                }
+            },
+        };
+        if let Some(last) = &d.last_synced
+            && *last != target
+            && git.is_ancestor(&target, last)?
+        {
+            refusals.push(format!(
+                "upstream '{}': the target {} is older than the last synced commit {}; \
+                 an update never moves an upstream back",
+                up.name,
+                described(&target, rev.as_deref()),
+                abbrev(last)
+            ));
+            continue;
+        }
+        if matches!(d.state, DriftState::Current | DriftState::Behind)
+            && git.is_ancestor(&target, &base)?
+        {
+            current.push((up.name.clone(), target, rev));
+            continue;
+        }
+        if let Some(last) = &d.last_synced
+            && !git.is_ancestor(last, &target)?
+        {
+            refusals.push(format!(
+                "upstream '{}': the target {} does not contain the last synced commit {}; \
+                 name a commit of {} that contains it",
+                up.name,
+                described(&target, rev.as_deref()),
+                abbrev(last),
+                up.source()
+            ));
+            continue;
+        }
+        // `finish` fast-forwards the mirror to the target; a mirror the target
+        // does not contain would only be refused there, after the merges.
+        if let Some(mirror) = &up.mirror
+            && let Some(at) = git.commit(&branch_ref(mirror))?
+            && !git.is_ancestor(&at, &target)?
+        {
+            refusals.push(format!(
+                "upstream '{}': the mirror branch '{mirror}' at {} is not contained in the target {}, \
+                 so it could not be fast-forwarded to it; name a target that contains it",
+                up.name,
+                abbrev(&at),
+                described(&target, rev.as_deref())
+            ));
             continue;
         }
         let has_record = d.last_synced_source == Some(drift::SyncSource::Record);
         match merge_kind(git, &base, up, &target, has_record)? {
             Ok(kind) => queue.push(QueuedUpstream {
                 name: up.name.clone(),
-                commits: d.commits_behind.unwrap_or_default(),
+                commits: git.count(&base, &target)?,
                 target,
+                rev,
                 previous: d.last_synced.clone(),
                 kind,
                 step: UpstreamStep::Pending,
@@ -129,8 +207,8 @@ pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
     if !refusals.is_empty() {
         bail!("cannot start the update:\n{}", bullet(&refusals));
     }
-    for (name, tip) in &current {
-        println!("{name}: current at {}", abbrev(tip));
+    for (name, target, rev) in &current {
+        println!("{name}: current at {}", described(target, rev.as_deref()));
     }
     if queue.is_empty() {
         println!("every selected upstream is current; nothing to update");
@@ -161,7 +239,7 @@ pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
         println!(
             "{}: queued at {} ({} new commit{})",
             q.name,
-            abbrev(&q.target),
+            described(&q.target, q.rev.as_deref()),
             q.commits,
             plural(q.commits)
         );
@@ -830,6 +908,15 @@ fn head(wt: &Git) -> Result<Option<String>> {
         return Ok(None);
     }
     wt.commit("HEAD")
+}
+
+/// A target as shown to the user: its abbreviated commit id, followed by the
+/// revision it was named by, if any.
+pub fn described(target: &str, rev: Option<&str>) -> String {
+    match rev {
+        Some(rev) => format!("{} ({rev})", abbrev(target)),
+        None => abbrev(target).to_string(),
+    }
 }
 
 pub fn plural(n: u64) -> &'static str {

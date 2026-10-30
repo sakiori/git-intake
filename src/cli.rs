@@ -33,9 +33,18 @@ pub enum Command {
         upstreams: Vec<String>,
     },
     /// Start an update: fix targets and merge each upstream with new commits
+    ///
+    /// Fetches the selected upstreams and fixes each one's target: its fetched branch tip, or, for an
+    /// upstream named as `UPSTREAM=REV`, the commit REV names. REV is a tag of the upstream's
+    /// remote (contacted to look it up), a commit id, or anything else git resolves, but not one of
+    /// the repository's own tags; its commit must be on the fetched upstream branch and contain the
+    /// upstream's last synced commit and mirror branch. Each upstream whose target the integration
+    /// branch lacks is merged in the update worktree with its own merge commit.
     Start {
-        /// Upstream names; all upstreams when none is given
-        upstreams: Vec<String>,
+        /// Upstream names, each optionally with the revision to take it at; all upstreams at their
+        /// fetched tips when none is given
+        #[arg(value_name = "UPSTREAM[=REV]", value_parser = parse_upstream_target)]
+        upstreams: Vec<UpstreamTarget>,
     },
     /// Conclude a resolved merge and merge the remaining queued upstreams
     Continue,
@@ -101,4 +110,54 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// An upstream named on the command line of `start`, with the revision to
+/// take it at when one is given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamTarget {
+    pub name: String,
+    pub rev: Option<String>,
+}
+
+/// Parses `UPSTREAM` or `UPSTREAM=REV`. An upstream name cannot contain `=`,
+/// so the first `=` ends the name and the rest is the revision.
+fn parse_upstream_target(arg: &str) -> Result<UpstreamTarget, String> {
+    match arg.split_once('=') {
+        None => Ok(UpstreamTarget {
+            name: arg.to_string(),
+            rev: None,
+        }),
+        Some(("", _)) => Err("the upstream name before '=' is empty".to_string()),
+        Some((_, "")) => Err("the revision after '=' is empty".to_string()),
+        Some((name, rev)) => Ok(UpstreamTarget {
+            name: name.to_string(),
+            rev: Some(rev.to_string()),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_targets_split_at_the_first_equals_sign() {
+        assert_eq!(
+            parse_upstream_target("app-a").unwrap(),
+            UpstreamTarget {
+                name: "app-a".into(),
+                rev: None
+            }
+        );
+        assert_eq!(
+            parse_upstream_target("app-a=refs/tags/a=b").unwrap(),
+            UpstreamTarget {
+                name: "app-a".into(),
+                rev: Some("refs/tags/a=b".into())
+            }
+        );
+        assert!(parse_upstream_target("=v1").is_err());
+        assert!(parse_upstream_target("app-a=").is_err());
+    }
 }
