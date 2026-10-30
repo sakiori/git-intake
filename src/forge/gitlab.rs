@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use super::http::{Auth, Client, Method};
-use super::{Forge, Kind, Location, MergeRequest, Review, State, endpoint, optional_text, text};
+use super::{Forge, Kind, Location, MergeRequest, Review, State, endpoint, instant, text};
 
 /// The longest description GitLab takes.
 const DESCRIPTION_LIMIT: usize = 1_048_576;
@@ -47,6 +47,13 @@ impl GitLab {
     }
 }
 
+/// Whether a merge request comes from a branch of the project itself, not
+/// of a fork.
+fn from_the_project(v: &Value) -> bool {
+    let id = |key: &str| v.get(key).and_then(Value::as_u64);
+    id("source_project_id").is_some() && id("source_project_id") == id("target_project_id")
+}
+
 fn merge_request(v: &Value) -> Result<MergeRequest> {
     let number = v
         .get("iid")
@@ -59,8 +66,8 @@ fn merge_request(v: &Value) -> Result<MergeRequest> {
         _ => State::Open,
     };
     let ended_at = match state {
-        State::Merged => optional_text(v, "merged_at").or_else(|| optional_text(v, "closed_at")),
-        State::Closed => optional_text(v, "closed_at"),
+        State::Merged => instant(v, "merged_at").or_else(|| instant(v, "closed_at")),
+        State::Closed => instant(v, "closed_at"),
         State::Open => None,
     };
     Ok(MergeRequest {
@@ -110,7 +117,12 @@ impl Forge for GitLab {
         let list = list
             .as_array()
             .context("GitLab answered the list of merge requests with something else")?;
-        list.iter().map(merge_request).collect()
+        // Only the project's own merge requests: one from a fork may come
+        // from a branch of the same name, with any description.
+        list.iter()
+            .filter(|v| from_the_project(v))
+            .map(merge_request)
+            .collect()
     }
 
     fn merge_request(&self, number: u64) -> Result<MergeRequest> {
@@ -326,7 +338,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(mr.state, State::Merged);
-        assert_eq!(mr.ended_at.as_deref(), Some("2026-01-02T00:00:00.000Z"));
+        assert_eq!(mr.ended_at, Some("2026-01-02T00:00:00Z".parse().unwrap()));
         assert_eq!(mr.description, "");
         assert_eq!(
             merge_request(&json!({"iid": 1, "state": "locked"}))
@@ -334,5 +346,12 @@ mod tests {
                 .state,
             State::Open
         );
+        assert!(from_the_project(
+            &json!({"source_project_id": 4, "target_project_id": 4})
+        ));
+        assert!(!from_the_project(
+            &json!({"source_project_id": 9, "target_project_id": 4})
+        ));
+        assert!(!from_the_project(&json!({"iid": 1})));
     }
 }

@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use super::http::{Auth, Client, Method};
-use super::{Forge, Kind, Location, MergeRequest, Review, State, endpoint, optional_text, text};
+use super::{Forge, Kind, Location, MergeRequest, Review, State, endpoint, instant, text};
 
 /// The API version every request asks for.
 pub const API_VERSION: &str = "2022-11-28";
@@ -86,8 +86,23 @@ impl GitHub {
         let list = list
             .as_array()
             .context("GitHub answered the list of pull requests with something else")?;
-        list.iter().map(pull).collect()
+        // Only the repository's own pull requests: one from a fork in the
+        // same organisation matches the head filter too, and one whose fork
+        // was deleted has no head repository at all.
+        let own = format!("{}/{}", self.owner, self.repo);
+        list.iter()
+            .filter(|v| from_the_repository(v, &own))
+            .map(pull)
+            .collect()
     }
+}
+
+/// Whether a pull request comes from a branch of the repository `own`
+/// (`owner/repo`) itself.
+fn from_the_repository(v: &Value, own: &str) -> bool {
+    v.pointer("/head/repo/full_name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case(own))
 }
 
 fn pull(v: &Value) -> Result<MergeRequest> {
@@ -95,7 +110,7 @@ fn pull(v: &Value) -> Result<MergeRequest> {
         .get("number")
         .and_then(Value::as_u64)
         .context("GitHub answered with a pull request without a number")?;
-    let merged_at = optional_text(v, "merged_at");
+    let merged_at = instant(v, "merged_at");
     let state = match (v.get("state").and_then(Value::as_str), &merged_at) {
         (Some("open"), _) => State::Open,
         (_, Some(_)) => State::Merged,
@@ -112,7 +127,7 @@ fn pull(v: &Value) -> Result<MergeRequest> {
         description: text(v, "body"),
         ended_at: match state {
             State::Open => None,
-            _ => optional_text(v, "closed_at").or(merged_at),
+            _ => instant(v, "closed_at").or(merged_at),
         },
     })
 }
@@ -204,11 +219,7 @@ impl Forge for GitHub {
         let classic = if protected {
             let url = self.url(&["branches", target, "protection"], &[]);
             let reply = self.client.send(Method::Get, &url, None)?;
-            if reply.success() {
-                Classic::Read(reply.json)
-            } else {
-                Classic::Unreadable(reply.status)
-            }
+            classic(reply.status, reply.json)
         } else {
             Classic::None
         };
@@ -217,6 +228,21 @@ impl Forge for GitHub {
 
     fn description_limit(&self) -> usize {
         DESCRIPTION_LIMIT
+    }
+}
+
+/// The classic protection a reply to `GET .../branches/{b}/protection`
+/// shows. `protected` on the branch also counts rulesets, so a branch
+/// covered by rulesets alone answers 404 with the message `Branch not
+/// protected`: it has no classic protection. A 404 `Not Found`, or 401 or
+/// 403, is what a token without administration access gets.
+fn classic(status: u16, json: Value) -> Classic {
+    match status {
+        200..=299 => Classic::Read(json),
+        404 if json.get("message").and_then(Value::as_str) == Some("Branch not protected") => {
+            Classic::None
+        }
+        _ => Classic::Unreadable(status),
     }
 }
 
@@ -503,6 +529,28 @@ mod tests {
         let r = review("main", &repo(None), &rules, &Classic::None);
         assert!(r.refusals.is_empty(), "{:?}", r.refusals);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn a_branch_covered_only_by_rulesets_has_no_classic_protection() {
+        assert!(matches!(
+            classic(404, json!({"message": "Branch not protected"})),
+            Classic::None
+        ));
+        assert!(matches!(
+            classic(404, json!({"message": "Not Found"})),
+            Classic::Unreadable(404)
+        ));
+        assert!(matches!(classic(403, json!({})), Classic::Unreadable(403)));
+        assert!(matches!(classic(200, json!({})), Classic::Read(_)));
+    }
+
+    #[test]
+    fn only_the_repository_s_own_pull_requests_count() {
+        let own = |repo: Value| from_the_repository(&json!({"head": {"repo": repo}}), "team/app");
+        assert!(own(json!({"full_name": "Team/App"})));
+        assert!(!own(json!({"full_name": "team/app-fork"})));
+        assert!(!own(Value::Null));
     }
 
     #[test]

@@ -15,6 +15,7 @@ members = ["xtask"]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 glob = "0.3.4"
+jiff = { version = "0.2.38", default-features = false, features = ["std"] }
 percent-encoding = "2.3.2"
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }

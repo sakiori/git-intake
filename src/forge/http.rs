@@ -244,6 +244,10 @@ impl Client {
         let hint = match reply.status {
             401 => "; the token was not accepted",
             403 => "; the token lacks the access this needs",
+            404 => {
+                "; the project was not found, or the token cannot see it: check the publish remote's URL, \
+                   the setting `api`, and the token's access to the project"
+            }
             _ => "",
         };
         format!(

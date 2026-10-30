@@ -86,9 +86,20 @@ pub struct MergeRequest {
     pub source: String,
     pub target: String,
     pub description: String,
-    /// When it was merged or closed, as the forge writes the time, which
-    /// orders the merge requests of one forge.
-    pub ended_at: Option<String>,
+    /// When it was merged or closed.
+    pub ended_at: Option<jiff::Timestamp>,
+}
+
+/// A time the forge writes, in RFC 3339, as an instant; `None` when absent
+/// or unreadable.
+fn instant(value: &serde_json::Value, key: &str) -> Option<jiff::Timestamp> {
+    optional_text(value, key).and_then(|t| t.parse().ok())
+}
+
+/// Orders merge requests by when they ended, the one that ended most
+/// recently first and those that did not end last.
+pub fn latest_first(list: &mut [MergeRequest]) {
+    list.sort_by(|a, b| b.ended_at.cmp(&a.ended_at));
 }
 
 /// What the forge's settings mean for an update's merge request.
@@ -253,6 +264,33 @@ mod tests {
             endpoint(&base, &["repos", "team", "app"], &[]).as_str(),
             "https://api.github.com/repos/team/app"
         );
+    }
+
+    #[test]
+    fn merge_requests_are_ordered_by_instant_across_offsets() {
+        let mr = |number: u64, ended: Option<&str>| MergeRequest {
+            number,
+            url: String::new(),
+            state: State::Closed,
+            head: String::new(),
+            source: String::new(),
+            target: String::new(),
+            description: String::new(),
+            ended_at: ended.map(|t| t.parse().unwrap()),
+        };
+        // Across the change to summer time: 03:15+02:00 is 01:15Z, before
+        // 01:30Z, though it sorts after it as text; and back to winter
+        // time, 02:10+01:00 is 01:10Z, after 02:30+02:00, which is 00:30Z.
+        let mut list = vec![
+            mr(1, Some("2026-03-29T03:15:00+02:00")),
+            mr(2, Some("2026-03-29T01:30:00Z")),
+            mr(3, None),
+            mr(4, Some("2026-10-25T02:30:00+02:00")),
+            mr(5, Some("2026-10-25T02:10:00+01:00")),
+        ];
+        latest_first(&mut list);
+        let order: Vec<u64> = list.iter().map(|m| m.number).collect();
+        assert_eq!(order, [5, 4, 2, 1, 3]);
     }
 
     #[test]

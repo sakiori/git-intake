@@ -108,7 +108,7 @@ pub fn requests(
         .into_iter()
         .filter(|m| m.state != State::Open && m.target == integration)
         .collect();
-    ended.sort_by(|a, b| b.ended_at.cmp(&a.ended_at));
+    forge::latest_first(&mut ended);
     Ok(Requests {
         open,
         elsewhere,
@@ -315,7 +315,7 @@ pub fn publish(
                     .next()
                     .with_context(|| {
                         format!(
-                            "the {} refused to open a {term} from '{}' into '{integration}' because one is open, \
+                            "{} refused to open a {term} from '{}' into '{integration}' because one is open, \
                              but lists none",
                             kind.name(),
                             p.branch
