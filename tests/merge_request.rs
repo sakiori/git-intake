@@ -6,7 +6,6 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use common::{
@@ -93,9 +92,7 @@ fn merge_request_opened_waits_and_completes_after_a_merge_commit() {
     assert!(options.contains(&"merge_request.remove_source_branch".to_string()));
     // Nothing moved, locally or on the remote's integration branch.
     assert_eq!(env.rev(&f.down, "main"), base);
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
     assert_eq!(env.rev(&f.publish, "main"), published);
-    assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
     assert!(!env.update_worktree(&f.down).exists());
 
     // Every command sees the waiting step.
@@ -149,7 +146,6 @@ fn merge_request_opened_waits_and_completes_after_a_merge_commit() {
         stdout(&waiting)
     );
     assert_eq!(env.rev(&f.down, "main"), base);
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
 
     // The forge merges the request with a merge commit and keeps the branch.
     let forge = forge(&f);
@@ -171,7 +167,6 @@ fn merge_request_opened_waits_and_completes_after_a_merge_commit() {
     let done = f.tool(&["finish"]).success();
     let out = stdout(&done);
     assert!(out.contains("received the verified commit"), "{out}");
-    assert!(out.contains("pushed upstream-main to 'origin'"), "{out}");
     assert!(
         out.contains(&format!(
             "deleted the merge request branch '{branch}' from 'origin'"
@@ -180,8 +175,7 @@ fn merge_request_opened_waits_and_completes_after_a_merge_commit() {
     );
     assert_eq!(env.rev(&f.down, "main"), merged);
     assert!(env.is_ancestor(&f.down, &commit, "main"));
-    assert_eq!(env.rev(&f.down, "upstream-main"), target);
-    assert_eq!(env.rev(&f.publish, "upstream-main"), target);
+    assert!(env.is_ancestor(&f.down, &target, "main"));
     assert_eq!(env.rev(&f.publish, "main"), merged);
     assert!(!env.has_rev(&f.publish, &format!("refs/heads/{branch}")));
     // The main checkout followed the fast-forward.
@@ -196,7 +190,7 @@ fn merge_request_opened_waits_and_completes_after_a_merge_commit() {
 fn fast_forward_merge_with_the_branch_already_removed_completes() {
     let f = Fork::merge_request();
     let env = &f.env;
-    let (commit, target) = verified(&f);
+    let (commit, _) = verified(&f);
     let branch = mr_branch(&commit);
     f.tool(&["finish"]).success();
 
@@ -214,7 +208,6 @@ fn fast_forward_merge_with_the_branch_already_removed_completes() {
         )))
         .stdout(contains("update finished"));
     assert_eq!(env.rev(&f.down, "main"), commit);
-    assert_eq!(env.rev(&f.publish, "upstream-main"), target);
     env.assert_no_update(&f.down);
 }
 
@@ -257,8 +250,6 @@ fn squash_merge_is_refused_and_moves_nothing() {
         "{err}"
     );
     assert_eq!(env.rev(&f.down, "main"), base);
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
-    assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
     assert_eq!(env.rev(&f.publish, "main"), squashed);
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["update"]["step"], "waiting_for_merge_request");
@@ -303,10 +294,7 @@ fn integration_moved_before_the_merge_is_refused_and_abort_withdraws() {
         )),
         "{out}"
     );
-    assert!(
-        out.contains("update aborted; 'main' and 'upstream-main' are unchanged"),
-        "{out}"
-    );
+    assert!(out.contains("update aborted; 'main' is unchanged"), "{out}");
     assert!(!env.has_rev(&f.publish, &format!("refs/heads/{branch}")));
     assert!(!env.intake_dir(&f.down).join("logs").exists());
     env.assert_no_update(&f.down);
@@ -410,10 +398,10 @@ fn no_publish_keeps_its_meaning_in_merge_request_mode() {
     f.tool(&["finish", "--no-publish"])
         .success()
         .stdout(contains(
-            "not published to 'origin' (advanced locally only): main, upstream-main",
+            "not published to 'origin' (advanced locally only): main",
         ));
     assert_eq!(env.rev(&f.down, "main"), commit);
-    assert_eq!(env.rev(&f.down, "upstream-main"), target);
+    assert!(env.is_ancestor(&f.down, &target, "main"));
     assert_eq!(env.rev(&f.publish, "main"), published);
     assert!(!env.has_rev(&f.publish, &format!("refs/heads/{}", mr_branch(&commit))));
     env.assert_no_update(&f.down);
@@ -429,62 +417,19 @@ fn no_publish_keeps_its_meaning_in_merge_request_mode() {
         "`--no-publish` moves no branch before the merge request is merged",
     ));
     assert_eq!(env.rev(&f.down, "main"), base);
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
 
-    // After the merge: local moves only; the mirror and the branch stay as they are on the remote.
+    // After the merge: the local move only; the merge request branch stays
+    // as it is on the remote.
     env.git(&f.publish, &["update-ref", "refs/heads/main", &commit]);
     f.tool(&["finish", "--no-publish"])
         .success()
-        .stdout(contains(
-            "not published to 'origin' (advanced locally only): upstream-main",
-        ));
+        .stdout(contains("update finished"));
     assert_eq!(env.rev(&f.down, "main"), commit);
-    assert_eq!(env.rev(&f.down, "upstream-main"), target);
-    assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
+    assert!(env.is_ancestor(&f.down, &target, "main"));
     assert_eq!(env.rev(&f.publish, &format!("refs/heads/{branch}")), commit);
     env.assert_no_update(&f.down);
     let report = env.tool_json(&f.down, &["report", "--json"], 0);
-    assert_eq!(report["unpublished"], serde_json::json!(["upstream-main"]));
-}
-
-#[test]
-fn rejected_mirror_push_after_the_merge_resumes() {
-    let f = Fork::merge_request();
-    let env = &f.env;
-    let (commit, target) = verified(&f);
-    f.tool(&["finish"]).success();
-    env.git(&f.publish, &["update-ref", "refs/heads/main", &commit]);
-
-    // The mirror branch is protected on the remote.
-    let hook = f.publish.join("hooks").join("update");
-    fs::write(
-        &hook,
-        "#!/bin/sh\n[ \"$1\" = refs/heads/upstream-main ] && { echo 'protected branch' >&2; exit 1; }\nexit 0\n",
-    )
-    .unwrap();
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let err = stderr(&f.tool(&["finish"]).code(2));
-    assert!(
-        err.contains("pushing them to 'origin' was rejected"),
-        "{err}"
-    );
-    assert_eq!(env.rev(&f.down, "main"), commit);
-    assert_eq!(env.rev(&f.down, "upstream-main"), target);
-    let status = env.tool_json(&f.down, &["status", "--json"], 0);
-    assert_eq!(status["update"]["step"], "finishing");
-    assert!(status["update"]["publish_error"].is_string());
-    f.tool(&["abort"])
-        .code(2)
-        .stderr(contains("can no longer be aborted"));
-
-    fs::remove_file(&hook).unwrap();
-    f.tool(&["finish"])
-        .success()
-        .stdout(contains("resuming finish"))
-        .stdout(contains("pushed upstream-main to 'origin'"));
-    assert_eq!(env.rev(&f.publish, "upstream-main"), target);
-    env.assert_no_update(&f.down);
+    assert_eq!(report["unpublished"], serde_json::json!([]));
 }
 
 #[test]
@@ -572,8 +517,6 @@ fn merge_request_branch_changed_before_the_merge_is_refused() {
         "{err}"
     );
     assert_eq!(env.rev(&f.down, "main"), base);
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
-    assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
 
     let out = stdout(&f.tool(&["abort"]).success());
     assert!(
@@ -583,14 +526,10 @@ fn merge_request_branch_changed_before_the_merge_is_refused() {
         )),
         "{out}"
     );
-    assert!(
-        out.contains("update aborted; 'main' and 'upstream-main' are unchanged"),
-        "{out}"
-    );
+    assert!(out.contains("update aborted; 'main' is unchanged"), "{out}");
     assert!(!out.contains("close the merge request"), "{out}");
     // The branch moved beyond the verified commit, so it is left alone.
     assert!(out.contains("left the merge request branch"), "{out}");
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
     assert_eq!(env.rev(&f.down, "main"), base);
     env.assert_no_update(&f.down);
 }
@@ -613,8 +552,6 @@ fn merged_after_the_integration_branch_moved_is_refused() {
     let err = stderr(&f.tool(&["finish"]).code(2));
     assert!(err.contains("differs from the verified tree"), "{err}");
     assert_eq!(env.rev(&f.down, "main"), base);
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
-    assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
 }
 
 #[test]
@@ -632,7 +569,7 @@ fn abort_after_a_valid_merge_is_refused() {
         .stderr(contains("Run `git intake finish` to complete it"));
     assert!(env.has_rev(&f.publish, &format!("refs/heads/{branch}")));
     f.tool(&["finish"]).success();
-    assert_eq!(env.rev(&f.down, "upstream-main"), target);
+    assert!(env.is_ancestor(&f.down, &target, "main"));
     env.assert_no_update(&f.down);
 }
 
@@ -959,13 +896,10 @@ fn fast_forward_of_a_changed_merge_request_is_refused_by_its_head() {
         "{err}"
     );
     assert_eq!(env.rev(&f.down, "main"), base);
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
-    assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
     f.tool(&["abort"]).success().stdout(contains(format!(
         "holds an unverified merge: the merge request's head is {}, and it landed instead of the verified commit",
         &extra[..12]
     )));
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
     env.assert_no_update(&f.down);
 }
 
@@ -991,7 +925,6 @@ fn fast_forward_of_a_changed_branch_is_refused_without_the_merge_request_head() 
         "{err}"
     );
     assert_eq!(env.rev(&f.down, "main"), base);
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
 }
 
 #[test]
@@ -1022,7 +955,7 @@ fn branch_as_last_seen_judges_once_it_is_gone() {
 fn fast_forward_with_later_work_completes_when_the_head_is_verified() {
     let f = Fork::merge_request();
     let env = &f.env;
-    let (commit, target) = verified(&f);
+    let (commit, _) = verified(&f);
     let branch = mr_branch(&commit);
     f.tool(&["finish"]).success();
     set_merge_request_head(&f, &commit);
@@ -1035,7 +968,6 @@ fn fast_forward_with_later_work_completes_when_the_head_is_verified() {
     let out = stdout(&f.tool(&["finish"]).success());
     assert!(!out.contains("could not be attributed"), "{out}");
     assert_eq!(env.rev(&f.down, "main"), later);
-    assert_eq!(env.rev(&f.publish, "upstream-main"), target);
     env.assert_no_update(&f.down);
 }
 
@@ -1119,8 +1051,6 @@ fn a_matching_merge_request_head_does_not_clear_a_changed_branch() {
     );
     assert!(!err.contains("the merge request's head is"), "{err}");
     assert_eq!(env.rev(&f.down, "main"), base);
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
-    assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
 }
 
 #[test]

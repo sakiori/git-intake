@@ -1,13 +1,18 @@
-//! `log`: upstream commits the integration branch does not contain.
+//! `log`: upstream commits the integration branch does not contain, or for a
+//! port upstream, the commits still to decide on.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::Exit;
-use crate::drift;
+use crate::commands::update::plural;
+use crate::config::Mode;
 use crate::git::{abbrev, branch_ref};
 use crate::output::{Render, emit};
+use crate::port::{self, Standing};
 use crate::repo::Repo;
+use crate::sync_record;
+use crate::upstreams::Fetches;
 
 #[derive(Serialize)]
 pub struct LogDoc {
@@ -20,9 +25,15 @@ pub struct UpstreamLog {
     pub name: String,
     pub path: Option<String>,
     pub branch: String,
+    pub mode: Mode,
     pub tip: Option<String>,
+    /// Whether the commits could be listed: the upstream was fetched and,
+    /// for a port upstream, its journal is valid and its history not
+    /// rewritten.
     pub available: bool,
     pub detail: Option<String>,
+    /// For a follow upstream, the commits the integration branch lacks; for
+    /// a port upstream, the pending commits, oldest first.
     pub commits: Vec<LogCommit>,
 }
 
@@ -44,18 +55,43 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
                 config.integration
             )
         })?;
+    let mut fetches = Fetches::new(repo);
+    let mut fetched = Vec::new();
+    for up in &selected {
+        fetched.push(fetches.upstream(up)?);
+    }
+    let fetch_failed = fetched.iter().any(|f| f.is_err());
+    let latest = sync_record::latest(&sync_record::records(git, &integration, &config)?);
     let mut upstreams = Vec::new();
-    for up in selected {
-        let (tip, detail, commits) = match drift::fetched_tip(git, up)? {
-            Err(why) => (None, Some(why), Vec::new()),
-            Ok(tip) => {
+    for (up, fetched) in selected.iter().zip(fetched) {
+        let mut entry = UpstreamLog {
+            name: up.name.clone(),
+            path: up.path.clone(),
+            branch: up.source(),
+            mode: up.mode,
+            tip: None,
+            available: false,
+            detail: None,
+            commits: Vec::new(),
+        };
+        let tip = match fetched {
+            Ok(tip) => tip,
+            Err(why) => {
+                entry.detail = Some(format!("fetch failed: {why}"));
+                upstreams.push(entry);
+                continue;
+            }
+        };
+        entry.tip = Some(tip.clone());
+        match up.mode {
+            Mode::Follow => {
                 let out = git.run(&[
                     "log",
                     "--format=%H%x1f%s",
                     &format!("{integration}..{tip}"),
                     "--",
                 ])?;
-                let commits = out
+                entry.commits = out
                     .lines()
                     .filter_map(|l| l.split_once('\u{1f}'))
                     .map(|(c, s)| LogCommit {
@@ -63,19 +99,37 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
                         subject: s.to_string(),
                     })
                     .collect();
-                (Some(tip), None, commits)
+                entry.available = true;
             }
-        };
-        upstreams.push(UpstreamLog {
-            name: up.name.clone(),
-            path: up.path.clone(),
-            branch: up.source(),
-            available: tip.is_some(),
-            tip,
-            detail,
-            commits,
-        });
+            Mode::Port => {
+                match port::standing(git, &config, &integration, up, latest.get(&up.name), &tip) {
+                    Err(err) => entry.detail = Some(format!("{err:#}")),
+                    Ok(Standing::Rewritten(why)) => {
+                        entry.detail = Some(format!("rewritten: {why}"))
+                    }
+                    Ok(Standing::NoBase) => {
+                        entry.detail = Some(format!(
+                            "no journal and no last synced commit to start one from; write the journal {} by hand",
+                            port::journal_path(&up.name)
+                        ))
+                    }
+                    Ok(Standing::Known(a)) => {
+                        entry.commits = a
+                            .pending()
+                            .into_iter()
+                            .map(|c| LogCommit {
+                                commit: c.commit.clone(),
+                                subject: c.subject.clone(),
+                            })
+                            .collect();
+                        entry.available = true;
+                    }
+                }
+            }
+        }
+        upstreams.push(entry);
     }
+    drop(fetches);
     emit(
         &LogDoc {
             integration: config.integration.clone(),
@@ -83,7 +137,11 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
         },
         json,
     )?;
-    Ok(Exit::Success)
+    Ok(if fetch_failed {
+        Exit::Negative
+    } else {
+        Exit::Success
+    })
 }
 
 impl Render for LogDoc {
@@ -104,14 +162,21 @@ impl Render for LogDoc {
                 continue;
             }
             let n = u.commits.len() as u64;
-            out.push_str(&format!(
-                "{} ({path}, {}): {} commit{} not in {}\n",
-                u.name,
-                u.branch,
-                n,
-                crate::commands::update::plural(n),
-                self.integration
-            ));
+            match u.mode {
+                Mode::Follow => out.push_str(&format!(
+                    "{} ({path}, {}): {n} commit{} not in {}\n",
+                    u.name,
+                    u.branch,
+                    plural(n),
+                    self.integration
+                )),
+                Mode::Port => out.push_str(&format!(
+                    "{} ({path}, {}): {n} pending commit{}, oldest first\n",
+                    u.name,
+                    u.branch,
+                    plural(n)
+                )),
+            }
             for c in &u.commits {
                 out.push_str(&format!("  {}  {}\n", abbrev(&c.commit), c.subject));
             }

@@ -13,12 +13,12 @@ fn first_import_keeps_full_history_under_each_path() {
     let b_tip = env.rev(&m.b.bare, "main");
     let base = env.rev(&m.down, "main");
 
-    // A new clone: the remotes do not exist yet and are added from the URLs.
+    // Upstreams are fetched by their URLs; no remote is added for them.
     let start = m.tool(&["start"]).success();
     let out = stdout(&start);
     assert!(out.contains("app-a: queued at"), "{out}");
     assert!(out.contains("app-b: queued at"), "{out}");
-    assert_eq!(env.git(&m.down, &["remote", "get-url", "app-a"]), m.a.url());
+    assert_eq!(env.git(&m.down, &["remote"]), "");
 
     let wt = env.update_worktree(&m.down);
     assert_eq!(
@@ -49,7 +49,6 @@ fn first_import_keeps_full_history_under_each_path() {
         "upstream history is kept"
     );
     assert!(env.is_ancestor(&m.down, &b_tip, "main"));
-    assert_eq!(env.rev(&m.down, "mirror-a"), a_tip);
     let subject = env.git(&m.down, &["log", "-1", "--format=%s", "main^1"]);
     assert!(
         subject.starts_with("sync(app-a): merge app-a/main at "),
@@ -104,7 +103,6 @@ fn later_update_merges_under_path_and_skips_unchanged() {
     assert!(m.down.join("apps/a/extra.txt").exists());
     assert!(!m.down.join("extra.txt").exists());
     assert_eq!(env.rev(&m.down, "main^2"), a2);
-    assert_eq!(env.rev(&m.down, "mirror-a"), a2);
     let report = env.tool_json(&m.down, &["report", "--json"], 0);
     let u = &report["upstreams"][0];
     assert_eq!(u["name"], "app-a");
@@ -186,7 +184,6 @@ fn abort_restores_everything() {
     );
     env.push_upstream(&m.a, &[("a.txt", "a1\na2-up\na3\n")], "app-a: change a2");
     let main = env.rev(&m.down, "main");
-    let mirror = env.rev(&m.down, "mirror-a");
 
     m.tool(&["start"]).code(1);
     m.tool(&["abort"])
@@ -195,12 +192,12 @@ fn abort_restores_everything() {
         .stdout(contains("removed branch git-intake/update"))
         .stdout(contains("removed logs"))
         .stdout(contains(
-            "update aborted; 'main' and 'mirror-a' are unchanged",
-        ));
+            "removed reference refs/git-intake/upstreams/app-a",
+        ))
+        .stdout(contains("update aborted; 'main' is unchanged"));
     env.assert_no_update(&m.down);
     assert!(!env.intake_dir(&m.down).join("logs").exists());
     assert_eq!(env.rev(&m.down, "main"), main);
-    assert_eq!(env.rev(&m.down, "mirror-a"), mirror);
     assert!(env.git(&m.down, &["status", "--porcelain"]).is_empty());
     m.tool(&["abort"])
         .success()
@@ -253,7 +250,7 @@ fn status_reports_three_upstreams_with_counts() {
     let env = &m.env;
     let c = env.upstream("app-c", &[("c.txt", "c\n")]);
     let extra = format!(
-        "\n[[upstream]]\nname = \"app-c\"\nremote = \"app-c\"\nbranch = \"main\"\nurl = {:?}\npath = \"libs/c\"\n",
+        "\n[[upstream]]\nname = \"app-c\"\nurl = {:?}\nbranch = \"main\"\npath = \"libs/c\"\n",
         c.url()
     );
     env.commit(
@@ -265,7 +262,6 @@ fn status_reports_three_upstreams_with_counts() {
     env.push_upstream(&m.a, &[("a2.txt", "x\n")], "app-a: one");
     env.push_upstream(&m.b, &[("b2.txt", "x\n")], "app-b: one");
     env.push_upstream(&m.b, &[("b3.txt", "x\n")], "app-b: two");
-    m.tool(&["fetch"]).success();
 
     let status = m.tool(&["status"]).success();
     let out = stdout(&status);
@@ -328,7 +324,6 @@ fn branches_lists_unmerged_upstream_work() {
     env.commit(&m.a.work, &[("f1.txt", "1\n")], "app-a: feature 1");
     env.commit(&m.a.work, &[("f2.txt", "2\n")], "app-a: feature 2");
     env.git(&m.a.work, &["push", "-q", "origin", "feature"]);
-    m.tool(&["fetch"]).success();
 
     m.tool(&["branches"])
         .success()
@@ -344,6 +339,9 @@ fn branches_lists_unmerged_upstream_work() {
     assert_eq!(json["upstreams"][1]["branches"], serde_json::json!([]));
     let only_b = env.tool_json(&m.down, &["branches", "app-b", "--json"], 0);
     assert_eq!(only_b["unmerged_work"], false);
+    // Every branch was fetched for the command only.
+    env.assert_no_update(&m.down);
+    assert!(!env.has_rev(&m.down, "refs/heads/feature"));
 }
 
 #[test]
@@ -359,7 +357,6 @@ fn log_lists_pending_commits() {
             &format!("app-a: change {i}"),
         ));
     }
-    m.tool(&["fetch", "app-a"]).success();
     let log = m.tool(&["log", "app-a"]).success();
     let out = stdout(&log);
     assert!(

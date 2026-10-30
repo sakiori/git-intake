@@ -54,8 +54,7 @@ fn commit_target_is_merged_published_and_shown_as_behind() {
     assert_eq!(env.rev(&f.down, "main^2"), c2);
     let msg = env.git(&f.down, &["log", "-1", "--format=%B", "main"]);
     assert!(msg.contains(&format!("Intake-Target: {c2}")), "{msg}");
-    assert_eq!(env.rev(&f.down, "upstream-main"), c2);
-    assert_eq!(env.rev(&f.publish, "upstream-main"), c2);
+    assert_eq!(env.rev(&f.publish, "main"), env.rev(&f.down, "main"));
 
     let report = env.tool_json(&f.down, &["report", "--json"], 0);
     assert_eq!(report["upstreams"][0]["target"], c2.as_str());
@@ -83,7 +82,7 @@ fn commit_target_is_merged_published_and_shown_as_behind() {
         .stdout(contains("(1 new commit)"));
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    assert_eq!(env.rev(&f.down, "upstream-main"), c3);
+    assert_eq!(env.rev(&f.down, "main^2"), c3);
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["upstreams"][0]["state"], "current");
     let report = env.tool_json(&f.down, &["report", "--json"], 0);
@@ -111,13 +110,12 @@ fn tag_target_is_the_upstream_tag_and_no_tag_is_fetched() {
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
     assert_eq!(env.rev(&f.down, "main^2"), c1);
-    assert_eq!(env.rev(&f.down, "upstream-main"), c1);
 
     // A lightweight tag works the same way.
     f.tool(&["start", "upstream=v1.2"]).success();
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    assert_eq!(env.rev(&f.down, "upstream-main"), c2);
+    assert_eq!(env.rev(&f.down, "main^2"), c2);
 
     // Upstream tags never enter the repository.
     let tags = env.git(&f.down, &["tag", "--list"]);
@@ -138,27 +136,28 @@ fn revision_outside_the_upstream_branch_is_refused() {
     let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local");
     env.git(&f.down, &["push", "-q", "origin", "main"]);
 
-    let refused = f.tool(&["start", "upstream=upstream/feature"]).code(2);
-    let err = stderr(&refused);
-    assert!(
-        err.contains(&format!(
-            "upstream 'upstream': 'upstream/feature' at {} is not in the history of upstream/main as fetched",
-            &side[..12]
-        )),
-        "{err}"
-    );
+    // Only the tracked branch is fetched, so the side commit is unknown.
+    f.tool(&["start", &format!("upstream={side}")])
+        .code(2)
+        .stderr(contains(format!(
+            "upstream 'upstream': '{side}' names no commit and no tag of {}",
+            f.up.url()
+        )));
     f.tool(&["start", "upstream=side-tag"])
         .code(2)
-        .stderr(contains("tag 'side-tag' of remote 'upstream' at"))
-        .stderr(contains("is not in the history of upstream/main"));
+        .stderr(contains(format!("tag 'side-tag' of {} at", f.up.url())))
+        .stderr(contains(
+            "is not in the history of upstream/main as fetched",
+        ));
     f.tool(&["start", &format!("upstream={local}")])
         .code(2)
         .stderr(contains("is not in the history of upstream/main"));
     f.tool(&["start", "upstream=no-such-rev"])
         .code(2)
-        .stderr(contains(
-            "upstream 'upstream': 'no-such-rev' names no commit and no tag of remote 'upstream'",
-        ));
+        .stderr(contains(format!(
+            "upstream 'upstream': 'no-such-rev' names no commit and no tag of {}",
+            f.up.url()
+        )));
     env.assert_no_update(&f.down);
     assert_eq!(env.rev(&f.down, "main"), local);
 }
@@ -276,7 +275,6 @@ fn conflict_at_a_chosen_target_resumes_and_records_that_target_after_the_tag_mov
     assert_eq!(env.rev(&f.down, "main^2"), c1);
     let msg = env.git(&f.down, &["log", "-1", "--format=%B", "main"]);
     assert!(msg.contains(&format!("Intake-Target: {c1}")), "{msg}");
-    assert_eq!(env.rev(&f.down, "upstream-main"), c1);
     assert!(!env.is_ancestor(&f.down, &later, "main"));
     let report = env.tool_json(&f.down, &["report", "--json"], 0);
     assert_eq!(report["upstreams"][0]["rev"], "v2.0");
@@ -294,11 +292,10 @@ fn abort_and_retry_keep_the_chosen_target() {
     f.tool(&["start", &format!("upstream={c1}")]).success();
     f.tool(&["abort"]).success();
     env.assert_no_update(&f.down);
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
     f.tool(&["start", &format!("upstream={c1}")]).success();
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    assert_eq!(env.rev(&f.down, "upstream-main"), c1);
+    assert_eq!(env.rev(&f.down, "main^2"), c1);
 }
 
 #[test]
@@ -322,7 +319,6 @@ fn several_upstreams_each_at_their_own_point() {
     assert_eq!(ups[0]["commits_behind"], 1);
     assert_eq!(ups[1]["last_synced"], b1.as_str());
     assert_eq!(ups[1]["state"], "current");
-    assert_eq!(env.rev(&m.down, "mirror-a"), a1);
     assert_eq!(
         std::fs::read_to_string(m.down.join("apps/a/a.txt")).unwrap(),
         "a1\na2\na3\na4\n"
@@ -380,7 +376,7 @@ fn own_tag_does_not_stand_in_for_a_missing_upstream_tag() {
     let env = &f.env;
     let [c1, c2, _] = three_upstream_commits(&f);
     // The repository tags an upstream commit; the upstream has no such tag.
-    env.git(&f.down, &["fetch", "-q", "upstream"]);
+    env.git(&f.down, &["fetch", "-q", &f.up.url(), "main"]);
     env.git(&f.down, &["tag", "v2.3", &c2]);
     env.git(&f.down, &["tag", "-a", "-m", "own", "own-1", &c1]);
 
@@ -391,31 +387,12 @@ fn own_tag_does_not_stand_in_for_a_missing_upstream_tag() {
             err.contains("resolves through the repository's own tag refs/tags/"),
             "{rev}: {err}"
         );
-        assert!(err.contains("remote 'upstream' has no tag"), "{rev}: {err}");
+        assert!(
+            err.contains(&format!("{} has no tag", f.up.url())),
+            "{rev}: {err}"
+        );
     }
     env.assert_no_update(&f.down);
-}
-
-#[test]
-fn mirror_ahead_of_the_target_is_refused_at_start() {
-    let f = Fork::new();
-    let env = &f.env;
-    let [_, c2, c3] = three_upstream_commits(&f);
-    env.git(&f.down, &["fetch", "-q", "upstream"]);
-    env.git(&f.down, &["branch", "upstream-main", &c3]);
-
-    f.tool(&["start", &format!("upstream={c2}")])
-        .code(2)
-        .stderr(contains(format!(
-            "upstream 'upstream': the mirror branch 'upstream-main' at {} is not contained in the target {}",
-            &c3[..12],
-            &c2[..12]
-        )));
-    env.assert_no_update(&f.down);
-    assert_eq!(env.rev(&f.down, "upstream-main"), c3);
-
-    // A target that contains the mirror is taken.
-    f.tool(&["start", &format!("upstream={c3}")]).success();
 }
 
 #[test]
@@ -423,11 +400,12 @@ fn revision_expression_on_the_fetched_branch_is_resolved() {
     let f = Fork::new();
     let env = &f.env;
     let [_, c2, _] = three_upstream_commits(&f);
-    // `start` fetches first, so the expression sees the new tip.
-    f.tool(&["start", "upstream=upstream/main~1"])
+    // `start` fetches first, so an expression on the reference that holds
+    // the fetched branch sees the new tip.
+    f.tool(&["start", "upstream=refs/git-intake/upstreams/upstream~1"])
         .success()
         .stdout(contains(format!(
-            "upstream: queued at {} (upstream/main~1)",
+            "upstream: queued at {} (refs/git-intake/upstreams/upstream~1)",
             &c2[..12]
         )));
     f.tool(&["verify"]).success();
@@ -462,7 +440,6 @@ fn first_import_of_a_path_upstream_at_a_chosen_revision() {
         fs::read_to_string(m.down.join("apps/a/a.txt")).unwrap(),
         "a1\na2\na3\n"
     );
-    assert_eq!(env.rev(&m.down, "mirror-a"), a0);
     let status = env.tool_json(&m.down, &["status", "--json"], 0);
     let a = &status["upstreams"][0];
     assert_eq!(a["last_synced"], a0.as_str());
@@ -472,40 +449,54 @@ fn first_import_of_a_path_upstream_at_a_chosen_revision() {
 }
 
 #[test]
-fn unreachable_remote_during_tag_lookup_is_refused_clearly() {
+fn unreachable_upstream_during_tag_lookup_is_refused_clearly() {
     let f = Fork::new();
     let env = &f.env;
     let [c1, _, _] = three_upstream_commits(&f);
-    // The upstream's remote serves the fetch of `start`, then fails.
+    // The upstream's URL serves the fetch of `start`, then fails. It runs a
+    // command through git's `ext` transport, allowed only in this test's
+    // own git configuration.
     let count = env.path("upload-pack-count");
     let script = env.path("upload-pack.sh");
     fs::write(
         &script,
         format!(
             "#!/bin/sh\nn=$(cat {count:?} 2>/dev/null || echo 0)\necho $((n + 1)) > {count:?}\n\
-             [ \"$n\" -ge 1 ] && {{ echo 'remote unavailable' >&2; exit 1; }}\nexec git-upload-pack \"$@\"\n"
+             [ \"$n\" -ge 1 ] && {{ echo 'upstream unavailable' >&2; exit 1; }}\nexec git upload-pack {:?}\n",
+            f.up.bare
         ),
     )
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-    env.git(
+    fs::write(
+        env.path("gitconfig"),
+        "[protocol \"ext\"]\n\tallow = always\n",
+    )
+    .unwrap();
+    let url = format!("ext::{} %S", script.to_string_lossy());
+    let cfg = fs::read_to_string(f.down.join(".git-intake.toml"))
+        .unwrap()
+        .replace(
+            &format!("url = {:?}", f.up.url()),
+            &format!("url = {url:?}"),
+        );
+    env.commit(
         &f.down,
-        &[
-            "config",
-            "remote.upstream.uploadpack",
-            &script.to_string_lossy(),
-        ],
+        &[(".git-intake.toml", &cfg)],
+        "fork: serve the upstream",
     );
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
 
     let refused = f.tool(&["start", &format!("upstream={c1}")]).code(2);
     let err = stderr(&refused);
     assert!(
         err.contains(&format!(
-            "upstream 'upstream': cannot ask remote 'upstream' whether it has a tag '{c1}'"
+            "upstream 'upstream': cannot ask {url} whether it has a tag '{c1}'"
         )),
         "{err}"
     );
+    assert!(err.contains("upstream unavailable"), "{err}");
     env.assert_no_update(&f.down);
 }
 
@@ -517,7 +508,7 @@ fn own_tag_that_is_also_a_branch_is_refused() {
     // `v2.3` is both a branch and a tag of the repository, on upstream
     // commits; the upstream has no tag `v2.3`. Git resolves the name through
     // the tag.
-    env.git(&f.down, &["fetch", "-q", "upstream"]);
+    env.git(&f.down, &["fetch", "-q", &f.up.url(), "main"]);
     env.git(&f.down, &["branch", "v2.3", &c1]);
     env.git(&f.down, &["tag", "v2.3", &c2]);
 
@@ -546,27 +537,6 @@ fn expression_on_a_tag_only_the_upstream_has_is_refused() {
 
     f.tool(&["start", "upstream=v3.0~1"])
         .code(2)
-        .stderr(contains(
-            "'v3.0~1' names no commit and no tag of remote 'upstream'",
-        ));
+        .stderr(contains("'v3.0~1' names no commit and no tag of"));
     env.assert_no_update(&f.down);
-}
-
-#[test]
-fn mirror_ahead_of_the_fetched_tip_is_refused_at_start() {
-    let f = Fork::new();
-    let env = &f.env;
-    let [_, c2, c3] = three_upstream_commits(&f);
-    // The mirror holds a commit the upstream branch no longer has.
-    env.git(&f.down, &["fetch", "-q", "upstream"]);
-    env.git(&f.down, &["branch", "upstream-main", &c3]);
-    env.git(&f.up.bare, &["update-ref", "refs/heads/main", &c2]);
-
-    f.tool(&["start"]).code(2).stderr(contains(format!(
-        "upstream 'upstream': the mirror branch 'upstream-main' at {} is not contained in the target {}",
-        &c3[..12],
-        &c2[..12]
-    )));
-    env.assert_no_update(&f.down);
-    assert_eq!(env.rev(&f.down, "upstream-main"), c3);
 }

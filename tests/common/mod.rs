@@ -205,8 +205,29 @@ impl Env {
         self.intake_dir(repo).join("worktree")
     }
 
-    /// Asserts that no update worktree, branch or state exists.
+    /// The references under `refs/git-intake/`.
+    pub fn intake_refs(&self, repo: &Path) -> Vec<String> {
+        self.git(
+            repo,
+            &["for-each-ref", "--format=%(refname)", "refs/git-intake/"],
+        )
+        .lines()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// Asserts that no update worktree, branch, state, plan or reference
+    /// under `refs/git-intake/` exists.
     pub fn assert_no_update(&self, repo: &Path) {
+        assert_eq!(
+            self.intake_refs(repo),
+            Vec::<String>::new(),
+            "references under refs/git-intake/ remain"
+        );
+        assert!(
+            !self.intake_dir(repo).join("plan").exists(),
+            "the plan remains"
+        );
         let dir = self.intake_dir(repo);
         assert!(!dir.join("worktree").exists(), "update worktree remains");
         assert!(!dir.join("state.json").exists(), "update state remains");
@@ -232,8 +253,8 @@ pub fn stderr(a: &Assert) -> String {
     String::from_utf8_lossy(&a.get_output().stderr).into_owned()
 }
 
-/// A fork: a clone of one upstream with the upstream at the root, a publish
-/// remote, and a mirror branch.
+/// A fork: a clone of one upstream with the upstream at the root, taken by
+/// URL with no remote kept for it, and a publish remote.
 pub struct Fork {
     pub env: Env,
     pub up: Upstream,
@@ -250,19 +271,32 @@ impl Fork {
     }
 
     pub fn with_checks(checks: &[&str]) -> Self {
-        Self::build(checks, "push")
+        Self::build(checks, "push", "follow")
+    }
+
+    /// A fork that takes its upstream in port mode, publishing by push.
+    pub fn port() -> Self {
+        Self::build(&["test -f app.txt"], "push", "port")
+    }
+
+    /// A fork that takes its upstream in port mode and publishes through
+    /// merge requests, like [`Fork::merge_request`].
+    pub fn port_merge_request() -> Self {
+        let f = Self::build(&["test -f app.txt"], "merge-request", "port");
+        accept_push_options(&f.env, &f.publish);
+        f
     }
 
     /// A fork that publishes through merge requests. Its publish remote
     /// accepts push options and records them, as a forge that opens the
     /// merge request would.
     pub fn merge_request() -> Self {
-        let f = Self::build(&["test -f app.txt"], "merge-request");
+        let f = Self::build(&["test -f app.txt"], "merge-request", "follow");
         accept_push_options(&f.env, &f.publish);
         f
     }
 
-    fn build(checks: &[&str], via: &str) -> Self {
+    fn build(checks: &[&str], via: &str, mode: &str) -> Self {
         let env = Env::new();
         let up = env.upstream("upstream", &[(FORK_FILE, FORK_CONTENT)]);
         let publish = env.bare("publish");
@@ -278,6 +312,7 @@ impl Fork {
                 &down.to_string_lossy(),
             ],
         );
+        env.git(&down, &["remote", "remove", "upstream"]);
         env.git(
             &down,
             &["remote", "add", "origin", &publish.to_string_lossy()],
@@ -290,7 +325,7 @@ impl Fork {
         let config = format!(
             "integration = \"main\"\ninstall = \"true\"\nchecks = [{checks}]\n\n\
              [publish]\nremote = \"origin\"\nvia = \"{via}\"\n\n\
-             [[upstream]]\nname = \"upstream\"\nremote = \"upstream\"\nbranch = \"main\"\nurl = {:?}\nmirror = \"upstream-main\"\n",
+             [[upstream]]\nname = \"upstream\"\nurl = {:?}\nbranch = \"main\"\nmode = \"{mode}\"\n",
             up.url()
         );
         env.commit(
@@ -309,6 +344,21 @@ impl Fork {
 
     pub fn tool(&self, args: &[&str]) -> Assert {
         self.env.tool(&self.down, args)
+    }
+
+    /// The committed configuration with `from` replaced by `to`, committed
+    /// and published on the integration branch.
+    pub fn reconfigure(&self, from: &str, to: &str) {
+        let path = self.down.join(".git-intake.toml");
+        let cfg = fs::read_to_string(&path).unwrap();
+        assert!(cfg.contains(from), "{cfg}");
+        let cfg = cfg.replace(from, to);
+        self.env.commit(
+            &self.down,
+            &[(".git-intake.toml", &cfg)],
+            "fork: reconfigure",
+        );
+        self.env.git(&self.down, &["push", "-q", "origin", "main"]);
     }
 }
 
@@ -359,8 +409,8 @@ pub fn recorded_push_options(bare: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A monorepo with path upstreams `app-a` at `apps/a` (mirror `mirror-a`) and
-/// `app-b` at `apps/b`, not yet imported, and no publish remote.
+/// A monorepo with path upstreams `app-a` at `apps/a` and `app-b` at
+/// `apps/b`, not yet imported, and no publish remote.
 pub struct Mono {
     pub env: Env,
     pub a: Upstream,
@@ -398,8 +448,8 @@ impl Mono {
 pub fn mono_config(a: &Upstream, b: &Upstream, extra: &str) -> String {
     format!(
         "integration = \"main\"\nchecks = [\"test -f apps/a/a.txt\", \"test -f apps/b/b.txt\"]\n\n\
-         [[upstream]]\nname = \"app-a\"\nremote = \"app-a\"\nbranch = \"main\"\nurl = {:?}\npath = \"apps/a\"\nmirror = \"mirror-a\"\n\n\
-         [[upstream]]\nname = \"app-b\"\nremote = \"app-b\"\nbranch = \"main\"\nurl = {:?}\npath = \"apps/b\"\n{extra}",
+         [[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n\n\
+         [[upstream]]\nname = \"app-b\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/b\"\n{extra}",
         a.url(),
         b.url()
     )

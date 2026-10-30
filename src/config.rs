@@ -26,11 +26,14 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawUpstream {
     name: String,
-    remote: String,
-    branch: String,
     url: Option<String>,
+    branch: String,
+    #[serde(default)]
+    mode: Mode,
     path: Option<String>,
-    mirror: Option<String>,
+    /// Settings of earlier releases, read only to name what replaces them.
+    remote: Option<toml::Value>,
+    mirror: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,11 +44,32 @@ struct RawPublish {
     via: PublishVia,
 }
 
+/// How an upstream is taken.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    /// Every update merges the upstream branch up to a target.
+    #[default]
+    Follow,
+    /// Every update takes the upstream commits a plan chooses, one by one.
+    Port,
+}
+
+impl Mode {
+    /// The value as written in the configuration.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Follow => "follow",
+            Mode::Port => "port",
+        }
+    }
+}
+
 /// How `finish` publishes the verified update.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PublishVia {
-    /// Push the integration and mirror branches.
+    /// Push the integration branch.
     #[default]
     Push,
     /// Push the verified commit to a branch of its own and open a merge
@@ -80,22 +104,22 @@ pub struct Config {
     pub upstreams: Vec<Upstream>,
 }
 
-/// One upstream: a source merged at the root or under its own path.
+/// One upstream: a source taken at the root or under its own path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Upstream {
     pub name: String,
-    pub remote: String,
+    /// Where the upstream is fetched from; the tool keeps no remote for it.
+    pub url: String,
     pub branch: String,
-    pub url: Option<String>,
+    pub mode: Mode,
     /// Normalised path inside the repository; `None` is the root.
     pub path: Option<String>,
-    pub mirror: Option<String>,
 }
 
 impl Upstream {
-    /// The upstream branch as `remote/branch`.
+    /// The upstream branch as `name/branch`, for messages and sync records.
     pub fn source(&self) -> String {
-        format!("{}/{}", self.remote, self.branch)
+        format!("{}/{}", self.name, self.branch)
     }
 }
 
@@ -180,16 +204,32 @@ pub fn parse(text: &str) -> Result<Config> {
             format!("upstream '{}'", up.name)
         };
         check_name(&label, &up.name, &mut problems);
-        check_remote(&format!("{label} remote"), &up.remote, &mut problems);
         check_branch(&format!("{label} branch"), &up.branch, &mut problems);
-        if let Some(mirror) = &up.mirror {
-            check_branch(&format!("{label} mirror"), mirror, &mut problems);
+        if up.remote.is_some() {
+            problems.push(format!(
+                "{label} remote: upstreams are fetched by their URL and the tool keeps no remote for them; \
+                 replace `remote` with `url` set to that remote's URL"
+            ));
         }
-        if let Some(url) = &up.url
-            && url.trim().is_empty()
-        {
-            problems.push(format!("{label} url: the URL is empty"));
+        if up.mirror.is_some() {
+            problems.push(format!(
+                "{label} mirror: mirror branches are no longer kept; remove `mirror` \
+                 (an existing mirror branch stays an ordinary branch)"
+            ));
         }
+        let url = match up.url {
+            Some(url) if url.trim().is_empty() => {
+                problems.push(format!("{label} url: the URL is empty"));
+                String::new()
+            }
+            Some(url) => url,
+            None => {
+                if up.remote.is_none() {
+                    problems.push(format!("{label}: `url` is required"));
+                }
+                String::new()
+            }
+        };
         let path = match &up.path {
             None => None,
             Some(p) => match normalise_path(p) {
@@ -200,22 +240,21 @@ pub fn parse(text: &str) -> Result<Config> {
                 }
             },
         };
+        if up.mode == Mode::Port && up.path.is_some() {
+            problems.push(format!(
+                "{label}: an upstream in `port` mode is taken at the repository root and cannot have a path"
+            ));
+        }
         upstreams.push(Upstream {
             name: up.name,
-            remote: up.remote,
+            url,
             branch: up.branch,
-            url: up.url,
+            mode: up.mode,
             path,
-            mirror: up.mirror,
         });
     }
 
-    check_layout(
-        &integration,
-        publish.as_ref().map(|p| p.remote.as_str()),
-        &upstreams,
-        &mut problems,
-    );
+    check_layout(&integration, &upstreams, &mut problems);
 
     if !problems.is_empty() {
         bail!(
@@ -254,25 +293,25 @@ fn parse_publish(value: toml::Value) -> std::result::Result<Publish, String> {
     })
 }
 
-/// Cross-entry rules: unique names, remotes and mirrors, non-nesting paths,
-/// a root upstream alone, no publishing to an upstream remote.
-fn check_layout(
-    integration: &str,
-    publish: Option<&str>,
-    upstreams: &[Upstream],
-    problems: &mut Vec<String>,
-) {
+/// Cross-entry rules: unique names and sources, non-nesting paths, a root
+/// upstream alone.
+fn check_layout(integration: &str, upstreams: &[Upstream], problems: &mut Vec<String>) {
     duplicates(upstreams.iter().map(|u| u.name.as_str()), "name", problems);
-    duplicates(
-        upstreams.iter().map(|u| u.remote.as_str()),
-        "remote",
-        problems,
-    );
-    duplicates(
-        upstreams.iter().filter_map(|u| u.mirror.as_deref()),
-        "mirror branch",
-        problems,
-    );
+    let mut sources: Vec<(&str, &str, usize)> = Vec::new();
+    for up in upstreams.iter().filter(|u| !u.url.is_empty()) {
+        match sources
+            .iter_mut()
+            .find(|(url, branch, _)| *url == up.url && *branch == up.branch)
+        {
+            Some(seen) => seen.2 += 1,
+            None => sources.push((&up.url, &up.branch, 1)),
+        }
+    }
+    for (url, branch, n) in sources.into_iter().filter(|s| s.2 > 1) {
+        problems.push(format!(
+            "{n} upstreams share the URL '{url}' and the branch '{branch}'"
+        ));
+    }
 
     if upstreams.len() > 1 {
         for (i, root) in upstreams.iter().enumerate() {
@@ -306,28 +345,6 @@ fn check_layout(
         }
     }
 
-    for up in upstreams {
-        if let Some(mirror) = &up.mirror {
-            if mirror == integration {
-                problems.push(format!(
-                    "upstream '{}' mirror '{mirror}' is the integration branch",
-                    up.name
-                ));
-            }
-            if mirror == crate::state::UPDATE_BRANCH {
-                problems.push(format!(
-                    "upstream '{}' mirror '{mirror}' is reserved for updates",
-                    up.name
-                ));
-            }
-        }
-        if Some(up.remote.as_str()) == publish {
-            problems.push(format!(
-                "publish remote '{}' is the remote of upstream '{}'; the tool never pushes to an upstream",
-                up.remote, up.name
-            ));
-        }
-    }
     if integration == crate::state::UPDATE_BRANCH {
         problems.push(format!(
             "integration: '{integration}' is reserved for updates"
@@ -454,10 +471,8 @@ mod tests {
         format!("{:#}", parse(text).unwrap_err())
     }
 
-    const UP_A: &str =
-        "[[upstream]]\nname = \"a\"\nremote = \"ra\"\nbranch = \"main\"\npath = \"apps/a\"\n";
-    const UP_B: &str =
-        "[[upstream]]\nname = \"b\"\nremote = \"rb\"\nbranch = \"main\"\npath = \"apps/b\"\n";
+    const UP_A: &str = "[[upstream]]\nname = \"a\"\nurl = \"https://example.com/a.git\"\nbranch = \"main\"\npath = \"apps/a\"\n";
+    const UP_B: &str = "[[upstream]]\nname = \"b\"\nurl = \"https://example.com/b.git\"\nbranch = \"main\"\npath = \"apps/b\"\n";
 
     #[test]
     fn parses_full_configuration() {
@@ -469,11 +484,9 @@ checks = ["make lint", "make test"]
 
 [[upstream]]
 name = "app-a"
-remote = "app-a"
-branch = "main"
 url = "git@example.com:team/app-a.git"
+branch = "main"
 path = "/apps/app-a/"
-mirror = "upstream-app-a"
 
 [publish]
 remote = "origin"
@@ -492,44 +505,96 @@ via = "merge-request"
         assert_eq!(cfg.checks.len(), 2);
         let up = &cfg.upstreams[0];
         assert_eq!(up.path.as_deref(), Some("apps/app-a"));
-        assert_eq!(up.mirror.as_deref(), Some("upstream-app-a"));
+        assert_eq!(up.url, "git@example.com:team/app-a.git");
+        assert_eq!(up.mode, Mode::Follow);
         assert_eq!(up.source(), "app-a/main");
     }
 
     #[test]
     fn root_upstream_alone_is_valid() {
         let cfg = parse(
-            "integration = \"main\"\n[[upstream]]\nname = \"up\"\nremote = \"upstream\"\nbranch = \"main\"\n",
+            "integration = \"main\"\n[[upstream]]\nname = \"up\"\nurl = \"../up.git\"\nbranch = \"main\"\nmode = \"port\"\n",
         )
         .unwrap();
         assert_eq!(cfg.upstreams[0].path, None);
+        assert_eq!(cfg.upstreams[0].mode, Mode::Port);
         assert!(cfg.checks.is_empty());
     }
 
     #[test]
-    fn rejects_unknown_keys() {
+    fn rejects_unknown_keys_and_modes() {
         let e = err("integration = \"main\"\nfoo = 1\n");
         assert!(e.contains("unknown field `foo`"), "{e}");
         let e = err(
-            "integration = \"main\"\n[[upstream]]\nname = \"a\"\nremote = \"a\"\nbranch = \"main\"\nsquash = true\n",
+            "integration = \"main\"\n[[upstream]]\nname = \"a\"\nurl = \"u\"\nbranch = \"main\"\nsquash = true\n",
         );
         assert!(e.contains("unknown field `squash`"), "{e}");
+        let e = err(
+            "integration = \"main\"\n[[upstream]]\nname = \"a\"\nurl = \"u\"\nbranch = \"main\"\nmode = \"pick\"\n",
+        );
+        assert!(e.contains("unknown variant `pick`"), "{e}");
     }
 
     #[test]
-    fn rejects_missing_upstreams() {
+    fn rejects_missing_upstreams_and_urls() {
         assert!(err("integration = \"main\"\n").contains("no [[upstream]]"));
+        let e = err("integration = \"main\"\n[[upstream]]\nname = \"a\"\nbranch = \"main\"\n");
+        assert!(e.contains("upstream 'a': `url` is required"), "{e}");
+        let e = err(
+            "integration = \"main\"\n[[upstream]]\nname = \"a\"\nurl = \" \"\nbranch = \"main\"\n",
+        );
+        assert!(e.contains("upstream 'a' url: the URL is empty"), "{e}");
     }
 
     #[test]
-    fn rejects_duplicate_names_and_remotes() {
+    fn removed_settings_name_their_replacement() {
+        let e = err(
+            "integration = \"main\"\n[[upstream]]\nname = \"a\"\nremote = \"a\"\nbranch = \"main\"\nmirror = \"upstream-a\"\n",
+        );
+        assert!(
+            e.contains("upstream 'a' remote: upstreams are fetched by their URL"),
+            "{e}"
+        );
+        assert!(e.contains("replace `remote` with `url`"), "{e}");
+        assert!(
+            e.contains("upstream 'a' mirror: mirror branches are no longer kept"),
+            "{e}"
+        );
+        assert!(!e.contains("`url` is required"), "{e}");
+    }
+
+    #[test]
+    fn rejects_a_port_upstream_with_a_path() {
+        let e = err(&format!(
+            "integration = \"main\"\n{}",
+            UP_A.replace("branch", "mode = \"port\"\nbranch")
+        ));
+        assert!(
+            e.contains("upstream 'a': an upstream in `port` mode is taken at the repository root"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_names_and_sources() {
         let text = format!(
             "integration = \"main\"\n{UP_A}{}",
-            UP_B.replace("\"b\"", "\"a\"").replace("\"rb\"", "\"ra\"")
+            UP_B.replace("\"b\"", "\"a\"").replace("b.git", "a.git")
         );
         let e = err(&text);
         assert!(e.contains("2 upstreams share the name 'a'"), "{e}");
-        assert!(e.contains("2 upstreams share the remote 'ra'"), "{e}");
+        assert!(
+            e.contains(
+                "2 upstreams share the URL 'https://example.com/a.git' and the branch 'main'"
+            ),
+            "{e}"
+        );
+        let other_branch = format!(
+            "integration = \"main\"\n{UP_A}{}",
+            UP_B.replace("b.git", "a.git")
+                .replace("branch = \"main\"", "branch = \"next\"")
+        );
+        assert!(parse(&other_branch).is_ok());
     }
 
     #[test]
@@ -570,12 +635,6 @@ via = "merge-request"
             e.contains("upstream 'b' has no path (the repository root) and cannot share the repository with 'a'"),
             "{e}"
         );
-    }
-
-    #[test]
-    fn rejects_publishing_to_an_upstream_remote() {
-        let text = format!("integration = \"main\"\n{UP_A}[publish]\nremote = \"ra\"\n");
-        assert!(err(&text).contains("never pushes to an upstream"));
     }
 
     #[test]
@@ -638,7 +697,7 @@ via = "merge-request"
     #[test]
     fn rejects_invalid_branch_and_name() {
         let e = err(
-            "integration = \"ma in\"\n[[upstream]]\nname = \"a b\"\nremote = \"r\"\nbranch = \"x..y\"\n",
+            "integration = \"ma in\"\n[[upstream]]\nname = \"a b\"\nurl = \"u\"\nbranch = \"x..y\"\n",
         );
         assert!(
             e.contains("integration: 'ma in' is not a valid branch name"),

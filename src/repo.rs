@@ -260,6 +260,7 @@ impl Repo {
             );
         };
         let config = config::parse(&text)?;
+        self.refuse_publishing_to_an_upstream(&config)?;
         if config.integration != integration {
             bail!(
                 "the {} committed on '{integration}' names '{}' as the integration branch",
@@ -280,6 +281,39 @@ impl Repo {
         })
     }
 
+    /// The tool never pushes to an upstream: a publish remote fetched from
+    /// or pushed to an upstream's URL is refused.
+    fn refuse_publishing_to_an_upstream(&self, config: &Config) -> Result<()> {
+        let Some(publish) = &config.publish else {
+            return Ok(());
+        };
+        let urls = crate::upstreams::remote_urls(&self.git, &publish.remote)?;
+        let problems: Vec<String> = config
+            .upstreams
+            .iter()
+            .filter(|up| urls.contains(&up.url))
+            .map(|up| {
+                format!(
+                    "publish remote '{}' has the URL {} of upstream '{}'; the tool never pushes to an upstream",
+                    publish.remote, up.url, up.name
+                )
+            })
+            .collect();
+        if !problems.is_empty() {
+            bail!(
+                "invalid {} on '{}':\n{}",
+                config::FILE_NAME,
+                config.integration,
+                problems
+                    .iter()
+                    .map(|p| format!("  - {p}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        Ok(())
+    }
+
     fn working_copy_differs(&self, committed: &str) -> bool {
         let Some(top) = &self.toplevel else {
             return false;
@@ -294,7 +328,8 @@ impl Repo {
     }
 
     /// Removes the update worktree and branch if they exist. Resolutions made
-    /// in an unfinished merge are recorded first so a retry reapplies them.
+    /// in an unfinished merge or copy are recorded first so a retry reapplies
+    /// them.
     pub fn remove_update_artifacts(&self) -> Result<Vec<String>> {
         let mut removed = self.remove_update_worktree()?;
         if self.update_branch_exists()? {
@@ -311,10 +346,11 @@ impl Repo {
         let mut removed = Vec::new();
         let wt = &self.paths.worktree;
         if self.update_worktree_registered()? {
-            let wt_git = Git::worktree(wt);
-            if wt.exists() && wt_git.merge_in_progress().unwrap_or(false) {
-                // Best effort: record resolutions already made by hand.
-                let _ = wt_git.raw(&["rerere"]);
+            if wt.exists() {
+                // Best effort: record resolutions already made by hand in a
+                // stopped merge or copy; with nothing pending, rerere does
+                // nothing.
+                let _ = Git::worktree(wt).raw(&["rerere"]);
             }
             self.git.run(&[
                 "worktree",
@@ -351,6 +387,16 @@ impl Repo {
     /// Whether the tool was started in the update worktree.
     fn started_in_update_worktree(&self) -> bool {
         self.toplevel.as_deref() == Some(canonical(&self.paths.worktree).as_path())
+    }
+
+    /// Removes the plan of a port update, if any.
+    pub fn remove_plan(&self) -> Result<Vec<String>> {
+        let plan = &self.paths.plan;
+        if !plan.exists() {
+            return Ok(Vec::new());
+        }
+        fs::remove_file(plan).with_context(|| format!("cannot remove {}", plan.display()))?;
+        Ok(vec![format!("plan {}", plan.display())])
     }
 
     /// Removes the update's logs: the verification logs and saved merge output.

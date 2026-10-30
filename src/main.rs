@@ -1,5 +1,5 @@
-//! `git intake`: merge-based, verified, resumable updates of a downstream
-//! repository from one or more upstreams.
+//! `git intake`: verified, resumable updates of a downstream repository from
+//! one or more upstreams, merged as a whole or ported commit by commit.
 
 mod cli;
 mod commands;
@@ -7,11 +7,12 @@ mod config;
 mod drift;
 mod git;
 mod output;
-mod remotes;
+mod port;
 mod repo;
 mod state;
 mod sync_record;
 mod target;
+mod upstreams;
 
 use std::process::ExitCode;
 
@@ -35,7 +36,6 @@ const ERROR_STATUS: u8 = 2;
 fn run(command: Command) -> anyhow::Result<Exit> {
     let repo = repo::Repo::open()?;
     let result = match command {
-        Command::Fetch { upstreams } => commands::fetch::run(&repo, &upstreams),
         Command::Start { upstreams } => commands::update::start(&repo, &upstreams),
         Command::Continue => commands::update::resume(&repo),
         Command::Abort => commands::update::abort(&repo),
@@ -46,6 +46,9 @@ fn run(command: Command) -> anyhow::Result<Exit> {
         Command::Log { upstreams, json } => commands::log::run(&repo, &upstreams, json),
         Command::Branches { upstreams, json } => commands::branches::run(&repo, &upstreams, json),
         Command::Doctor { json } => commands::doctor::run(&repo, json),
+        Command::Contribute { upstream, branch } => {
+            commands::contribute::run(&repo, &upstream, &branch)
+        }
     };
     repo.note_removed_directory();
     result

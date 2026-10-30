@@ -56,7 +56,7 @@ fn full_cycle_merges_verifies_and_publishes() {
 
     f.tool(&["finish"])
         .success()
-        .stdout(contains("pushed main, upstream-main to 'origin'"));
+        .stdout(contains("pushed main to 'origin'"));
     env.assert_no_update(&f.down);
 
     let main = env.rev(&f.down, "main");
@@ -72,17 +72,22 @@ fn full_cycle_merges_verifies_and_publishes() {
     );
     assert!(msg.contains("Intake-Upstream: upstream"), "{msg}");
     assert!(msg.contains(&format!("Intake-Target: {t1}")), "{msg}");
-    assert_eq!(env.rev(&f.down, "upstream-main"), t1);
     assert!(!env.is_ancestor(&f.down, &t2, "main"));
     // The main checkout followed the fast-forward.
     assert!(f.down.join("new.txt").exists());
     assert!(env.git(&f.down, &["status", "--porcelain"]).is_empty());
     // Published without force.
     assert_eq!(env.rev(&f.publish, "main"), main);
-    assert_eq!(env.rev(&f.publish, "upstream-main"), t1);
-    // The upstream received nothing.
-    assert!(!env.has_rev(&f.up.bare, "upstream-main"));
+    // The upstream received nothing, and no remote or branch of it exists.
     assert_eq!(env.rev(&f.up.bare, "main"), t2);
+    assert_eq!(env.git(&f.down, &["remote"]), "origin");
+    assert_eq!(
+        env.git(
+            &f.down,
+            &["for-each-ref", "--format=%(refname)", "refs/heads/"]
+        ),
+        "refs/heads/main"
+    );
 
     // The report of the finished update is still available.
     let report = env.tool_json(&f.down, &["report", "--json"], 0);
@@ -90,20 +95,18 @@ fn full_cycle_merges_verifies_and_publishes() {
     assert_eq!(report["upstreams"][0]["target"], t1.as_str());
     assert_eq!(report["upstreams"][0]["commits"], 1);
 
-    // The last synced commit comes from the history; without --check,
-    // status uses the remote-tracking refs as last fetched.
-    let status = env.tool_json(&f.down, &["status", "--json"], 0);
-    assert_eq!(status["upstreams"][0]["last_synced"], t1.as_str());
-    assert_eq!(status["upstreams"][0]["state"], "current");
-    f.tool(&["fetch"])
-        .success()
-        .stdout(contains("upstream: fetched upstream/main"));
+    // The last synced commit comes from the history; status fetches the
+    // upstream itself and keeps nothing of it.
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     let up = &status["upstreams"][0];
     assert_eq!(up["last_synced"], t1.as_str());
     assert_eq!(up["tip"], t2.as_str());
+    assert_eq!(up["mode"], "follow");
+    assert_eq!(up["url"], f.up.url().as_str());
     assert_eq!(up["state"], "behind");
     assert_eq!(up["commits_behind"], 1);
+    assert!(up.get("remote").is_none() && up.get("mirror").is_none());
+    env.assert_no_update(&f.down);
 }
 
 #[test]
@@ -231,10 +234,9 @@ fn integration_moved_blocks_finish() {
         .code(2)
         .stderr(contains("'main' moved from"))
         .stderr(contains(
-            "must merge the new integration tip and be verified again",
+            "must take the new integration tip and be verified again",
         ));
     assert_eq!(env.rev(&f.down, "main"), moved);
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
     f.tool(&["abort"]).success();
     env.assert_no_update(&f.down);
     assert_eq!(env.rev(&f.down, "main"), moved);
@@ -264,7 +266,10 @@ fn remote_moved_rejects_push_without_force() {
     let verified = env.rev(&env.update_worktree(&f.down), "HEAD");
     let finish = f.tool(&["finish"]).code(2);
     let err = stderr(&finish);
-    assert!(err.contains("the local branches are advanced"), "{err}");
+    assert!(
+        err.contains("the local integration branch is advanced"),
+        "{err}"
+    );
     assert!(
         err.contains("`git intake finish --no-publish` to close the update locally"),
         "{err}"
@@ -316,16 +321,13 @@ fn remote_moved_rejects_push_without_force() {
     f.tool(&["finish", "--no-publish"])
         .success()
         .stdout(contains(
-            "not published to 'origin' (advanced locally only): main, upstream-main",
+            "not published to 'origin' (advanced locally only): main",
         ));
     env.assert_no_update(&f.down);
     assert!(env.is_ancestor(&f.down, &verified, "main"));
     assert_eq!(env.rev(&f.publish, "main"), theirs);
     let report = env.tool_json(&f.down, &["report", "--json"], 0);
-    assert_eq!(
-        report["unpublished"],
-        serde_json::json!(["main", "upstream-main"])
-    );
+    assert_eq!(report["unpublished"], serde_json::json!(["main"]));
 }
 
 #[test]
@@ -344,7 +346,6 @@ fn rewritten_upstream_is_detected_and_refused() {
         &f.up.work,
         &["push", "-q", "--force", "origin", "HEAD:main"],
     );
-    f.tool(&["fetch"]).success();
 
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["upstreams"][0]["state"], "rewritten");
@@ -515,8 +516,9 @@ fn stacked_downstream_branch_follows_another_fork() {
         ],
     );
     env.git(&stacked, &["checkout", "-q", "-b", "develop"]);
+    env.git(&stacked, &["remote", "remove", "upstream"]);
     let config = format!(
-        "integration = \"develop\"\nchecks = [\"test -f app.txt\"]\n\n[[upstream]]\nname = \"upstream\"\nremote = \"upstream\"\nbranch = \"main\"\nurl = {:?}\n",
+        "integration = \"develop\"\nchecks = [\"test -f app.txt\"]\n\n[[upstream]]\nname = \"upstream\"\nurl = {:?}\nbranch = \"main\"\n",
         f.publish.to_string_lossy()
     );
     env.commit(
@@ -563,7 +565,6 @@ fn stacked_downstream_branch_follows_another_fork() {
     env.commit(&f.down, &[("fork-feature.txt", "f\n")], "fork: feature");
     env.git(&f.down, &["push", "-q", "origin", "main"]);
     let fork_tip = env.rev(&f.down, "main");
-    env.tool(&stacked, &["fetch"]).success();
     let status = env.tool_json(&stacked, &["status", "--json"], 0);
     let up = &status["upstreams"][0];
     assert_eq!(up["last_synced"], cloned_tip.as_str());
@@ -598,7 +599,6 @@ fn stacked_downstream_branch_follows_another_fork() {
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
     let fork_tip2 = env.rev(&f.down, "main");
-    env.tool(&stacked, &["fetch"]).success();
     let status = env.tool_json(&stacked, &["status", "--json"], 0);
     assert_eq!(status["upstreams"][0]["last_synced"], fork_tip.as_str());
     assert_eq!(status["upstreams"][0]["state"], "behind");
@@ -608,64 +608,6 @@ fn stacked_downstream_branch_follows_another_fork() {
     let status = env.tool_json(&stacked, &["status", "--json"], 0);
     assert_eq!(status["upstreams"][0]["last_synced"], fork_tip2.as_str());
     assert_eq!(status["upstreams"][0]["state"], "current");
-}
-
-#[test]
-fn atomic_push_publishes_nothing_when_one_ref_is_rejected() {
-    let f = Fork::new();
-    let env = &f.env;
-    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
-    f.tool(&["start"]).success();
-    f.tool(&["verify"]).success();
-
-    // Someone else created the mirror branch on the publish remote with
-    // unrelated work; the integration branch itself would push cleanly.
-    let other = env.path("other");
-    env.git(
-        &env.path(""),
-        &[
-            "clone",
-            "-q",
-            &f.publish.to_string_lossy(),
-            &other.to_string_lossy(),
-        ],
-    );
-    env.git(&other, &["checkout", "-q", "-b", "upstream-main"]);
-    let theirs = env.commit(&other, &[("other.txt", "o\n")], "other: mirror work");
-    env.git(&other, &["push", "-q", "origin", "upstream-main"]);
-    let published_main = env.rev(&f.publish, "main");
-
-    let verified = env.rev(&env.update_worktree(&f.down), "HEAD");
-    let finish = f.tool(&["finish"]).code(2);
-    let err = stderr(&finish);
-    assert!(err.contains("pushing to 'origin' was rejected"), "{err}");
-    assert!(
-        err.contains("`git intake finish --no-publish` to close the update locally"),
-        "{err}"
-    );
-    assert!(
-        err.contains(
-            "publish the result through a new verified update or the repository's usual review"
-        ),
-        "{err}"
-    );
-    assert!(
-        !err.contains("run the checks, then run `git intake finish`"),
-        "{err}"
-    );
-    assert_eq!(
-        env.rev(&f.down, "main"),
-        verified,
-        "local branch stays advanced"
-    );
-    assert_eq!(
-        env.rev(&f.publish, "main"),
-        published_main,
-        "the accepted ref did not move either"
-    );
-    assert_eq!(env.rev(&f.publish, "upstream-main"), theirs);
-    let status = env.tool_json(&f.down, &["status", "--json"], 0);
-    assert_eq!(status["update"]["step"], "finishing");
 }
 
 #[test]
@@ -721,7 +663,7 @@ fn cloned_fork_without_records_shows_history_sourced_last_synced() {
     let f = Fork::new();
     let env = &f.env;
     // The fork was created by cloning: no sync record exists yet.
-    let cloned = env.rev(&f.down, "upstream/main");
+    let cloned = env.rev(&f.up.bare, "main");
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     let u = &status["upstreams"][0];
     assert_eq!(u["last_synced"], cloned.as_str());
@@ -736,7 +678,6 @@ fn cloned_fork_without_records_shows_history_sourced_last_synced() {
     )));
 
     let target = env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
-    f.tool(&["fetch"]).success();
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     let u = &status["upstreams"][0];
     assert_eq!(u["last_synced"], cloned.as_str());
@@ -757,20 +698,16 @@ fn cloned_fork_without_records_shows_history_sourced_last_synced() {
 }
 
 #[test]
-fn abort_removes_logs_and_names_only_configured_branches() {
+fn abort_removes_logs_and_the_update_references() {
     let f = Fork::new();
     let env = &f.env;
-    let cfg = std::fs::read_to_string(f.down.join(".git-intake.toml"))
-        .unwrap()
-        .replace("mirror = \"upstream-main\"\n", "");
-    env.commit(
-        &f.down,
-        &[(".git-intake.toml", &cfg)],
-        "fork: no mirror branch",
-    );
-    env.git(&f.down, &["push", "-q", "origin", "main"]);
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
+    assert_eq!(
+        env.intake_refs(&f.down),
+        vec!["refs/git-intake/upstreams/upstream".to_string()],
+        "the update keeps its upstream reference"
+    );
     f.tool(&["verify"]).success();
     let logs = env.intake_dir(&f.down).join("logs");
     assert!(logs.join("01-install.log").exists());
@@ -778,8 +715,11 @@ fn abort_removes_logs_and_names_only_configured_branches() {
     let abort = f.tool(&["abort"]).success();
     let out = stdout(&abort);
     assert!(out.contains("update aborted; 'main' is unchanged"), "{out}");
-    assert!(!out.contains("mirror"), "{out}");
     assert!(out.contains("removed logs"), "{out}");
+    assert!(
+        out.contains("removed reference refs/git-intake/upstreams/upstream"),
+        "{out}"
+    );
     assert!(!logs.exists(), "the update's logs remain");
     env.assert_no_update(&f.down);
 }

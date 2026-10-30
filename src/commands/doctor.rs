@@ -1,18 +1,21 @@
-//! `doctor`: read-only checks of configuration, remotes, history and state.
+//! `doctor`: checks of configuration, upstreams, history, journals and
+//! state. It changes nothing but the references of its own fetches, which it
+//! removes before it exits.
 
 use anyhow::Result;
 use serde::Serialize;
 
 use crate::Exit;
 use crate::commands::update::unrelated_content;
-use crate::config::Config;
+use crate::config::{Config, Mode, Upstream};
 use crate::drift::adopted_base;
-use crate::git::{Git, abbrev, branch_ref, tracking_ref};
+use crate::git::{Git, abbrev, branch_ref, lines};
 use crate::output::{Render, emit};
-use crate::remotes::{self, RemoteCheck};
+use crate::port::{self, Standing};
 use crate::repo::{MainWorktree, Repo};
-use crate::state::{UPDATE_BRANCH, UpstreamStep};
-use crate::sync_record;
+use crate::state::{UPDATE_BRANCH, UpstreamStep, Work};
+use crate::sync_record::{self, Record};
+use crate::upstreams::{self, Fetches, REFS_PREFIX};
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -62,20 +65,25 @@ impl Checks {
 
 pub fn run(repo: &Repo, json: bool) -> Result<Exit> {
     let mut checks = Checks(Vec::new());
-    match repo.load_config() {
-        Ok(loaded) => {
-            checks.add(
-                "configuration",
-                None,
-                CheckStatus::Pass,
-                format!(
-                    "the configuration on '{}' is valid",
-                    loaded.config.integration
-                ),
-            );
-            upstream_checks(repo, &loaded.config, &mut checks)?;
-        }
+    let loaded = repo.load_config();
+    match &loaded {
+        Ok(loaded) => checks.add(
+            "configuration",
+            None,
+            CheckStatus::Pass,
+            format!(
+                "the configuration on '{}' is valid",
+                loaded.config.integration
+            ),
+        ),
         Err(err) => checks.add("configuration", None, CheckStatus::Fail, format!("{err:#}")),
+    }
+    // Before this command fetches anything of its own.
+    reference_checks(repo, &mut checks)?;
+    if let Ok(loaded) = &loaded {
+        upstream_checks(repo, &loaded.config, &mut checks)?;
+        remote_checks(repo, &loaded.config, &mut checks)?;
+        journal_checks(repo, &loaded.config, &mut checks)?;
     }
     checkout_checks(repo, &mut checks)?;
     state_checks(repo, &mut checks)?;
@@ -95,6 +103,34 @@ pub fn run(repo: &Repo, json: bool) -> Result<Exit> {
     })
 }
 
+/// References under `refs/git-intake/` that no update accounts for.
+fn reference_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
+    let held = match repo.state() {
+        Ok(Some(state)) => upstreams::held_by(&state),
+        _ => Default::default(),
+    };
+    let stray: Vec<String> = upstreams::existing(&repo.git)?
+        .into_iter()
+        .filter(|(name, _)| !held.contains_key(name))
+        .map(|(name, oid)| format!("{name} at {}", abbrev(&oid)))
+        .collect();
+    checks.pass_or_fail(
+        "references",
+        None,
+        stray.is_empty(),
+        if stray.is_empty() {
+            format!("no reference under {REFS_PREFIX} is left without an update")
+        } else {
+            format!(
+                "references under {REFS_PREFIX} are left without an update: {}; the next command that fetches \
+                 the upstream replaces its reference, or remove them with `git update-ref -d <reference>`",
+                stray.join(", ")
+            )
+        },
+    );
+    Ok(())
+}
+
 fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<()> {
     let git = &repo.git;
     let Some(integration) = git.commit(&branch_ref(&config.integration))? else {
@@ -109,140 +145,37 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
         );
         return Ok(());
     };
+    let mut fetches = Fetches::new(repo);
+    let mut fetched = Vec::new();
+    for up in &config.upstreams {
+        fetched.push(fetches.upstream(up)?);
+    }
     let records = sync_record::records(git, &integration, config)?;
     let latest = sync_record::latest(&records);
-    for up in &config.upstreams {
+    for (up, fetched) in config.upstreams.iter().zip(&fetched) {
         let name = Some(up.name.as_str());
-        match remotes::check(git, up)? {
-            RemoteCheck::Ready => checks.add(
-                "remote",
-                name,
-                CheckStatus::Pass,
-                format!(
-                    "remote '{}' exists{}",
-                    up.remote,
-                    if up.url.is_some() {
-                        " with the configured url"
-                    } else {
-                        ""
-                    }
-                ),
-            ),
-            RemoteCheck::Add(url) => checks.add(
-                "remote",
-                name,
-                CheckStatus::Fail,
-                format!(
-                    "remote '{}' does not exist; `git intake fetch` adds it from {url}",
-                    up.remote
-                ),
-            ),
-            RemoteCheck::Refused(why) => checks.add("remote", name, CheckStatus::Fail, why),
-        }
-
-        let tip = git.commit(&tracking_ref(&up.remote, &up.branch))?;
         checks.pass_or_fail(
-            "branch",
+            "fetch",
             name,
-            tip.is_some(),
-            match &tip {
-                Some(t) => format!("{} exists at {}", up.source(), abbrev(t)),
-                None => format!("{} has not been fetched or does not exist", up.source()),
+            fetched.is_ok(),
+            match fetched {
+                Ok(t) => format!(
+                    "branch '{}' of {} was fetched at {}",
+                    up.branch,
+                    up.url,
+                    abbrev(t)
+                ),
+                Err(why) => format!("cannot fetch branch '{}' of {}: {why}", up.branch, up.url),
             },
         );
-
+        let tip = fetched.as_ref().ok();
         let record = latest.get(&up.name);
-        if let Some(path) = &up.path {
-            let exists = git.object_type(&integration, path)?.is_some();
-            // Synced: a record, or a merge in the history that brought the
-            // upstream into its path; unknown when the branch is not fetched.
-            let synced = match (record.is_some(), &tip) {
-                (true, _) => Some(true),
-                (false, Some(t)) => Some(adopted_base(git, &integration, up, t)?.is_some()),
-                (false, None) => None,
-            };
-            let (status, detail) = match (record.is_some(), synced, exists) {
-                (_, Some(true), true) => (
-                    CheckStatus::Pass,
-                    if record.is_some() {
-                        format!("path '{path}' exists on '{}'", config.integration)
-                    } else {
-                        format!(
-                            "path '{path}' was imported without a sync record; the next update records it"
-                        )
-                    },
-                ),
-                (_, Some(true), false) => (
-                    CheckStatus::Fail,
-                    format!(
-                        "upstream is imported but path '{path}' does not exist on '{}'",
-                        config.integration
-                    ),
-                ),
-                (_, _, false) => (
-                    CheckStatus::Pass,
-                    format!("not imported yet; path '{path}' will be created by the first update"),
-                ),
-                (_, Some(false), true) => (CheckStatus::Fail, unrelated_content(up, path)),
-                (_, None, true) => (
-                    CheckStatus::Fail,
-                    format!(
-                        "path '{path}' exists without a sync record and {} is not available to check it",
-                        up.source()
-                    ),
-                ),
-            };
-            checks.add("path", name, status, detail);
-        }
-
-        match (record, &tip) {
-            (None, Some(t)) => {
-                let detail = match adopted_base(git, &integration, up, t)? {
-                    Some(base) => format!(
-                        "no sync record yet; last synced from history is {}, contained in {}",
-                        abbrev(&base),
-                        up.source()
-                    ),
-                    None => "no sync record yet".to_string(),
-                };
-                checks.add("last_synced", name, CheckStatus::Pass, detail);
-            }
-            (None, None) => checks.add(
-                "last_synced",
-                name,
-                CheckStatus::Pass,
-                "no sync record yet".to_string(),
-            ),
-            (Some(r), Some(t)) => {
-                let contained = git.object_exists(&r.target)? && git.is_ancestor(&r.target, t)?;
-                checks.pass_or_fail(
-                    "last_synced",
-                    name,
-                    contained,
-                    if contained {
-                        format!("last synced commit {} is contained in {}", abbrev(&r.target), up.source())
-                    } else {
-                        format!(
-                            "{} no longer contains the last synced commit {}; the upstream was rewritten",
-                            up.source(),
-                            abbrev(&r.target)
-                        )
-                    },
-                );
-            }
-            (Some(r), None) => checks.add(
-                "last_synced",
-                name,
-                CheckStatus::Fail,
-                format!(
-                    "cannot check last synced commit {}: {} is not available",
-                    abbrev(&r.target),
-                    up.source()
-                ),
-            ),
+        match up.mode {
+            Mode::Follow => follow_checks(git, config, &integration, up, record, tip, checks)?,
+            Mode::Port => port_checks(git, config, &integration, up, record, tip, checks),
         }
     }
-
+    drop(fetches);
     let mut dropped: Vec<&str> = Vec::new();
     for r in &records {
         if config.upstream(&r.upstream).is_none() && !dropped.contains(&r.upstream.as_str()) {
@@ -258,6 +191,265 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
                 "upstream '{name}' has sync records on '{}' but was dropped from the configuration",
                 config.integration
             ),
+        );
+    }
+    Ok(())
+}
+
+/// The path and the last synced commit of a follow upstream.
+fn follow_checks(
+    git: &Git,
+    config: &Config,
+    integration: &str,
+    up: &Upstream,
+    record: Option<&Record>,
+    tip: Option<&String>,
+    checks: &mut Checks,
+) -> Result<()> {
+    let name = Some(up.name.as_str());
+    if let Some(path) = &up.path {
+        let exists = git.object_type(integration, path)?.is_some();
+        // Synced: a record, or a merge in the history that brought the
+        // upstream into its path; unknown when the branch is not fetched.
+        let synced = match (record.is_some(), tip) {
+            (true, _) => Some(true),
+            (false, Some(t)) => Some(adopted_base(git, integration, up, t)?.is_some()),
+            (false, None) => None,
+        };
+        let (status, detail) = match (synced, exists) {
+            (Some(true), true) => (
+                CheckStatus::Pass,
+                if record.is_some() {
+                    format!("path '{path}' exists on '{}'", config.integration)
+                } else {
+                    format!(
+                        "path '{path}' was imported without a sync record; the next update records it"
+                    )
+                },
+            ),
+            (Some(true), false) => (
+                CheckStatus::Fail,
+                format!(
+                    "upstream is imported but path '{path}' does not exist on '{}'",
+                    config.integration
+                ),
+            ),
+            (_, false) => (
+                CheckStatus::Pass,
+                format!("not imported yet; path '{path}' will be created by the first update"),
+            ),
+            (Some(false), true) => (CheckStatus::Fail, unrelated_content(up, path)),
+            (None, true) => (
+                CheckStatus::Fail,
+                format!(
+                    "path '{path}' exists without a sync record and {} is not available to check it",
+                    up.source()
+                ),
+            ),
+        };
+        checks.add("path", name, status, detail);
+    }
+
+    match (record, tip) {
+        (None, Some(t)) => {
+            let detail = match adopted_base(git, integration, up, t)? {
+                Some(base) => format!(
+                    "no sync record yet; last synced from history is {}, contained in {}",
+                    abbrev(&base),
+                    up.source()
+                ),
+                None => "no sync record yet".to_string(),
+            };
+            checks.add("last_synced", name, CheckStatus::Pass, detail);
+        }
+        (None, None) => checks.add(
+            "last_synced",
+            name,
+            CheckStatus::Pass,
+            "no sync record yet".to_string(),
+        ),
+        (Some(r), Some(t)) => {
+            let contained = git.object_exists(&r.target)? && git.is_ancestor(&r.target, t)?;
+            checks.pass_or_fail(
+                "last_synced",
+                name,
+                contained,
+                if contained {
+                    format!(
+                        "last synced commit {} is contained in {}",
+                        abbrev(&r.target),
+                        up.source()
+                    )
+                } else {
+                    format!(
+                        "{} no longer contains the last synced commit {}; the upstream was rewritten",
+                        up.source(),
+                        abbrev(&r.target)
+                    )
+                },
+            );
+        }
+        (Some(r), None) => checks.add(
+            "last_synced",
+            name,
+            CheckStatus::Fail,
+            format!(
+                "cannot check last synced commit {}: {} is not available",
+                abbrev(&r.target),
+                up.source()
+            ),
+        ),
+    }
+    Ok(())
+}
+
+/// The journal of a port upstream, and its commits against the fetched
+/// branch.
+fn port_checks(
+    git: &Git,
+    config: &Config,
+    integration: &str,
+    up: &Upstream,
+    record: Option<&Record>,
+    tip: Option<&String>,
+    checks: &mut Checks,
+) {
+    let name = Some(up.name.as_str());
+    let journal = port::journal_path(&up.name);
+    let Some(tip) = tip else {
+        let detail = match port::read_journal(git, integration, &up.name) {
+            Err(err) => format!("{err:#}"),
+            Ok(_) => format!(
+                "cannot check the journal {journal} against {}: the upstream is not available",
+                up.source()
+            ),
+        };
+        checks.add("journal", name, CheckStatus::Fail, detail);
+        return;
+    };
+    let (status, detail) = match port::standing(git, config, integration, up, record, tip) {
+        Err(err) => (CheckStatus::Fail, format!("{err:#}")),
+        Ok(Standing::NoBase) => (
+            CheckStatus::Fail,
+            format!(
+                "no journal, and no sync record of the upstream or history shared with it to start one from; \
+                 write the journal {journal} by hand"
+            ),
+        ),
+        Ok(Standing::Rewritten(why)) => (
+            CheckStatus::Fail,
+            format!("{why}; the upstream was rewritten"),
+        ),
+        Ok(Standing::Known(a)) if !a.journal => (
+            CheckStatus::Pass,
+            format!(
+                "no journal yet; the first update that carries out a plan starts it at the last synced commit {}",
+                abbrev(&a.base)
+            ),
+        ),
+        Ok(Standing::Known(a)) => (
+            CheckStatus::Pass,
+            format!(
+                "the journal {journal} is valid, and its base {} and its decided and taken commits are on {}; \
+                 {} taken, {} decided, {} pending",
+                abbrev(&a.base),
+                up.source(),
+                a.taken.len(),
+                a.decided.len(),
+                a.pending().len()
+            ),
+        ),
+    };
+    checks.add("journal", name, status, detail);
+}
+
+/// Git remotes left at an upstream's URL.
+fn remote_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<()> {
+    let git = &repo.git;
+    let promisor = git
+        .raw(&["config", "--get", "extensions.partialClone"])?
+        .stdout
+        .trim()
+        .to_string();
+    let mut found = false;
+    for remote in upstreams::remotes(git)? {
+        let urls = upstreams::remote_urls(git, &remote)?;
+        for up in config.upstreams.iter().filter(|u| urls.contains(&u.url)) {
+            found = true;
+            let partial = remote == promisor
+                || git
+                    .raw(&[
+                        "config",
+                        "--bool",
+                        "--get",
+                        &format!("remote.{remote}.promisor"),
+                    ])?
+                    .stdout
+                    .trim()
+                    == "true";
+            let mut detail = format!(
+                "git remote '{remote}' has the URL {} of upstream '{}'; the tool fetches upstreams by their URL \
+                 and needs no remote for them, and other tools take the remote for a place of the repository's own: \
+                 remove it with `git remote remove {remote}`",
+                up.url, up.name
+            );
+            if partial {
+                detail.push_str(&format!(
+                    ". This partial clone fetches missing objects from '{remote}': fetch the objects the history \
+                     still lacks before removing the remote, or that history can no longer be read"
+                ));
+            }
+            checks.add("remote", Some(&up.name), CheckStatus::Fail, detail);
+        }
+    }
+    if !found {
+        checks.add(
+            "remote",
+            None,
+            CheckStatus::Pass,
+            "no git remote has an upstream's URL".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Journals on the integration branch that belong to no port upstream.
+fn journal_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<()> {
+    let git = &repo.git;
+    let Some(integration) = git.commit(&branch_ref(&config.integration))? else {
+        return Ok(());
+    };
+    let listed = lines(&git.run(&[
+        "ls-tree",
+        "--name-only",
+        &integration,
+        &format!("{}/", port::JOURNAL_DIR),
+    ])?);
+    let mut stale = false;
+    for path in listed {
+        let Some(name) = path
+            .strip_prefix(&format!("{}/", port::JOURNAL_DIR))
+            .and_then(|f| f.strip_suffix(".toml"))
+        else {
+            continue;
+        };
+        let why = match config.upstream(name) {
+            Some(up) if up.mode == Mode::Port => continue,
+            Some(_) => format!(
+                "the journal {path} belongs to upstream '{name}', which is in follow mode, where a journal means nothing; \
+                 remove it, or set the upstream's mode to port"
+            ),
+            None => format!("the journal {path} belongs to no configured upstream; remove it"),
+        };
+        stale = true;
+        checks.add("stale_journal", Some(name), CheckStatus::Fail, why);
+    }
+    if !stale {
+        checks.add(
+            "stale_journal",
+            None,
+            CheckStatus::Pass,
+            "every journal belongs to an upstream in port mode".to_string(),
         );
     }
     Ok(())
@@ -366,16 +558,29 @@ fn state_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
         if head_branch.stdout.trim() != UPDATE_BRANCH {
             problems.push(format!("the update worktree is not on '{UPDATE_BRANCH}'"));
         }
-        let in_conflict = state
+        // A copy stops without a merge in progress; only a merge leaves one.
+        let merging = state
             .upstreams
             .iter()
-            .any(|u| u.step == UpstreamStep::Conflict);
-        if wt.merge_in_progress()? != in_conflict {
-            problems.push(if in_conflict {
+            .any(|u| u.step == UpstreamStep::Conflict && u.follow().is_some());
+        if wt.merge_in_progress()? != merging {
+            problems.push(if merging {
                 "an upstream is recorded in conflict but no merge is in progress in the update worktree".to_string()
             } else {
                 "a merge is in progress in the update worktree that the update state does not record".to_string()
             });
+        }
+        for q in &state.upstreams {
+            if let Work::Port(plan) = &q.work
+                && q.step == UpstreamStep::Plan
+                && !plan.plan.exists()
+            {
+                problems.push(format!(
+                    "upstream '{}' waits at its plan, but the plan {} is missing",
+                    q.name,
+                    plan.plan.display()
+                ));
+            }
         }
     }
     checks.pass_or_fail(

@@ -8,13 +8,16 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::port::Verb;
 
 /// The branch an update is built on.
 pub const UPDATE_BRANCH: &str = "git-intake/update";
 
-/// Version 2: the publication setting became a table, and an update can wait
-/// for its merge request.
-const STATE_VERSION: u32 = 2;
+/// Version 3: upstreams are fetched by URL into references the update holds,
+/// mirror branches are gone, and an upstream is taken in `follow` or `port`
+/// mode. Version 2 made the publication setting a table and let an update
+/// wait for its merge request.
+const STATE_VERSION: u32 = 3;
 
 /// Prefix of the branch a merge request is opened from.
 pub const MERGE_REQUEST_BRANCH_PREFIX: &str = "git-intake/update-";
@@ -27,6 +30,8 @@ pub struct Paths {
     pub last_update: PathBuf,
     pub worktree: PathBuf,
     pub logs: PathBuf,
+    /// The plan of a port update.
+    pub plan: PathBuf,
 }
 
 impl Paths {
@@ -37,6 +42,7 @@ impl Paths {
             last_update: root.join("last-update.json"),
             worktree: root.join("worktree"),
             logs: root.join("logs"),
+            plan: root.join("plan"),
             root,
         }
     }
@@ -58,9 +64,26 @@ pub enum MergeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamStep {
+    /// A port upstream whose plan waits to be edited and carried out.
+    Plan,
     Pending,
     Conflict,
+    /// Merged, or for a port upstream, its plan carried out to the journal
+    /// commit.
     Merged,
+}
+
+impl UpstreamStep {
+    /// The step as shown to the user.
+    pub fn describe(self, port: bool) -> &'static str {
+        match self {
+            UpstreamStep::Plan => "at its plan",
+            UpstreamStep::Pending => "pending",
+            UpstreamStep::Conflict => "in conflict",
+            UpstreamStep::Merged if port => "carried out",
+            UpstreamStep::Merged => "merged",
+        }
+    }
 }
 
 /// Where a conflicted file's resolution came from.
@@ -95,22 +118,131 @@ pub struct ConflictFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedUpstream {
     pub name: String,
+    /// The upstream tip `start` fetched. The update's reference to the
+    /// upstream keeps it, so that the target and the planned commits stay
+    /// in the repository until the update ends.
+    pub fetched: String,
+    /// The revision named on the command line, if any: the target of a
+    /// follow upstream, the limit of a port upstream's plan.
+    pub rev: Option<String>,
+    pub step: UpstreamStep,
+    #[serde(flatten)]
+    pub work: Work,
+}
+
+/// What an update does with a queued upstream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum Work {
+    Follow(FollowMerge),
+    Port(PortPlan),
+}
+
+impl QueuedUpstream {
+    pub fn follow(&self) -> Option<&FollowMerge> {
+        match &self.work {
+            Work::Follow(f) => Some(f),
+            Work::Port(_) => None,
+        }
+    }
+
+    pub fn port(&self) -> Option<&PortPlan> {
+        match &self.work {
+            Work::Port(p) => Some(p),
+            Work::Follow(_) => None,
+        }
+    }
+
+    /// The conflicted files of the merge or copy that stopped, if any.
+    pub fn conflicts(&self) -> &[ConflictFile] {
+        match &self.work {
+            Work::Follow(f) => &f.conflicts,
+            Work::Port(p) => p
+                .stopped()
+                .map(|c| c.conflicts.as_slice())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// The merge of a follow upstream up to its target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FollowMerge {
     /// The fixed target: the upstream tip fetched by `start`, or the commit
     /// of the revision named for the upstream.
     pub target: String,
-    /// The revision named on the command line for the target, if any.
-    #[serde(default)]
-    pub rev: Option<String>,
     /// The last synced commit before this update, if any.
     pub previous: Option<String>,
     /// Upstream commits the base did not contain.
     pub commits: u64,
     pub kind: MergeKind,
-    pub step: UpstreamStep,
     /// Update branch head before this upstream's merge began.
     pub head_before: Option<String>,
     pub merge_commit: Option<String>,
     pub conflicts: Vec<ConflictFile>,
+}
+
+/// The plan of a port upstream and how far it is carried out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortPlan {
+    /// The plan file `start` wrote and `continue` reads.
+    pub plan: PathBuf,
+    /// The journal's base, or the base of the journal the plan creates.
+    pub base: String,
+    /// Whether the journal exists at the update's base.
+    pub journal_exists: bool,
+    /// Pending commits the revision named to `start` leaves out of the plan.
+    pub left_out: u64,
+    /// The planned commits, oldest first.
+    pub commits: Vec<PlannedCommit>,
+    /// The commits marked `take`, as indexes into `commits`, in plan order.
+    /// Set when `continue` reads the plan.
+    pub takes: Vec<usize>,
+    /// The commit that recorded the decisions in the journal, once made.
+    pub journal_commit: Option<String>,
+    /// Update branch head before the journal commit.
+    pub journal_head_before: Option<String>,
+}
+
+impl PortPlan {
+    /// The taken commit whose copy stopped on conflicts, if any.
+    pub fn stopped(&self) -> Option<&PlannedCommit> {
+        self.commits.iter().find(|c| c.copy == CopyStep::Conflict)
+    }
+}
+
+/// One commit of a port plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedCommit {
+    pub commit: String,
+    pub subject: String,
+    /// A merge is copied as its change against its first parent.
+    pub merge: bool,
+    /// The verb the plan gives it; `None` until the plan is read.
+    pub verb: Option<Verb>,
+    /// The note of a `skip` or `have` decision.
+    pub note: Option<String>,
+    pub copy: CopyStep,
+    /// Update branch head before the copy began.
+    pub head_before: Option<String>,
+    /// The copy on the update branch.
+    pub copied: Option<String>,
+    pub conflicts: Vec<ConflictFile>,
+    /// Earlier planned commits still pending that changed some of the same
+    /// files; set for a taken commit once the plan is carried out.
+    pub overlaps: Vec<String>,
+}
+
+/// Progress of the copy of one planned commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyStep {
+    /// Not copied: not taken, or not reached yet.
+    None,
+    Conflict,
+    Copied,
+    /// The copy changed nothing; the commit is recorded as `have`.
+    Empty,
 }
 
 /// Result of one install or check command.
@@ -235,7 +367,7 @@ impl UpdateState {
         }
     }
 
-    /// Upstreams that are not merged yet.
+    /// Upstreams that are not merged, or whose plan is not carried out, yet.
     pub fn unmerged(&self) -> Vec<&QueuedUpstream> {
         self.upstreams
             .iter()
@@ -324,76 +456,77 @@ mod tests {
     use super::*;
     use crate::config;
 
+    fn config() -> Config {
+        config::parse(
+            "integration = \"main\"\n[[upstream]]\nname = \"up\"\nurl = \"../up.git\"\nbranch = \"main\"\n",
+        )
+        .unwrap()
+    }
+
     #[test]
     fn round_trips_through_json() {
-        let cfg = config::parse(
-            "integration = \"main\"\n[[upstream]]\nname = \"up\"\nremote = \"up\"\nbranch = \"main\"\n",
-        )
-        .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("git-intake").join("state.json");
         assert!(load(&path).unwrap().is_none());
-        let state = UpdateState::new(
-            cfg,
-            "b".repeat(40),
-            dir.path().join("wt"),
-            vec![QueuedUpstream {
-                name: "up".into(),
+        let follow = QueuedUpstream {
+            name: "up".into(),
+            fetched: "c".repeat(40),
+            rev: Some("v1.0".into()),
+            step: UpstreamStep::Conflict,
+            work: Work::Follow(FollowMerge {
                 target: "a".repeat(40),
-                rev: Some("v1.0".into()),
                 previous: None,
                 commits: 3,
                 kind: MergeKind::Root,
-                step: UpstreamStep::Conflict,
                 head_before: None,
                 merge_commit: None,
                 conflicts: vec![ConflictFile {
                     path: "f".into(),
                     resolution: Resolution::Recorded,
                 }],
-            }],
-        );
-        save(&path, &state).unwrap();
-        assert_eq!(load(&path).unwrap().unwrap(), state);
-        assert!(!state.all_merged());
+            }),
+        };
+        let port = QueuedUpstream {
+            name: "up".into(),
+            fetched: "c".repeat(40),
+            rev: None,
+            step: UpstreamStep::Plan,
+            work: Work::Port(PortPlan {
+                plan: dir.path().join("plan"),
+                base: "d".repeat(40),
+                journal_exists: false,
+                left_out: 0,
+                commits: vec![PlannedCommit {
+                    commit: "e".repeat(40),
+                    subject: "fix".into(),
+                    merge: false,
+                    verb: Some(Verb::Take),
+                    note: None,
+                    copy: CopyStep::Conflict,
+                    head_before: None,
+                    copied: None,
+                    conflicts: Vec::new(),
+                    overlaps: Vec::new(),
+                }],
+                takes: vec![0],
+                journal_commit: None,
+                journal_head_before: None,
+            }),
+        };
+        for queued in [follow, port] {
+            let state = UpdateState::new(
+                config(),
+                "b".repeat(40),
+                dir.path().join("wt"),
+                vec![queued],
+            );
+            save(&path, &state).unwrap();
+            assert_eq!(load(&path).unwrap().unwrap(), state);
+            assert!(!state.all_merged());
+        }
         remove(&path).unwrap();
         remove(&path).unwrap();
         assert!(load(&path).unwrap().is_none());
-    }
-
-    #[test]
-    fn a_queued_upstream_without_a_revision_is_read() {
-        let cfg = config::parse(
-            "integration = \"main\"\n[[upstream]]\nname = \"up\"\nremote = \"up\"\nbranch = \"main\"\n",
-        )
-        .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.json");
-        let mut queued = QueuedUpstream {
-            name: "up".into(),
-            target: "a".repeat(40),
-            rev: Some("v1.0".into()),
-            previous: None,
-            commits: 1,
-            kind: MergeKind::Root,
-            step: UpstreamStep::Pending,
-            head_before: None,
-            merge_commit: None,
-            conflicts: Vec::new(),
-        };
-        let state = UpdateState::new(
-            cfg,
-            "b".repeat(40),
-            dir.path().join("wt"),
-            vec![queued.clone()],
-        );
-        // A state written before queued upstreams carried their revision.
-        let mut value = serde_json::to_value(&state).unwrap();
-        value["upstreams"][0].as_object_mut().unwrap().remove("rev");
-        fs::write(&path, value.to_string()).unwrap();
-        let loaded = load(&path).unwrap().unwrap();
-        queued.rev = None;
-        assert_eq!(loaded.upstreams, vec![queued]);
     }
 
     #[test]
@@ -402,12 +535,16 @@ mod tests {
         let path = dir.path().join("state.json");
         fs::write(
             &path,
-            r#"{"version": 1, "config": {"integration": "main", "publish": "origin"}}"#,
+            r#"{"version": 2, "config": {"integration": "main", "upstreams": [{"remote": "up", "mirror": "m"}]}}"#,
         )
         .unwrap();
         let err = format!("{:#}", load(&path).unwrap_err());
         assert!(
-            err.contains("keeps its state in format 1; this release understands format 2"),
+            err.contains("keeps its state in format 2; this release understands format 3"),
+            "{err}"
+        );
+        assert!(
+            err.contains("Finish or abort the update with the release"),
             "{err}"
         );
         assert!(load_finished(&path).unwrap().is_none());

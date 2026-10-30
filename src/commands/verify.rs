@@ -1,4 +1,4 @@
-//! `verify`: run the install command and checks on the merged update.
+//! `verify`: run the install command and checks on the update.
 
 use std::fs::{self, File};
 use std::path::Path;
@@ -11,7 +11,7 @@ use crate::commands::update::{require_merging, require_worktree};
 use crate::config;
 use crate::git::{Git, abbrev};
 use crate::repo::{Repo, bullet};
-use crate::state::{CheckOutcome, CheckResult, UpstreamStep, Verification};
+use crate::state::{CheckOutcome, CheckResult, Verification};
 
 pub fn run(repo: &Repo) -> Result<Exit> {
     let mut state = repo.require_state()?;
@@ -20,18 +20,12 @@ pub fn run(repo: &Repo) -> Result<Exit> {
     let open: Vec<String> = state
         .unmerged()
         .iter()
-        .map(|u| {
-            let step = if u.step == UpstreamStep::Conflict {
-                "in conflict"
-            } else {
-                "pending"
-            };
-            format!("{} ({step})", u.name)
-        })
+        .map(|u| format!("{} ({})", u.name, u.step.describe(u.port().is_some())))
         .collect();
     if !open.is_empty() {
         bail!(
-            "cannot verify before every queued upstream is merged; these still need `git intake continue`:\n{}",
+            "cannot verify before every queued upstream is merged or its plan carried out; \
+             these still need `git intake continue`:\n{}",
             bullet(&open)
         );
     }

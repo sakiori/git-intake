@@ -25,7 +25,7 @@ fn update_worktree_in(git_dir: &Path) -> PathBuf {
 fn root_config(url: &str) -> String {
     format!(
         "integration = \"main\"\nchecks = [\"test -f {FORK_FILE}\"]\n\n\
-         [[upstream]]\nname = \"upstream\"\nremote = \"upstream\"\nbranch = \"main\"\nurl = {url:?}\n"
+         [[upstream]]\nname = \"upstream\"\nurl = {url:?}\nbranch = \"main\"\n"
     )
 }
 
@@ -93,7 +93,7 @@ fn push_and_no_publish_finish_run_from_the_update_worktree_complete() {
     let verified = env.rev(&wt, "HEAD");
     env.tool(&wt, &["finish"])
         .success()
-        .stdout(contains("pushed main, upstream-main to 'origin'"))
+        .stdout(contains("pushed main to 'origin'"))
         .stderr(contains(LEFT_REMOVED_DIRECTORY));
     assert_eq!(env.rev(&f.publish, "main"), verified);
     env.assert_no_update(&f.down);
@@ -214,18 +214,20 @@ fn relative_remote_urls_mean_the_same_from_every_worktree() {
         .success()
         .stdout(contains("app-a: queued"))
         .stdout(contains("app-b: queued"));
-    assert_eq!(
-        env.git(&m.down, &["config", "remote.app-a.url"]),
-        "../app-a.git"
-    );
+    assert_eq!(env.git(&m.down, &["remote"]), "", "no remote was added");
+    let held = env.rev(&m.down, "refs/git-intake/upstreams/app-a");
 
+    // From the update worktree, status fetches the relative URLs as the
+    // main worktree means them, and gives the update its references back.
     let wt = env.update_worktree(&m.down);
-    env.push_upstream(&m.a, &[("n.txt", "n\n")], "app-a: n");
-    env.tool(&wt, &["fetch"])
-        .success()
-        .stdout(contains("app-a: fetched"))
-        .stdout(contains("app-b: fetched"));
-    assert_eq!(env.rev(&m.down, "app-a/main"), env.rev(&m.a.bare, "main"));
+    let a2 = env.push_upstream(&m.a, &[("n.txt", "n\n")], "app-a: n");
+    let status = env.tool_json(&wt, &["status", "--json"], 0);
+    assert_eq!(status["upstreams"][0]["tip"], a2.as_str());
+    assert_eq!(
+        status["upstreams"][1]["tip"],
+        env.rev(&m.b.bare, "main").as_str()
+    );
+    assert_eq!(env.rev(&m.down, "refs/git-intake/upstreams/app-a"), held);
 }
 
 #[test]
@@ -234,7 +236,7 @@ fn start_resolves_a_revision_in_the_worktree_it_runs_in() {
     let env = &f.env;
     let c1 = env.push_upstream(&f.up, &[("c1.txt", "1\n")], "upstream: c1");
     env.push_upstream(&f.up, &[("c2.txt", "2\n")], "upstream: c2");
-    f.tool(&["fetch"]).success();
+    env.git(&f.down, &["fetch", "-q", &f.up.url(), "main"]);
     // In a linked worktree, HEAD^2 is c1; the main checkout's HEAD has no
     // second parent.
     let linked = env.path("side");
@@ -287,10 +289,9 @@ fn submodule_downstream_resolves_relative_urls_from_its_checkout() {
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     ));
     let wt = update_worktree_in(&git_dir);
-    env.push_upstream(&up, &[("m.txt", "m\n")], "upstream: m");
-    env.tool(&wt, &["fetch"])
-        .success()
-        .stdout(contains("upstream: fetched"));
+    let m = env.push_upstream(&up, &[("m.txt", "m\n")], "upstream: m");
+    let status = env.tool_json(&wt, &["status", "--json"], 0);
+    assert_eq!(status["upstreams"][0]["tip"], m.as_str());
     env.tool(&wt, &["verify"]).success();
     let verified = env.rev(&wt, "HEAD");
     env.tool(&wt, &["finish"])
@@ -342,10 +343,9 @@ fn update_from_checkout_and_update_worktree(env: &Env, up: &Upstream, down: &Pat
         .success()
         .stdout(contains("upstream: queued"));
     let wt = update_worktree_in(git_dir);
-    env.push_upstream(up, &[("m.txt", "m\n")], "upstream: m");
-    env.tool(&wt, &["fetch"])
-        .success()
-        .stdout(contains("upstream: fetched"));
+    let m = env.push_upstream(up, &[("m.txt", "m\n")], "upstream: m");
+    let status = env.tool_json(&wt, &["status", "--json"], 0);
+    assert_eq!(status["upstreams"][0]["tip"], m.as_str());
     env.tool(&wt, &["verify"]).success();
     let verified = env.rev(&wt, "HEAD");
     env.tool(&wt, &["finish"])
@@ -399,14 +399,22 @@ fn unreadable_state_stops_finish_from_the_update_worktree() {
 fn separate_git_dir_main_worktree_unknown_from_a_linked_worktree_is_named() {
     let (env, up, down, _) = separate_git_dir_downstream("git-dirs/down.git");
     env.push_upstream(&up, &[("n.txt", "n\n")], "upstream: n");
-    env.tool(&down, &["fetch"]).success();
     let linked = env.path("side");
     add_worktree(&env, &down, "side", &linked);
     let reason = "the main worktree cannot be located from here";
     let start = env.tool(&linked, &["start"]).code(2);
     assert!(stderr(&start).contains(reason), "{}", stderr(&start));
-    // Nothing is wrong with the repository, so doctor only warns.
-    let doctor = env.tool_json(&linked, &["doctor", "--json"], 0);
+    // Nothing is wrong with the repository, so doctor only warns about the
+    // main checkout. The relative URL resolves against the git directory
+    // from here, where it reaches no upstream, so the fetch check fails.
+    let doctor = env.tool_json(&linked, &["doctor", "--json"], 1);
+    let fetch = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check"] == "fetch")
+        .expect("fetch check");
+    assert_eq!(fetch["status"], "fail");
     let check = doctor["checks"]
         .as_array()
         .unwrap()
