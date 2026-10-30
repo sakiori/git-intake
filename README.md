@@ -139,14 +139,15 @@ git intake finish       # fast-forward, publish, clean up
 - an update is already in progress;
 - the main checkout or a checkout of the integration branch has uncommitted changes to tracked files;
 - the integration branch is behind its counterpart on the publish remote;
-- a selected upstream is unknown, unavailable or rewritten;
+- a selected upstream is unknown, named more than once, unavailable or rewritten;
+- a revision named for an upstream is refused, as described under *Choosing a target* below;
 - a path upstream that has no sync record yet finds its path holding content unrelated to the upstream's history, or finds a file where a directory of its path would go;
 - a path upstream that was imported before finds its path removed on the integration branch.
 
 When `start` runs, it does the following:
 
 1. Fetches the selected upstreams. With no names it selects all of them.
-2. Records each fetched tip as that upstream's **target** and the integration tip as the **base**. Targets never change during the update, even if the upstream moves on.
+2. Records each fetched tip, or the commit a revision names (see *Choosing a target*), as that upstream's **target**, and the integration tip as the **base**. Targets never change during the update, even if the upstream or a tag moves on.
 3. Queues, in configuration order, the upstreams whose target the base does not contain yet. The others are reported as current. If nothing is queued, nothing is created.
 4. Creates the worktree `<git-common-dir>/git-intake/worktree` on the branch `git-intake/update` from the base. The main checkout is never touched.
 5. Enables `rerere.enabled` for the repository. A resolution recorded in one attempt is reapplied when the same conflict recurs, and the tool reports such files as *resolved by a recorded resolution*. Review those files and stage them like any other resolution.
@@ -185,6 +186,29 @@ It then fast-forwards the integration branch to the verified commit. A checkout 
 The push sends exactly the planned commits (`<commit>:refs/heads/<branch>`), never whatever a local branch points to by then. A commit added to the integration branch while the update is finishing stays local.
 
 If the push is rejected, nothing is published, the local branches stay advanced, and the update stays in the `finishing` step. Running `finish` again retries the same push. If the remote holds work the local branches lack, or never accepts the push (for example a protected branch), run `finish --no-publish`. It closes the update locally: it completes any remaining local moves with the same checks, removes the worktree, the update branch and the state, and lists the branches it left unpublished (also in `report`). Then merge the remote's work and publish the result through a new verified update or the repository's usual review. `--no-publish` also works on a verified update before any push attempt.
+
+### Choosing a target
+
+By default an update takes each upstream at the tip it just fetched. To take an upstream at a reviewed point instead, such as a release tag, name it with a revision:
+
+```sh
+git intake start upstream=v2.3              # a fork: take the upstream's tag v2.3
+git intake start app-a=1a2b3c4d app-b       # app-a at a commit, app-b at its fetched tip
+```
+
+The name ends at the first `=`, since an upstream name cannot contain one, and the rest is the revision. Upstreams named without a revision take their fetched tip, and naming an upstream twice is refused. The revision is resolved as follows:
+
+- If the upstream's remote has a tag of that name, the tag's commit is the target, peeled through an annotated tag. The tool reads the remote's tag list with `git ls-remote` and fetches no tag, so the repository's own tags never clash with the upstream's: a tag `v2.3` in the repository does not stand in for the upstream's `v2.3`.
+- Otherwise the revision is resolved in the repository, like any argument to `git rev-parse`: a full or abbreviated commit id, or an expression such as `upstream/main~3`.
+
+The commit, however it was named, must be on the fetched upstream branch: the tool syncs a branch, not arbitrary commits. With `L` the upstream's last synced commit, `start` then decides:
+
+- a target older than `L` is refused, because an update never moves an upstream back;
+- a target the integration branch already contains, such as `L` itself, is reported as current;
+- a target that does not contain `L`, such as a commit of a side branch that the upstream merged after `L`, is refused, because the last synced commit and the mirror branch only move forward;
+- otherwise the upstream is queued at that target.
+
+The rest of the update does not change: the sync record names the target, `finish` fast-forwards the mirror branch to it, and `status` and `report` show the revision next to the target. Afterwards `status` shows the upstream as `behind`, by the commits between the target and the fetched tip.
 
 ### Publication through a merge request
 
@@ -240,7 +264,7 @@ An upstream's **last synced commit** is the target in the newest such commit on 
 | Command | Purpose |
 | --- | --- |
 | `fetch [UPSTREAM...]` | Adds missing remotes from configured URLs and fetches the selected upstreams, reporting each one. An upstream whose existing remote has a different URL, or whose remote is missing with no URL configured, is refused: nothing is fetched from it, and the others are still fetched. Any refusal or failed fetch exits with status 1. The fetch uses `--prune --no-tags`. `start` refuses outright if a selected upstream cannot be fetched. |
-| `start [UPSTREAM...]` | Starts an update, as described above. |
+| `start [UPSTREAM[=REV]...]` | Starts an update, as described above. An upstream named as `UPSTREAM=REV` is taken at the commit REV names instead of its fetched tip (see *Choosing a target*). |
 | `continue` | Concludes the merge stopped on conflicts and merges the remaining queued upstreams. It also accepts a merge concluded by hand when the commit keeps the sync record. |
 | `abort` | Removes the update worktree, branch, logs and state. While the update waits for its merge request, also deletes the merge request branch from the publish remote. |
 | `verify` | Runs `install` and the checks and records the verified commit. |
@@ -255,7 +279,7 @@ An upstream's **last synced commit** is the target in the newest such commit on 
 
 ### JSON output
 
-`status`, `report`, `log`, `branches` and `doctor` accept `--json`. They then write one JSON document to standard output, with the same facts as the text form under stable snake_case field names, and exit with the same status. Notes and errors go to standard error. For example, `status --json` carries `publish` (the publish remote or null) and `publish_via` (`push`, `merge_request` or null); while an update waits for its merge request, its `update` carries `step` `waiting_for_merge_request` and `merge_request` with `remote`, `source_branch`, `target_branch`, `commit`, `requested` (whether the push that asked the remote to open the merge request transferred the branch; when false, the merge request is opened by hand) and `number` (the merge request's number from the remote's reply, or null). Every entry of `status --json` `upstreams` carries `name`, `path`, `remote`, `branch`, `url`, `mirror`, `last_synced`, `last_synced_source` (`record`, `history` or null), `tip`, `commits_behind`, `state` (`current`, `behind`, `not_imported`, `path_removed`, `rewritten`, `unavailable`), `detail`, and, with `--check`, `conflicts`.
+`status`, `report`, `log`, `branches` and `doctor` accept `--json`. They then write one JSON document to standard output, with the same facts as the text form under stable snake_case field names, and exit with the same status. Notes and errors go to standard error. For example, `status --json` carries `publish` (the publish remote or null) and `publish_via` (`push`, `merge_request` or null); while an update waits for its merge request, its `update` carries `step` `waiting_for_merge_request` and `merge_request` with `remote`, `source_branch`, `target_branch`, `commit`, `requested` (whether the push that asked the remote to open the merge request transferred the branch; when false, the merge request is opened by hand) and `number` (the merge request's number from the remote's reply, or null). Every entry of `status --json` `upstreams` carries `name`, `path`, `remote`, `branch`, `url`, `mirror`, `last_synced`, `last_synced_source` (`record`, `history` or null), `tip`, `commits_behind`, `state` (`current`, `behind`, `not_imported`, `path_removed`, `rewritten`, `unavailable`), `detail`, and, with `--check`, `conflicts`. Each queued upstream under `update` in `status --json`, and each entry of `report --json` `upstreams`, carries `target` and `rev`: the revision `start` was given for the target, or null for the fetched tip.
 
 ## Exit status
 

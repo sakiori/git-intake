@@ -30,6 +30,8 @@ pub struct UpstreamReport {
     /// Start of the merged range; `None` for a first import (full history).
     pub range_start: Option<String>,
     pub target: String,
+    /// The revision `start` was given for the target; `null` for the fetched tip.
+    pub rev: Option<String>,
     pub commits: u64,
     pub merge_commit: Option<String>,
     pub conflicts: Vec<ConflictFile>,
@@ -116,6 +118,7 @@ fn build(git: &Git, state: &UpdateState, in_progress: bool) -> Result<ReportDoc>
             step: q.step,
             range_start,
             target: q.target.clone(),
+            rev: q.rev.clone(),
             commits: q.commits,
             merge_commit: q.merge_commit.clone(),
             conflicts,
@@ -211,6 +214,9 @@ impl Render for ReportDoc {
                 u.commits,
                 plural(u.commits)
             ));
+            if let Some(rev) = &u.rev {
+                out.push_str(&format!("  target named by: {rev}\n"));
+            }
             if let Some(m) = &u.merge_commit {
                 out.push_str(&format!("  merge commit: {}\n", abbrev(m)));
             }

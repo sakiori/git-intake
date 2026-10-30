@@ -6,7 +6,9 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::Exit;
-use crate::commands::update::{blocking_prefix, next_step, step_name, unrelated_content};
+use crate::commands::update::{
+    blocking_prefix, described, next_step, step_name, unrelated_content,
+};
 use crate::drift::{self, Drift, DriftState, SyncSource};
 use crate::git::{Git, abbrev, branch_ref};
 use crate::output::{Render, emit, table};
@@ -85,6 +87,8 @@ pub struct MergeRequestView {
 pub struct QueuedView {
     pub name: String,
     pub target: String,
+    /// The revision `start` was given for the target; `null` for the fetched tip.
+    pub rev: Option<String>,
     pub kind: MergeKind,
     pub step: UpstreamStep,
     pub merge_commit: Option<String>,
@@ -216,6 +220,7 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
             .map(|q| QueuedView {
                 name: q.name.clone(),
                 target: q.target.clone(),
+                rev: q.rev.clone(),
                 kind: q.kind,
                 step: q.step,
                 merge_commit: q.merge_commit.clone(),
@@ -386,7 +391,7 @@ pub fn render_update(u: &UpdateView) -> String {
         out.push_str(&format!(
             "  {}: target {}, {step}\n",
             q.name,
-            abbrev(&q.target)
+            described(&q.target, q.rev.as_deref())
         ));
         if q.step == UpstreamStep::Conflict {
             for c in &q.conflicts {

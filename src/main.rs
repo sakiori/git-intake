@@ -11,6 +11,7 @@ mod remotes;
 mod repo;
 mod state;
 mod sync_record;
+mod target;
 
 use std::process::ExitCode;
 

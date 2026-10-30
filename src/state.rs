@@ -95,8 +95,12 @@ pub struct ConflictFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedUpstream {
     pub name: String,
-    /// The fixed target: the upstream tip fetched by `start`.
+    /// The fixed target: the upstream tip fetched by `start`, or the commit
+    /// of the revision named for the upstream.
     pub target: String,
+    /// The revision named on the command line for the target, if any.
+    #[serde(default)]
+    pub rev: Option<String>,
     /// The last synced commit before this update, if any.
     pub previous: Option<String>,
     /// Upstream commits the base did not contain.
@@ -330,6 +334,7 @@ mod tests {
             vec![QueuedUpstream {
                 name: "up".into(),
                 target: "a".repeat(40),
+                rev: Some("v1.0".into()),
                 previous: None,
                 commits: 3,
                 kind: MergeKind::Root,
