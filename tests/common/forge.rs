@@ -49,6 +49,8 @@ pub struct FakeMr {
     /// A head the forge reports while it is open instead of its branch's
     /// tip, as a forge that has not processed a push yet does.
     pub pinned_head: Option<String>,
+    /// Whether it comes from a fork, whose branch is not the project's.
+    pub fork: bool,
     /// GitLab: what the request asked for.
     pub squash: Option<bool>,
     pub remove_source_branch: Option<bool>,
@@ -84,8 +86,9 @@ pub struct World {
     pub rules: Value,
     /// GitHub: whether the integration branch has classic protection.
     pub protected: bool,
-    /// GitHub: its classic protection, or the status reading it answers.
-    pub protection: Result<Value, u16>,
+    /// GitHub: its classic protection, or the status and message reading it
+    /// answers.
+    pub protection: Result<Value, (u16, &'static str)>,
     pub mrs: Vec<FakeMr>,
     pub requests: Vec<Recorded>,
     /// Requests answered with a failure: method, path suffix, status and
@@ -161,7 +164,7 @@ impl FakeForge {
             project,
             rules: json!([]),
             protected: false,
-            protection: Err(404),
+            protection: Err((404, "Branch not protected")),
             mrs: Vec::new(),
             requests: Vec::new(),
             failures: Vec::new(),
@@ -337,9 +340,21 @@ impl FakeForge {
             head: None,
             ended: None,
             pinned_head: None,
+            fork: false,
             squash: None,
             remove_source_branch: None,
         });
+        number
+    }
+
+    /// Adds a merge request from a fork's branch of the name `source`, as
+    /// anyone may open; the fork's head is `head`.
+    pub fn add_from_fork(&self, source: &str, target: &str, description: &str, head: &str) -> u64 {
+        let number = self.add(source, target, description);
+        let mut w = self.world();
+        let mr = w.mrs.iter_mut().find(|m| m.number == number).unwrap();
+        mr.fork = true;
+        mr.pinned_head = Some(head.into());
         number
     }
 
@@ -502,6 +517,8 @@ fn gitlab_mr(mr: &FakeMr, bare: &Path, host: &str) -> Value {
         "state": if mr.state == "open" { "opened" } else { mr.state },
         "sha": head_of(mr, bare),
         "source_branch": mr.source,
+        "source_project_id": if mr.fork { 2 } else { 1 },
+        "target_project_id": 1,
         "target_branch": mr.target,
         "title": mr.title,
         "description": mr.description,
@@ -565,7 +582,7 @@ fn gitlab(
             if let Some(open) = w
                 .mrs
                 .iter()
-                .find(|m| m.state == "open" && m.source == source && m.target == target)
+                .find(|m| m.state == "open" && !m.fork && m.source == source && m.target == target)
             {
                 return reply(
                     409,
@@ -586,6 +603,7 @@ fn gitlab(
                 head: None,
                 ended: None,
                 pinned_head: None,
+                fork: false,
                 squash: body["squash"].as_bool(),
                 remove_source_branch: body["remove_source_branch"].as_bool(),
             };
@@ -626,7 +644,15 @@ fn github_pr(mr: &FakeMr, bare: &Path, host: &str) -> Value {
         "state": if mr.state == "open" { "open" } else { "closed" },
         "merged_at": (mr.state == "merged").then(|| time(mr.ended.unwrap_or(0))),
         "closed_at": (mr.state != "open").then(|| time(mr.ended.unwrap_or(0))),
-        "head": {"sha": head_of(mr, bare), "ref": mr.source},
+        "head": {
+            "sha": head_of(mr, bare),
+            "ref": mr.source,
+            "repo": if mr.fork {
+                Value::Null
+            } else {
+                json!({"full_name": format!("{OWNER}/{REPO}")})
+            },
+        },
         "base": {"ref": mr.target},
         "title": mr.title,
         "body": mr.description,
@@ -653,10 +679,7 @@ fn github(
         ("GET", ["branches", b]) => reply(200, json!({"name": b, "protected": w.protected})),
         ("GET", ["branches", _, "protection"]) => match &w.protection {
             Ok(p) => reply(200, p.clone()),
-            Err(status) => reply(
-                *status,
-                json!({"message": "Resource not accessible by integration"}),
-            ),
+            Err((status, message)) => reply(*status, json!({ "message": message })),
         },
         ("GET", ["pulls"]) => {
             if w.stale_lists > 0 {
@@ -692,7 +715,7 @@ fn github(
             let target = body["base"].as_str().unwrap_or_default().to_string();
             if w.mrs
                 .iter()
-                .any(|m| m.state == "open" && m.source == source && m.target == target)
+                .any(|m| m.state == "open" && !m.fork && m.source == source && m.target == target)
             {
                 return reply(
                     422,
@@ -713,6 +736,7 @@ fn github(
                 head: None,
                 ended: None,
                 pinned_head: None,
+                fork: false,
                 squash: None,
                 remove_source_branch: None,
             };

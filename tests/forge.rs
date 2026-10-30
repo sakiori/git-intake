@@ -264,3 +264,180 @@ fn the_forge_is_that_of_the_url_git_uses() {
     assert!(err.contains("names no host"), "{err}");
     assert!(g.forge().requests().is_empty());
 }
+
+#[test]
+fn status_judges_the_merge_request_against_the_remote_s_integration_branch() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    behind(&f);
+    f.tool(&["sync"]).success();
+    // Other work lands on the remote; the local integration branch lags.
+    let dir = common::forge(env, &f.publish);
+    env.commit(&dir, &[("other.txt", "o\n")], "other: lands");
+    env.git(&dir, &["push", "-q", "origin", "HEAD:main"]);
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["merge_request"]["current"], false);
+    // Merged with a merge commit and not pulled: merged with its history.
+    f.tool(&["sync"]).success();
+    common::merge_on_fake(env, f.forge(), 1, common::How::MergeCommit);
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["merge_request"], serde_json::Value::Null);
+    assert_eq!(status["merged_without_history"], serde_json::Value::Null);
+    let out = stdout(&f.tool(&["status"]).success());
+    assert!(!out.contains("merged without"), "{out}");
+}
+
+/// A merge request from a fork's `git-intake/update` whose description
+/// records the targets the next update takes.
+fn fork_request(f: &Fork, target: &str) -> u64 {
+    let block = format!("<!-- git-intake targets\nupstream {target}\n-->\n");
+    f.forge()
+        .add_from_fork(MERGE_REQUEST_BRANCH, "main", &block, &"f".repeat(40))
+}
+
+#[test]
+fn merge_requests_from_forks_are_not_the_update_s() {
+    for f in [Fork::merge_request(), Fork::github()] {
+        let target = behind(&f);
+        let fork = fork_request(&f, &target);
+        let status = f.env.tool_json(&f.down, &["status", "--json"], 0);
+        assert_eq!(status["merge_request"], serde_json::Value::Null);
+        let out = stdout(&f.tool(&["abort", "--merge-request"]).success());
+        assert!(out.contains("there is nothing to withdraw"), "{out}");
+        assert_eq!(f.forge().mr(fork).state, "open");
+        f.tool(&["start"]).success();
+        f.tool(&["abort"]).success();
+        let out = stdout(&f.tool(&["sync"]).success());
+        assert!(
+            out.contains(&format!(
+                "opened {}",
+                if f.forge().kind == common::forge::Kind::GitHub {
+                    "pull request #2"
+                } else {
+                    "merge request !2"
+                }
+            )),
+            "{out}"
+        );
+        assert_eq!(f.forge().mr(fork).state, "open");
+    }
+    // A fork's closed merge request declines nothing.
+    let f = Fork::merge_request();
+    let target = behind(&f);
+    let fork = fork_request(&f, &target);
+    f.forge().end(fork, "closed");
+    let out = stdout(&f.tool(&["sync"]).success());
+    assert!(out.contains("opened merge request !2"), "{out}");
+}
+
+#[test]
+fn credentials_in_urls_never_reach_the_output() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    behind(&f);
+    // The publish remote's URL carries a credential.
+    let url = f
+        .forge()
+        .remote_url()
+        .replace("ssh://", "ssh://user:s3cret-word@");
+    env.git(&f.down, &["remote", "set-url", "origin", &url]);
+    // A branch of unknown origin makes the refusal name the remote's URL.
+    let dir = common::forge(env, &f.publish);
+    env.commit(&dir, &[("w.txt", "w\n")], "someone's work");
+    env.git(
+        &dir,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("HEAD:refs/heads/{MERGE_REQUEST_BRANCH}"),
+        ],
+    );
+    let sync = f.tool(&["sync"]).code(2);
+    let (out, err) = (stdout(&sync), stderr(&sync));
+    assert!(err.contains("ssh://127.0.0.1/team/app.git"), "{err}");
+    assert!(
+        !out.contains("s3cret") && !err.contains("s3cret"),
+        "{out}{err}"
+    );
+    // An upstream whose URL carries a credential and cannot be fetched.
+    let g = Fork::new();
+    g.reconfigure(
+        &format!("url = {:?}", g.up.url()),
+        "url = \"https://user:s3cret-word@127.0.0.1:9/team/up.git\"",
+    );
+    let status = g.tool(&["status"]).code(1);
+    let (out, err) = (stdout(&status), stderr(&status));
+    assert!(out.contains("https://127.0.0.1:9/team/up.git"), "{out}");
+    assert!(
+        !out.contains("s3cret") && !err.contains("s3cret"),
+        "{out}{err}"
+    );
+    let json = g.env.tool_json(&g.down, &["status", "--json"], 1);
+    assert!(!json.to_string().contains("s3cret"), "{json}");
+}
+
+#[test]
+fn a_job_s_api_on_another_host_is_refused() {
+    let f = Fork::merge_request();
+    behind(&f);
+    let mut elsewhere = mockito::Server::new();
+    let nothing = elsewhere
+        .mock("GET", mockito::Matcher::Any)
+        .expect(0)
+        .create();
+    let api = format!(
+        "{}/api/v4",
+        elsewhere.url().replace("127.0.0.1", "localhost")
+    );
+    f.env.set_var("CI_API_V4_URL", &api);
+    let err = stderr(&f.tool(&["sync"]).code(2));
+    assert!(
+        err.contains("CI_API_V4_URL names the host 'localhost'"),
+        "{err}"
+    );
+    nothing.assert();
+    assert!(f.forge().requests().is_empty());
+}
+
+#[test]
+fn a_branch_covered_by_rulesets_alone_has_no_classic_protection() {
+    let f = Fork::github();
+    behind(&f);
+    f.tool(&["start"]).success();
+    // GitHub counts rulesets as protection, and the classic protection of
+    // such a branch answers 404 "Branch not protected".
+    {
+        let mut w = f.forge().world();
+        w.protected = true;
+        w.protection = Err((404, "Branch not protected"));
+    }
+    f.tool(&["finish"]).success();
+    assert_eq!(f.forge().open_mrs().len(), 1);
+
+    // A 404 "Not Found" is a token that cannot read the protection.
+    let g = Fork::github();
+    behind(&g);
+    g.tool(&["start"]).success();
+    {
+        let mut w = g.forge().world();
+        w.protected = true;
+        w.protection = Err((404, "Not Found"));
+    }
+    let err = stderr(&g.tool(&["finish"]).code(2));
+    assert!(err.contains("could not be confirmed"), "{err}");
+    assert!(g.forge().open_mrs().is_empty());
+}
+
+#[test]
+fn a_project_the_forge_does_not_show_is_named_as_such() {
+    let f = Fork::merge_request();
+    f.forge()
+        .fail("GET", "/projects/team%2Fapp", 404, "404 Project Not Found");
+    let doctor = stdout(&f.tool(&["doctor"]).code(1));
+    assert!(doctor.contains("404 404 Project Not Found"), "{doctor}");
+    assert!(
+        doctor.contains("the project was not found, or the token cannot see it"),
+        "{doctor}"
+    );
+}

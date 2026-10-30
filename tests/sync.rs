@@ -851,7 +851,7 @@ fn a_merge_during_the_catch_up_ends_the_run() {
     let out = stdout(&f.tool(&["sync"]).success());
     assert!(out.contains("merge request !1"), "{out}");
     assert!(
-        out.contains("was merged while sync caught it up; nothing was pushed"),
+        out.contains("was merged before the update was pushed to it; nothing was pushed"),
         "{out}"
     );
     assert_eq!(on_remote(&f, MERGE_REQUEST_BRANCH), before);
@@ -979,4 +979,139 @@ fn in_update_worktree_hook(repo: &Path, name: &str, script: &str) {
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A merge request opened by `sync` whose catch-up stopped on a conflict in
+/// this clone, resolved and concluded with `continue`.
+fn resolved_catch_up(f: &Fork) {
+    let env = &f.env;
+    f.reconfigure("checks = [\"test -f app.txt\"]", "checks = [\"false\"]");
+    env.push_upstream(
+        &f.up,
+        &[("app.txt", "upstream\ntwo\nthree\n")],
+        "upstream: change",
+    );
+    f.tool(&["sync"]).success();
+    land(f, &[("app.txt", "fork\ntwo\nthree\n")], "fork: change");
+    f.tool(&["sync"]).code(1);
+    let wt = env.update_worktree(&f.down);
+    fs::write(wt.join("app.txt"), "both\ntwo\nthree\n").unwrap();
+    env.git(&wt, &["add", "app.txt"]);
+    f.tool(&["continue"]).success();
+}
+
+#[test]
+fn finish_reads_the_open_merge_request_again_before_the_push() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    resolved_catch_up(&f);
+    let before = on_remote(&f, MERGE_REQUEST_BRANCH);
+    // The integration branch moves again, and a person merges the merge
+    // request while `finish` makes its catch-up merge.
+    land(&f, &[("other.txt", "o\n")], "other: lands");
+    let marker = env.path("merged-now");
+    f.forge().world().merge_when = Some((1, marker.clone()));
+    in_update_worktree_hook(
+        &f.down,
+        "post-merge",
+        &format!("touch {}", marker.display()),
+    );
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(
+        out.contains("was merged before the update was pushed to it; nothing was pushed"),
+        "{out}"
+    );
+    assert_eq!(on_remote(&f, MERGE_REQUEST_BRANCH), before);
+}
+
+#[test]
+fn finish_deletes_the_branch_a_push_recreated_after_a_merge() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    resolved_catch_up(&f);
+    // The merge request is merged, and its branch removed, in the instant
+    // between the last read and the push.
+    let marker = env.path("merged-now");
+    f.forge().world().merge_when = Some((1, marker.clone()));
+    let hook = f.down.join(".git").join("hooks").join("pre-push");
+    fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    f.forge().clear_requests();
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(
+        out.contains("the branch the push recreated was deleted again"),
+        "{out}"
+    );
+    assert_eq!(on_remote(&f, MERGE_REQUEST_BRANCH), None);
+    assert!(
+        !f.forge()
+            .changes()
+            .iter()
+            .any(|r| r.json().get("title").is_some()),
+        "{:?}",
+        f.forge().changes()
+    );
+}
+
+#[test]
+fn sync_carries_a_port_update_on_from_its_history() {
+    let f = Fork::port_merge_request();
+    let env = &f.env;
+    let c0 = env.push_upstream(
+        &f.up,
+        &[("app.txt", "ported\ntwo\nthree\n")],
+        "upstream: c0",
+    );
+    let c1 = env.push_upstream(&f.up, &[("skipped.txt", "s\n")], "upstream: c1");
+    f.tool(&["start"]).success();
+    let plan = env.intake_dir(&f.down).join("plan");
+    fs::write(
+        &plan,
+        format!("take {} \nskip {} # not ours\n", &c0[..12], &c1[..12]),
+    )
+    .unwrap();
+    f.tool(&["continue"]).success();
+    f.tool(&["finish"]).success();
+    let before = on_remote(&f, MERGE_REQUEST_BRANCH).unwrap();
+    // The integration branch changes the file the copy changed.
+    land(&f, &[("app.txt", "fork\ntwo\nthree\n")], "fork: change");
+
+    // A fresh `sync` rebuilds the port's plan from the merge request's
+    // history and stops on the catch-up's conflict.
+    f.tool(&["sync"]).code(1);
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    let up = &status["update"]["upstreams"][0];
+    assert_eq!(up["mode"], "port");
+    assert_eq!(up["step"], "merged");
+    let commits = up["commits"].as_array().unwrap();
+    let verbs: Vec<(&str, &str)> = commits
+        .iter()
+        .map(|c| (c["commit"].as_str().unwrap(), c["verb"].as_str().unwrap()))
+        .collect();
+    assert_eq!(verbs, [(c0.as_str(), "take"), (c1.as_str(), "skip")]);
+    assert_eq!(commits[0]["copy"], "copied");
+    assert!(up["journal_commit"].is_string());
+
+    // Resolved, the catch-up merge is published: `finish` accepts the
+    // copies and the journal commit the plan was rebuilt from.
+    let wt = env.update_worktree(&f.down);
+    fs::write(wt.join("app.txt"), "both\ntwo\nthree\n").unwrap();
+    env.git(&wt, &["add", "app.txt"]);
+    f.tool(&["continue"]).success();
+    let json = env.tool_json(&wt, &["env", "--json"], 0);
+    assert_eq!(json["GIT_INTAKE_UPSTREAM_UPSTREAM_TARGET"], c1.as_str());
+    f.tool(&["finish"]).success();
+    let after = on_remote(&f, MERGE_REQUEST_BRANCH).unwrap();
+    assert_eq!(env.rev(&f.publish, &format!("{after}^2")), before);
+    let description = f.forge().mr(1).description;
+    assert!(
+        description.contains(&format!(
+            "`upstream` from upstream/main, ported: took {}; skipped {}",
+            &c0[..12],
+            &c1[..12]
+        )),
+        "{description}"
+    );
+    env.assert_no_update(&f.down);
 }

@@ -396,7 +396,7 @@ fn github_classic_protection_the_token_cannot_read_is_refused() {
         let mut w = f.forge().world();
         w.rules = json!([]);
         w.protected = true;
-        w.protection = Err(403);
+        w.protection = Err((403, "Resource not accessible by integration"));
     }
     refused(
         &f,
