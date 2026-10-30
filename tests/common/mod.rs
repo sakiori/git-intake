@@ -69,7 +69,29 @@ impl Upstream {
 impl Env {
     pub fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(dir.path().join("gitconfig"), "").unwrap();
+        // git's own technique for SSH remotes in tests: `ssh://<host>/<path>`
+        // reaches the repository `<path>` under `served/` through a shim
+        // that drops the host and runs the requested git command locally.
+        let shim = dir.path().join("ssh-shim");
+        fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\n# git runs: ssh-shim <host> \"<git-upload-pack|git-receive-pack> '<path>'\"\n\
+                 shift\neval \"set -- $1\"\nexec git \"${{1#git-}}\" \"{}$2\"\n",
+                dir.path().join("served").display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            dir.path().join("gitconfig"),
+            format!(
+                "[core]\n\tsshCommand = {}\n[ssh]\n\tvariant = simple\n",
+                shim.display()
+            ),
+        )
+        .unwrap();
         fs::create_dir_all(dir.path().join("home")).unwrap();
         Self {
             dir,
@@ -167,6 +189,12 @@ impl Env {
         self.git_output(cwd, &["merge-base", "--is-ancestor", a, b])
             .status
             .success()
+    }
+
+    /// A bare repository at `/<path>.git` of the SSH host the shim serves,
+    /// as `ssh://127.0.0.1/<path>.git` reaches it.
+    pub fn served(&self, path: &str) -> PathBuf {
+        self.bare(&format!("served/{path}"))
     }
 
     /// A bare repository with `main` as its default branch.
@@ -404,7 +432,10 @@ impl Fork {
     fn build(checks: &[&str], via: &str, mode: &str, kind: Option<forge::Kind>) -> Self {
         let env = Env::new();
         let up = env.upstream("upstream", &[(FORK_FILE, FORK_CONTENT)]);
-        let publish = env.bare("publish");
+        let publish = match kind {
+            Some(_) => env.served(&format!("{}/{}", forge::OWNER, forge::REPO)),
+            None => env.bare("publish"),
+        };
         let down = env.path("down");
         env.git(
             &env.path(""),
@@ -424,17 +455,8 @@ impl Fork {
         });
         match &fake {
             Some(fake) => {
-                // The remote is on the forge's host; git reaches it through
-                // the bare repository.
+                // The remote is on the forge's host, reached over SSH.
                 env.git(&down, &["remote", "add", "origin", &fake.remote_url()]);
-                env.git(
-                    &down,
-                    &[
-                        "config",
-                        &format!("url.{}.insteadOf", publish.display()),
-                        &fake.remote_url(),
-                    ],
-                );
                 for (k, v) in fake.job_vars() {
                     env.set_var(&k, &v);
                 }
@@ -632,18 +654,10 @@ impl Mono {
     /// `origin`, on a GitLab as in [`Fork::merge_request`].
     pub fn merge_request() -> Self {
         let mut m = Self::build("\n[publish]\nremote = \"origin\"\nvia = \"merge-request\"\n");
-        let publish = m.env.bare("publish");
+        let publish = m.env.served(&format!("{}/{}", forge::OWNER, forge::REPO));
         let fake = forge::FakeForge::gitlab(&publish);
         m.env
             .git(&m.down, &["remote", "add", "origin", &fake.remote_url()]);
-        m.env.git(
-            &m.down,
-            &[
-                "config",
-                &format!("url.{}.insteadOf", publish.display()),
-                &fake.remote_url(),
-            ],
-        );
         for (k, v) in fake.job_vars() {
             m.env.set_var(&k, &v);
         }

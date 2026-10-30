@@ -7,8 +7,9 @@
 //! forge does after a push. Every request is recorded, with its headers, so
 //! that tests can tell what the tool sent and where. The tool reaches the
 //! fake as a forge reached from its own CI job: the publish remote's URL is
-//! on the fake's host, git rewrites it to the bare repository, and the job's
-//! variables name the fake's API.
+//! an SSH URL on the fake's host, which the test environment's SSH shim
+//! serves from the bare repository, and the job's variables name the fake's
+//! API.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -221,9 +222,12 @@ impl FakeForge {
         self.server.url()
     }
 
-    /// The publish remote's URL on the forge.
+    /// The publish remote's URL on the forge's host, which git reaches over
+    /// SSH through the test environment's shim.
     pub fn remote_url(&self) -> String {
-        format!("{}/{OWNER}/{REPO}.git", self.url())
+        let host = self.server.host_with_port();
+        let host = host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h);
+        format!("ssh://{host}/{OWNER}/{REPO}.git")
     }
 
     /// The API base.

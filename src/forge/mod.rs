@@ -169,14 +169,15 @@ pub fn connect(git: &Git, publish: &Publish) -> Result<Box<dyn Forge>> {
     })
 }
 
-/// The URL a remote is fetched from, as configured.
+/// The URL git fetches a remote from: its configured URL after git's
+/// `url.<base>.insteadOf` rewriting, as `git remote get-url` reports it, so
+/// that the forge is the one the branch actually lands on. `None` when the
+/// remote does not exist.
 pub fn fetch_url(git: &Git, remote: &str) -> Result<Option<String>> {
-    let out = git.raw(&["config", "--get", &format!("remote.{remote}.url")])?;
-    Ok(match out.code {
-        Some(0) => Some(out.stdout.trim().to_string()),
-        Some(1) => None,
-        _ => return Err(out.into_error().into()),
-    })
+    if git.remote_url(remote)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(git.line(&["remote", "get-url", remote])?))
 }
 
 /// The host an SSH host alias stands for, as `ssh -G` resolves the client's

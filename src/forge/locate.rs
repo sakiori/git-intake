@@ -1,8 +1,8 @@
 //! Finding the forge of the publish remote, its API and the token.
 //!
-//! The forge is that of the publish remote's fetch URL as configured; git's
-//! `url.<base>.insteadOf` rewriting changes only how git reaches the
-//! repository, not which repository the URL names. The kind of forge comes
+//! The forge is that of the publish remote's fetch URL as git uses it, after
+//! its `url.<base>.insteadOf` rewriting: the merge request is opened on the
+//! forge the branch actually lands on. The kind of forge comes
 //! from the setting `forge`, else from the URL's host, else from the CI job
 //! when the job's server is that host. The API base comes from the setting
 //! `api`, which must be on the remote's host, else from the CI job's
@@ -228,7 +228,9 @@ fn own_host(kind: Kind, remote: &RemoteUrl, api_host: &str, around: &Surrounding
     if matches(&remote.host) {
         return true;
     }
+    // An address names no SSH host alias, so there is nothing to resolve.
     remote.scheme == "ssh"
+        && remote.host.parse::<std::net::IpAddr>().is_err()
         && (around.ssh_host)(&remote.host)
             .map(|h| h.to_ascii_lowercase())
             .is_some_and(|h| matches(&h))

@@ -226,3 +226,41 @@ fn requests_go_through_the_proxy_of_the_environment() {
     assert!(why.contains("proxy"), "{why}");
     assert!(f.forge().requests().is_empty());
 }
+
+#[test]
+fn the_forge_is_that_of_the_url_git_uses() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    // A shorthand that git's URL rewriting expands to the forge's URL.
+    let url = f.forge().remote_url();
+    let base = url.strip_suffix("team/app.git").unwrap();
+    env.git(
+        &f.down,
+        &["config", &format!("url.{base}.insteadOf"), "forge:"],
+    );
+    env.git(
+        &f.down,
+        &["remote", "set-url", "origin", "forge:team/app.git"],
+    );
+    behind(&f);
+    let out = stdout(&f.tool(&["sync"]).success());
+    assert!(out.contains("opened merge request !1"), "{out}");
+    assert!(common::forge::branch_tip(&f.publish, MERGE_REQUEST_BRANCH).is_some());
+
+    // A rewrite to a host that is no forge leaves the forge unknown, though
+    // the configured URL is on the forge's host.
+    let g = Fork::merge_request();
+    let elsewhere = g.env.bare("elsewhere");
+    g.env.git(
+        &g.down,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", elsewhere.display()),
+            &g.forge().remote_url(),
+        ],
+    );
+    behind(&g);
+    let err = stderr(&g.tool(&["sync"]).code(2));
+    assert!(err.contains("names no host"), "{err}");
+    assert!(g.forge().requests().is_empty());
+}

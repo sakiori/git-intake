@@ -24,7 +24,7 @@ fn land(f: &Fork, files: &[(&str, &str)], message: &str) -> String {
 
 /// A fresh clone of the fork as a CI job makes it: `HEAD` detached at the
 /// integration branch's tip, no local integration branch, the publish
-/// remote's URL and its rewriting as in the fork.
+/// remote's URL as in the fork.
 fn ci_clone(f: &Fork, name: &str) -> PathBuf {
     let env = &f.env;
     let dir = env.path(name);
@@ -44,14 +44,6 @@ fn ci_clone(f: &Fork, name: &str) -> PathBuf {
     env.git(
         &dir,
         &["remote", "set-url", "origin", &f.forge().remote_url()],
-    );
-    env.git(
-        &dir,
-        &[
-            "config",
-            &format!("url.{}.insteadOf", f.publish.display()),
-            &f.forge().remote_url(),
-        ],
     );
     dir
 }
