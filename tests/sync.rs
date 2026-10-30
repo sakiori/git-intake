@@ -1122,3 +1122,98 @@ fn sync_carries_a_port_update_on_from_its_history() {
     );
     env.assert_no_update(&f.down);
 }
+
+/// A pre-push hook of the fork that, at the push of the update, has the
+/// forge merge merge request 1, and at the next push, the deletion of the
+/// branch it recreated, moves that branch on the remote, as someone pushing
+/// in between does, so that the deletion's lease fails.
+fn merge_then_move_on_push(f: &Fork) {
+    let env = &f.env;
+    let marker = env.path("merged-now");
+    let count = env.path("pushes");
+    f.forge().world().merge_when = Some((1, marker.clone()));
+    let main = env.rev(&f.publish, "main");
+    let hook = f.down.join(".git").join("hooks").join("pre-push");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nif [ -e {count} ]; then\n  git --git-dir={bare} update-ref refs/heads/{MERGE_REQUEST_BRANCH} {main}\n\
+             else\n  touch {count} {marker}\nfi\n",
+            count = count.display(),
+            marker = marker.display(),
+            bare = f.publish.display(),
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn finish_keeps_a_recreated_branch_that_moved_and_says_so() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    resolved_catch_up(&f);
+    merge_then_move_on_push(&f);
+    let main = env.rev(&f.publish, "main");
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(err.contains("is now merged"), "{err}");
+    assert!(
+        err.contains("the branch the push recreated after it ended was kept"),
+        "{err}"
+    );
+    assert!(err.contains("`git intake abort --merge-request`"), "{err}");
+    assert!(!err.contains("deleted again"), "{err}");
+    assert_eq!(on_remote(&f, MERGE_REQUEST_BRANCH), Some(main));
+    assert!(env.update_worktree(&f.down).exists(), "the update is kept");
+}
+
+#[test]
+fn sync_keeps_a_recreated_branch_that_moved_and_says_so() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    behind(&f);
+    f.tool(&["sync"]).success();
+    land(&f, &[("other.txt", "o\n")], "other: lands");
+    merge_then_move_on_push(&f);
+    let main = env.rev(&f.publish, "main");
+    let out = stdout(&f.tool(&["sync"]).success());
+    assert!(
+        out.contains("the branch the push recreated after it ended was kept"),
+        "{out}"
+    );
+    assert!(out.contains("`git intake abort --merge-request`"), "{out}");
+    assert_eq!(on_remote(&f, MERGE_REQUEST_BRANCH), Some(main));
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn finish_refuses_an_open_merge_request_whose_branch_is_gone() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    resolved_catch_up(&f);
+    let before = on_remote(&f, MERGE_REQUEST_BRANCH).unwrap();
+    f.forge().pin_head(1, &before);
+    env.git(
+        &f.publish,
+        &[
+            "update-ref",
+            "-d",
+            &format!("refs/heads/{MERGE_REQUEST_BRANCH}"),
+        ],
+    );
+    f.forge().clear_requests();
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(err.contains("the merge request !1"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "is open, but its branch '{MERGE_REQUEST_BRANCH}' is not on 'origin'"
+        )),
+        "{err}"
+    );
+    assert!(err.contains("`git intake abort --merge-request`"), "{err}");
+    assert!(!err.contains("run the command again"), "{err}");
+    assert_eq!(on_remote(&f, MERGE_REQUEST_BRANCH), None);
+    assert!(f.forge().changes().is_empty());
+    assert!(env.update_worktree(&f.down).exists(), "the update is kept");
+}

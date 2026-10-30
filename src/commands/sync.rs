@@ -489,12 +489,7 @@ fn sync_open(
     let kind = forge.kind();
     let term = kind.term();
     let Some(head) = remote_branch(repo, fetches, remote, &open.source)? else {
-        bail!(
-            "the {} is open, but its branch '{}' is not on '{remote}'; nothing was pushed. Restore the branch, or \
-             withdraw the {term} with `git intake abort --merge-request`",
-            named(kind, &open),
-            open.source
-        );
+        bail!("{}", merge_request::branch_gone(kind, &open, remote));
     };
     let base = git.merge_base(&head, tip)?;
     let history = match &base {

@@ -207,9 +207,34 @@ pub type Guard<'g> = &'g mut dyn FnMut(Stage) -> Result<Option<Stopped>>;
 pub struct Stopped {
     pub exit: Exit,
     pub message: String,
-    /// The merge request when it is no longer open, and whether the branch
-    /// a push recreated after its merge was deleted.
-    pub ended: Option<(MergeRequest, bool)>,
+    /// The merge request when it is no longer open, and what became of the
+    /// branch a push recreated after it ended.
+    pub ended: Option<(MergeRequest, Recreated)>,
+}
+
+/// The update's branch when its merge request ended during the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recreated {
+    /// Nothing was pushed.
+    NotPushed,
+    /// The push recreated the branch, which was deleted again.
+    Deleted,
+    /// The push recreated the branch, which moved since and was kept.
+    Kept,
+}
+
+impl Recreated {
+    /// What a message says of the branch.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Recreated::NotPushed => "nothing was pushed",
+            Recreated::Deleted => "the branch the push recreated after it ended was deleted again",
+            Recreated::Kept => {
+                "the branch the push recreated after it ended was kept, since it moved after the push; \
+                 `git intake abort --merge-request` removes it once what it holds is fetched"
+            }
+        }
+    }
 }
 
 /// What [`publish`] publishes.
@@ -361,7 +386,7 @@ pub fn guard<'a>(
                             now.state.describe(),
                             kind.term()
                         ),
-                        ended: Some((now, false)),
+                        ended: Some((now, Recreated::NotPushed)),
                     }));
                 }
                 let integration = format!("refs/heads/{}", open.target);
@@ -388,16 +413,22 @@ pub fn guard<'a>(
                 if now.state == State::Open {
                     return Ok(None);
                 }
-                // The push recreated a branch the merge removed.
-                delete_branch(&repo.git, remote, &open.source, pushed)?;
+                // The push recreated a branch the merge removed; it is
+                // deleted while it is still at the pushed commit.
+                let recreated = if delete_branch(&repo.git, remote, &open.source, pushed)? {
+                    Recreated::Kept
+                } else {
+                    Recreated::Deleted
+                };
                 Ok(Some(Stopped {
                     exit: Exit::Success,
                     message: format!(
-                        "the {} was {} just before the push; the branch the push recreated was deleted again",
+                        "the {} was {} just before the push; {}",
                         named(kind, &now),
-                        now.state.describe()
+                        now.state.describe(),
+                        recreated.describe()
                     ),
-                    ended: Some((now, true)),
+                    ended: Some((now, recreated)),
                 }))
             }
         }
@@ -958,6 +989,18 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
             abbrev(&open.head)
         );
     }
+    // An open merge request is read again just before and right after the
+    // push, as `sync` reads it, against its branch as the remote has it now.
+    let read_head = match &open {
+        Some(open) => {
+            let full = branch_ref(&open.source);
+            match remote_refs(&repo.git, &remote, std::slice::from_ref(&full))?.remove(&full) {
+                Some(at) => at,
+                None => bail!("{}", branch_gone(kind, open, &remote)),
+            }
+        }
+        None => String::new(),
+    };
     let branch = match &open {
         Some(open) => open.source.clone(),
         None => state
@@ -1017,17 +1060,6 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
         open: open.as_ref(),
         retry_of: None,
     };
-    // An open merge request is read again just before and right after the
-    // push, as `sync` reads it, against its branch as the remote has it now.
-    let read_head = match &open {
-        Some(open) => {
-            let full = branch_ref(&open.source);
-            remote_refs(&repo.git, &remote, std::slice::from_ref(&full))?
-                .remove(&full)
-                .unwrap_or_default()
-        }
-        None => String::new(),
-    };
     let published = match &open {
         Some(open) => {
             let mut guard = guard(repo, forge.as_ref(), &remote, open, &read_head, &tip);
@@ -1040,18 +1072,14 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
         // A merge request no longer open is refused as for an update carried
         // on from it, keeping the update.
         Published::Stopped(Stopped {
-            ended: Some((mr, deleted)),
+            ended: Some((mr, recreated)),
             ..
         }) => bail!(
-            "the {} is now {}, so the update is not published to it{}. The update is kept: run \
+            "the {} is now {}, so the update is not published to it; {}. The update is kept: run \
              `git intake abort` to end it",
             named(kind, &mr),
             mr.state.describe(),
-            if deleted {
-                "; the branch the push recreated after it ended was deleted again"
-            } else {
-                "; nothing was pushed"
-            }
+            recreated.describe()
         ),
         Published::Stopped(stop) => {
             println!("{}", stop.message);
@@ -1065,6 +1093,18 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
         named(kind, &mr)
     );
     Ok(exit)
+}
+
+/// Why an open merge request whose branch is not on the publish remote is
+/// left alone.
+pub fn branch_gone(kind: Kind, open: &MergeRequest, remote: &str) -> String {
+    format!(
+        "the {} is open, but its branch '{}' is not on '{remote}'; nothing was pushed. Restore the branch, or \
+         withdraw the {} with `git intake abort --merge-request`",
+        named(kind, open),
+        open.source,
+        kind.term()
+    )
 }
 
 /// Refuses, before anything moves, an update that cannot be published as a
