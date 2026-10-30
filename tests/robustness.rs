@@ -632,3 +632,268 @@ fn conflicts_are_labelled_recorded_only_when_rerere_reports_them() {
         "unresolved"
     );
 }
+
+/// Two upstreams created from one template, and a monorepo that is not.
+struct Twins {
+    env: Env,
+    a: common::Upstream,
+    b: common::Upstream,
+    down: std::path::PathBuf,
+}
+
+fn twins() -> Twins {
+    let env = Env::new();
+    let tmpl = env.work("template");
+    env.commit(&tmpl, &[("template.txt", "t\n")], "template");
+    let mut ups = Vec::new();
+    for name in ["app-a", "app-b"] {
+        let bare = env.bare(name);
+        let work = env.path(&format!("{name}-src"));
+        env.git(
+            &env.path(""),
+            &[
+                "clone",
+                "-q",
+                &tmpl.to_string_lossy(),
+                &work.to_string_lossy(),
+            ],
+        );
+        env.git(
+            &work,
+            &["remote", "set-url", "origin", &bare.to_string_lossy()],
+        );
+        env.commit(
+            &work,
+            &[(&format!("{name}.txt") as &str, "own\n")],
+            &format!("{name}: own work"),
+        );
+        env.git(&work, &["push", "-q", "origin", "HEAD:main"]);
+        ups.push(common::Upstream { bare, work });
+    }
+    let b = ups.pop().unwrap();
+    let a = ups.pop().unwrap();
+    let down = env.work("mono");
+    let cfg = format!(
+        "integration = \"main\"\n\n\
+         [[upstream]]\nname = \"app-a\"\nremote = \"app-a\"\nbranch = \"main\"\nurl = {:?}\npath = \"apps/a\"\n\n\
+         [[upstream]]\nname = \"app-b\"\nremote = \"app-b\"\nbranch = \"main\"\nurl = {:?}\npath = \"apps/b\"\n",
+        a.url(),
+        b.url()
+    );
+    env.commit(&down, &[(".fork-sync.toml", &cfg)], "mono: configuration");
+    Twins { env, a, b, down }
+}
+
+fn assert_b_unrelated(t: &Twins) {
+    let env = &t.env;
+    let status = env.tool_json(&t.down, &["status", "--json"], 0);
+    let b = &status["upstreams"][1];
+    assert_eq!(b["state"], "not_imported", "{b}");
+    assert_eq!(b["last_synced"], serde_json::Value::Null, "{b}");
+    let check = env.tool_json(&t.down, &["status", "--check", "--json"], 1);
+    assert!(
+        check["upstreams"][1]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("path 'apps/b' holds content unrelated to the history of app-b/main"),
+        "{check}"
+    );
+    env.tool(&t.down, &["start", "app-b"])
+        .code(2)
+        .stderr(contains(
+            "upstream 'app-b': path 'apps/b' holds content unrelated",
+        ));
+    env.assert_no_update(&t.down);
+    env.tool(&t.down, &["doctor"]).code(1).stdout(contains(
+        "[FAIL] app-b: upstream 'app-b': path 'apps/b' holds content unrelated",
+    ));
+}
+
+#[test]
+fn ancestry_shared_only_through_a_template_is_not_an_import() {
+    let t = twins();
+    let env = &t.env;
+    env.commit(
+        &t.down,
+        &[("apps/b/own.txt", "the monorepo's own code\n")],
+        "mono: own apps/b",
+    );
+    env.tool(&t.down, &["fetch"]).success();
+
+    // Before app-a is imported.
+    assert_b_unrelated(&t);
+
+    // After app-a, which shares the template with app-b, is imported.
+    env.tool(&t.down, &["start", "app-a"]).success();
+    env.tool(&t.down, &["verify"]).success();
+    env.tool(&t.down, &["finish"]).success();
+    assert!(t.down.join("apps/a/template.txt").exists());
+    assert_b_unrelated(&t);
+    assert_eq!(
+        fs::read_to_string(t.down.join("apps/b/own.txt")).unwrap(),
+        "the monorepo's own code\n"
+    );
+}
+
+#[test]
+fn subtree_add_import_sharing_a_template_is_adopted() {
+    let t = twins();
+    let env = &t.env;
+    env.tool(&t.down, &["fetch"]).success();
+    env.tool(&t.down, &["start", "app-a"]).success();
+    env.tool(&t.down, &["verify"]).success();
+    env.tool(&t.down, &["finish"]).success();
+    // app-b imported by other means, as `git subtree add` does.
+    let b1 = env.rev(&t.down, "refs/remotes/app-b/main");
+    env.git(
+        &t.down,
+        &[
+            "merge",
+            "-q",
+            "-s",
+            "ours",
+            "--no-commit",
+            "--allow-unrelated-histories",
+            "app-b/main",
+        ],
+    );
+    env.git(
+        &t.down,
+        &["read-tree", "--prefix=apps/b/", "-u", "app-b/main"],
+    );
+    env.git(&t.down, &["commit", "-q", "-m", "Add 'apps/b/' from app-b"]);
+
+    let status = env.tool_json(&t.down, &["status", "--json"], 0);
+    let b = &status["upstreams"][1];
+    assert_eq!(b["state"], "current");
+    assert_eq!(b["last_synced"], b1.as_str());
+    assert_eq!(b["last_synced_source"], "history");
+
+    let b2 = env.push_upstream(&t.b, &[("app-b.txt", "own\nmore\n")], "app-b: more");
+    env.tool(&t.down, &["fetch"]).success();
+    let status = env.tool_json(&t.down, &["status", "--json"], 0);
+    assert_eq!(status["upstreams"][1]["state"], "behind");
+    assert_eq!(status["upstreams"][1]["last_synced"], b1.as_str());
+    env.tool(&t.down, &["start"]).success();
+    env.tool(&t.down, &["verify"]).success();
+    env.tool(&t.down, &["finish"]).success();
+    assert_eq!(
+        fs::read_to_string(t.down.join("apps/b/app-b.txt")).unwrap(),
+        "own\nmore\n"
+    );
+    let status = env.tool_json(&t.down, &["status", "--json"], 0);
+    assert_eq!(status["upstreams"][1]["last_synced"], b2.as_str());
+    assert_eq!(status["upstreams"][1]["last_synced_source"], "record");
+    let _ = &t.a;
+}
+
+#[test]
+fn unusual_file_names_are_listed_once_and_raw() {
+    let f = Fork::new();
+    let env = &f.env;
+    let names = ["café.txt", "q\"uote.txt"];
+    env.push_upstream(
+        &f.up,
+        &[(names[0], "1\n2\n3\n"), (names[1], "1\n2\n3\n")],
+        "upstream: add files",
+    );
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+    env.commit(
+        &f.down,
+        &[(names[0], "1\nfork\n3\n"), (names[1], "1\nfork\n3\n")],
+        "fork: edit",
+    );
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
+    env.push_upstream(
+        &f.up,
+        &[(names[0], "1\nup\n3\n"), (names[1], "1\nup\n3\n")],
+        "upstream: edit",
+    );
+
+    let first = stdout(&f.tool(&["start"]).code(1));
+    for n in names {
+        assert!(first.contains(&format!("  {n}  (unresolved)")), "{first}");
+    }
+    let wt = env.update_worktree(&f.down);
+    for n in names {
+        fs::write(wt.join(n), "1\nboth\n3\n").unwrap();
+        env.git(&wt, &["add", n]);
+    }
+    f.tool(&["continue"]).success();
+    f.tool(&["abort"]).success();
+
+    let again = stdout(&f.tool(&["start"]).code(1));
+    for n in names {
+        assert_eq!(again.matches(n).count(), 1, "{again}");
+        assert!(
+            again.contains(&format!("  {n}  (resolved by a recorded resolution)")),
+            "{again}"
+        );
+    }
+    let report = env.tool_json(&f.down, &["report", "--json"], 0);
+    let conflicts = report["upstreams"][0]["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 2, "{report}");
+    let mut paths: Vec<&str> = conflicts
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    paths.sort();
+    assert_eq!(paths, vec!["café.txt", "q\"uote.txt"]);
+    assert!(
+        conflicts.iter().all(|c| c["resolution"] == "recorded"),
+        "{report}"
+    );
+}
+
+#[test]
+fn recovered_conflict_keeps_recorded_resolution_labels() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.commit(
+        &f.down,
+        &[(FORK_FILE, "one\nTWO-fork\nthree\n")],
+        "fork: change two",
+    );
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
+    env.push_upstream(
+        &f.up,
+        &[(FORK_FILE, "one\nTWO-upstream\nthree\n")],
+        "upstream: change two",
+    );
+    f.tool(&["start"]).code(1);
+    let wt = env.update_worktree(&f.down);
+    fs::write(wt.join(FORK_FILE), "one\nTWO-both\nthree\n").unwrap();
+    env.git(&wt, &["add", FORK_FILE]);
+    f.tool(&["continue"]).success();
+    f.tool(&["abort"]).success();
+    f.tool(&["start"]).code(1);
+
+    // As if the process stopped after the merge but before saving the conflict.
+    let forget = |s: &mut serde_json::Value| {
+        s["upstreams"][0]["step"] = "pending".into();
+        s["upstreams"][0]["conflicts"] = serde_json::json!([]);
+    };
+    edit_state(&f.down, forget);
+    f.tool(&["continue"])
+        .code(1)
+        .stdout(contains("app.txt  (resolved by a recorded resolution)"));
+    let report = env.tool_json(&f.down, &["report", "--json"], 0);
+    assert_eq!(
+        report["upstreams"][0]["conflicts"][0]["resolution"],
+        "recorded"
+    );
+
+    // Without the saved output, nothing is claimed as a recorded resolution.
+    edit_state(&f.down, forget);
+    fs::remove_file(
+        env.fork_sync_dir(&f.down)
+            .join("logs")
+            .join("merge-upstream.out"),
+    )
+    .unwrap();
+    f.tool(&["continue"])
+        .code(1)
+        .stdout(contains("app.txt  (unresolved)"));
+}

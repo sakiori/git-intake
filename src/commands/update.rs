@@ -5,7 +5,7 @@ use std::fs;
 use anyhow::{Context, Result, bail};
 
 use crate::Exit;
-use crate::config::Upstream;
+use crate::config::{Config, Upstream};
 use crate::drift::{self, DriftState};
 use crate::git::{Git, abbrev, branch_ref, tracking_ref};
 use crate::remotes;
@@ -72,7 +72,7 @@ pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
     let mut queue = Vec::new();
     let mut current = Vec::new();
     for up in &selected {
-        let d = drift::evaluate(git, &base, up, latest.get(&up.name))?;
+        let d = drift::evaluate(git, &base, up, latest.get(&up.name), &config)?;
         let target = match (d.state, &d.tip) {
             (DriftState::Rewritten, _) => {
                 refusals.push(format!(
@@ -97,7 +97,7 @@ pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
             continue;
         }
         let has_record = d.last_synced_source == Some(drift::SyncSource::Record);
-        match merge_kind(git, &base, up, &target, has_record)? {
+        match merge_kind(git, &base, up, &target, has_record, &config)? {
             Ok(kind) => queue.push(QueuedUpstream {
                 name: up.name.clone(),
                 commits: d.commits_behind.unwrap_or_default(),
@@ -190,17 +190,19 @@ fn require_not_behind_published(
 /// is merged with the subtree strategy. Without a record it is imported when
 /// its path is absent (shared ancestry alone, such as a common template, does
 /// not count as imported); when its path exists, it is adopted by a subtree
-/// merge if the integration branch contains part of its history (an import by
-/// other means, such as `git subtree add`), and refused otherwise.
+/// merge if the integration branch contains commits of its own history that no
+/// other upstream has (an import by other means, such as `git subtree add`),
+/// and refused otherwise.
 fn merge_kind(
     git: &Git,
     base: &str,
     up: &Upstream,
     target: &str,
     has_record: bool,
+    config: &Config,
 ) -> Result<std::result::Result<MergeKind, String>> {
     let Some(path) = &up.path else {
-        let shared = has_record || git.merge_base(base, target)?.is_some();
+        let shared = has_record || drift::adopted_base(git, base, up, target, config)?.is_some();
         return Ok(if shared {
             Ok(MergeKind::Root)
         } else {
@@ -228,7 +230,7 @@ fn merge_kind(
             )),
         },
         (false, true) => {
-            if git.merge_base(base, target)?.is_some() {
+            if drift::adopted_base(git, base, up, target, config)?.is_some() {
                 Ok(MergeKind::Subtree)
             } else {
                 Err(unrelated_content(up, path))
@@ -241,7 +243,7 @@ fn merge_kind(
 pub fn unrelated_content(up: &Upstream, path: &str) -> String {
     format!(
         "upstream '{}': path '{path}' holds content unrelated to the history of {}; \
-         the integration branch shares no commit with it, so it cannot be merged there",
+         the integration branch contains none of its own commits, so it cannot be merged there",
         up.name,
         up.source()
     )
@@ -282,9 +284,14 @@ fn merge_pending(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
         if wt.merge_in_progress()? {
             let ours = wt.commit("MERGE_HEAD")?.as_deref() == Some(target.as_str());
             if ours && kind != MergeKind::Import {
-                // A merge of this upstream that stopped before the state was saved.
+                // A merge of this upstream that stopped before the state was
+                // saved: its output, saved right after the merge, still says
+                // which files rerere resolved. Without it, nothing is
+                // labelled as resolved by a recorded resolution.
                 state.upstreams[i].head_before = Some(wt.line(&["rev-parse", "HEAD"])?);
-                return stop_on_conflict(repo, state, i, "");
+                let output =
+                    fs::read_to_string(merge_output_path(repo, &up.name)).unwrap_or_default();
+                return stop_on_conflict(repo, state, i, &output);
             }
             wt.run(&["merge", "--abort"])?;
         }
@@ -313,7 +320,10 @@ fn merge_pending(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
                     ));
                 }
                 args.extend(["-m".to_string(), msg, target.clone()]);
+                let output_path = merge_output_path(repo, &up.name);
+                state::remove(&output_path)?;
                 let out = wt.raw(&args)?;
+                save_merge_output(&output_path, &out)?;
                 (!out.success()).then_some(out)
             }
             MergeKind::Import => {
@@ -339,6 +349,21 @@ fn merge_pending(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
     }
     println!("every queued upstream is merged; next: git fork-sync verify");
     Ok(Exit::Success)
+}
+
+/// Where a merge's output is kept until the update's state records it.
+fn merge_output_path(repo: &Repo, name: &str) -> std::path::PathBuf {
+    repo.paths.logs.join(format!("merge-{name}.out"))
+}
+
+/// Saves what a merge printed before anything else can fail, so that a
+/// recovery after an interruption still sees rerere's report.
+fn save_merge_output(path: &std::path::Path, out: &crate::git::Output) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    fs::write(path, format!("{}{}", out.stdout, out.stderr))
+        .with_context(|| format!("cannot write {}", path.display()))
 }
 
 fn mark_merged(repo: &Repo, state: &mut UpdateState, i: usize, commit: String) -> Result<()> {

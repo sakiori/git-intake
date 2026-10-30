@@ -98,7 +98,7 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     let latest = sync_record::latest(&sync_record::records(git, &tip, config)?);
     let mut upstreams = Vec::new();
     for (i, up) in config.upstreams.iter().enumerate() {
-        let mut d: Drift = drift::evaluate(git, &tip, up, latest.get(&up.name))?;
+        let mut d: Drift = drift::evaluate(git, &tip, up, latest.get(&up.name), config)?;
         if let Some(why) = fetch_errors[i].take() {
             d.state = DriftState::Unavailable;
             d.detail = Some(format!("fetch failed: {why}"));

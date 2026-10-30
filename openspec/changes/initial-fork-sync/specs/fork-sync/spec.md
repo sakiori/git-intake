@@ -39,7 +39,7 @@ Before fetching, the tool SHALL ensure that every selected upstream's remote exi
 - **THEN** the tool fetches the others, reports the failed upstream with the git error, and exits with a failure status
 
 ### Requirement: Sync record in history
-Every merge commit the tool creates SHALL name the upstream and its target commit in commit trailers. The tool SHALL derive the last synced commit of each upstream from these trailers on the integration branch and SHALL NOT store it in the configuration or outside the history. For an upstream that carries no sync record but whose history is partly contained in the integration branch (at the root, or at a path that exists), the last synced commit SHALL be the newest upstream commit the integration branch contains, and the tool SHALL show that it comes from the history rather than a record. When an upstream's last synced commit is no longer contained in its branch, the tool SHALL report that upstream's history as rewritten and SHALL refuse to update it.
+Every merge commit the tool creates SHALL name the upstream and its target commit in commit trailers. The tool SHALL derive the last synced commit of each upstream from these trailers on the integration branch and SHALL NOT store it in the configuration or outside the history. For an upstream that carries no sync record but whose history is partly contained in the integration branch (at the root, or at a path that exists), the last synced commit SHALL be the newest upstream commit the integration branch contains that no other configured upstream's branch contains, and the tool SHALL show that it comes from the history rather than a record. When an upstream's last synced commit is no longer contained in its branch, the tool SHALL report that upstream's history as rewritten and SHALL refuse to update it.
 
 #### Scenario: Last synced commit
 - **WHEN** the integration branch contains a merge of an upstream
@@ -77,11 +77,15 @@ Every merge commit the tool creates SHALL name the upstream and its target commi
 - **THEN** the tool imports the target's tree under that path with a merge commit that keeps the upstream's full history
 
 #### Scenario: Path already holds unrelated content
-- **WHEN** a queued upstream's path exists at the base, the integration branch carries no sync record of that upstream, and none of the upstream's history is part of the integration branch
+- **WHEN** a queued upstream's path exists at the base, the integration branch carries no sync record of that upstream, and the integration branch contains none of the upstream's commits that other configured upstreams lack
 - **THEN** `start` refuses and names the upstream and the path
 
+#### Scenario: Ancestry shared only through a template
+- **WHEN** two upstreams descend from one template, one of them is imported, and the other's path already holds the repository's own content
+- **THEN** the other upstream is not treated as imported, and `start` refuses for its path
+
 #### Scenario: Path imported by other means
-- **WHEN** a queued upstream's path exists at the base and the integration branch carries no sync record of that upstream but contains part of its history, as after an import by `git subtree add`
+- **WHEN** a queued upstream's path exists at the base and the integration branch carries no sync record of that upstream but contains commits of that upstream that no other configured upstream contains, as after an import by `git subtree add`
 - **THEN** `status` shows the newest upstream commit contained in the integration branch as the last synced commit, and `start` updates the path by a subtree merge that records the sync
 
 #### Scenario: Imported path removed downstream

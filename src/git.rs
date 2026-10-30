@@ -221,18 +221,14 @@ impl Git {
 
     /// Tracked files with uncommitted changes in this worktree.
     pub fn tracked_changes(&self) -> Result<Vec<String>> {
-        let out = self.run(&["status", "--porcelain", "--untracked-files=no"])?;
-        Ok(out
-            .lines()
-            .filter(|l| l.len() > 3)
-            .map(|l| l[3..].to_string())
-            .collect())
+        let out = self.run(&["status", "--porcelain", "-z", "--untracked-files=no"])?;
+        Ok(parse_porcelain_z(&out))
     }
 
     /// Files with unmerged index entries in this worktree.
     pub fn unmerged_files(&self) -> Result<Vec<String>> {
-        let out = self.run(&["diff", "--name-only", "--diff-filter=U"])?;
-        Ok(lines(&out))
+        let out = self.run(&["diff", "--name-only", "-z", "--diff-filter=U"])?;
+        Ok(split_z(&out))
     }
 
     /// Whether a merge is in progress in this worktree.
@@ -269,6 +265,32 @@ pub fn lines(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Splits NUL-terminated git output (`-z`) into raw, unquoted paths.
+pub fn split_z(text: &str) -> Vec<String> {
+    text.split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Paths from `git status --porcelain -z`. A rename or copy entry is followed
+/// by its source path, which is skipped.
+fn parse_porcelain_z(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut entries = text.split('\0').filter(|e| !e.is_empty());
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let (status, path) = entry.split_at(3);
+        out.push(path.to_string());
+        if status.starts_with(['R', 'C']) {
+            entries.next();
+        }
+    }
+    out
+}
+
 /// A full ref name for a local branch.
 pub fn branch_ref(branch: &str) -> String {
     format!("refs/heads/{branch}")
@@ -291,6 +313,18 @@ mod tests {
     #[test]
     fn lines_skips_blank_lines() {
         assert_eq!(lines("a\n\nb  \n"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn nul_separated_paths_stay_raw() {
+        assert_eq!(
+            split_z("caf\u{e9}.txt\0q\"uote.txt\0"),
+            vec!["caf\u{e9}.txt", "q\"uote.txt"]
+        );
+        assert_eq!(
+            parse_porcelain_z(" M caf\u{e9}.txt\0R  new name\0old name\0M  q\"uote.txt\0"),
+            vec!["caf\u{e9}.txt", "new name", "q\"uote.txt"]
+        );
     }
 
     #[test]

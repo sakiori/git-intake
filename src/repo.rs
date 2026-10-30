@@ -70,10 +70,10 @@ impl Repo {
 
     /// Every worktree of the repository, the main one first.
     pub fn worktrees(&self) -> Result<Vec<Worktree>> {
-        let out = self.git.run(&["worktree", "list", "--porcelain"])?;
+        let out = self.git.run(&["worktree", "list", "--porcelain", "-z"])?;
         let mut list = Vec::new();
         let mut current: Option<Worktree> = None;
-        for line in out.lines() {
+        for line in out.split('\0') {
             if let Some(path) = line.strip_prefix("worktree ") {
                 if let Some(w) = current.take() {
                     list.push(w);

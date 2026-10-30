@@ -155,7 +155,7 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
         if let Some(path) = &up.path {
             let exists = git.object_type(&integration, path)?.is_some();
             let shared = match &tip {
-                Some(t) => Some(git.merge_base(&integration, t)?.is_some()),
+                Some(t) => Some(adopted_base(git, &integration, up, t, config)?.is_some()),
                 None => None,
             };
             let (status, detail) = match (record.is_some(), exists, shared) {
@@ -194,7 +194,7 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
 
         match (record, &tip) {
             (None, Some(t)) => {
-                let detail = match adopted_base(git, &integration, up, t)? {
+                let detail = match adopted_base(git, &integration, up, t, config)? {
                     Some(base) => format!(
                         "no sync record yet; last synced from history is {}, contained in {}",
                         abbrev(&base),

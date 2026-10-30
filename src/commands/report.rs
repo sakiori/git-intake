@@ -138,13 +138,14 @@ fn build(git: &Git, state: &UpdateState, in_progress: bool) -> Result<ReportDoc>
 
 /// Size of the difference between two tree-ish objects.
 fn diff_stat(git: &Git, from: &str, to: &str) -> Result<DiffStat> {
-    let out = git.run(&["diff", "--numstat", "--no-renames", from, to])?;
+    let out = git.run(&["diff", "--numstat", "-z", "--no-renames", from, to])?;
     Ok(parse_numstat(&out))
 }
 
 fn parse_numstat(out: &str) -> DiffStat {
     let mut stat = DiffStat::default();
-    for line in out.lines().filter(|l| !l.trim().is_empty()) {
+    // With -z and no renames each entry is `<ins>\t<del>\t<path>\0`.
+    for line in out.split('\0').filter(|l| !l.trim().is_empty()) {
         let mut parts = line.split('\t');
         let ins = parts
             .next()
@@ -239,7 +240,7 @@ mod tests {
 
     #[test]
     fn numstat_counts_text_and_binary_files() {
-        let s = parse_numstat("3\t1\ta.txt\n-\t-\timg.png\n10\t0\tb.txt\n");
+        let s = parse_numstat("3\t1\ta.txt\u{0}-\t-\timg.png\u{0}10\t0\tb.txt\u{0}");
         assert_eq!(
             s,
             DiffStat {
