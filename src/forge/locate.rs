@@ -121,6 +121,12 @@ impl Surroundings<'_> {
     /// The host of the CI job's server, when the tool runs in a job of that
     /// kind of forge.
     fn job_host(&self, kind: Kind) -> Option<String> {
+        Some(self.job_server(kind)?.host_str()?.to_ascii_lowercase())
+    }
+
+    /// The server URL of the CI job the tool runs in, when it is a job of
+    /// that kind of forge.
+    fn job_server(&self, kind: Kind) -> Option<Url> {
         let (flag, server) = match kind {
             Kind::GitLab => ("GITLAB_CI", "CI_SERVER_URL"),
             Kind::GitHub => ("GITHUB_ACTIONS", "GITHUB_SERVER_URL"),
@@ -128,8 +134,7 @@ impl Surroundings<'_> {
         if self.var(flag).as_deref() != Some("true") {
             return None;
         }
-        let server = Url::parse(self.var(server)?.trim()).ok()?;
-        Some(server.host_str()?.to_ascii_lowercase())
+        Url::parse(self.var(server)?.trim()).ok()
     }
 }
 
@@ -190,8 +195,31 @@ pub fn locate(
                 Kind::GitHub => "GITHUB_API_URL",
             };
             match around.var(from_job).filter(|_| in_job) {
-                Some(api) => Url::parse(api.trim().trim_end_matches('/'))
-                    .map_err(|e| format!("{from_job} is not a URL: {e}"))?,
+                Some(api) => {
+                    let base = Url::parse(api.trim().trim_end_matches('/'))
+                        .map_err(|e| format!("{from_job} is not a URL: {e}"))?;
+                    let api_host = base.host_str().unwrap_or_default().to_ascii_lowercase();
+                    let same = |h: &str| {
+                        api_host == h || (kind == Kind::GitHub && api_host == format!("api.{h}"))
+                    };
+                    if !same(&host) {
+                        return Err(format!(
+                            "{from_job} names the host '{api_host}', but the publish remote '{remote}' is on '{host}'; \
+                             the token is sent only to the API of the remote's own host"
+                        ));
+                    }
+                    // `https`, or the scheme of the job's own server, which
+                    // a self-managed instance may serve without TLS.
+                    let server = around.job_server(kind).map(|u| u.scheme().to_string());
+                    if base.scheme() != "https" && server.as_deref() != Some(base.scheme()) {
+                        return Err(format!(
+                            "{from_job} is not an `https` URL, and the job's server is not reached by `{}` either; \
+                             the token is not sent over it",
+                            base.scheme()
+                        ));
+                    }
+                    base
+                }
                 None => default_api(kind, &parsed)?,
             }
         }
@@ -451,6 +479,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("does not recognise"), "{e}");
+    }
+
+    #[test]
+    fn the_job_s_api_must_be_on_the_remote_s_host() {
+        let vars = [
+            ("GITLAB_CI", "true"),
+            ("CI_SERVER_URL", "https://gitlab.example.com"),
+            ("CI_API_V4_URL", "https://collector.example.net/api/v4"),
+            ("GITLAB_TOKEN", "t"),
+        ];
+        let e = located(
+            &publish(None, None),
+            "https://gitlab.example.com/g/app.git",
+            &vars,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("CI_API_V4_URL names the host 'collector.example.net'"),
+            "{e}"
+        );
+        // Plain HTTP only where the job's own server uses it.
+        let vars = [
+            ("GITLAB_CI", "true"),
+            ("CI_SERVER_URL", "https://gitlab.example.com"),
+            ("CI_API_V4_URL", "http://gitlab.example.com/api/v4"),
+            ("GITLAB_TOKEN", "t"),
+        ];
+        let e = located(
+            &publish(None, None),
+            "https://gitlab.example.com/g/app.git",
+            &vars,
+        )
+        .unwrap_err();
+        assert!(e.contains("is not an `https` URL"), "{e}");
+        let vars = [
+            ("GITLAB_CI", "true"),
+            ("CI_SERVER_URL", "http://gitlab.example.com"),
+            ("CI_API_V4_URL", "http://gitlab.example.com/api/v4"),
+            ("GITLAB_TOKEN", "t"),
+        ];
+        assert!(
+            located(
+                &publish(None, None),
+                "https://gitlab.example.com/g/app.git",
+                &vars
+            )
+            .is_ok()
+        );
+        // github.com's job API lives on `api.github.com`.
+        let vars = [
+            ("GITHUB_ACTIONS", "true"),
+            ("GITHUB_SERVER_URL", "https://github.com"),
+            ("GITHUB_API_URL", "https://api.github.com"),
+            ("GITHUB_TOKEN", "t"),
+        ];
+        assert!(
+            located(
+                &publish(None, None),
+                "https://github.com/team/app.git",
+                &vars
+            )
+            .is_ok()
+        );
     }
 
     #[test]
