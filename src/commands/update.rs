@@ -257,6 +257,9 @@ fn require_not_behind_published(
     if git.remote_url(publish)?.is_none() {
         bail!("the publish remote '{publish}' does not exist");
     }
+    // Read where the remote is fetched from, as every other comparison with
+    // its tracking refs is. This is only a precondition: if the push side is
+    // ahead, the push at `finish`, never forced, is rejected instead.
     let out = git.raw(&["fetch", "--quiet", "--no-tags", publish])?;
     if !out.success() {
         bail!(

@@ -40,20 +40,24 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     // A branch already in place, as after an interrupted `finish`, needs no
     // push. Pushing it again with options would update no ref, and git then
     // writes the options to a remote that has stopped reading, which can end
-    // the push with SIGPIPE. It is looked up where the push would go.
-    let in_place = match pushed_branch(&repo.git, &publish.remote, &branch) {
-        Ok(at) => holds(&at, &commit),
+    // the push with SIGPIPE. It is looked up, and pushed, only where pushes
+    // go and the branch is not yet at the verified commit.
+    let places = match pushed_branch(&repo.git, &publish.remote, &branch) {
+        Ok(places) => places,
         Err(err) => bail!(
             "cannot check whether the merge request branch '{branch}' is on '{}': {err:#}\n\
              Nothing moved, and the update stays verified; fix the cause and run `git intake finish` again",
             publish.remote
         ),
     };
-    let (requested, options_refused, number) = if in_place {
-        (false, false, None)
-    } else {
-        push_merge_request_branch(repo, &state, &publish, &branch, &commit)?
-    };
+    let (mut requested, mut options_refused, mut number) = (false, false, None);
+    for target in push_targets(&publish.remote, &places, |at| at != Some(commit.as_str())) {
+        let (asked, refused, named) =
+            push_merge_request_branch(repo, &state, &target, &branch, &commit)?;
+        requested |= asked;
+        options_refused |= refused;
+        number = number.or(named);
+    }
 
     let mr = MergeRequest {
         remote: publish.remote.clone(),
@@ -96,13 +100,15 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     Ok(Exit::Success)
 }
 
-/// Pushes the verified commit to the merge request branch, asking the remote
-/// to open the merge request. Returns whether it was asked for, whether the
-/// remote refused push options, and the number its reply names.
+/// Pushes the verified commit to the merge request branch on `target`, the
+/// publish remote or one of its push URLs, asking it to open the merge
+/// request. Returns whether a push carrying the options transferred the
+/// branch, whether the remote refused push options, and the number its reply
+/// names.
 fn push_merge_request_branch(
     repo: &Repo,
     state: &UpdateState,
-    publish: &Publish,
+    target: &str,
     branch: &str,
     commit: &str,
 ) -> Result<(bool, bool, Option<u64>)> {
@@ -112,7 +118,7 @@ fn push_merge_request_branch(
         args.push("-o".into());
         args.push(option);
     }
-    args.push(publish.remote.clone());
+    args.push(target.to_string());
     args.push(refspec.clone());
     let out = repo.git.raw(&args)?;
     Ok(if out.success() {
@@ -127,12 +133,12 @@ fn push_merge_request_branch(
         )
     } else if out.stderr.contains(NO_PUSH_OPTIONS) {
         // Refused before anything was written: push the branch alone.
-        let retry = repo.git.raw(&["push", &publish.remote, &refspec])?;
+        let retry = repo.git.raw(&["push", target, &refspec])?;
         if !retry.success() {
             bail!(
                 "pushing the merge request branch '{branch}' to '{}' failed: {}\n\
                  Nothing moved, and the update stays verified; fix the cause and run `git intake finish` again",
-                publish.remote,
+                target,
                 retry.into_error()
             );
         }
@@ -142,7 +148,7 @@ fn push_merge_request_branch(
         bail!(
             "pushing the merge request branch '{branch}' to '{}' failed: {}\n\
              Nothing moved, and the update stays verified; fix the cause and run `git intake finish` again",
-            publish.remote,
+            target,
             out.into_error()
         );
     })
@@ -253,6 +259,10 @@ pub fn inspect(repo: &Repo, state: &mut UpdateState) -> Result<Landing> {
         .clone()
         .context("the update does not wait for a merge request")?;
     let integration = state.config.integration.clone();
+    // Everything here is read where the publish remote is fetched from, not
+    // where it is pushed to: the local integration branch later moves to the
+    // tracking ref this fetch writes, so the merge is judged on the same side.
+    // A fetch side that lags behind the push side only makes the update wait.
     // The heads are looked up before the integration branch is fetched: a
     // merge that removes the branch afterwards is then seen by the fetch.
     let branch_ref_name = branch_ref(&mr.branch);
@@ -702,11 +712,18 @@ fn carried_records(
     Ok(found)
 }
 
-/// The commit `branch` points at, or `None` where it does not exist, on each
-/// URL a push to `remote` goes to: its push URLs, or else its URL, as `git
-/// push` resolves them. A remote may be fetched from one place and pushed to
-/// another, and what decides a push must be read where the push goes.
-fn pushed_branch(git: &Git, remote: &str, branch: &str) -> Result<Vec<Option<String>>> {
+/// One URL a push to the publish remote goes to, and the commit the branch
+/// in question points at there, or `None` where it does not exist.
+struct Place {
+    url: String,
+    at: Option<String>,
+}
+
+/// Where `branch` is on each URL a push to `remote` goes to: its push URLs,
+/// or else its URL, as `git push` resolves them. A remote may be fetched from
+/// one place and pushed to another, and what decides a push must be read
+/// where the push goes.
+fn pushed_branch(git: &Git, remote: &str, branch: &str) -> Result<Vec<Place>> {
     let out = git.raw(&["remote", "get-url", "--push", "--all", remote])?;
     if !out.success() {
         bail!(
@@ -716,21 +733,30 @@ fn pushed_branch(git: &Git, remote: &str, branch: &str) -> Result<Vec<Option<Str
     }
     let full = branch_ref(branch);
     crate::git::lines(&out.stdout)
-        .iter()
-        .map(|url| Ok(remote_refs(git, url, std::slice::from_ref(&full))?.remove(&full)))
+        .into_iter()
+        .map(|url| {
+            let at = remote_refs(git, &url, std::slice::from_ref(&full))?.remove(&full);
+            Ok(Place { url, at })
+        })
         .collect()
 }
 
-/// Whether every place a push goes to holds `commit`.
-fn holds(at: &[Option<String>], commit: &str) -> bool {
-    !at.is_empty() && at.iter().all(|c| c.as_deref() == Some(commit))
-}
-
-/// The first place that does not hold `commit`, as what it holds instead.
-fn deviation(at: Vec<Option<String>>, commit: &str) -> Option<String> {
-    at.into_iter()
-        .find(|c| c.as_deref() != Some(commit))
-        .flatten()
+/// What to push to so that exactly the places `wanted` selects receive the
+/// push: the remote itself when that is all of them, so that its own
+/// settings apply, and otherwise each selected URL.
+fn push_targets(
+    remote: &str,
+    places: &[Place],
+    wanted: impl Fn(Option<&str>) -> bool,
+) -> Vec<String> {
+    let selected: Vec<&Place> = places.iter().filter(|p| wanted(p.at.as_deref())).collect();
+    if selected.is_empty() {
+        Vec::new()
+    } else if selected.len() == places.len() {
+        vec![remote.to_string()]
+    } else {
+        selected.into_iter().map(|p| p.url.clone()).collect()
+    }
 }
 
 /// The commits the remote's refs with exactly these names point at; a ref
@@ -767,52 +793,64 @@ fn remote_refs(
 /// points at the verified commit. A branch that is already gone counts as
 /// deleted; a branch that moved on is left alone.
 pub fn delete_branch(git: &Git, mr: &MergeRequest) -> Result<()> {
-    let describe = |current: Option<String>| match current {
-        None => println!(
-            "the merge request branch '{}' is already gone from '{}'",
-            mr.branch, mr.remote
-        ),
-        Some(c) => println!(
-            "left the merge request branch '{}' on '{}': it moved from the verified commit {} to {}",
-            mr.branch,
-            mr.remote,
-            abbrev(&mr.commit),
-            abbrev(&c)
-        ),
-    };
-    // The branch is judged where the deletion is pushed.
-    let current = pushed_branch(git, &mr.remote, &mr.branch)?;
-    if !holds(&current, &mr.commit) {
-        describe(deviation(current, &mr.commit));
-        return Ok(());
-    }
-    // The lease makes the deletion conditional on the verified commit; it
+    // The branch is judged where the deletion is pushed, on each push URL.
+    let places = pushed_branch(git, &mr.remote, &mr.branch)?;
+    let verified = |at: Option<&str>| at == Some(mr.commit.as_str());
+    let targets = push_targets(&mr.remote, &places, verified);
+    // The lease makes each deletion conditional on the verified commit; it
     // never overwrites anything.
     let full = branch_ref(&mr.branch);
-    let out = git.raw(&[
-        "push",
-        "--quiet",
-        &format!("--force-with-lease={full}:{}", mr.commit),
-        &mr.remote,
-        &format!(":{full}"),
-    ])?;
-    if out.success() {
-        println!(
-            "deleted the merge request branch '{}' from '{}'",
-            mr.branch, mr.remote
-        );
-        return Ok(());
+    let mut failed = None;
+    for target in &targets {
+        let out = git.raw(&[
+            "push",
+            "--quiet",
+            &format!("--force-with-lease={full}:{}", mr.commit),
+            target,
+            &format!(":{full}"),
+        ])?;
+        if !out.success() {
+            failed = Some(out.into_error());
+        }
     }
-    let current = pushed_branch(git, &mr.remote, &mr.branch)?;
-    if holds(&current, &mr.commit) {
+    let after = if targets.is_empty() {
+        None
+    } else {
+        Some(pushed_branch(git, &mr.remote, &mr.branch)?)
+    };
+    let several = places.len() > 1;
+    let mut left = false;
+    for (i, before) in places.iter().enumerate() {
+        let tried = verified(before.at.as_deref());
+        let place = after.as_ref().and_then(|a| a.get(i)).unwrap_or(before);
+        let on = if several {
+            format!("'{}' at {}", mr.remote, place.url)
+        } else {
+            format!("'{}'", mr.remote)
+        };
+        match &place.at {
+            Some(c) if verified(Some(c)) => left = true,
+            Some(c) => println!(
+                "left the merge request branch '{}' on {on}: it moved from the verified commit {} to {}",
+                mr.branch,
+                abbrev(&mr.commit),
+                abbrev(c)
+            ),
+            None if tried => println!("deleted the merge request branch '{}' from {on}", mr.branch),
+            None => println!(
+                "the merge request branch '{}' is already gone from {on}",
+                mr.branch
+            ),
+        }
+    }
+    if left {
+        let why = failed.map(|e| format!(": {e}")).unwrap_or_default();
         bail!(
-            "cannot delete the merge request branch '{}' from '{}': {}",
+            "cannot delete the merge request branch '{}' from '{}'{why}",
             mr.branch,
-            mr.remote,
-            out.into_error()
+            mr.remote
         );
     }
-    describe(deviation(current, &mr.commit));
     Ok(())
 }
 
