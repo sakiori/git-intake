@@ -154,34 +154,37 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
         let record = latest.get(&up.name);
         if let Some(path) = &up.path {
             let exists = git.object_type(&integration, path)?.is_some();
-            let shared = match &tip {
-                Some(t) => Some(adopted_base(git, &integration, up, t, config)?.is_some()),
-                None => None,
+            // Synced: a record, or a merge in the history that brought the
+            // upstream into its path; unknown when the branch is not fetched.
+            let synced = match (record.is_some(), &tip) {
+                (true, _) => Some(true),
+                (false, Some(t)) => Some(adopted_base(git, &integration, up, t)?.is_some()),
+                (false, None) => None,
             };
-            let (status, detail) = match (record.is_some(), exists, shared) {
-                (true, true, _) => (
+            let (status, detail) = match (record.is_some(), synced, exists) {
+                (_, Some(true), true) => (
                     CheckStatus::Pass,
-                    format!("path '{path}' exists on '{}'", config.integration),
+                    if record.is_some() {
+                        format!("path '{path}' exists on '{}'", config.integration)
+                    } else {
+                        format!(
+                            "path '{path}' was imported without a sync record; the next update records it"
+                        )
+                    },
                 ),
-                (true, false, _) => (
+                (_, Some(true), false) => (
                     CheckStatus::Fail,
                     format!(
                         "upstream is imported but path '{path}' does not exist on '{}'",
                         config.integration
                     ),
                 ),
-                (false, false, _) => (
+                (_, _, false) => (
                     CheckStatus::Pass,
                     format!("not imported yet; path '{path}' will be created by the first update"),
                 ),
-                (false, true, Some(true)) => (
-                    CheckStatus::Pass,
-                    format!(
-                        "path '{path}' was imported without a sync record; the next update records it"
-                    ),
-                ),
-                (false, true, Some(false)) => (CheckStatus::Fail, unrelated_content(up, path)),
-                (false, true, None) => (
+                (_, Some(false), true) => (CheckStatus::Fail, unrelated_content(up, path)),
+                (_, None, true) => (
                     CheckStatus::Fail,
                     format!(
                         "path '{path}' exists without a sync record and {} is not available to check it",
@@ -194,7 +197,7 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
 
         match (record, &tip) {
             (None, Some(t)) => {
-                let detail = match adopted_base(git, &integration, up, t, config)? {
+                let detail = match adopted_base(git, &integration, up, t)? {
                     Some(base) => format!(
                         "no sync record yet; last synced from history is {}, contained in {}",
                         abbrev(&base),

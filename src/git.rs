@@ -136,6 +136,37 @@ impl Git {
         })
     }
 
+    /// Runs git with `input` on its standard input and returns stdout,
+    /// failing on a non-zero exit status. The input is written from another
+    /// thread so that large outputs cannot block it.
+    pub fn run_with_input<S: AsRef<str>>(&self, args: &[S], input: String) -> Result<String> {
+        use std::io::Write;
+        let owned: Vec<String> = args.iter().map(|a| a.as_ref().to_string()).collect();
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("cannot run `git {}`", owned.join(" ")))?;
+        let mut stdin = child.stdin.take().context("no stdin for git")?;
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let out = child
+            .wait_with_output()
+            .with_context(|| format!("cannot run `git {}`", owned.join(" ")))?;
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("writing to `git {}` panicked", owned.join(" ")))?
+            .with_context(|| format!("cannot write to `git {}`", owned.join(" ")))?;
+        Ok(Output {
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            args: owned,
+        }
+        .checked()?)
+    }
+
     /// Runs git and returns stdout, failing on a non-zero exit status.
     pub fn run<S: AsRef<str>>(&self, args: &[S]) -> Result<String> {
         Ok(self.raw(args)?.checked()?)

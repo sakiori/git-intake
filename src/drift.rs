@@ -3,10 +3,8 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use std::collections::HashSet;
-
-use crate::config::{Config, Upstream};
-use crate::git::{Git, abbrev, lines, tracking_ref};
+use crate::config::Upstream;
+use crate::git::{Git, abbrev, tracking_ref};
 use crate::sync_record::Record;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -37,8 +35,8 @@ impl DriftState {
 pub enum SyncSource {
     /// The newest sync record on the integration branch.
     Record,
-    /// No sync record: the newest upstream commit the integration branch
-    /// contains, for a fork created by cloning or a path imported by other means.
+    /// No sync record: derived from the history, for a fork created by
+    /// cloning or a path imported by other means.
     History,
 }
 
@@ -86,7 +84,6 @@ pub fn evaluate(
     integration_tip: &str,
     up: &Upstream,
     last: Option<&Record>,
-    config: &Config,
 ) -> Result<Drift> {
     let recorded = last.map(|r| r.target.clone());
     let tip = match fetched_tip(git, up)? {
@@ -111,16 +108,15 @@ pub fn evaluate(
     }
     let (last_synced, source) = match recorded {
         Some(r) => (Some(r), Some(SyncSource::Record)),
-        None => match adopted_base(git, integration_tip, up, &tip, config)? {
+        None => match adopted_base(git, integration_tip, up, &tip)? {
             Some(mb) => (Some(mb), Some(SyncSource::History)),
             None => (None, None),
         },
     };
     let behind = git.count(integration_tip, &tip)?;
-    // An upstream is imported once a sync record exists, or when the
-    // integration branch contains part of its own history (commits no other
-    // upstream has): at the root, or at a path that exists (an import by
-    // other means, such as `git subtree add`).
+    // An upstream is imported once a sync record exists, or when the history
+    // shows a last synced commit: shared history at the root, or a merge that
+    // brought the upstream into its path (`git subtree add` or `pull`).
     let imported = last_synced.is_some();
     let state = if !imported {
         DriftState::NotImported
@@ -139,73 +135,81 @@ pub fn evaluate(
     })
 }
 
-/// For an upstream without a sync record: the newest commit of its own
-/// history that the integration branch contains, or `None`.
+/// For an upstream without a sync record: its last synced commit as the
+/// history shows it, or `None`. Depends only on the integration branch and
+/// this upstream's own branch, never on other upstreams.
 ///
-/// "Own" excludes every commit another configured upstream's fetched branch
-/// contains, so ancestry shared only through a common template (or any other
-/// upstream) never makes this upstream look imported. A path upstream also
-/// needs its path to exist; shared ancestry with an absent path is not an
-/// import.
+/// - A root upstream: the newest upstream commit the integration branch
+///   contains (their merge base), as for a fork created by cloning.
+/// - A path upstream: the second parent of the newest merge on the
+///   integration branch's first-parent line whose second parent belongs to
+///   the upstream's branch and which changes the upstream's path, the merge
+///   `git subtree add` or `git subtree pull` leaves.
 pub fn adopted_base(
     git: &Git,
     integration_tip: &str,
     up: &Upstream,
     tip: &str,
-    config: &Config,
 ) -> Result<Option<String>> {
-    if let Some(path) = &up.path
-        && git.object_type(integration_tip, path)?.is_none()
-    {
-        return Ok(None);
+    match &up.path {
+        None => git.merge_base(integration_tip, tip),
+        Some(path) => newest_path_merge(git, integration_tip, path, tip),
     }
-    newest_own_contained(git, integration_tip, tip, &other_tips(git, config, up)?)
 }
 
-/// Fetched tips of every configured upstream other than `up`.
-pub fn other_tips(git: &Git, config: &Config, up: &Upstream) -> Result<Vec<String>> {
-    let mut tips = Vec::new();
-    for other in config.upstreams.iter().filter(|o| o.name != up.name) {
-        if let Some(t) = git.commit(&tracking_ref(&other.remote, &other.branch))? {
-            tips.push(t);
-        }
-    }
-    Ok(tips)
-}
-
-/// The newest commit reachable from `tip` but from none of `others` that
-/// `integration_tip` contains.
+/// The second parent of the newest first-parent merge into `integration_tip`
+/// that changes `path` and whose second parent is contained in `tip`.
 ///
-/// Such commits are closed under ancestry within the upstream's own history,
-/// so the answer is the first commit, in topological order, of
-/// `tip --not others` that is missing from `tip --not others integration_tip`.
-/// Two `rev-list` walks, linear in the upstream's own history. Without other
-/// upstreams this is the merge base.
-pub fn newest_own_contained(
+/// One walk lists the first-parent merges; one `cat-file --batch-check`
+/// compares each merge's tree at `path` with its first parent's; ancestry is
+/// checked only for the merges that change the path, newest first, stopping
+/// at the first match.
+fn newest_path_merge(
     git: &Git,
     integration_tip: &str,
+    path: &str,
     tip: &str,
-    others: &[String],
 ) -> Result<Option<String>> {
-    if others.is_empty() {
-        return git.merge_base(integration_tip, tip);
-    }
-    let mut own: Vec<String> = vec![
-        "rev-list".into(),
-        "--topo-order".into(),
-        tip.into(),
-        "--not".into(),
-    ];
-    own.extend(others.iter().cloned());
-    let own = lines(&git.run(&own)?);
-    if own.is_empty() {
+    let listing = git.run(&[
+        "rev-list",
+        "--first-parent",
+        "--merges",
+        "--parents",
+        integration_tip,
+    ])?;
+    // (merge, first parent, second parent), newest first.
+    let merges: Vec<(String, String, String)> = listing
+        .lines()
+        .filter_map(|l| {
+            let mut ids = l.split_whitespace();
+            Some((ids.next()?.into(), ids.next()?.into(), ids.next()?.into()))
+        })
+        .collect();
+    if merges.is_empty() {
         return Ok(None);
     }
-    let mut pending: Vec<String> = vec!["rev-list".into(), tip.into(), "--not".into()];
-    pending.extend(others.iter().cloned());
-    pending.push(integration_tip.into());
-    let pending: HashSet<String> = lines(&git.run(&pending)?).into_iter().collect();
-    Ok(own.into_iter().find(|c| !pending.contains(c)))
+    let mut input = String::new();
+    for (m, p1, _) in &merges {
+        input.push_str(&format!("{m}:{path}\n{p1}:{path}\n"));
+    }
+    let objects = git.run_with_input(&["cat-file", "--batch-check=%(objectname)"], input)?;
+    let objects: Vec<&str> = objects.lines().collect();
+    anyhow::ensure!(
+        objects.len() == merges.len() * 2,
+        "unexpected output from git cat-file --batch-check"
+    );
+    for (i, (_, _, p2)) in merges.iter().enumerate() {
+        // A missing path prints "<rev> missing"; any difference, including
+        // the path appearing, counts as a change.
+        let (at_merge, at_parent) = (objects[2 * i], objects[2 * i + 1]);
+        if at_merge.ends_with(" missing") || at_merge == at_parent {
+            continue;
+        }
+        if git.is_ancestor(p2, tip)? {
+            return Ok(Some(p2.clone()));
+        }
+    }
+    Ok(None)
 }
 
 /// Files a merge of `tip` into `integration_tip` would conflict in, predicted

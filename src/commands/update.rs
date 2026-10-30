@@ -5,7 +5,7 @@ use std::fs;
 use anyhow::{Context, Result, bail};
 
 use crate::Exit;
-use crate::config::{Config, Upstream};
+use crate::config::Upstream;
 use crate::drift::{self, DriftState};
 use crate::git::{Git, abbrev, branch_ref, tracking_ref};
 use crate::remotes;
@@ -72,7 +72,7 @@ pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
     let mut queue = Vec::new();
     let mut current = Vec::new();
     for up in &selected {
-        let d = drift::evaluate(git, &base, up, latest.get(&up.name), &config)?;
+        let d = drift::evaluate(git, &base, up, latest.get(&up.name))?;
         let target = match (d.state, &d.tip) {
             (DriftState::Rewritten, _) => {
                 refusals.push(format!(
@@ -97,7 +97,7 @@ pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
             continue;
         }
         let has_record = d.last_synced_source == Some(drift::SyncSource::Record);
-        match merge_kind(git, &base, up, &target, has_record, &config)? {
+        match merge_kind(git, &base, up, &target, has_record)? {
             Ok(kind) => queue.push(QueuedUpstream {
                 name: up.name.clone(),
                 commits: d.commits_behind.unwrap_or_default(),
@@ -186,24 +186,22 @@ fn require_not_behind_published(
 
 /// Decides how a queued upstream is merged, or why it cannot be.
 ///
-/// A root upstream needs shared history. A path upstream with a sync record
-/// is merged with the subtree strategy. Without a record it is imported when
-/// its path is absent (shared ancestry alone, such as a common template, does
-/// not count as imported); when its path exists, it is adopted by a subtree
-/// merge if the integration branch contains commits of its own history that no
-/// other upstream has (an import by other means, such as `git subtree add`),
-/// and refused otherwise.
+/// An upstream counts as synced when it has a sync record or the history
+/// shows a last synced commit (see [`drift::adopted_base`]); that decision
+/// depends only on the integration branch and the upstream's own branch. A
+/// root upstream must be synced. A synced path upstream is merged with the
+/// subtree strategy; an unsynced one is imported when its path is absent and
+/// refused when the path holds other content.
 fn merge_kind(
     git: &Git,
     base: &str,
     up: &Upstream,
     target: &str,
     has_record: bool,
-    config: &Config,
 ) -> Result<std::result::Result<MergeKind, String>> {
+    let synced = has_record || drift::adopted_base(git, base, up, target)?.is_some();
     let Some(path) = &up.path else {
-        let shared = has_record || drift::adopted_base(git, base, up, target, config)?.is_some();
-        return Ok(if shared {
+        return Ok(if synced {
             Ok(MergeKind::Root)
         } else {
             Err(format!(
@@ -215,7 +213,7 @@ fn merge_kind(
         });
     };
     let exists = git.object_type(base, path)?.is_some();
-    Ok(match (has_record, exists) {
+    Ok(match (synced, exists) {
         (true, true) => Ok(MergeKind::Subtree),
         (true, false) => Err(format!(
             "upstream '{}' was imported before, but path '{path}' was removed on the integration branch; \
@@ -229,13 +227,7 @@ fn merge_kind(
                 up.name
             )),
         },
-        (false, true) => {
-            if drift::adopted_base(git, base, up, target, config)?.is_some() {
-                Ok(MergeKind::Subtree)
-            } else {
-                Err(unrelated_content(up, path))
-            }
-        }
+        (false, true) => Err(unrelated_content(up, path)),
     })
 }
 
@@ -243,7 +235,7 @@ fn merge_kind(
 pub fn unrelated_content(up: &Upstream, path: &str) -> String {
     format!(
         "upstream '{}': path '{path}' holds content unrelated to the history of {}; \
-         the integration branch contains none of its own commits, so it cannot be merged there",
+         no merge on the integration branch brought that history into the path, so it cannot be merged there",
         up.name,
         up.source()
     )

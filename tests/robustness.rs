@@ -897,3 +897,153 @@ fn recovered_conflict_keeps_recorded_resolution_labels() {
         .code(1)
         .stdout(contains("app.txt  (unresolved)"));
 }
+
+/// Imports an upstream at `prefix` the way `git subtree add` does: an `ours`
+/// merge plus `read-tree`, with no sync record.
+fn subtree_add(env: &Env, repo: &Path, prefix: &str, rev: &str) {
+    env.git(
+        repo,
+        &[
+            "merge",
+            "-q",
+            "-s",
+            "ours",
+            "--no-commit",
+            "--allow-unrelated-histories",
+            rev,
+        ],
+    );
+    env.git(
+        repo,
+        &["read-tree", &format!("--prefix={prefix}/"), "-u", rev],
+    );
+    env.git(
+        repo,
+        &["commit", "-q", "-m", &format!("Add '{prefix}/' from {rev}")],
+    );
+}
+
+#[test]
+fn unrelated_path_is_refused_whichever_upstreams_are_fetched() {
+    let t = twins();
+    let env = &t.env;
+    env.commit(
+        &t.down,
+        &[("apps/b/own.txt", "the monorepo's own code\n")],
+        "mono: own apps/b",
+    );
+    env.tool(&t.down, &["start", "app-a"]).success();
+    env.tool(&t.down, &["verify"]).success();
+    env.tool(&t.down, &["finish"]).success();
+
+    // A fresh clone in which only app-b has been fetched.
+    let clone = env.path("clone");
+    env.git(
+        &env.path(""),
+        &[
+            "clone",
+            "-q",
+            &t.down.to_string_lossy(),
+            &clone.to_string_lossy(),
+        ],
+    );
+    env.tool(&clone, &["fetch", "app-b"]).success();
+    assert!(!env.has_rev(&clone, "refs/remotes/app-a/main"));
+    let status = env.tool_json(&clone, &["status", "--json"], 0);
+    let b = &status["upstreams"][1];
+    assert_eq!(b["state"], "not_imported", "{b}");
+    assert_eq!(b["last_synced"], serde_json::Value::Null);
+    env.tool(&clone, &["start", "app-b"])
+        .code(2)
+        .stderr(contains(
+            "upstream 'app-b': path 'apps/b' holds content unrelated",
+        ));
+    env.assert_no_update(&clone);
+}
+
+#[test]
+fn import_without_record_survives_another_upstream_merging_it() {
+    let t = twins();
+    let env = &t.env;
+    env.tool(&t.down, &["fetch"]).success();
+    let a1 = env.rev(&t.down, "refs/remotes/app-a/main");
+    subtree_add(env, &t.down, "apps/a", "app-a/main");
+    env.tool(&t.down, &["start", "app-b"]).success();
+    env.tool(&t.down, &["verify"]).success();
+    env.tool(&t.down, &["finish"]).success();
+
+    // app-b merges app-a's history, and the monorepo takes app-b in.
+    env.git(&t.b.work, &["fetch", "-q", &t.a.url(), "main"]);
+    env.git(&t.b.work, &["merge", "-q", "--no-edit", "FETCH_HEAD"]);
+    env.git(&t.b.work, &["push", "-q", "origin", "HEAD:main"]);
+    env.tool(&t.down, &["fetch"]).success();
+    env.tool(&t.down, &["start", "app-b"]).success();
+    env.tool(&t.down, &["verify"]).success();
+    env.tool(&t.down, &["finish"]).success();
+
+    let status = env.tool_json(&t.down, &["status", "--json"], 0);
+    let a = &status["upstreams"][0];
+    assert_eq!(a["state"], "current", "{a}");
+    assert_eq!(a["last_synced"], a1.as_str());
+    assert_eq!(a["last_synced_source"], "history");
+
+    let a2 = env.push_upstream(&t.a, &[("app-a.txt", "own\nmore\n")], "app-a: more");
+    env.tool(&t.down, &["fetch"]).success();
+    let status = env.tool_json(&t.down, &["status", "--json"], 0);
+    let a = &status["upstreams"][0];
+    assert_eq!(a["state"], "behind", "{a}");
+    assert_eq!(a["last_synced"], a1.as_str());
+    assert_eq!(a["last_synced_source"], "history");
+    env.tool(&t.down, &["doctor"])
+        .success()
+        .stdout(contains("path 'apps/a' was imported without a sync record"));
+    env.tool(&t.down, &["start", "app-a"]).success();
+    env.tool(&t.down, &["verify"]).success();
+    env.tool(&t.down, &["finish"]).success();
+    assert_eq!(
+        fs::read_to_string(t.down.join("apps/a/app-a.txt")).unwrap(),
+        "own\nmore\n"
+    );
+    let status = env.tool_json(&t.down, &["status", "--json"], 0);
+    assert_eq!(status["upstreams"][0]["last_synced"], a2.as_str());
+    assert_eq!(status["upstreams"][0]["last_synced_source"], "record");
+}
+
+#[test]
+fn subtree_pull_merge_without_record_is_the_newest_sync() {
+    let t = twins();
+    let env = &t.env;
+    env.tool(&t.down, &["fetch"]).success();
+    subtree_add(env, &t.down, "apps/a", "app-a/main");
+    // A later `git subtree pull`-style merge, again without a record.
+    let a2 = env.push_upstream(&t.a, &[("app-a.txt", "own\n2\n")], "app-a: 2");
+    env.tool(&t.down, &["fetch"]).success();
+    env.git(
+        &t.down,
+        &[
+            "merge",
+            "-q",
+            "--no-edit",
+            "-X",
+            "subtree=apps/a",
+            "app-a/main",
+        ],
+    );
+    assert_eq!(
+        fs::read_to_string(t.down.join("apps/a/app-a.txt")).unwrap(),
+        "own\n2\n"
+    );
+
+    let status = env.tool_json(&t.down, &["status", "--json"], 0);
+    let a = &status["upstreams"][0];
+    assert_eq!(a["state"], "current", "{a}");
+    assert_eq!(a["last_synced"], a2.as_str());
+    assert_eq!(a["last_synced_source"], "history");
+
+    env.push_upstream(&t.a, &[("app-a.txt", "own\n2\n3\n")], "app-a: 3");
+    env.tool(&t.down, &["fetch"]).success();
+    let status = env.tool_json(&t.down, &["status", "--json"], 0);
+    assert_eq!(status["upstreams"][0]["state"], "behind");
+    assert_eq!(status["upstreams"][0]["commits_behind"], 1);
+    assert_eq!(status["upstreams"][0]["last_synced"], a2.as_str());
+}
