@@ -678,14 +678,24 @@ fn commits_that_change_what_the_update_means_are_refused() {
     let f = Fork::new();
     let env = &f.env;
     let (verified, target) = verify_update(&f);
-    let record = land(
-        &f,
-        &[],
-        &format!(
-            "sync(upstream): merge upstream/main at {}\n\nIntake-Upstream: upstream\nIntake-Target: {target}\n",
-            &target[..12]
-        ),
+    let dir = other(&f);
+    env.git(&dir, &["fetch", "-q", &f.up.url(), "main"]);
+    env.git(
+        &dir,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            &format!(
+                "sync(upstream): merge upstream/main at {}\n\nIntake-Upstream: upstream\nIntake-Target: {target}\n",
+                &target[..12]
+            ),
+            &target,
+        ],
     );
+    env.git(&dir, &["push", "-q", "origin", "HEAD:main"]);
+    let record = env.rev(&dir, "HEAD");
     let err = stderr(&f.tool(&["finish"]).code(2));
     assert!(
         err.contains(&format!(
