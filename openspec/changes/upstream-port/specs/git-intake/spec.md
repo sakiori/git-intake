@@ -12,7 +12,7 @@ The tool SHALL fetch an upstream by its configured URL, in the main worktree and
 - **THEN** `status` reports that upstream as unavailable with git's error, reports the others, and exits with a failure status, and `start` refuses and creates nothing
 
 ### Requirement: Lifetime of upstream references
-A command SHALL fetch upstreams into references of its own that no other command uses, and SHALL remove them before it exits, whatever its outcome. An update SHALL hold `refs/git-intake/upstreams/<name>` for each queued upstream at the tip `start` fetched; only `start` SHALL write it and only `finish` or `abort` SHALL remove it.
+A command SHALL fetch upstreams into references of its own that no other command uses, and SHALL remove them before it exits, whatever its outcome. An update SHALL hold `refs/git-intake/upstreams/<name>` for each queued upstream at the tip `start` fetched; only `start` SHALL write it and only `finish` or `abort` SHALL remove it. A command that acts on the update in progress SHALL restore such a reference that is missing, from the update state, when its commit is in the repository.
 
 #### Scenario: Reading command leaves nothing behind
 - **WHEN** `status` runs on a repository with no update in progress
@@ -22,9 +22,20 @@ A command SHALL fetch upstreams into references of its own that no other command
 - **WHEN** an update stops on a conflict and the repository is later garbage-collected
 - **THEN** every target and planned commit of the update is still present, and `continue` proceeds without fetching
 
+#### Scenario: Start interrupted before holding its references
+- **WHEN** `start` saved the update but stopped before writing the update's references, leaving the fetched commits held only by its own references
+- **THEN** `status`, `continue`, `verify` and `finish` restore the update's references from the update state before they go on
+
 #### Scenario: Reading command during an update
 - **WHEN** `status` runs while an update is in progress and the upstream has moved since `start`
 - **THEN** it reports the upstream's new tip, and the update's reference keeps the tip `start` fetched
+
+### Requirement: Checking the update's references
+`doctor` SHALL report each reference the update in progress holds that is missing or not at the tip the update state names, and how to restore it. It SHALL NOT report as left without an update, nor advise removing, a reference that holds the commit of a missing update reference.
+
+#### Scenario: Update reference missing
+- **WHEN** an update's reference is missing and only a reference left by an interrupted command holds its commit
+- **THEN** `doctor` fails, says that `status` or `continue` restores the update's reference, and says to keep the other reference
 
 ### Requirement: Port journal
 An upstream in `port` mode SHALL keep a journal at `.git-intake/<name>.toml`, committed on the integration branch, holding the upstream commit the port started from as its base, decisions that each name an upstream commit, the verdict `skip` or `have` and an optional note, and optionally a list of retired commits. Commit ids SHALL be full ids, compared in lower case. The tool SHALL read the journal from the integration tip and SHALL refuse an invalid one, naming the problem.
@@ -141,6 +152,13 @@ A copy that stops on conflicts SHALL stop the update as a conflicted merge does,
 - **WHEN** a hook of the repository rejects the commit of a copy, and the user fixes and stages the copy and runs `continue`
 - **THEN** the first `continue` stops with the hook's output, and the next commits the staged fix as the copy with the upstream author, message and trailers, keeping any unstaged work
 
+### Requirement: Unstaged copy
+A copy SHALL be recorded as `have` only when neither the index nor the worktree differs from the update branch head. When the index holds no change of the copy but tracked files in the worktree differ, the tool SHALL stop the update as for a failed commit, change nothing, and say to stage what belongs to the copy.
+
+#### Scenario: Interrupted copy left in the worktree
+- **WHEN** `continue` resumes a copy whose changes are in the worktree but not staged
+- **THEN** it stops, commits nothing and records no decision, and after the changes are staged the next `continue` commits them as the copy
+
 ### Requirement: Git-intake files in copies
 A copy SHALL NOT change `.git-intake.toml` or anything under `.git-intake/`. The tool SHALL restore those paths from the update branch head before committing a copy, report the paths it left out in the output of `continue` and in `report`, and record a copy that changed nothing else as `have`.
 
@@ -156,10 +174,18 @@ An upstream's name SHALL be usable in a git reference name, as `refs/git-intake/
 - **THEN** the tool refuses to run and names the upstream and why
 
 ### Requirement: Same repository by URL
-Where the tool compares a URL with an upstream's URL, URLs that name the same repository SHALL count as equal: local paths and `file://` URLs once resolved against the main worktree and made canonical, other URLs once a trailing `/` and `.git` are dropped and the host is in lower case.
+Where the tool compares a URL with an upstream's URL, URLs that name the same repository SHALL count as equal: local paths and `file://` URLs once resolved against the main worktree as git finds a repository (`<path>/.git`, `<path>`, `<path>.git`) and made canonical; other URLs once the scp-like form is read as `ssh://`, scheme and host are in lower case, a default port is dropped, and a leading `/` and a trailing `/` and `.git` of the path are dropped.
 
 #### Scenario: Relative and absolute paths
 - **WHEN** the publish remote's URL is a relative path to an upstream's repository, configured by its absolute path
+- **THEN** the tool refuses to run and names the remote and the upstream
+
+#### Scenario: Path without its `.git`
+- **WHEN** the publish remote's URL is `../upstream` and an upstream's repository is the directory `../upstream.git`
+- **THEN** the tool refuses to run and names the remote and the upstream
+
+#### Scenario: Scp-like and ssh URLs
+- **WHEN** an upstream's URL is `git@example.com:team/up.git` and the publish remote's is `ssh://git@example.com:22/team/up`
 - **THEN** the tool refuses to run and names the remote and the upstream
 
 #### Scenario: Hosted URL written differently
