@@ -48,10 +48,12 @@ jobs:
     environment: release-pr
     permissions:
       contents: read
-    # Only the latest main matters for the release pull request.
+    # Only the latest main matters for the release pull request: a newer push
+    # replaces a run that still waits, but a run in progress is never
+    # interrupted, so release-plz never stops halfway through updating it.
     concurrency:
       group: release-pr
-      cancel-in-progress: true
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -67,7 +69,7 @@ jobs:
         run: |
           version=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "git-intake") | .version')
           if [ "$version" = 0.0.0 ]; then
-            echo "::error::Cargo.toml holds the placeholder version 0.0.0. At the cutover, set it to the next unreleased version, publish that version to crates.io and push its tag vX.Y.Z by hand, then run this workflow by hand for that tag."
+            echo "::error::Cargo.toml holds the placeholder version 0.0.0. At the cutover, publish the next unreleased version to crates.io from a clean checkout of the cutover commit (no --allow-dirty) and push its tag vX.Y.Z before that commit reaches main, then run this workflow by hand for that tag."
             exit 1
           fi
       # Pull requests opened with the workflow's own token start no workflow
@@ -120,7 +122,7 @@ jobs:
         run: |
           version=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "git-intake") | .version')
           if [ "$version" = 0.0.0 ]; then
-            echo "::error::Cargo.toml holds the placeholder version 0.0.0. At the cutover, set it to the next unreleased version, publish that version to crates.io and push its tag vX.Y.Z by hand, then run this workflow by hand for that tag."
+            echo "::error::Cargo.toml holds the placeholder version 0.0.0. At the cutover, publish the next unreleased version to crates.io from a clean checkout of the cutover commit (no --allow-dirty) and push its tag vX.Y.Z before that commit reaches main, then run this workflow by hand for that tag."
             exit 1
           fi
       # Without CARGO_REGISTRY_TOKEN, release-plz obtains a short-lived token
@@ -165,7 +167,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ steps.input.outputs.tag }}
+          fetch-depth: 0
           persist-credentials: false
+      # Only a tag on main is released: its commit went through review and CI.
+      - env:
+          TAG: ${{ steps.input.outputs.tag }}
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::the commit of $TAG is not on main"
+            exit 1
+          fi
       - id: release
         env:
           TAG: ${{ steps.input.outputs.tag }}
