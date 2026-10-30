@@ -65,6 +65,8 @@ fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Resu
             require_finishable(&state)?;
             if let Some(remote) = &remote {
                 follow_published(repo, remote, &integration)?;
+                state.remote_tip = repo.git.commit(&tracking_ref(remote, &integration))?;
+                repo.save_state(&state)?;
             }
             let tip = local_tip(&repo.git, &integration)?;
             let recheck = |repo: &Repo, state: &mut UpdateState| -> Result<Option<String>> {
@@ -188,11 +190,26 @@ fn resume(
     let published = git.commit(&tracking_ref(remote, &integration))?;
     // A catch-up made from this step is still to be verified or planned.
     let caught_up = head.is_some_and(|h| h != planned.new) || state.catching_up().is_some();
+    // A remote that no longer holds what the update last took from it
+    // dropped work a push would publish again.
+    let rewound = match (&state.remote_tip, &published) {
+        (Some(seen), Some(p)) => !git.is_ancestor(seen, p)?,
+        _ => false,
+    };
     let published = match published {
         // The remote did not move past the planned commit, or received it:
         // retry the same push, or skip it.
         None => return Ok(Ok(f)),
         Some(p) if git.is_ancestor(&planned.new, &p)? => return Ok(Ok(f)),
+        Some(p) if rewound => {
+            bail!(
+                "'{remote}/{integration}' was rewritten: it is at {}, which no longer contains {}, its tip when \
+                 the update last took it, so pushing again would publish what it dropped. No branch moved. \
+                 Run `git intake finish --no-publish` to close the update locally",
+                abbrev(&p),
+                abbrev(state.remote_tip.as_deref().unwrap_or_default())
+            );
+        }
         Some(p) if caught_up => p,
         Some(p) if git.is_ancestor(&p, &planned.new)? => return Ok(Ok(f)),
         Some(p) => p,
@@ -402,7 +419,10 @@ pub fn prepare(
         return Ok(Ready::Stop(Exit::Negative));
     }
     if moved_on {
-        catch_up::require_possible(repo, state, tip, run.moved)?;
+        catch_up::require_possible(repo, state, tip, run.moved, run.remote_tip)?;
+        if run.remote_tip {
+            state.remote_tip = Some(tip.to_string());
+        }
         if let Some(exit) = catch_up::run(repo, state, tip)? {
             return Ok(Ready::Stop(exit));
         }

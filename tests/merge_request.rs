@@ -737,6 +737,48 @@ fn a_remote_rewound_below_the_base_refuses_a_pending_catch_up_push() {
     );
 }
 
+/// Asserts that `finish` refuses because the update's base holds `local`,
+/// an unpublished commit of the integration branch that the remote's new
+/// work lacks, and not because the remote was rewritten.
+fn assert_unpublished_refusal(f: &Fork, local: &str) {
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(
+        err.contains("holds commits of 'main' that were never published"),
+        "{err}"
+    );
+    assert!(err.contains(&local[..7]), "{err}");
+    assert!(err.contains("`git intake abort`"), "{err}");
+    assert!(err.contains("`git intake start`"), "{err}");
+    assert!(!err.contains("rewritten"), "{err}");
+}
+
+#[test]
+fn new_remote_work_without_the_unpublished_local_commits_is_refused_before_the_first_push() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
+    let (commit, _) = verified(&f);
+    land(&f, &[("other.txt", "o\n")], "other: lands first");
+    assert_unpublished_refusal(&f, &local);
+    assert!(!env.has_rev(&f.publish, &format!("refs/heads/{MERGE_REQUEST_BRANCH}")));
+    assert_eq!(env.rev(&env.update_worktree(&f.down), "HEAD"), commit);
+}
+
+#[test]
+fn new_remote_work_without_the_unpublished_local_commits_is_refused_while_waiting() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
+    let (commit, _) = verified(&f);
+    f.tool(&["finish"]).success();
+    land(&f, &[("other.txt", "o\n")], "other: lands first");
+    assert_unpublished_refusal(&f, &local);
+    assert_eq!(
+        env.rev(&f.publish, &format!("refs/heads/{MERGE_REQUEST_BRANCH}")),
+        commit
+    );
+}
+
 #[test]
 fn a_merge_request_closed_with_its_branch_kept_is_treated_as_open() {
     let f = Fork::merge_request();

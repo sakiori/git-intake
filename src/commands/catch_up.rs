@@ -41,8 +41,14 @@ fn output_path(repo: &Repo) -> std::path::PathBuf {
 /// by a catch-up merge: `tip` does not contain the base, or the commits it
 /// adds change what the update means. `moved` says that `finish` has moved
 /// the integration branch, so that the update can only be closed at the
-/// planned commit.
-pub fn require_possible(repo: &Repo, state: &UpdateState, tip: &str, moved: bool) -> Result<()> {
+/// planned commit; `remote` that `tip` is the publish remote's.
+pub fn require_possible(
+    repo: &Repo,
+    state: &UpdateState,
+    tip: &str,
+    moved: bool,
+    remote: bool,
+) -> Result<()> {
     let git = &repo.git;
     let integration = &state.config.integration;
     let advice = if moved {
@@ -50,6 +56,18 @@ pub fn require_possible(repo: &Repo, state: &UpdateState, tip: &str, moved: bool
     } else {
         "Run `git intake abort`, then `git intake start` to plan the update from the new history"
     };
+    if remote && let Some(unpublished) = unpublished(repo, state, tip)? {
+        let publish = state
+            .config
+            .publish
+            .as_ref()
+            .map(|p| p.remote.as_str())
+            .unwrap_or_default();
+        bail!(
+            "{}",
+            unpublished_refusal(state, publish, tip, &unpublished, moved)
+        );
+    }
     if !git.is_ancestor(&state.base, tip)? {
         bail!(
             "'{integration}' was rewritten: its tip {} does not contain the update's base {}, so the update \
@@ -89,6 +107,57 @@ pub fn require_possible(repo: &Repo, state: &UpdateState, tip: &str, moved: bool
         );
     }
     Ok(())
+}
+
+/// The commits of the base that the publish remote's integration tip `tip`
+/// lacks, when it moved forward from the tip the update last took and
+/// lacks the base only because the base holds commits of the local
+/// integration branch that were never published; `None` otherwise.
+pub fn unpublished(repo: &Repo, state: &UpdateState, tip: &str) -> Result<Option<Vec<String>>> {
+    let git = &repo.git;
+    let Some(seen) = &state.remote_tip else {
+        return Ok(None);
+    };
+    if git.is_ancestor(&state.base, tip)? || !git.is_ancestor(seen, tip)? {
+        return Ok(None);
+    }
+    Ok(Some(crate::git::lines(&git.run(&[
+        "log",
+        "--format=%h %s",
+        &state.base,
+        &format!("^{tip}"),
+        "--",
+    ])?)))
+}
+
+/// Why the update cannot take in the publish remote's new tip `tip`, which
+/// lacks the `unpublished` local commits of the base.
+pub fn unpublished_refusal(
+    state: &UpdateState,
+    remote: &str,
+    tip: &str,
+    unpublished: &[String],
+    moved: bool,
+) -> String {
+    let integration = &state.config.integration;
+    let advice = if moved {
+        "Run `git intake finish --no-publish` to close the update locally, publish or reconcile those commits \
+         with the remote's work, and publish the result through a new update"
+            .to_string()
+    } else {
+        format!(
+            "Run `git intake abort`, publish those commits or reconcile '{integration}' with '{remote}/{integration}', \
+             then run `git intake start` again"
+        )
+    };
+    format!(
+        "'{remote}/{integration}' moved to {}, but the update's base {} holds commits of '{integration}' that were \
+         never published, and the remote's new work does not contain them:\n{}\n\
+         The update carries them, so it cannot catch up with the remote. Nothing was merged and no branch moved. {advice}",
+        abbrev(tip),
+        abbrev(&state.base),
+        bullet(unpublished)
+    )
 }
 
 /// How the configuration at `tip` differs from the update's in anything but

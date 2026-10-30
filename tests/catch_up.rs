@@ -1225,3 +1225,22 @@ fn continue_keeps_commits_made_on_top_of_a_detached_catch_up_merge() {
         .stdout(contains("next: git intake verify"));
     assert_eq!(env.rev(&f.down, "git-intake/update"), fix);
 }
+
+#[test]
+fn a_remote_rewound_after_a_rejected_push_is_refused_as_rewritten() {
+    let f = Fork::new();
+    let env = &f.env;
+    let (verified, _) = verify_update(&f);
+    reject_pushes(&f);
+    f.tool(&["finish"]).code(2);
+    accept_pushes(&f);
+    // The remote drops the commit the update was based on.
+    let older = env.rev(&f.publish, "main~1");
+    env.git(&f.publish, &["update-ref", "refs/heads/main", &older]);
+
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(err.contains("'origin/main' was rewritten"), "{err}");
+    assert!(err.contains("`git intake finish --no-publish`"), "{err}");
+    assert_eq!(env.rev(&f.publish, "main"), older);
+    assert_eq!(env.rev(&f.down, "main"), verified);
+}

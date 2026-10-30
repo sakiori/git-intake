@@ -462,6 +462,11 @@ pub struct UpdateState {
     /// in progress.
     #[serde(default)]
     pub catch_ups: Vec<CatchUp>,
+    /// The publish remote's integration tip as the update last took it:
+    /// at `start`, when `finish` fetched it, or when the update caught up
+    /// with it. A remote branch that no longer contains it was rewritten.
+    #[serde(default)]
+    pub remote_tip: Option<String>,
     /// Set once `finish` completed.
     pub finished: bool,
     /// The main worktree as `start` found it. Git cannot locate a main
@@ -492,6 +497,7 @@ impl UpdateState {
             finishing: None,
             merge_request: None,
             catch_ups: Vec::new(),
+            remote_tip: None,
             finished: false,
             main_worktree: None,
         }

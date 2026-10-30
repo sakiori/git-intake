@@ -197,6 +197,12 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
     ])?;
     let mut state = UpdateState::new(config, base.clone(), worktree, queue);
     state.main_worktree = repo.main_checkout()?;
+    if let Some(publish) = &state.config.publish {
+        state.remote_tip = git.commit(&crate::git::tracking_ref(
+            &publish.remote,
+            &state.config.integration,
+        ))?;
+    }
     for q in &state.upstreams {
         if let Some(plan) = q.port() {
             let listed: Vec<(String, String)> = plan

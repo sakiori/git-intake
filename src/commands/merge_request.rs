@@ -150,6 +150,7 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
         pushed: vec![commit.clone()],
     };
     state.merge_request = Some(mr.clone());
+    state.remote_tip = Some(tip);
     repo.save_state(&state)?;
     repo.remove_update_worktree()?;
 
@@ -397,6 +398,10 @@ pub enum Landing {
     Squashed { tip: String },
     /// It no longer contains the base.
     Rewritten { tip: String },
+    /// It moved forward from the tip the update last took, but lacks
+    /// `commits`, commits of the local integration branch in the base that
+    /// were never published.
+    Unpublished { tip: String, commits: Vec<String> },
     /// The merge request branch is gone and nothing was merged.
     Closed,
     /// Not merged yet; `head` is the merge request's head, or where its
@@ -578,6 +583,9 @@ pub fn inspect(repo: &Repo, state: &mut UpdateState) -> Result<Landing> {
         if squash {
             return Ok(Landing::Squashed { tip });
         }
+        if let Some(commits) = catch_up::unpublished(repo, state, &tip)? {
+            return Ok(Landing::Unpublished { tip, commits });
+        }
         if !git.is_ancestor(&state.base, &tip)? {
             return Ok(Landing::Rewritten { tip });
         }
@@ -654,6 +662,9 @@ fn refusal(state: &UpdateState, mr: &MergeRequest, landing: &Landing) -> String 
             abbrev(tip),
             abbrev(&state.base)
         ),
+        Landing::Unpublished { tip, commits } => {
+            catch_up::unpublished_refusal(state, &mr.remote, tip, commits, false)
+        }
         Landing::Closed => format!(
             "the merge request branch '{}' no longer exists on '{}', and '{remote_branch}' did not receive the verified commit \
              {verified}: the merge request was closed without merging, or its branch was deleted. No branch moved. Run \
