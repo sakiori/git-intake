@@ -178,6 +178,25 @@ pub fn connect(git: &Git, publish: &Publish) -> Result<Box<dyn Forge>> {
     })
 }
 
+/// The paths of the forge's CI definition that an update may change, as the
+/// tool can tell them without the forge's API, for publication by push:
+/// `.github/workflows/` on GitHub, and on GitLab the default CI
+/// configuration file `.gitlab-ci.yml`, since a project's own setting is
+/// readable only through the API. Empty when the forge is not recognised.
+pub fn ci_paths_without_api(git: &Git, publish: &Publish) -> Result<Vec<String>> {
+    let url = fetch_url(git, &publish.remote)?;
+    let env = |name: &str| std::env::var(name).ok();
+    let around = locate::Surroundings {
+        env: &env,
+        ssh_host: &ssh_host,
+    };
+    Ok(match locate::kind(publish, url.as_deref(), &around) {
+        Some(Kind::GitHub) => vec![github::WORKFLOWS.to_string()],
+        Some(Kind::GitLab) => vec![gitlab::DEFAULT_CI_FILE.to_string()],
+        None => Vec::new(),
+    })
+}
+
 /// The URL git fetches a remote from: its configured URL after git's
 /// `url.<base>.insteadOf` rewriting, as `git remote get-url` reports it, so
 /// that the forge is the one the branch actually lands on. `None` when the

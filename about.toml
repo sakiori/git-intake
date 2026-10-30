@@ -1,0 +1,63 @@
+# cargo-about configuration: `cargo run --locked -p xtask -- notices <dir>
+# <target>` writes the third-party notices that every release archive carries,
+# the crates' from this file and the template about.hbs.
+
+# The licenses of the crates the binary links, in order of preference: of a
+# crate offered under several licenses, the notices carry the first one listed
+# here. deny.toml allows the same licenses, and Unlicense besides, which no
+# crate needs here because each crate under it also offers MIT.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+# The release targets: a crate only another platform uses is not linked.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+# Build scripts' dependencies and dev-dependencies are not part of the binary.
+# Procedural macros are not either, but cargo-about cannot tell them apart, so
+# their notices are carried too.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# xtask is never published nor shipped.
+private = { ignore = true }
+
+# ring is "Apache-2.0 AND ISC", with its terms spread over several files:
+# its own code under the ISC terms of LICENSE-other-bits, code from BoringSSL
+# and OpenSSL under Apache-2.0 (LICENSE-BoringSSL) or under the same ISC terms,
+# fiat-crypto under Apache-2.0, and once_cell's polyfill under Apache-2.0.
+# cargo-about's built-in workaround for ring checks files of older releases,
+# so the license files are named here, each with the SHA-256 of the file; when
+# ring changes one, the notices refuse to build until it is checked again.
+# The copyright lines in the headers of ring's files, like those of every
+# other crate, are added by `xtask notices` under "Additional copyright
+# notices".
+[ring]
+clarify.license = "Apache-2.0 AND ISC"
+
+[[ring.clarify.files]]
+path = "LICENSE-other-bits"
+license = "ISC"
+checksum = "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f"
+
+[[ring.clarify.files]]
+path = "LICENSE-BoringSSL"
+license = "Apache-2.0"
+checksum = "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d"
+
+[[ring.clarify.files]]
+path = "third_party/fiat/LICENSE"
+license = "Apache-2.0"
+checksum = "9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f"
+
+[[ring.clarify.files]]
+path = "src/polyfill/once_cell/LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"

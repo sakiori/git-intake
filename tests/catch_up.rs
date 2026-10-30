@@ -581,11 +581,21 @@ fn concluded_after_a_rejected_push(f: &Fork) -> (String, String) {
 fn no_publish_lands_a_verified_catch_up_of_the_finishing_step_locally() {
     let f = Fork::new();
     let env = &f.env;
+    // The update also changes the pipeline, which the landing names.
+    f.reconfigure("via = \"push\"", "via = \"push\"\nforge = \"gitlab\"");
+    env.push_upstream(
+        &f.up,
+        &[(".gitlab-ci.yml", "test:\n  script: [make]\n")],
+        "upstream: ci",
+    );
     let (verified, merge) = concluded_after_a_rejected_push(&f);
     f.tool(&["verify"]).success();
-    f.tool(&["finish", "--no-publish"])
-        .success()
-        .stdout(contains("lands the verified catch-up of the update"));
+    let out = stdout(&f.tool(&["finish", "--no-publish"]).success());
+    assert!(
+        out.contains("lands the verified catch-up of the update"),
+        "{out}"
+    );
+    assert_eq!(out.matches(CI_NOTICE).count(), 1, "{out}");
     assert_eq!(env.rev(&f.down, "main"), merge);
     assert!(env.is_ancestor(&f.down, &verified, "main"));
     env.assert_no_update(&f.down);
@@ -1219,4 +1229,61 @@ fn a_remote_rewound_after_a_rejected_push_is_refused_as_rewritten() {
     assert!(err.contains("`git intake finish --no-publish`"), "{err}");
     assert_eq!(env.rev(&f.publish, "main"), older);
     assert_eq!(env.rev(&f.down, "main"), verified);
+}
+
+const CI_NOTICE: &str = "the update changes its own checks: `.gitlab-ci.yml`; the checks that verify it are \
+                         the ones it brings";
+
+#[test]
+fn a_catch_up_after_a_rejected_push_names_the_update_s_own_checks() {
+    let f = Fork::new();
+    let env = &f.env;
+    f.reconfigure("via = \"push\"", "via = \"push\"\nforge = \"gitlab\"");
+    env.push_upstream(
+        &f.up,
+        &[(".gitlab-ci.yml", "test:\n  script: [make]\n")],
+        "upstream: ci",
+    );
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    reject_pushes(&f);
+    let out = stdout(&f.tool(&["finish"]).code(2));
+    assert!(out.contains(CI_NOTICE), "{out}");
+    accept_pushes(&f);
+    land(&f, &[("other.txt", "o\n")], "other: published meanwhile");
+
+    // The resumed finish catches up and publishes another head, and names
+    // the change again, once, before it verifies the catch-up merge.
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(out.contains("resuming finish"), "{out}");
+    assert_eq!(out.matches(CI_NOTICE).count(), 1, "{out}");
+    let verifying = out
+        .find("verifying")
+        .expect("the catch-up merge is verified");
+    assert!(out.find(CI_NOTICE).unwrap() < verifying, "{out}");
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn a_catch_up_whose_checks_fail_names_the_update_s_own_checks() {
+    let f = Fork::new();
+    let env = &f.env;
+    f.reconfigure("via = \"push\"", "via = \"push\"\nforge = \"gitlab\"");
+    env.push_upstream(
+        &f.up,
+        &[(".gitlab-ci.yml", "test:\n  script: [make]\n")],
+        "upstream: ci",
+    );
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    // Work landed meanwhile removes the file the check needs, so the
+    // catch-up merge fails its checks.
+    let dir = other(&f);
+    env.git(&dir, &["rm", "-q", FORK_FILE]);
+    env.git(&dir, &["commit", "-q", "-m", "other: drop the app"]);
+    env.git(&dir, &["push", "-q", "origin", "HEAD:main"]);
+
+    let out = stdout(&f.tool(&["finish"]).code(1));
+    assert!(out.contains(CI_NOTICE), "{out}");
+    assert!(out.contains("verification of the catch-up merge"), "{out}");
 }

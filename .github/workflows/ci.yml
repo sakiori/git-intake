@@ -1,0 +1,245 @@
+# Pinned versions bumped by hand (Dependabot updates only the actions):
+# - cargo-deny 0.20.2 (the deny job's install-action input)
+# - cargo-about 0.9.2 (the release-build job's install-action input, and
+#   CARGO_ABOUT_VERSION in xtask/src/main.rs, which refuses another release)
+# - zig 0.17.0 and cargo-zigbuild 0.23.4 (the release-build job's setup-zig
+#   and install-action inputs; release.yml and binaries.yml pin the same)
+# - git 2.43.0 and 2.47.3, with their source archives' SHA-256 (the git job's
+#   matrix)
+# The Rust toolchain is the current stable release, except in the msrv job,
+# which reads rust-version from Cargo.toml.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, so that a new RustSec advisory, a new stable toolchain or a new
+  # runner image fails here rather than in the next change.
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: git --version
+      - run: cargo test --workspace --locked
+
+  # The test job runs the runner's current git. This one runs the tests against
+  # older releases built from source: the oldest the README supports, and the
+  # one Debian stable ships.
+  git:
+    name: test (git ${{ matrix.version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: 2.43.0
+            sha256: 5446603e73d911781d259e565750dcd277a42836c8e392cac91cf137aa9b76ec
+          - version: 2.47.3
+            sha256: 9c2eb1250781b3e5bfef098572d07fdf132d67e6c065e4307332ade9819a1501
+    runs-on: ubuntu-latest
+    env:
+      GIT_VERSION: ${{ matrix.version }}
+      GIT_SHA256: ${{ matrix.sha256 }}
+      GIT_PREFIX_DIR: ${{ github.workspace }}/../git-${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The build links the image's libraries, so the cache belongs to one
+      # runner image. ImageOS and ImageVersion are variables of the runner's
+      # environment, which the env context does not hold.
+      - id: image
+        run: echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.GIT_PREFIX_DIR }}
+          key: git-${{ matrix.version }}-${{ steps.image.outputs.image }}-${{ runner.arch }}
+      - name: Build git ${{ matrix.version }}
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential curl xz-utils \
+            libcurl4-openssl-dev libexpat1-dev libssl-dev zlib1g-dev
+          src="$RUNNER_TEMP/git-src"
+          mkdir -p "$src"
+          archive="$src/git-$GIT_VERSION.tar.xz"
+          curl --fail --silent --show-error --location --output "$archive" \
+            "https://mirrors.edge.kernel.org/pub/software/scm/git/git-$GIT_VERSION.tar.xz"
+          echo "$GIT_SHA256  $archive" | sha256sum --check -
+          tar -C "$src" -xJf "$archive"
+          make -C "$src/git-$GIT_VERSION" -j"$(nproc)" prefix="$GIT_PREFIX_DIR" \
+            NO_GETTEXT=YesPlease NO_TCLTK=YesPlease NO_PERL=YesPlease NO_PYTHON=YesPlease \
+            install
+      - run: echo "$GIT_PREFIX_DIR/bin" >> "$GITHUB_PATH"
+      - run: |
+          git --version
+          git --version | grep -Fqx "git version $GIT_VERSION"
+      - run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test --workspace --locked
+
+  # Builds the workspace with the toolchain that `rust-version` in Cargo.toml
+  # names, the minimum supported Rust version.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          [ -n "$version" ] || { echo "cannot read rust-version from Cargo.toml" >&2; exit 1; }
+          rustup toolchain install "$version" --profile minimal
+          rustup default "$version"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --workspace --all-targets --locked
+
+  # Advisories (the RustSec database that cargo-audit reads), licenses, bans
+  # and sources, as deny.toml configures them.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny@0.20.2
+      # cargo-deny tells a yanked version only from cargo's cached index
+      # entries, which a fresh runner lacks and a resolution from Cargo.lock
+      # never fetches; a dry-run update fetches the current entry of every
+      # locked crate without changing Cargo.lock.
+      - run: cargo update --dry-run
+      - run: cargo deny --locked check
+
+  # Packages the crate as cargo publish does and builds the packaged crate,
+  # which the release job, publishing with publish_no_verify, does not do.
+  # The release job requires this check on the release pull request's last
+  # commit.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - run: cargo package --locked
+
+  # Builds and packs the release archive of every release target exactly as
+  # binaries.yml does for a release tag, with the third-party notices and the
+  # manual pages, and checks its layout; it attests and uploads nothing. A
+  # release publishes the crate before it builds the binaries, so the build of
+  # every target must pass here first: the release job of release.yml requires
+  # these checks on the release pull request's commit, and the ruleset of main
+  # requires them on every pull request. A license cargo-about cannot read or
+  # does not accept fails the notices here, not in a release.
+  release-build:
+    name: release-build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            build-tool: cargo-zigbuild
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            build-tool: cargo-zigbuild
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            build-tool: cargo
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            build-tool: cargo
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      BUILD_TOOL: ${{ matrix.build-tool }}
+    steps:
+      # A pull request's own last commit, not the merge with its base that a
+      # pull_request run checks out by default: the release job requires these
+      # checks on exactly that commit, which release-plz then releases.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - run: |
+          rustup toolchain install stable --profile minimal --component rust-src --target "$TARGET"
+          rustup default stable
+      - if: matrix.build-tool == 'cargo-zigbuild'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          use-cache: false
+      - if: matrix.build-tool == 'cargo-zigbuild'
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-zigbuild@0.23.4
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-about@0.9.2
+      # The archive is packed with GNU tar, which macOS lacks; Homebrew's
+      # bottle installs it as gtar.
+      - if: runner.os == 'macOS'
+        run: brew install gnu-tar
+      - run: .github/scripts/build-archive.sh "$TARGET" "$BUILD_TOOL"

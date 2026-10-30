@@ -1238,3 +1238,24 @@ fn a_short_token_value_leaves_the_output_intact() {
     assert_eq!(json["integration"], "main");
     assert_eq!(json["publish_via"], "push");
 }
+
+#[test]
+fn status_reads_an_upstream_url_with_a_non_ascii_path() {
+    // A path ending in a multi-byte character used to be sliced inside it
+    // when the tool looked for a `.git` suffix, and the tool panicked.
+    for url in [
+        "https://example.invalid/%C3%A9abc",
+        "https://example.invalid/éabc",
+        "https://example.invalid/abcé",
+        "https://example.invalid/%E2%82%ACx.git",
+    ] {
+        let f = Fork::new();
+        f.reconfigure(
+            &format!("url = {:?}", f.up.url()),
+            &format!("url = {url:?}"),
+        );
+        let out = f.tool(&["status"]).code(1);
+        let text = stdout(&out);
+        assert!(text.contains("unavailable"), "{url}: {text}");
+    }
+}

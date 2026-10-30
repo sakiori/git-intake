@@ -440,6 +440,44 @@ pub fn guard<'a>(
     }
 }
 
+/// The heads whose changes to the update's own checks one run of `finish`
+/// or `sync` has named, so that each is named once in it.
+#[derive(Debug, Default)]
+pub struct Announced(Vec<String>);
+
+impl Announced {
+    /// Names the changes the update makes, from its base to `head`, to its
+    /// own checks, when `finish` or `sync` verifies or moves the integration
+    /// branch itself: before checks run on `head`, and before the branch moves
+    /// to it, with or without `--no-publish`, as publication through a merge
+    /// request names them. Each head is named once per run. The CI
+    /// definition counts when the tool can tell the forge without its API.
+    pub fn check_changes(&mut self, repo: &Repo, state: &UpdateState, head: &str) -> Result<()> {
+        if self.0.iter().any(|h| h == head) {
+            return Ok(());
+        }
+        self.0.push(head.to_string());
+        announce_check_changes(repo, state, head)
+    }
+}
+
+/// Names the changes the update makes, from its base to `head`, to its own
+/// checks; [`Announced`] calls it once per head.
+fn announce_check_changes(repo: &Repo, state: &UpdateState, head: &str) -> Result<()> {
+    let ci_paths = match &state.config.publish {
+        Some(publish) => crate::forge::ci_paths_without_api(&repo.git, publish)?,
+        None => Vec::new(),
+    };
+    let changes = check_changes(&repo.git, state, head, &ci_paths)?;
+    if !changes.is_empty() {
+        println!(
+            "the update changes its own checks: {}; the checks that verify it are the ones it brings",
+            changes.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// The changes the update makes, from its base to `head`, to its own
 /// checks: the forge's CI definition at `ci_paths`, and the install command
 /// and checks of the configuration.

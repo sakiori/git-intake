@@ -864,3 +864,45 @@ fn an_older_record_merged_later_never_moves_the_upstream_back() {
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["upstreams"][0]["base"], t2.as_str());
 }
+
+#[test]
+fn finish_by_push_names_changes_to_the_update_s_own_checks() {
+    let f = Fork::new();
+    let env = &f.env;
+    // The setting `forge` tells the forge, so its CI definition counts.
+    f.reconfigure("via = \"push\"", "via = \"push\"\nforge = \"gitlab\"");
+    env.push_upstream(
+        &f.up,
+        &[(".gitlab-ci.yml", "test:\n  script: [make]\n")],
+        "upstream: ci",
+    );
+    f.tool(&["start"]).success();
+    let wt = env.update_worktree(&f.down);
+    let cfg = fs::read_to_string(wt.join(".git-intake.toml"))
+        .unwrap()
+        .replace(
+            &common::checks_line(&[common::FORK_CHECK]),
+            &common::checks_line(&[common::FORK_CHECK, ("audit", "true")]),
+        );
+    env.commit(&wt, &[(".git-intake.toml", &cfg)], "fork: add a check");
+    f.tool(&["verify"]).success();
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(
+        out.contains(
+            "the update changes its own checks: `.gitlab-ci.yml`, the check `audit` added to \
+             `.git-intake.toml`; the checks that verify it are the ones it brings"
+        ),
+        "{out}"
+    );
+}
+
+#[test]
+fn finish_by_push_names_no_change_when_the_checks_stay() {
+    let f = Fork::new();
+    f.env
+        .push_upstream(&f.up, &[(FORK_FILE, "one\n")], "upstream: change");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(!out.contains("changes its own checks"), "{out}");
+}

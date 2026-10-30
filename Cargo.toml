@@ -1,15 +1,37 @@
 [package]
 name = "git-intake"
 version = "0.0.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Merge-based, verified, resumable updates of a downstream repository from its upstreams"
 readme = "README.md"
-publish = false
+keywords = ["git", "upstream", "fork", "merge", "monorepo"]
+categories = ["command-line-utilities", "development-tools"]
+# The published crate holds what building and installing the binary needs.
+include = ["/src/", "/Cargo.lock", "/LICENSE", "/README.md"]
+
+# cargo-binstall downloads the release archive of the target instead of
+# building the crate: git-intake-vX.Y.Z-<target>.tar.gz with the binary at its
+# root (see .github/scripts/build-archive.sh).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
 
 # `xtask` holds development tasks, such as generating the manual page, so that
 # their dependencies stay out of the shipped binary.
 [workspace]
 members = ["xtask"]
+
+# rust-version is the oldest toolchain that builds the workspace with the
+# locked dependencies; CI builds it with that toolchain.
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/sakiori/git-intake"
 
 [dependencies]
 anyhow = "1.0.104"

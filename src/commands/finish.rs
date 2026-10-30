@@ -19,6 +19,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::Exit;
+use crate::commands::merge_request::Announced;
 use crate::commands::update::require_worktree;
 use crate::commands::{catch_up, merge_request, verify};
 use crate::config::{PublishVia, Upstream};
@@ -29,6 +30,12 @@ use crate::state::{self, Finishing, PlannedMove, Stored, UpdateState, Work};
 use crate::upstreams;
 
 pub fn run(repo: &Repo, no_publish: bool) -> Result<Exit> {
+    run_announced(repo, no_publish, &mut Announced::default())
+}
+
+/// `finish` within a run that may have named the update's changes to its
+/// own checks already, as `sync` does before it verifies.
+pub fn run_announced(repo: &Repo, no_publish: bool, announced: &mut Announced) -> Result<Exit> {
     // An update an earlier release left waiting for its merge request is
     // the merge request's from now on.
     if let Some(Stored::Waiting(waiting)) = repo.stored()? {
@@ -39,11 +46,16 @@ pub fn run(repo: &Repo, no_publish: bool) -> Result<Exit> {
     if via == Some(PublishVia::MergeRequest) && state.finishing.is_none() && !no_publish {
         return merge_request::finish(repo, state);
     }
-    finish_by_push(repo, state, no_publish)
+    finish_by_push(repo, state, no_publish, announced)
 }
 
 /// Moves the integration branch locally and, in push mode, pushes it.
-fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Result<Exit> {
+fn finish_by_push(
+    repo: &Repo,
+    mut state: UpdateState,
+    no_publish: bool,
+    announced: &mut Announced,
+) -> Result<Exit> {
     let integration = state.config.integration.clone();
     // The remote pushed to, when this run publishes by push.
     let remote = state
@@ -61,7 +73,14 @@ fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Resu
     let finishing = match state.finishing.clone() {
         Some(f) => {
             println!("resuming finish");
-            match resume(repo, &mut state, f, no_publish, remote.as_deref())? {
+            match resume(
+                repo,
+                &mut state,
+                f,
+                no_publish,
+                remote.as_deref(),
+                announced,
+            )? {
                 Ok(f) => f,
                 Err(exit) => return Ok(exit),
             }
@@ -100,9 +119,15 @@ fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Resu
                 caught,
                 remote_tip: false,
             };
-            let moves = match prepare(repo, &mut state, &tip, run, &recheck)? {
-                Ready::Publish(_) => plan(repo, &state, &tip)?,
-                Ready::Holds(head) => held(repo, &state, &tip, &head)?,
+            let moves = match prepare(repo, &mut state, &tip, run, &recheck, announced)? {
+                Ready::Publish(head) => {
+                    announced.check_changes(repo, &state, &head)?;
+                    plan(repo, &state, &tip)?
+                }
+                Ready::Holds(head) => {
+                    announced.check_changes(repo, &state, &head)?;
+                    held(repo, &state, &tip, &head)?
+                }
                 Ready::Stop(exit) => return Ok(exit),
             };
             let f = Finishing {
@@ -175,6 +200,7 @@ fn resume(
     mut f: Finishing,
     no_publish: bool,
     remote: Option<&str>,
+    announced: &mut Announced,
 ) -> Result<std::result::Result<Finishing, Exit>> {
     let integration = state.config.integration.clone();
     let Some(planned) = f.moves.iter().find(|m| m.branch == integration).cloned() else {
@@ -182,7 +208,7 @@ fn resume(
     };
     let wt = Git::worktree(&state.worktree);
     if no_publish {
-        return close_locally(repo, state, f, &planned).map(Ok);
+        return close_locally(repo, state, f, &planned, announced).map(Ok);
     }
     let Some(remote) = remote else {
         return Ok(Ok(f));
@@ -253,10 +279,11 @@ fn resume(
         caught,
         remote_tip: true,
     };
-    let head = match prepare(repo, state, &published, run, &recheck)? {
+    let head = match prepare(repo, state, &published, run, &recheck, announced)? {
         Ready::Publish(head) | Ready::Holds(head) => head,
         Ready::Stop(exit) => return Ok(Err(exit)),
     };
+    announced.check_changes(repo, state, &head)?;
     check(repo, state, &head)?;
     // The integration branch moves on from the planned commit, which the
     // catch-up merge contains.
@@ -283,6 +310,7 @@ fn close_locally(
     state: &mut UpdateState,
     mut f: Finishing,
     planned: &PlannedMove,
+    announced: &mut Announced,
 ) -> Result<Finishing> {
     let wt = Git::worktree(&state.worktree);
     if state.catching_up().is_some() {
@@ -329,6 +357,7 @@ fn close_locally(
         }
         return Ok(f);
     }
+    announced.check_changes(repo, state, &head)?;
     check(repo, state, &head)?;
     let m = PlannedMove {
         branch: planned.branch.clone(),
@@ -390,6 +419,7 @@ pub fn prepare(
     tip: &str,
     run: Run,
     recheck: &dyn Fn(&Repo, &mut UpdateState) -> Result<Option<String>>,
+    announced: &mut Announced,
 ) -> Result<Ready> {
     let mut head = require_finishable(state)?;
     let wt = Git::worktree(&state.worktree);
@@ -437,6 +467,9 @@ pub fn prepare(
         verify = true;
     }
     if verify {
+        // Named before the checks run, since they run what the update
+        // brings whether they pass or fail.
+        announced.check_changes(repo, state, &head)?;
         if !verify::verify_head(repo, state, &head)? {
             println!(
                 "verification of the catch-up merge {} failed; no branch moved to the update. Fix it on the update \

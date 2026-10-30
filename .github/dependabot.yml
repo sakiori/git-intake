@@ -1,0 +1,30 @@
+version: 2
+updates:
+  # A dependency update changes the shipped binary, so it is a fix and asks
+  # for a release: "fix(deps): ...".
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+      semver-minor-days: 3
+      semver-patch-days: 3
+    groups:
+      cargo:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: fix(deps)
+
+  # Workflow changes ask for no release: "ci: ...".
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci

@@ -754,7 +754,9 @@ mod tests {
     fn plan_lists_every_commit_as_later() {
         let plan = render_plan("example-app", &commits());
         assert!(
-            plan.starts_with("# git intake plan for example-app: 3 pending commits, oldest first.\n")
+            plan.starts_with(
+                "# git intake plan for example-app: 3 pending commits, oldest first.\n"
+            )
         );
         assert!(plan.contains("later aaaaaaaaaaaa fix: keep # in names\n"));
         assert!(plan.ends_with("later cccccccccccc chore: update\n"));

@@ -1,7 +1,10 @@
 [package]
 name = "xtask"
 version = "0.0.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Development tasks of git-intake that stay out of the shipped binary"
 publish = false
 
@@ -9,4 +12,6 @@ publish = false
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 clap_mangen = "0.3.3"
+flate2 = "1.1.10"
+serde_json = "1.0.151"
 toml = "1.1.6"

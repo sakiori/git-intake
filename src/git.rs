@@ -370,9 +370,10 @@ pub fn tracking_ref(remote: &str, branch: &str) -> String {
     format!("refs/remotes/{remote}/{branch}")
 }
 
-/// The first twelve characters of a commit id, for display.
+/// The first twelve characters of a commit id, for display. A revision a
+/// user named may be shown the same way, so the cut falls between characters.
 pub fn abbrev(oid: &str) -> &str {
-    &oid[..oid.len().min(12)]
+    oid.char_indices().nth(12).map_or(oid, |(at, _)| &oid[..at])
 }
 
 #[cfg(test)]
@@ -399,6 +400,7 @@ mod tests {
     #[test]
     fn abbrev_truncates() {
         assert_eq!(abbrev("0123456789abcdef"), "0123456789ab");
+        assert_eq!(abbrev("ééééééééééééé"), "éééééééééééé");
         assert_eq!(abbrev("abc"), "abc");
     }
 
