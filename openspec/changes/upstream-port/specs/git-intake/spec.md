@@ -1,10 +1,10 @@
 ## ADDED Requirements
 
 ### Requirement: Upstream fetch by URL
-The tool SHALL fetch an upstream by its configured URL, in the main worktree and without tags, into the reference `refs/git-intake/upstreams/<name>`, and SHALL NOT add, change or read a git remote for it. A command that reads upstreams SHALL fetch them itself. Apart from `contribute`, the tool SHALL create no branch, remote-tracking branch or tag from an upstream.
+The tool SHALL fetch an upstream by its configured URL, in the main worktree and without tags, into a reference under `refs/git-intake/`, and SHALL NOT add, change or read a git remote for it. A command that reads upstreams SHALL fetch them itself. Apart from `contribute`, the tool SHALL create no branch, remote-tracking branch or tag from an upstream.
 
 #### Scenario: Remote with an upstream's URL
-- **WHEN** the repository has a git remote whose URL is a configured upstream's URL
+- **WHEN** the repository has a git remote whose URL names a configured upstream's repository
 - **THEN** commands fetch the upstream by URL without using or changing that remote, and `doctor` reports the remote
 
 #### Scenario: Upstream unreachable
@@ -12,7 +12,7 @@ The tool SHALL fetch an upstream by its configured URL, in the main worktree and
 - **THEN** `status` reports that upstream as unavailable with git's error, reports the others, and exits with a failure status, and `start` refuses and creates nothing
 
 ### Requirement: Lifetime of upstream references
-A command that reads upstreams without starting an update SHALL remove the upstream references it created before it exits, whatever its outcome. An update SHALL keep the references of its upstreams from `start` until `finish` or `abort` removes the update.
+A command SHALL fetch upstreams into references of its own that no other command uses, and SHALL remove them before it exits, whatever its outcome. An update SHALL hold `refs/git-intake/upstreams/<name>` for each queued upstream at the tip `start` fetched; only `start` SHALL write it and only `finish` or `abort` SHALL remove it.
 
 #### Scenario: Reading command leaves nothing behind
 - **WHEN** `status` runs on a repository with no update in progress
@@ -22,15 +22,23 @@ A command that reads upstreams without starting an update SHALL remove the upstr
 - **WHEN** an update stops on a conflict and the repository is later garbage-collected
 - **THEN** every target and planned commit of the update is still present, and `continue` proceeds without fetching
 
+#### Scenario: Reading command during an update
+- **WHEN** `status` runs while an update is in progress and the upstream has moved since `start`
+- **THEN** it reports the upstream's new tip, and the update's reference keeps the tip `start` fetched
+
 ### Requirement: Port journal
-An upstream in `port` mode SHALL keep a journal at `.git-intake/<name>.toml`, committed on the integration branch, holding the upstream commit the port started from as its base and a list of decisions, each naming an upstream commit, the verdict `skip` or `have`, and an optional note. The tool SHALL read the journal from the integration branch tip and SHALL refuse an invalid journal, naming the problem.
+An upstream in `port` mode SHALL keep a journal at `.git-intake/<name>.toml`, committed on the integration branch, holding the upstream commit the port started from as its base, decisions that each name an upstream commit, the verdict `skip` or `have` and an optional note, and optionally a list of retired commits. Commit ids SHALL be full ids, compared in lower case. The tool SHALL read the journal from the integration tip and SHALL refuse an invalid one, naming the problem.
 
 #### Scenario: Invalid journal
 - **WHEN** the journal names a verdict other than `skip` or `have`, or decides one commit twice
 - **THEN** the tool refuses to run for that upstream and names the journal and the problem
 
+#### Scenario: Ids in upper case
+- **WHEN** the journal names its base, a decision or a retired commit with an id in upper case
+- **THEN** the tool reads it as the same commit as in lower case
+
 ### Requirement: Pending port commits
-The pending commits of a `port` upstream SHALL be the commits on the first-parent line of its fetched branch after the journal's base, other than those that a commit copied onto the integration branch names as taken and those the journal decides. The tool SHALL treat the upstream as rewritten, and SHALL refuse to plan it, when the base, a decided commit or a taken commit is no longer on that first-parent line.
+The pending commits of a `port` upstream SHALL be the commits on the first-parent line of its fetched branch after the journal's base, other than those that a commit on the integration branch names as taken and those the journal decides; commits the journal retires SHALL count as neither. The tool SHALL treat the upstream as rewritten, and refuse to plan it, when the base, or a taken or decided commit that is not retired, is not on that line.
 
 #### Scenario: Decision changed by hand
 - **WHEN** a `skip` decision is removed from the journal in an ordinary commit on the integration branch
@@ -43,6 +51,25 @@ The pending commits of a `port` upstream SHALL be the commits on the first-paren
 #### Scenario: Port upstream rewritten
 - **WHEN** a commit that the journal decides is no longer on the first-parent line of the fetched upstream branch
 - **THEN** `status` reports the upstream as rewritten and `start` refuses to plan it
+
+### Requirement: Recovering a rewritten port upstream
+For a rewritten `port` upstream, `status` and `doctor` SHALL name the base when it is off the first-parent line and every taken or decided commit off it that the journal does not retire, and say to list those commits under `retired` in the journal and to move the base to a commit of the line when it is off. A base off the line SHALL keep the upstream rewritten until it is moved.
+
+#### Scenario: Taken commit force-pushed away
+- **WHEN** an upstream commit that a copy took is no longer on the upstream's first-parent line after a force-push
+- **THEN** `status` reports the upstream as rewritten, names the commit as taken in its text and JSON, and says to list it under `retired`
+
+#### Scenario: Commits retired
+- **WHEN** the owner lists every such commit under `retired` in the journal
+- **THEN** the upstream is no longer rewritten, the retired commits count as neither taken nor decided, the rewritten versions of their changes are pending, and `start` plans them
+
+#### Scenario: Base gone
+- **WHEN** the journal's base is no longer on the upstream's first-parent line
+- **THEN** the upstream stays rewritten, with the base named, until the base is moved to a commit of the line and the commits off it are retired
+
+#### Scenario: Retired commit no longer in the repository
+- **WHEN** a commit the journal retires has been pruned from the repository
+- **THEN** the upstream is judged and planned as if the commit were present
 
 ### Requirement: Journal creation
 When a `port` upstream has no journal, the first update that carries out its plan SHALL create the journal with the upstream's last synced commit, from a sync record or from the history, as the base. `start` SHALL refuse when the upstream has neither, and say that the journal and its base have to be written by hand.
@@ -100,7 +127,7 @@ After the last copy, the tool SHALL commit the plan's `skip` and `have` decision
 - **THEN** the update branch holds one commit that adds the decisions to the journal, and the next step is `verify`
 
 ### Requirement: Outcome of a copy
-A copy that stops on conflicts SHALL stop the update as a conflicted merge does, and `continue` SHALL conclude the copy and go on with the remaining ones. A copy that changes nothing SHALL NOT be committed and SHALL be recorded as a `have` decision.
+A copy that stops on conflicts SHALL stop the update as a conflicted merge does, and `continue` SHALL conclude the copy and go on with the remaining ones. A copy whose commit fails SHALL stop the update with git's output and stay staged; `continue` SHALL commit what is then staged as that copy and SHALL never discard work in the worktree. A copy that changes nothing SHALL NOT be committed and SHALL be recorded as a `have` decision.
 
 #### Scenario: Conflict while copying
 - **WHEN** the copy of a taken commit stops on conflicts
@@ -109,6 +136,35 @@ A copy that stops on conflicts SHALL stop the update as a conflicted merge does,
 #### Scenario: Change already present
 - **WHEN** a commit marked `take` changes nothing on the update branch
 - **THEN** no copy is committed, the journal records the commit as `have`, and `report` names it
+
+#### Scenario: Commit of a copy refused by a hook
+- **WHEN** a hook of the repository rejects the commit of a copy, and the user fixes and stages the copy and runs `continue`
+- **THEN** the first `continue` stops with the hook's output, and the next commits the staged fix as the copy with the upstream author, message and trailers, keeping any unstaged work
+
+### Requirement: Git-intake files in copies
+A copy SHALL NOT change `.git-intake.toml` or anything under `.git-intake/`. The tool SHALL restore those paths from the update branch head before committing a copy, report the paths it left out in the output of `continue` and in `report`, and record a copy that changed nothing else as `have`.
+
+#### Scenario: Upstream commit with git-intake files of its own
+- **WHEN** a taken upstream commit changes `.git-intake.toml` and a file under `.git-intake/` as well as other files, and another taken commit changes only a file under `.git-intake/`
+- **THEN** the first copy changes only the other files and names the paths it left out, and the second is recorded as `have`
+
+### Requirement: Upstream names
+An upstream's name SHALL be usable in a git reference name, as `refs/git-intake/upstreams/<name>` needs it. The tool SHALL refuse a name that contains `..` or ends with `.` or `.lock`, naming it.
+
+#### Scenario: Name git cannot use
+- **WHEN** an upstream is named `app.lock`
+- **THEN** the tool refuses to run and names the upstream and why
+
+### Requirement: Same repository by URL
+Where the tool compares a URL with an upstream's URL, URLs that name the same repository SHALL count as equal: local paths and `file://` URLs once resolved against the main worktree and made canonical, other URLs once a trailing `/` and `.git` are dropped and the host is in lower case.
+
+#### Scenario: Relative and absolute paths
+- **WHEN** the publish remote's URL is a relative path to an upstream's repository, configured by its absolute path
+- **THEN** the tool refuses to run and names the remote and the upstream
+
+#### Scenario: Hosted URL written differently
+- **WHEN** a git remote's URL differs from an upstream's URL only by a trailing `/` or `.git`, or by the case of the host
+- **THEN** `doctor` reports the remote as having the upstream's URL
 
 ### Requirement: Contribution branch
 `contribute <upstream>[=<revision>] <branch>` SHALL fetch the upstream and create the local branch `<branch>` at the fetched tip, or at the commit the revision names on the fetched branch as `start` resolves it, without the rules that compare the commit with the last synced commit. It SHALL set no tracking branch, change no checkout and never push the branch. It SHALL refuse when `<branch>` exists or is not a valid branch name.
@@ -246,7 +302,7 @@ A revision named to `start` for a `follow` upstream, without a leading `refs/tag
 ## MODIFIED Requirements
 
 ### Requirement: Fork configuration
-The tool SHALL read a repository's settings from a `.git-intake.toml` file committed on the integration branch: the integration branch, an optional publication setting with the publish remote and the mode `push` or `merge-request`, an install command, an ordered list of check commands, and an ordered list of upstreams. Each upstream SHALL have a unique name, a URL, a branch, a mode `follow` or `port` with `follow` as the default, and optionally a path inside the repository. No two upstreams SHALL have the same URL and branch. An upstream without a path is taken at the repository root. The tool SHALL read the committed file from the integration branch tip, not from a working tree, and SHALL refuse to run when the file is missing or invalid, naming the problem. It SHALL refuse the settings `remote` and `mirror`, naming what replaces them, an upstream in `port` mode with a path, and a publish remote whose fetch or push URL is a configured upstream's URL.
+The tool SHALL read a repository's settings from a `.git-intake.toml` file committed on the integration branch: the integration branch, an optional publication setting with the publish remote and the mode `push` or `merge-request`, an install command, an ordered list of check commands, and an ordered list of upstreams. Each upstream SHALL have a unique name, a URL, a branch, a mode `follow` or `port` with `follow` as the default, and optionally a path inside the repository. No two upstreams SHALL have the same URL and branch. An upstream without a path is taken at the repository root. The tool SHALL read the committed file from the integration branch tip, not from a working tree, and SHALL refuse to run when the file is missing or invalid, naming the problem. It SHALL refuse the settings `remote` and `mirror`, naming what replaces them, an upstream in `port` mode with a path, and a publish remote whose fetch or push URL names a configured upstream's repository.
 
 #### Scenario: Valid configuration
 - **WHEN** the integration branch carries a valid configuration
@@ -281,7 +337,7 @@ The tool SHALL read a repository's settings from a `.git-intake.toml` file commi
 - **THEN** the tool refuses to run and names the upstream
 
 #### Scenario: Publish remote at an upstream's URL
-- **WHEN** the publish remote's fetch or push URL is a configured upstream's URL
+- **WHEN** the publish remote's fetch or push URL names a configured upstream's repository
 - **THEN** the tool refuses to run and names the remote and the upstream
 
 ### Requirement: Sync record in history
@@ -383,7 +439,7 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **THEN** the output lists the taken commit with its conflicts and names the earlier pending commit beside it
 
 ### Requirement: Upstream status
-`status` SHALL fetch every upstream and report, for each, its path, its branch, its mode and its fetched tip. For a `follow` upstream it SHALL report its last synced commit, the number of commits the integration branch lacks, and one state: current, behind, not imported, path removed when a synced path upstream's path no longer exists, rewritten, or unavailable when its URL cannot be fetched or its branch is missing. For a `port` upstream it SHALL report its journal's base, the numbers of taken, decided and pending commits, and one state: current, pending, rewritten, or unavailable. `status --check` SHALL additionally list the files a merge of each behind `follow` upstream's tip would conflict in, create no worktree, branch or state, and exit with a failure status unless every upstream is current, so that it can run on a schedule and gate a cutover or a port review.
+`status` SHALL fetch every upstream and report, for each, its path, its branch, its mode and its fetched tip. For a `follow` upstream it SHALL report its last synced commit, the number of commits the integration branch lacks, and one state: current, behind, not imported, path removed when a synced path upstream's path no longer exists, rewritten, or unavailable when its URL cannot be fetched or its branch is missing. For a `port` upstream it SHALL report its journal's base, the numbers of taken, decided and pending commits, and one state: current, pending, no base, rewritten, or unavailable. `status --check` SHALL additionally list the files a merge of each behind `follow` upstream's tip would conflict in, create no worktree, branch or state, and exit with a failure status unless every upstream is current, so that it can run on a schedule and gate a cutover or a port review.
 
 #### Scenario: Several upstreams
 - **WHEN** `status` runs on a repository with three upstreams, two of them behind
@@ -404,6 +460,10 @@ The tool SHALL keep the state of an update in the repository's common git direct
 #### Scenario: Port with pending commits
 - **WHEN** `status --check` runs for a `port` upstream with twelve first-parent commits after its base, of which three were taken, two skipped and seven are undecided
 - **THEN** it reports the base, three taken, two decided and seven pending, the state pending, and exits with a failure status
+
+#### Scenario: Port without a base
+- **WHEN** `status --check` runs for a `port` upstream with no journal, no sync record and no history shared with the integration branch
+- **THEN** it reports the state no base with the advice to write the journal and its base by hand, and exits with a failure status
 
 ### Requirement: Pending commits
 `log` SHALL list, for the named upstreams or all of them, the commits on the fetched upstream branch that the integration branch does not contain for a `follow` upstream, and the pending commits for a `port` upstream.
@@ -428,7 +488,7 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **THEN** `branches` reports that no upstream holds unmerged work
 
 ### Requirement: Doctor
-`doctor` SHALL check, without changing the repository other than through the references of its own fetches, that the configuration is valid, every upstream's URL can be fetched and its branch exists, every imported upstream's path exists on the integration branch, every `follow` upstream's last synced commit is still contained in its branch, every `port` upstream's journal is valid and its base, decided and taken commits are still on its branch, the main checkout is clean, no merge is in progress, the update state, if any, matches its worktree and branch, no git remote has a configured upstream's URL, no reference under `refs/git-intake/` is left without an update, and no journal belongs to an upstream that is missing or in `follow` mode. It SHALL report each check with its result and exit with a failure status when any check fails.
+`doctor` SHALL check, without changing the repository other than through the references of its own fetches, that the configuration is valid, every upstream's URL can be fetched and its branch exists, every imported upstream's path exists on the integration branch, every `follow` upstream's last synced commit is still contained in its branch, every `port` upstream's journal is valid and its base and its decided and taken commits that are not retired are still on its branch, the main checkout is clean, no merge is in progress, the update state, if any, matches its worktree and branch, no git remote names a configured upstream's repository, no reference under `refs/git-intake/` is left without an update, and no journal belongs to an upstream that is missing or in `follow` mode. It SHALL report each check with its result and exit with a failure status when any check fails.
 
 #### Scenario: Healthy repository
 - **WHEN** every check passes
@@ -451,11 +511,15 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **THEN** `doctor` fails the check and names the journal
 
 ### Requirement: Machine-readable output
-`status`, `report`, `log`, `branches` and `doctor` SHALL accept `--json` and then write a single JSON document to standard output that carries the same facts as the text form, under field names that are stable across releases, with the same exit status.
+`status`, `report`, `log`, `branches` and `doctor` SHALL accept `--json` and then write a single JSON document to standard output that carries the same facts as the text form, under field names that are stable across releases, with the same exit status. A rewritten `port` upstream SHALL carry the base and the commits that are off its line.
 
 #### Scenario: Agent reads status
 - **WHEN** an agent runs `status --json`
 - **THEN** it receives, for every upstream, its name, path, branch, mode, fetched tip and state, for a `follow` upstream its last synced commit and commit count, and for a `port` upstream its base and its numbers of taken, decided and pending commits, without parsing text
+
+#### Scenario: Agent reads a rewritten port upstream
+- **WHEN** an agent runs `status --json` for a rewritten `port` upstream
+- **THEN** it receives the state `rewritten` and each taken or decided commit off the upstream's line that is not retired, with what it was recorded as
 
 ### Requirement: Publication through a merge request
 When the publication mode is `merge-request`, `finish` SHALL apply the same checks as in push mode, then push the verified commit without force to a new branch `git-intake/update-<short verified commit>` on the publish remote, requesting through git push options a merge request from that branch into the integration branch whose title names the updated upstreams and whose description lists each `follow` upstream's merged range and each `port` upstream's taken commits and decisions. It SHALL move no local branch, remove the update worktree, and keep the update in a step that waits for the merge request. When the remote does not accept push options, the tool SHALL push the branch without them and name the merge request to open. When the branch is already at the verified commit where pushes to the publish remote go, as after an interrupted `finish`, `finish` SHALL push nothing and count no merge request as requested; when the remote has several push URLs, it SHALL push only to those where the branch is not yet at the verified commit. Deleting the merge request branch SHALL likewise act on each push URL and report what remains on each. A later `finish` SHALL fetch the publish remote and, once its integration branch received the verified commit itself by fast-forward or a merge whose tree equals the verified commit's tree, fast-forward the local integration branch to the remote one, delete the merge request branch if it remains, and remove the update. While the merge request is open it SHALL report that the update waits for it, exit with the status of a negative result, and say so when the merge request branch no longer points at the verified commit. It SHALL count a merge request as requested only when the push that carried the options transferred the branch. When the remote's response names the merge request it opened, the tool SHALL record its number and judge the merge by the merge request's head as the remote keeps it (`refs/merge-requests/<number>/head`), which outlives the merge request branch: a merge request whose final head is not the verified commit SHALL count as not having landed the verified tree, whichever merge method was used. Without that reference, the tool SHALL judge by the merge request branch as last seen and SHALL say, when it completes a fast-forward merge, that commits above the verified commit could not be attributed. It SHALL refuse to complete, and explain why, when the integration branch changed without receiving the verified commit (as by a squash or rebase merge), when what it received differs from the verified tree, when the integration branch moved so that the verified commit no longer contains its tip, or when the merge request branch disappeared without a merge. `abort` while waiting SHALL refuse when the integration branch received the verified commit as required and name `finish`; after a merge that did not land the verified tree it SHALL remove the update and say that the integration branch holds an unverified merge.
