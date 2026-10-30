@@ -46,9 +46,24 @@ cargo run --locked --quiet -p xtask -- man "$stage/man/man1"
 
 mkdir -p dist
 archive="dist/$name.tar.gz"
-# COPYFILE_DISABLE keeps macOS tar from adding AppleDouble files.
-COPYFILE_DISABLE=1 tar -C "$stage" -czf "$archive" \
-  git-intake LICENSE THIRD-PARTY-NOTICES.txt RUST-LIBRARY-COPYRIGHT.html man
+# The archive is packed deterministically, so that it carries nothing of the
+# build host: GNU tar's gnu format without PAX records, names sorted, owner
+# and group 0 without names, every modification time the commit's time
+# (SOURCE_DATE_EPOCH), modes 0755 and 0644, no extended attributes, ACLs or
+# SELinux labels, and gzip without a file name or time. xtask check-archive
+# reads the raw headers back.
+epoch=$(git log -1 --format=%ct)
+SOURCE_DATE_EPOCH=$epoch
+export SOURCE_DATE_EPOCH
+gnutar=tar
+command -v gtar > /dev/null 2>&1 && gnutar=gtar
+"$gnutar" --version 2>/dev/null | grep -q 'GNU tar' || { echo "packing needs GNU tar (tar or gtar)" >&2; exit 1; }
+"$gnutar" --create --format=gnu --sort=name --mtime="@$epoch" \
+  --owner=0 --group=0 --numeric-owner --mode='u=rwX,go=rX' \
+  --no-xattrs --no-acls --no-selinux -C "$stage" \
+  LICENSE RUST-LIBRARY-COPYRIGHT.html THIRD-PARTY-NOTICES.txt git-intake man \
+  | gzip -n -9 > "$archive"
+cargo run --locked --quiet -p xtask -- check-archive "$archive" "$epoch"
 
 # The layout check: the files above and nothing else, the main page and
 # command pages among them, every section of the notices the target needs,

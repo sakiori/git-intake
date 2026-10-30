@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 
@@ -35,7 +36,16 @@ fn main() -> Result<()> {
     match args.as_slice() {
         [task, dir] if task == "man" => man(Path::new(dir)),
         [task, dir, target] if task == "notices" => notices(Path::new(dir), target),
-        _ => bail!("usage: cargo run -p xtask -- man <dir> | notices <dir> <target>"),
+        [task, archive, epoch] if task == "check-archive" => check_archive(
+            Path::new(archive),
+            epoch
+                .parse()
+                .context("the epoch is not a number of seconds")?,
+        ),
+        _ => bail!(
+            "usage: cargo run -p xtask -- man <dir> | notices <dir> <target> | \
+             check-archive <archive> <epoch>"
+        ),
     }
 }
 
@@ -608,4 +618,86 @@ fn notice_files(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+/// Checks the raw headers of a release archive, a gzip-compressed tar file:
+/// the gzip header records no file name, comment or time, and every tar
+/// header is a plain GNU or ustar header of a file or directory, with no PAX
+/// or GNU extension record, owner and group 0 without names, the
+/// modification time `epoch`, and mode 0755 for directories and executables
+/// or 0644 for other files. A packer that leaked the build host's user,
+/// times or extended attributes fails it.
+fn check_archive(archive: &Path, epoch: u64) -> Result<()> {
+    let bytes = fs::read(archive).with_context(|| format!("cannot read {}", archive.display()))?;
+    if bytes.len() < 10 || bytes[0..3] != [0x1f, 0x8b, 8] {
+        bail!("{} is not a gzip file", archive.display());
+    }
+    if bytes[3] & !0x02 != 0 {
+        bail!("its gzip header carries a file name, comment or extra field");
+    }
+    if bytes[4..8] != [0, 0, 0, 0] {
+        bail!("its gzip header carries a time");
+    }
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(&bytes[..])
+        .read_to_end(&mut tar)
+        .context("cannot decompress it")?;
+
+    let field = |h: &[u8], at: usize, len: usize| -> String {
+        let raw = &h[at..at + len];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(len);
+        String::from_utf8_lossy(&raw[..end]).trim().to_string()
+    };
+    let octal = |h: &[u8], at: usize, len: usize| -> Result<u64> {
+        let text = field(h, at, len);
+        u64::from_str_radix(if text.is_empty() { "0" } else { &text }, 8)
+            .with_context(|| format!("a header field holds '{text}', not an octal number"))
+    };
+    let mut at = 0;
+    let mut entries = 0;
+    while at + 512 <= tar.len() {
+        let header = &tar[at..at + 512];
+        if header.iter().all(|&b| b == 0) {
+            break;
+        }
+        let name = field(header, 0, 100);
+        let kind = header[156];
+        let magic = &header[257..265];
+        if magic != b"ustar  \0" && magic != b"ustar\x0000" {
+            bail!("{name}: not a GNU or ustar header");
+        }
+        match kind {
+            b'0' | b'\0' | b'5' => {}
+            other => bail!(
+                "{name}: an entry of type '{}', such as a PAX or GNU extension record",
+                char::from(other)
+            ),
+        }
+        let mode = octal(header, 100, 8)? & 0o7777;
+        let (uid, gid) = (octal(header, 108, 8)?, octal(header, 116, 8)?);
+        let mtime = octal(header, 136, 12)?;
+        let (uname, gname) = (field(header, 265, 32), field(header, 297, 32));
+        if uid != 0 || gid != 0 || !uname.is_empty() || !gname.is_empty() {
+            bail!("{name}: owner {uid} '{uname}' and group {gid} '{gname}', not 0 without names");
+        }
+        if mtime != epoch {
+            bail!("{name}: modification time {mtime}, not {epoch}");
+        }
+        let executable = kind == b'5' || mode & 0o111 != 0;
+        let expected = if executable { 0o755 } else { 0o644 };
+        if mode != expected {
+            bail!("{name}: mode {mode:o}, not {expected:o}");
+        }
+        let size = octal(header, 124, 12)?;
+        at += 512 + size.div_ceil(512) as usize * 512;
+        entries += 1;
+    }
+    if entries == 0 {
+        bail!("{} holds no entry", archive.display());
+    }
+    println!(
+        "{}: {entries} entries with deterministic headers",
+        archive.display()
+    );
+    Ok(())
 }
