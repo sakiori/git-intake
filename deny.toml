@@ -15,8 +15,13 @@ targets = [
 all-features = true
 
 [advisories]
-# Every RustSec advisory, unmaintained and unsound crates included, fails the
-# check; a yanked version in the lockfile does too.
+# Every RustSec advisory fails the check, for any crate of the graph: a
+# vulnerability, and an unmaintained or unsound crate whether the workspace
+# depends on it directly or through another crate (cargo-deny's default for
+# unsound crates covers only the workspace's direct dependencies). A yanked
+# version in the lockfile fails it too.
+unmaintained = "all"
+unsound = "all"
 yanked = "deny"
 
 [licenses]
