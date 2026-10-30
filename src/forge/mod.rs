@@ -99,7 +99,7 @@ fn instant(value: &serde_json::Value, key: &str) -> Option<jiff::Timestamp> {
 /// Orders merge requests by when they ended, the one that ended most
 /// recently first and those that did not end last.
 pub fn latest_first(list: &mut [MergeRequest]) {
-    list.sort_by(|a, b| b.ended_at.cmp(&a.ended_at));
+    list.sort_by_key(|m| std::cmp::Reverse(m.ended_at));
 }
 
 /// What the forge's settings mean for an update's merge request.

@@ -312,7 +312,8 @@ fn local_paths_and_ssh_urls_are_matched_as_git_reads_them() {
         ],
     );
     f.tool(&["status"]).code(2).stderr(contains(
-        "has the URL ssh://git@Example.com:22/team/upstream, which names the repository of upstream 'upstream'",
+        // The user part of the URL is not shown.
+        "has the URL ssh://Example.com:22/team/upstream, which names the repository of upstream 'upstream'",
     ));
 }
 
