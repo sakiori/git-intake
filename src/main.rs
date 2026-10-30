@@ -42,6 +42,7 @@ fn run(command: Command) -> anyhow::Result<Exit> {
         Command::Abort => commands::update::abort(&repo),
         Command::Verify => commands::verify::run(&repo),
         Command::Finish { no_publish } => commands::finish::run(&repo, no_publish),
+        Command::Migrate => commands::migrate::run(&repo),
         Command::Status { check, json } => commands::status::run(&repo, check, json),
         Command::Report { json } => commands::report::run(&repo, json),
         Command::Log { upstreams, json } => commands::log::run(&repo, &upstreams, json),

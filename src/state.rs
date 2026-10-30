@@ -21,6 +21,11 @@ pub const UPDATE_BRANCH: &str = "git-intake/update";
 /// request.
 const STATE_VERSION: u32 = 4;
 
+/// The format `migrate` carries over to [`STATE_VERSION`]. Format 3 differs
+/// from format 4 only in the recorded worktree, which lay in the git
+/// directory, so it reads into the same shape.
+const PREVIOUS_STATE_VERSION: u32 = 3;
+
 /// The release of this binary, as recorded in the states it starts. A build
 /// from source reports `0.0.0`.
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
@@ -416,6 +421,16 @@ impl UpdateState {
         }
     }
 
+    /// The state in the current format with its update worktree at
+    /// `worktree`, for an update `migrate` carries over. The release that
+    /// started it stays unrecorded: the previous format predates releases
+    /// recording themselves.
+    pub fn into_current(mut self, worktree: PathBuf) -> Self {
+        self.version = STATE_VERSION;
+        self.worktree = worktree;
+        self
+    }
+
     /// Upstreams that are not merged, or whose plan is not carried out, yet.
     pub fn unmerged(&self) -> Vec<&QueuedUpstream> {
         self.upstreams
@@ -431,15 +446,55 @@ impl UpdateState {
 
 /// Reads the state of the update in progress, or `None` when there is none.
 /// A state in any other format, older or newer, is refused: its update has
-/// to be finished or aborted with a release that understands that format.
+/// to be finished or aborted with a release that understands that format,
+/// or, in the previous format, carried over by `migrate`.
 pub fn load(path: &Path) -> Result<Option<UpdateState>> {
+    match load_stored(path)? {
+        None => Ok(None),
+        Some(Stored::Current(state)) => Ok(Some(*state)),
+        Some(Stored::Previous(state)) => anyhow::bail!(
+            "{}",
+            other_format(
+                path,
+                Some(u64::from(PREVIOUS_STATE_VERSION)),
+                state.release.as_deref()
+            )
+        ),
+    }
+}
+
+/// The state of the update in progress as `migrate` reads it: in the
+/// current format or the previous one.
+pub enum Stored {
+    Current(Box<UpdateState>),
+    Previous(Box<UpdateState>),
+}
+
+/// Reads the state of the update in progress in the current or the previous
+/// format, or `None` when there is none. Any other format is refused as by
+/// [`load`].
+pub fn load_stored(path: &Path) -> Result<Option<Stored>> {
     match read(path)? {
         None => Ok(None),
-        Some(Versioned::Current(state)) => Ok(Some(*state)),
+        Some(Versioned::Current(state)) => Ok(Some(Stored::Current(state))),
+        Some(Versioned::Previous(state)) => Ok(Some(Stored::Previous(state))),
         Some(Versioned::Other { version, release }) => {
             anyhow::bail!("{}", other_format(path, version, release.as_deref()))
         }
     }
+}
+
+/// The main worktree the update in progress recorded, in the current or the
+/// previous format, so that `migrate` finds it as every other command does.
+pub fn recorded_main_worktree(path: &Path) -> Option<PathBuf> {
+    match load_stored(path).ok().flatten()? {
+        Stored::Current(state) | Stored::Previous(state) => state.main_worktree,
+    }
+}
+
+/// The state format this release writes.
+pub fn current_format() -> u32 {
+    STATE_VERSION
 }
 
 /// Why a state of another format is refused, and what to do about it.
@@ -461,17 +516,28 @@ fn other_format(path: &Path, version: Option<u64>, release: Option<&str>) -> Str
             "{started} that keeps its state in format {version}; {this}, an older one. Finish or abort \
              the update with that release or a later one that understands format {version} ({path})"
         )
+    } else if version == u64::from(PREVIOUS_STATE_VERSION) {
+        format!(
+            "{started} that keeps its state in format {version}; {this}. Run `git intake migrate` to carry \
+             the update over to this release, or finish or abort it with {} ({path})",
+            keeping(version)
+        )
     } else {
-        let with = match FORMAT_RELEASES.iter().find(|(f, _)| *f == version) {
-            Some((_, releases)) => {
-                format!("a release that keeps format {version} (git-intake {releases})")
-            }
-            None => "the release that started it".to_string(),
-        };
         format!(
             "{started} that keeps its state in format {version}; {this}. Finish or abort the update with \
-             {with}, then start it again with this release ({path})"
+             {}, then start it again with this release ({path})",
+            keeping(version)
         )
+    }
+}
+
+/// The releases that keep the state in `version`, as a refusal names them.
+fn keeping(version: u64) -> String {
+    match FORMAT_RELEASES.iter().find(|(f, _)| *f == version) {
+        Some((_, releases)) => {
+            format!("a release that keeps format {version} (git-intake {releases})")
+        }
+        None => "the release that started it".to_string(),
     }
 }
 
@@ -507,6 +573,7 @@ pub fn load_finished(path: &Path) -> Result<Option<UpdateState>> {
 
 enum Versioned {
     Current(Box<UpdateState>),
+    Previous(Box<UpdateState>),
     /// Another format, or none, with the release that wrote it when the
     /// state records one.
     Other {
@@ -535,15 +602,21 @@ fn read(path: &Path) -> Result<Option<Versioned>> {
     // The version is checked before the shape, so that a state written by
     // another release is named as such rather than as unreadable.
     let version = value.get("version").and_then(serde_json::Value::as_u64);
-    if version != Some(u64::from(STATE_VERSION)) {
+    let current = version == Some(u64::from(STATE_VERSION));
+    if !current && version != Some(u64::from(PREVIOUS_STATE_VERSION)) {
         let release = value
             .get("release")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
         return Ok(Some(Versioned::Other { version, release }));
     }
-    let state: UpdateState = serde_json::from_value(value).with_context(unreadable)?;
-    Ok(Some(Versioned::Current(Box::new(state))))
+    // The previous format has the shape of the current one.
+    let state = Box::new(serde_json::from_value::<UpdateState>(value).with_context(unreadable)?);
+    Ok(Some(if current {
+        Versioned::Current(state)
+    } else {
+        Versioned::Previous(state)
+    }))
 }
 
 /// Writes a state file atomically.
@@ -645,6 +718,36 @@ mod tests {
         remove(&path).unwrap();
         remove(&path).unwrap();
         assert!(load(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_state_of_the_previous_version_names_migrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = UpdateState::new(config(), "b".repeat(40), dir.path().join("wt"), vec![]);
+        state.version = PREVIOUS_STATE_VERSION;
+        state.release = None;
+        save(&path, &state).unwrap();
+        let err = format!("{:#}", load(&path).unwrap_err());
+        assert!(
+            err.contains(&format!(
+                "keeps its state in format 3; this release (git-intake {RELEASE}) understands format 4. \
+                 Run `git intake migrate` to carry the update over to this release, or finish or abort it \
+                 with a release that keeps format 3 (git-intake v0.3.0 to v0.3.1)"
+            )),
+            "{err}"
+        );
+        let Some(Stored::Previous(read)) = load_stored(&path).unwrap() else {
+            panic!("not read as the previous format");
+        };
+        let current = read.into_current(dir.path().join("new"));
+        assert_eq!(current.version, STATE_VERSION);
+        assert_eq!(current.release, None);
+        save(&path, &current).unwrap();
+        assert_eq!(
+            load(&path).unwrap().unwrap().worktree,
+            dir.path().join("new")
+        );
     }
 
     #[test]
