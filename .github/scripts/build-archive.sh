@@ -13,7 +13,8 @@
 #
 # The xtask package generates the notices on the build host: those of the
 # crates, with cargo-about, of the Rust toolchain's compiler-builtins, from its
-# rust-src component, and for a musl target of the musl that zig links; and it
+# rust-src component, and for a musl target of the musl and the libc and
+# compiler_rt that zig links; and it
 # copies the toolchain's COPYRIGHT-library.html. It also generates the manual
 # pages. Cargo.toml's [package.metadata.binstall] describes
 # this layout to cargo-binstall. CI runs this script on every change, and the
@@ -69,7 +70,10 @@ for heading in 'Third-party notices of git-intake' 'The Rust standard library an
   grep -Fq "$heading" "$notices" || { echo "the notices lack '$heading'" >&2; exit 1; }
 done
 case "$target" in
-  *-linux-musl) grep -Eq '^musl libc [0-9]' "$notices" || { echo "the notices lack musl's" >&2; exit 1; } ;;
+  *-linux-musl)
+    grep -Eq '^musl libc [0-9]' "$notices" || { echo "the notices lack musl's" >&2; exit 1; }
+    grep -Eq '^Zig [0-9]' "$notices" || { echo "the notices lack Zig's" >&2; exit 1; }
+    ;;
 esac
 grep -Fq 'Copyright notices for The Rust Standard Library' "$stage/RUST-LIBRARY-COPYRIGHT.html" \
   || { echo "RUST-LIBRARY-COPYRIGHT.html is not the standard library's notices" >&2; exit 1; }

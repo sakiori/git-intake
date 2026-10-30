@@ -12,6 +12,7 @@
 //! `RUST-LIBRARY-COPYRIGHT.html`, the toolchain's notices of the Rust standard
 //! library.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
@@ -279,9 +280,15 @@ fn notices(dir: &Path, target: &str) -> Result<()> {
                 body.trim_end()
             ));
         }
-        crates.push((name.to_string(), version.to_string(), source));
+        // The workspace's own crate is the subject of the notices, not a part
+        // of them; its license ships beside them.
+        if package["source"].is_string() {
+            crates.push((name.to_string(), version.to_string(), source));
+        }
     }
-    check_clarified(root, &crates, &text)?;
+    let additional = additional_notices(&graph, &crates)?;
+    text.push_str(&additional);
+    check_copyright_lines(&crates, &text)?;
 
     let sysroot = rust_sysroot()?;
     text.push_str(&rust_notices(&sysroot)?);
@@ -301,40 +308,146 @@ fn notices(dir: &Path, target: &str) -> Result<()> {
     write(&dir.join(RUST_LIBRARY_COPYRIGHT), &library)
 }
 
-/// Fails unless every copyright line of every source file of a crate that
-/// `about.toml` clarifies is in the notices. A clarification replaces what
-/// cargo-about harvests, so a notice it does not name would be lost.
-fn check_clarified(root: &Path, crates: &[(String, String, PathBuf)], text: &str) -> Result<()> {
-    let config: toml::Table = toml::from_str(
-        &fs::read_to_string(root.join("about.toml")).context("cannot read about.toml")?,
-    )
-    .context("cannot parse about.toml")?;
+/// The copyright lines of a crate's sources that the notices must carry, by
+/// line, with the files that hold each, relative to the crate's root.
+///
+/// Every file of the crate's package counts, except what is not part of the
+/// binary or not a notice of the crate's license:
+/// - files under a directory named `tests`, `test`, `testdata`, `test-data`,
+///   `benches`, `examples`, `fuzz` or starting with `.`: test data,
+///   benchmarks, examples and repository metadata;
+/// - files at the crate's root whose name starts with `LICENSE`, `LICENCE`,
+///   `COPYING`, `UNLICENSE`, `NOTICE` or `COPYRIGHT`: the license texts, whose
+///   notices the output carries when the license is the one it carries for the
+///   crate, and which belong to an alternative license otherwise; NOTICE files
+///   are carried whole.
+fn copyright_lines(source: &Path) -> Result<BTreeMap<String, Vec<String>>> {
+    const SKIPPED_DIRS: &[&str] = &[
+        "tests",
+        "test",
+        "testdata",
+        "test-data",
+        "benches",
+        "examples",
+        "fuzz",
+    ];
+    const LICENSE_FILES: &[&str] = &[
+        "LICENSE",
+        "LICENCE",
+        "COPYING",
+        "UNLICENSE",
+        "NOTICE",
+        "COPYRIGHT",
+    ];
+    let mut lines: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for file in source_files(source)? {
+        let path = file.strip_prefix(source).unwrap_or(&file);
+        let parts: Vec<String> = path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .collect();
+        let (dirs, name) = parts.split_at(parts.len() - 1);
+        if dirs
+            .iter()
+            .any(|d| d.starts_with('.') || SKIPPED_DIRS.contains(&d.as_str()))
+        {
+            continue;
+        }
+        let upper = name[0].to_ascii_uppercase();
+        if dirs.is_empty() && LICENSE_FILES.iter().any(|l| upper.starts_with(l)) {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let shown = parts.join("/");
+        for line in content.lines().filter(|l| is_copyright_line(l)) {
+            let files = lines.entry(normalized(line)).or_default();
+            if !files.contains(&shown) {
+                files.push(shown.clone());
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// The section of the notices that carries, for every crate, the copyright
+/// lines of its sources that the license texts cargo-about found for it lack,
+/// with the files that hold them; empty when there are none.
+fn additional_notices(
+    graph: &serde_json::Value,
+    crates: &[(String, String, PathBuf)],
+) -> Result<String> {
+    // The license texts the notices carry for each crate.
+    let mut texts: BTreeMap<(String, String), String> = BTreeMap::new();
+    for license in graph["licenses"]
+        .as_array()
+        .context("cargo-about listed no licenses")?
+    {
+        let text = license["text"].as_str().unwrap_or_default();
+        for user in license["used_by"].as_array().into_iter().flatten() {
+            let krate = &user["crate"];
+            let key = (
+                krate["name"].as_str().unwrap_or_default().to_string(),
+                krate["version"].as_str().unwrap_or_default().to_string(),
+            );
+            let entry = texts.entry(key).or_default();
+            entry.push_str(&text.lines().map(normalized).collect::<Vec<_>>().join(" "));
+            entry.push(' ');
+        }
+    }
+    let mut section = String::new();
+    for (name, version, source) in crates {
+        let carried = texts
+            .get(&(name.clone(), version.clone()))
+            .map(String::as_str)
+            .unwrap_or_default();
+        let mut notices = notice_files(source)?
+            .iter()
+            .filter_map(|f| fs::read_to_string(f).ok())
+            .map(|t| t.lines().map(normalized).collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+            .join(" ");
+        notices.push_str(carried);
+        let missing: Vec<_> = copyright_lines(source)?
+            .into_iter()
+            .filter(|(line, _)| !notices.contains(line.as_str()))
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        section.push_str(&format!("\n{name} {version}\n"));
+        for (line, files) in missing {
+            section.push_str(&format!("\n  {line}\n    in {}\n", files.join(", ")));
+        }
+    }
+    if section.is_empty() {
+        return Ok(section);
+    }
+    Ok(format!(
+        "\n{rule}\nAdditional copyright notices\n\n\
+         Copyright notices in the sources of these crates that the license texts above\n\
+         do not carry, with the files that hold them. The files are under the license\n\
+         the notices name for their crate.\n{section}",
+        rule = "-".repeat(80),
+    ))
+}
+
+/// Fails unless the notices carry every copyright line of every crate's
+/// sources that `copyright_lines` counts.
+fn check_copyright_lines(crates: &[(String, String, PathBuf)], text: &str) -> Result<()> {
     let notices = text.lines().map(normalized).collect::<Vec<_>>().join(" ");
     let mut missing = Vec::new();
     for (name, version, source) in crates {
-        let clarified = config
-            .get(name)
-            .and_then(|c| c.as_table())
-            .is_some_and(|c| c.contains_key("clarify"));
-        if !clarified {
-            continue;
-        }
-        for file in source_files(source)? {
-            let Ok(content) = fs::read_to_string(&file) else {
-                continue;
-            };
-            for line in content.lines().filter(|l| is_copyright_line(l)) {
-                let line = normalized(line);
-                if !notices.contains(&line) {
-                    let path = file.strip_prefix(source).unwrap_or(&file);
-                    missing.push(format!("{name} {version}, {}: {line}", path.display()));
-                }
+        for (line, files) in copyright_lines(source)? {
+            if !notices.contains(&line) {
+                missing.push(format!("{name} {version}, {}: {line}", files.join(", ")));
             }
         }
     }
     if !missing.is_empty() {
         bail!(
-            "the notices lack copyright lines of clarified crates; add the files to about.toml:\n{}",
+            "the notices lack copyright lines of the crates' sources:\n{}",
             missing.join("\n")
         );
     }
@@ -431,9 +544,10 @@ fn rust_notices(sysroot: &Path) -> Result<String> {
     ))
 }
 
-/// musl's COPYRIGHT, from the zig installation that cargo-zigbuild links the
-/// static Linux binaries with: cargo-zigbuild leaves out the toolchain's own
-/// musl, and zig links the musl it ships.
+/// musl's COPYRIGHT and the Zig distribution's LICENSE, from the zig
+/// installation that cargo-zigbuild links the static Linux binaries with:
+/// cargo-zigbuild leaves out the toolchain's own musl, and zig links the musl
+/// it ships, its own libc (libzigc) and its compiler_rt.
 fn musl_notices() -> Result<String> {
     let zig = std::env::var_os("CARGO_ZIGBUILD_ZIG_PATH").unwrap_or_else(|| "zig".into());
     let out = Process::new(&zig)
@@ -451,7 +565,8 @@ fn musl_notices() -> Result<String> {
             .map(str::to_string)
             .with_context(|| format!("zig env names no {name}"))
     };
-    let musl = Path::new(&field("lib_dir")?).join("libc/musl");
+    let lib_dir = PathBuf::from(field("lib_dir")?);
+    let musl = lib_dir.join("libc/musl");
     let header = fs::read_to_string(musl.join("src/internal/version.h"))
         .with_context(|| format!("cannot read musl's version in {}", musl.display()))?;
     let version = header
@@ -461,10 +576,21 @@ fn musl_notices() -> Result<String> {
         .context("musl's version.h names no version")?;
     let copyright = fs::read_to_string(musl.join("COPYRIGHT"))
         .with_context(|| format!("cannot read musl's COPYRIGHT in {}", musl.display()))?;
+    // Zig's own libc (libzigc) and compiler_rt, which it builds from its lib
+    // directory and links statically, are under the license of the Zig
+    // distribution, at the root of the installation.
+    let zig_license = lib_dir
+        .parent()
+        .map(|root| root.join("LICENSE"))
+        .context("zig's lib directory has no parent")?;
+    let zig_license = fs::read_to_string(&zig_license)
+        .with_context(|| format!("cannot read zig's license {}", zig_license.display()))?;
+    let zig_version = field("version")?;
     Ok(format!(
-        "\n{rule}\nmusl libc {version} (linked statically, as zig {} ships it)\n\n{}\n",
-        field("version")?,
+        "\n{rule}\nmusl libc {version} (linked statically, as Zig {zig_version} ships it)\n\n{}\n\
+         \n{rule}\nZig {zig_version} (its libc and compiler_rt, linked statically)\n\n{}\n",
         copyright.trim_end(),
+        zig_license.trim_end(),
         rule = "-".repeat(80),
     ))
 }
