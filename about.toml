@@ -1,6 +1,6 @@
-# cargo-about configuration: `cargo run --locked -p xtask -- notices <file>`
-# writes the third-party notices that every release archive carries, from this
-# file and the template about.hbs.
+# cargo-about configuration: `cargo run --locked -p xtask -- notices <dir>
+# <target>` writes the third-party notices that every release archive carries,
+# the crates' from this file and the template about.hbs.
 
 # The licenses of the crates the binary links, in order of preference: of a
 # crate offered under several licenses, the notices carry the first one listed
@@ -29,15 +29,23 @@ ignore-dev-dependencies = true
 # xtask is never published nor shipped.
 private = { ignore = true }
 
-# ring is "Apache-2.0 AND ISC", with its terms spread over several files: its
-# own code under the ISC terms of LICENSE-other-bits, code from BoringSSL under
-# Apache-2.0 (LICENSE-BoringSSL) or under ISC terms with the copyright notice
-# at the top of each file, fiat-crypto's code under Apache-2.0, and once_cell's
-# polyfill under Apache-2.0. cargo-about's built-in workaround for ring checks
-# files of older releases, so the files are named here. Each checksum is the
-# SHA-256 of the text between `start` and `end`, or of the whole file; when
-# ring changes one, the notices refuse to build until the files are checked
-# again.
+# A clarification replaces what cargo-about would harvest from a crate, so it
+# names every file that carries a notice of the crate: its license files and,
+# for each distinct copyright notice in its sources, the header of one file
+# that carries it, from the copyright line to the end of the license statement.
+# Each checksum is the SHA-256 of the text between `start` and `end`, or of the
+# whole file. `xtask notices` fails when a checksum no longer matches, and when
+# a copyright line in any source file of a clarified crate is missing from the
+# notices, so a new release of the crate needs its clarification redone.
+#
+# ring is "Apache-2.0 AND ISC": its own code under the ISC terms of
+# LICENSE-other-bits and of its files' headers, code from BoringSSL and
+# OpenSSL under Apache-2.0 (LICENSE-BoringSSL) or under ISC terms, fiat-crypto
+# under Apache-2.0, and once_cell's polyfill under Apache-2.0. cargo-about's
+# built-in workaround for ring checks files of older releases.
+#
+# rustls-webpki is ISC, with copyright notices of further authors in some of
+# its files' headers.
 [ring]
 clarify.license = "Apache-2.0 AND ISC"
 
@@ -45,41 +53,6 @@ clarify.license = "Apache-2.0 AND ISC"
 path = "LICENSE-other-bits"
 license = "ISC"
 checksum = "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f"
-
-[[ring.clarify.files]]
-path = "crypto/fipsmodule/ec/ecp_nistz.c"
-license = "ISC"
-checksum = "4e622e20d04fd552b8b528b950c08a8125b0c7f934f20a2a1df75f8273a17773"
-start = "Copyright (c) 2014, Intel Corporation."
-end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
-
-[[ring.clarify.files]]
-path = "crypto/poly1305/poly1305.c"
-license = "ISC"
-checksum = "ed6813e62aea0e5af661f769415dc44e1d316c37487634181661d9c2ea974391"
-start = "Copyright (c) 2014, Google Inc."
-end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
-
-[[ring.clarify.files]]
-path = "crypto/fipsmodule/ec/ecp_nistz.h"
-license = "ISC"
-checksum = "a4716a1ece644e3e80c2fab29012c567f6c4edb4a5ad8ff0590e42c2c751b34f"
-start = "Copyright (c) 2015, Google Inc."
-end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
-
-[[ring.clarify.files]]
-path = "src/aead/chacha.rs"
-license = "ISC"
-checksum = "dfafd9dadfdf390b9f25a6548cd235b8aeffb7dc63ea023df99e9f1d85232bb9"
-start = "Portions Copyright (c) 2016, Google Inc."
-end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
-
-[[ring.clarify.files]]
-path = "crypto/fipsmodule/aes/aes_nohw.c"
-license = "ISC"
-checksum = "a3e1cc5cfe20882b769f280a2090cbbee3d33f844901379401b6840f7861f7ae"
-start = "Copyright (c) 2019, Google Inc."
-end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
 
 [[ring.clarify.files]]
 path = "LICENSE-BoringSSL"
@@ -95,3 +68,536 @@ checksum = "9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f"
 path = "src/polyfill/once_cell/LICENSE-APACHE"
 license = "Apache-2.0"
 checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+
+[[ring.clarify.files]]
+path = "build.rs"
+license = "ISC"
+checksum = "e371c15f57c6839ea4f4959d90f5f4fbb30be23aa75b429c7fa9de25958c10b7"
+start = "Copyright 2015-2016 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "crypto/chacha/asm/chacha-armv4.pl"
+license = "Apache-2.0"
+checksum = "1e3be5e349e2841819f1b33e07ace865e3e9b6fcaad2d1fc62a75f79993b0c03"
+start = "Copyright 2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/cipher/asm/chacha20_poly1305_armv8.pl"
+license = "Apache-2.0"
+checksum = "fa80ab64c92a9465fd0dfce307a4cd9902c53635a6305c7b13d59e2e6aaa3a6c"
+start = "Copyright (c) 2020, CloudFlare Ltd."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/cipher/asm/chacha20_poly1305_x86_64.pl"
+license = "Apache-2.0"
+checksum = "f95e69b07730b4457b07170b64e5eb1805f859af143fafa4098b7b03e35ae3dc"
+start = "Copyright (c) 2015, CloudFlare Ltd."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/cpu_intel.c"
+license = "Apache-2.0"
+checksum = "930620fcdf40d4bf0bd114d4cf60fb97d5c9c5bcce0d4ad53e73f31650e68183"
+start = "Copyright 1995-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/crypto.c"
+license = "Apache-2.0"
+checksum = "912e225b2fe43be265a74c6bcee5daa5c0058bb674aae1b9a6921753b95d77a5"
+start = "Copyright 2014 The BoringSSL Authors"
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/curve25519/asm/x25519-asm-arm.S"
+license = "Apache-2.0"
+checksum = "067172870ceee105b8eae3a2109cac8448d2fd9984b95964a60c6042a304f1f8"
+start = "Copyright 2015 The BoringSSL Authors"
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/curve25519/curve25519.c"
+license = "Apache-2.0"
+checksum = "96d8843347742dece5acfa8f212f008db983c8747b11c5de45a7bb6c96ed9a06"
+start = "Copyright 2020 The BoringSSL Authors"
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/curve25519/curve25519_64_adx.c"
+license = "Apache-2.0"
+checksum = "d4bbeb734ff9b3a06fffe523f6bdc031ba81e574310c0b6f72cbb29d1eb550c1"
+start = "Copyright 2023 The BoringSSL Authors"
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/aes_nohw.c"
+license = "ISC"
+checksum = "a3e1cc5cfe20882b769f280a2090cbbee3d33f844901379401b6840f7861f7ae"
+start = "Copyright (c) 2019, Google Inc."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/asm/aes-gcm-avx2-x86_64.pl"
+license = "Apache-2.0"
+checksum = "ea7096793bd60e04cb77cb0443cd6f9679b0fc4283227a106cb1ce4c261bb4da"
+start = "Copyright 2024 The BoringSSL Authors"
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/asm/aesni-gcm-x86_64.pl"
+license = "Apache-2.0"
+checksum = "178991e3438c3cb7bb49b90d37783cbbca88e94e59308d9ab7ac65675b54f94b"
+start = "Copyright 2013-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/asm/aesni-x86.pl"
+license = "Apache-2.0"
+checksum = "6762df739cdee041d7cb5f0e0c86cb7bc75e59bfce6f4a4f126d22dc4a9d43ee"
+start = "Copyright 2009-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/asm/aesv8-armx.pl"
+license = "Apache-2.0"
+checksum = "6c7a9fcda575d5a04cbf5c4257824360109e277ae431b70571b0a7e44c6d32d7"
+start = "Copyright 2014-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/asm/aesv8-gcm-armv8.pl"
+license = "Apache-2.0"
+checksum = "5da1689bf37250b1830a3fef701d9762f83264aa733fe16bc29cd6ba4dc9f7c7"
+start = "Copyright (c) 2022, ARM Inc."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/asm/bsaes-armv7.pl"
+license = "Apache-2.0"
+checksum = "73747f93801c6f7c376a2282f3ed22f6d18da6c6da469ab08bd2f6d033c75ddd"
+start = "Copyright 2012-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/asm/ghash-armv4.pl"
+license = "Apache-2.0"
+checksum = "3a34583a8d7a70a2e09a5eb676f98317692e32197a82cd8045df17204941383b"
+start = "Copyright 2010-2018 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/asm/ghash-neon-armv8.pl"
+license = "Apache-2.0"
+checksum = "79a61d56aba00448ff3d52081786c0d011eee07a3d7b122afc30fa5ba9f9e585"
+start = "Copyright 2010-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/asm/ghashv8-armx.pl"
+license = "Apache-2.0"
+checksum = "e67677ceb9ff7f85f7ca0787418a691fb9b13c80489d4d4578adf1b84d7c798c"
+start = "Copyright 2014-2020 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/asm/vpaes-armv7.pl"
+license = "Apache-2.0"
+checksum = "d083f73286bb32059390f3c21457dd2432a2490075d1c13066b04f96a096a3f6"
+start = "Copyright 2015-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/asm/vpaes-x86.pl"
+license = "Apache-2.0"
+checksum = "e5646b382cc42cec2eff433b28fd7944797b54f57b12b8bcb50db0750eb51d9a"
+start = "Copyright 2011-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/bn/asm/armv4-mont.pl"
+license = "Apache-2.0"
+checksum = "7ad3d61cf6154b2964291676591eda3052192d2d41bd2e27c299a51a29f68255"
+start = "Copyright 2007-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/bn/asm/x86-mont.pl"
+license = "Apache-2.0"
+checksum = "86fc2ef3977d6a81117d6fa3219f6e44987ee9001690db952ca515580b334c7f"
+start = "Copyright 2005-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/bn/internal.h"
+license = "Apache-2.0"
+checksum = "90e00fcafbd6ec9ae400ed6b93ae0590c3a7de026d99e03895f82552ef52dd55"
+start = "Copyright 1995-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/bn/montgomery_inv.c"
+license = "ISC"
+checksum = "82f5b7bc0a677e9643195a830b967dcae6eb84010fd3c3382319cbdf57c309c5"
+start = "Copyright 2016 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/ec/asm/p256-armv8-asm.pl"
+license = "Apache-2.0"
+checksum = "c52f31da3e3752890a6bfd78263751b6226d28f9f682c4d97c5b8e8af8d983c4"
+start = "Copyright 2015-2020 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/ec/asm/p256-x86_64-asm.pl"
+license = "Apache-2.0"
+checksum = "e56b038b08e736a2ea40bea1781db545bbccdc343f02060d7441e6585cc64c46"
+start = "Copyright 2014-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/ec/ecp_nistz.c"
+license = "ISC"
+checksum = "4e622e20d04fd552b8b528b950c08a8125b0c7f934f20a2a1df75f8273a17773"
+start = "Copyright (c) 2014, Intel Corporation."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/ec/ecp_nistz.h"
+license = "ISC"
+checksum = "a4716a1ece644e3e80c2fab29012c567f6c4edb4a5ad8ff0590e42c2c751b34f"
+start = "Copyright (c) 2015, Google Inc."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/ec/p256-nistz-table.h"
+license = "Apache-2.0"
+checksum = "dd2fcaf6e75b3d9f6c230cd981e45339c2dfed48a258a202ae305f460ef218df"
+start = "Copyright 2014-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/limbs/limbs.c"
+license = "ISC"
+checksum = "f3c576b6a73de460550d461e3f61166275033aa6150d4aa29fab32528e479256"
+start = "Copyright 2016-2017 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "crypto/perlasm/x86asm.pl"
+license = "Apache-2.0"
+checksum = "55a0eab58ad94232ecd3c1af468d1240815a189cd5f375280b881a41fb17320f"
+start = "Copyright 1995-2018 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/perlasm/x86nasm.pl"
+license = "Apache-2.0"
+checksum = "282890f0c56f60a67d34f8a677af01535327e80e4dfd3db94084e0f62faba13f"
+start = "Copyright 1999-2018 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "crypto/poly1305/poly1305.c"
+license = "ISC"
+checksum = "ed6813e62aea0e5af661f769415dc44e1d316c37487634181661d9c2ea974391"
+start = "Copyright (c) 2014, Google Inc."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "include/ring-core/aes.h"
+license = "Apache-2.0"
+checksum = "d9d921c5e40fe66c70c0f1a4a43f50e803aec92f3962601a2e4612e9372ea65b"
+start = "Copyright 2002-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "include/ring-core/base.h"
+license = "Apache-2.0"
+checksum = "9d61ee462c80af969e14230df8cbce12342c67b389a72b88b28a2d9795943702"
+start = "Copyright 2001-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "include/ring-core/check.h"
+license = "ISC"
+checksum = "8e18ea59b4050432ad697c45980486c5df0e42584dd11b39c93f18d0a1dffb2b"
+start = "Copyright 2020 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "include/ring-core/type_check.h"
+license = "Apache-2.0"
+checksum = "dceed5e4d560a54c1a3b6f17369e86e8e0d278fcf3a5c7ff6d9c63a7970dfdd8"
+start = "Copyright 1999-2016 The OpenSSL Project Authors. All Rights Reserved."
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "src/aead.rs"
+license = "ISC"
+checksum = "b294bfdf352052a345ee8a2230f7ee380a80bd1e9f5e6e3dd72fec470c09c7de"
+start = "Copyright 2015-2024 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/aead/aes.rs"
+license = "ISC"
+checksum = "a5465ef118fc7628b4f9740bd1d63145159ef87dfd95f1e04b7be965e3a56d0e"
+start = "Copyright 2018-2024 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/aead/algorithm.rs"
+license = "ISC"
+checksum = "f34c00ef951bf5580cb8f27330264be6e34ea18688252313e4a848bb1d45c444"
+start = "Copyright 2015-2021 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/aead/chacha.rs"
+license = "ISC"
+checksum = "abd785ff52ffcb0df97d8bb785f07dc22240312b9246861dbb1302ddb3bc63bb"
+start = "Copyright 2016 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/aead/chacha/fallback.rs"
+license = "ISC"
+checksum = "d8668783e779904e70075d269da190f1e0ee582c71833191d46835457884912f"
+start = "Copyright 2021 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/aead/chacha/ffi.rs"
+license = "ISC"
+checksum = "97578cb20126991fb838f9f097886673fd0be310656daac03f2614eebc2c522e"
+start = "Copyright 2016-2025 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/aead/gcm/fallback.rs"
+license = "ISC"
+checksum = "20366f8dc2e9424f0b6f63155aeae00e0c17abddf1dd451b8265943ef6bb1f0f"
+start = "Copyright (c) 2019, Google Inc."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/aead/gcm/ffi.rs"
+license = "ISC"
+checksum = "f9a1cc3c341c48a1501fc3459b22df60e78cc4398e3a7512c59bf919bb81a8fe"
+start = "Copyright 2018 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/aead/gcm/vclmulavx2.rs"
+license = "ISC"
+checksum = "1d65db160daf639dd90f3d747ac315961d8fda836dda2e66c148dce79e8158a7"
+start = "Copyright 2018-2025 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/aead/overlapping/array.rs"
+license = "ISC"
+checksum = "7857625aea8f9e7c09e4ab343334c07c13501a0224e8dc0a77cafa24bf3d5d69"
+start = "Copyright 2024 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/aead/poly1305/ffi_arm_neon.rs"
+license = "ISC"
+checksum = "17b27d7defa2f73628d69624d35c3e12adc80cb20e1dac134e53fc81fd49a109"
+start = "Copyright 2015-2025 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/agreement.rs"
+license = "ISC"
+checksum = "d8f42c568d9cb1ef1e5fd47a02289f54c727dcb13f5c787acc72a11042be8e72"
+start = "Copyright 2015-2017 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/arithmetic.rs"
+license = "ISC"
+checksum = "f7a53e8ec5f4773187a3ac7b7ab21cc2b61227b234c256772c73ee6287222c29"
+start = "Copyright 2017-2023 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/arithmetic/bigint.rs"
+license = "ISC"
+checksum = "82c24458281162082be0345644291cb5d30d1e6039ac22e808e025a5a1f824a1"
+start = "Copyright 2015-2023 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/arithmetic/ffi.rs"
+license = "ISC"
+checksum = "20958dd22b3ec7a1a214d46376ed5bb1bf267b9abc49bd7f9625bb6cdffa21bf"
+start = "Copyright 2024-2025 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/arithmetic/inout.rs"
+license = "ISC"
+checksum = "9a94a7370e87d326cc23a81bb39345c2631ad9f716cab7567f2fdb19df345910"
+start = "Copyright 2025 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/arithmetic/montgomery.rs"
+license = "ISC"
+checksum = "36a5afe4eb3ae1a9b12b78dd6031900e2694ca81cb6c515e4aeff5699448c05e"
+start = "Copyright 2017-2025 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/arithmetic/n0.rs"
+license = "ISC"
+checksum = "d2a812fd5b644b92ab0d300fe015bd8b2dc72b5481d00df870911e621bd2b783"
+start = "Copyright 2015-2022 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/bssl.rs"
+license = "ISC"
+checksum = "809ee279977210f99b1bd8b379d3eeadf9699a15ef2b95d45dddf1fde09487d1"
+start = "Copyright 2015 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/c.rs"
+license = "ISC"
+checksum = "1100d97e17b813acb72880f7083a4f32580fa69f70687bb1d193388227e8421a"
+start = "Copyright 2016-2019 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/cpu/arm.rs"
+license = "ISC"
+checksum = "d97ffd22b72f1874f38a9cbc2b0fe53c64137c5e8632d36257e0a0afde23a04a"
+start = "Copyright 2016-2024 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/cpu/intel.rs"
+license = "ISC"
+checksum = "b6fab7a583efbc71fcd40610add09449f6e71cf12bde68119dd5a3abb32253c8"
+start = "Copyright 2016-2021 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/debug.rs"
+license = "ISC"
+checksum = "14a67430aef942ebaf72deed89a78834d1725f7c99ebf5cbbad2585a44adeec5"
+start = "Copyright 2018 Trent Clarke."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/digest.rs"
+license = "ISC"
+checksum = "a14a56d7273b1d709d088f5c2b4bfa34246d15f5c7aa95c8a5d3d07f597d303f"
+start = "Copyright 2015-2019 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/digest/sha1.rs"
+license = "ISC"
+checksum = "904b266ceade273cb7d069f32413e97ced78f7edd46da853f4e72412b5d82f73"
+start = "Copyright 2015-2025 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/digest/sha2/fallback.rs"
+license = "ISC"
+checksum = "cdc992bbea93ccc7e683f23fc7996c14e2353a1501119dc756be2b5942e4db24"
+start = "Copyright 2019-2025 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/digest/sha2/mod.rs"
+license = "ISC"
+checksum = "6e836dece09cb8545ea358fb719f8524a37da10165b1aaf2caff4ae6c9b40928"
+start = "Copyright 2019-2024 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/ec/suite_b/ops/elem.rs"
+license = "ISC"
+checksum = "4f82af8e9a8ce6f24c2b326f67abd6c073b52a671c5cd3a78412dcb806d7f386"
+start = "Copyright 2017 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/ec/suite_b/ops/p256.rs"
+license = "ISC"
+checksum = "bf8edf396188613d2eb5554ba25bb4a708b317ab51c4a79661af7d840ea34999"
+start = "Copyright 2016-2023 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/limb.rs"
+license = "ISC"
+checksum = "b146bcea2f89d2e464f3d9cd13f1126e978c6228539bee216627c6366a05ee17"
+start = "Copyright 2016 David Judd."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/polyfill/array_split_map.rs"
+license = "ISC"
+checksum = "e62cbaf4a06213ce9f196480ef5e75337dca0658051890411d2806fa027f823e"
+start = "Copyright 2023 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/polyfill/unwrap_const.rs"
+license = "ISC"
+checksum = "23a7c0dc6250105447ef1136821d393583057d406648238ea99987135078ffe4"
+start = "Copyright 2022 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[rustls-webpki]
+clarify.license = "ISC"
+
+[[rustls-webpki.clarify.files]]
+path = "LICENSE"
+license = "ISC"
+checksum = "5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a"
+
+[[rustls-webpki.clarify.files]]
+path = "src/crl/mod.rs"
+license = "ISC"
+checksum = "d68ec5cbcf80ef02f43343b35f2164c0d9fd20e9dee53251fb3315cc975247e6"
+start = "Copyright 2023 Daniel McCarney."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[rustls-webpki.clarify.files]]
+path = "src/end_entity.rs"
+license = "ISC"
+checksum = "86b1a2f7c8c18853d4787a99945eeb6052efd92ae73bbc97aa7b41e6d54517db"
+start = "Copyright 2015-2021 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[rustls-webpki.clarify.files]]
+path = "src/subject_name/dns_name.rs"
+license = "ISC"
+checksum = "66dda4d9bdc61d98f9b0f51d88a0c543bd032146ddb1096b8e612c77a4c2b0aa"
+start = "Copyright 2015-2020 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[rustls-webpki.clarify.files]]
+path = "src/subject_name/mod.rs"
+license = "ISC"
+checksum = "9fbef21ebbdf736edcdadb087f3fd76620a8fdea779691524edddbbd8d6ef1a5"
+start = "Copyright 2022 Rafael Fernández López."
+end = "PERFORMANCE OF THIS SOFTWARE."
+
+[[rustls-webpki.clarify.files]]
+path = "src/time.rs"
+license = "ISC"
+checksum = "21bb9eae41703936836ee16557c96e26dd8a4b772f771821af027f1d18573b79"
+start = "Copyright 2015-2016 Brian Smith."
+end = "PERFORMANCE OF THIS SOFTWARE."
