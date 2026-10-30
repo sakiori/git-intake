@@ -25,6 +25,15 @@ const STATE_VERSION: u32 = 4;
 /// from source reports `0.0.0`.
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
 
+/// The releases that keep the update state in each format, so that a
+/// refusal can name the release to finish an update with.
+const FORMAT_RELEASES: &[(u64, &str)] = &[
+    (1, "v0.1.0"),
+    (2, "v0.2.0 to v0.2.2"),
+    (3, "v0.3.0 to v0.3.1"),
+    (4, "v0.3.2 and later"),
+];
+
 /// The update worktree, relative to the main worktree. It lives under
 /// `.worktrees/<branch>`, where these repositories keep their worktrees, and
 /// never in the git directory: tools such as compilers, bundlers and
@@ -350,11 +359,16 @@ pub struct MergeRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateState {
     pub version: u32,
-    /// The release that started the update. Another release of the same
-    /// state format carries it on with a warning; a state without it was
-    /// started before releases recorded themselves.
+    /// The release that started the update, set only by `start`. Another
+    /// release of the same state format carries it on with a warning; a
+    /// state without it was started before releases recorded themselves, or
+    /// does not come from `start`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release: Option<String>,
+    /// The release that last warned that another release started the
+    /// update, so that it warns once rather than at every command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_warned: Option<String>,
     /// The configuration read from the integration tip at `start`.
     pub config: Config,
     /// Integration tip at `start`.
@@ -388,6 +402,7 @@ impl UpdateState {
         Self {
             version: STATE_VERSION,
             release: Some(RELEASE.to_string()),
+            release_warned: None,
             config,
             base,
             branch: UPDATE_BRANCH.to_string(),
@@ -447,24 +462,38 @@ fn other_format(path: &Path, version: Option<u64>, release: Option<&str>) -> Str
              the update with that release or a later one that understands format {version} ({path})"
         )
     } else {
+        let with = match FORMAT_RELEASES.iter().find(|(f, _)| *f == version) {
+            Some((_, releases)) => {
+                format!("a release that keeps format {version} (git-intake {releases})")
+            }
+            None => "the release that started it".to_string(),
+        };
         format!(
             "{started} that keeps its state in format {version}; {this}. Finish or abort the update with \
-             the release that started it, then start it again with this release ({path})"
+             {with}, then start it again with this release ({path})"
         )
     }
 }
 
 /// A warning when another release of the same state format carries on the
-/// update: the update keeps working, but what each release does may differ.
+/// update and has not warned yet: the update keeps working, but what each
+/// release does may differ. Starting over is advised only before `finish`:
+/// once it moved a branch or published a merge request, `abort` would undo
+/// or withdraw work that is already out.
 pub fn release_warning(state: &UpdateState) -> Option<String> {
     let started = state.release.as_deref()?;
-    (started != RELEASE).then(|| {
-        format!(
-            "the update was started by git-intake {started} and is carried on by git-intake {RELEASE}; \
-             both understand its state, but they may differ in what they do. To use one release \
-             throughout, run `git intake abort` and start the update again"
-        )
-    })
+    if started == RELEASE || state.release_warned.as_deref() == Some(RELEASE) {
+        return None;
+    }
+    let advice = if state.finishing.is_none() && state.merge_request.is_none() {
+        " To use one release throughout, run `git intake abort` and start the update again."
+    } else {
+        ""
+    };
+    Some(format!(
+        "the update was started by git-intake {started} and is carried on by git-intake {RELEASE}; \
+         both understand its state, but they may differ in what they do.{advice}"
+    ))
 }
 
 /// Reads the record of the last finished update, or `None` when there is
@@ -486,14 +515,23 @@ enum Versioned {
     },
 }
 
-fn read(path: &Path) -> Result<Option<Versioned>> {
+/// The state file as JSON, whatever its format, or `None` when there is none.
+fn read_value(path: &Path) -> Result<Option<serde_json::Value>> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
     };
+    let value = serde_json::from_str(&text)
+        .with_context(|| format!("the update state in {} is unreadable", path.display()))?;
+    Ok(Some(value))
+}
+
+fn read(path: &Path) -> Result<Option<Versioned>> {
+    let Some(value) = read_value(path)? else {
+        return Ok(None);
+    };
     let unreadable = || format!("the update state in {} is unreadable", path.display());
-    let value: serde_json::Value = serde_json::from_str(&text).with_context(unreadable)?;
     // The version is checked before the shape, so that a state written by
     // another release is named as such rather than as unreadable.
     let version = value.get("version").and_then(serde_json::Value::as_u64);
@@ -626,10 +664,20 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.contains("Finish or abort the update with the release"),
+            err.contains("with a release that keeps format 2 (git-intake v0.2.0 to v0.2.2)"),
             "{err}"
         );
         assert!(load_finished(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn every_format_up_to_this_one_names_its_releases() {
+        for format in 1..=u64::from(STATE_VERSION) {
+            assert!(
+                FORMAT_RELEASES.iter().any(|(f, _)| *f == format),
+                "{format}"
+            );
+        }
     }
 
     #[test]
@@ -656,11 +704,23 @@ mod tests {
         assert_eq!(state.release.as_deref(), Some(RELEASE));
         assert_eq!(release_warning(&state), None);
         state.release = Some("0.0.1-other".to_string());
+        let warning = release_warning(&state).unwrap();
         assert!(
-            release_warning(&state)
-                .unwrap()
-                .starts_with("the update was started by git-intake 0.0.1-other")
+            warning.starts_with("the update was started by git-intake 0.0.1-other"),
+            "{warning}"
         );
+        assert!(warning.contains("`git intake abort`"), "{warning}");
+        // Once `finish` began, starting over is not advised.
+        state.finishing = Some(Finishing {
+            moves: Vec::new(),
+            push_error: None,
+            unpublished: Vec::new(),
+        });
+        assert!(!release_warning(&state).unwrap().contains("abort"));
+        // A release warns once.
+        state.release_warned = Some(RELEASE.to_string());
+        assert_eq!(release_warning(&state), None);
+        state.release_warned = None;
         // A state from before releases recorded themselves names none.
         state.release = None;
         assert_eq!(release_warning(&state), None);

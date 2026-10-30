@@ -127,9 +127,11 @@ impl Repo {
     /// missing.
     pub fn require_state(&self) -> Result<UpdateState> {
         match self.state()? {
-            Some(s) => {
+            Some(mut s) => {
                 if let Some(warning) = state::release_warning(&s) {
                     eprintln!("warning: {warning}");
+                    s.release_warned = Some(state::RELEASE.to_string());
+                    self.save_state(&s)?;
                 }
                 self.restore_held_references(&s)?;
                 Ok(s)

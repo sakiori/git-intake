@@ -337,7 +337,16 @@ In each case where it proceeds, it deletes the merge request branch from the pub
 
 ### The update state
 
-The update state lives in `<git-common-dir>/git-intake/state.json`, which every worktree shares and no commit can carry. Its format has a version, and the state records the release that started the update. A state in any other format, older or newer, is refused by every command that reads the update: it names both formats and the release that started the update when the state records it, and advises finishing or aborting the update with that release (for a newer format, with that release or a later one that reads it). An update started by a release that kept the update worktree in the git directory is such a case. Another release with the same format carries the update on, but `continue`, `verify` and `finish` warn that a different release started it.
+The update state lives in `<git-common-dir>/git-intake/state.json`, which every worktree shares and no commit can carry. Its format has a version, and the state records the release that started the update. A state in any other format, older or newer, is refused by every command that reads the update: it names both formats and the release that started the update when the state records it, and advises finishing or aborting the update with a release that keeps that format. The formats belong to these releases:
+
+| Format | Releases |
+| --- | --- |
+| 1 | v0.1.0 |
+| 2 | v0.2.0 to v0.2.2 |
+| 3 | v0.3.0 to v0.3.1 (the update worktree in the git directory) |
+| 4 | v0.3.2 and later |
+
+A newer format is refused with the advice to use the release that started the update, or a later one that reads its format. Another release with the same format carries the update on; the first of `continue`, `verify` and `finish` that it runs warns once that a different release started it. Before `finish`, the warning advises `abort` and a new `start` to use one release throughout; once `finish` has moved a branch or opened the merge request, it gives no such advice, because `abort` would withdraw what is already published.
 
 ## The sync record
 

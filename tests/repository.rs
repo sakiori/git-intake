@@ -681,7 +681,7 @@ fn state_files_of_another_format_are_named_or_ignored() {
         assert!(
             err.contains(
                 "the update in progress was started by a release that keeps its state in format 2; \
-                 this release (git-intake 0.0.0) understands format 4. Finish or abort the update with the release that started it"
+                 this release (git-intake 0.0.0) understands format 4. Finish or abort the update with a release that keeps format 2 (git-intake v0.2.0 to v0.2.2), then start it again with this release"
             ),
             "{args:?}: {err}"
         );
@@ -743,18 +743,28 @@ fn state_of_a_newer_or_unknown_format_is_refused() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), unversioned);
 }
 
+/// Reads the update state of `f`, applies `edit` to it and writes it back.
+fn edit_state(f: &Fork, edit: impl FnOnce(&mut serde_json::Value)) -> serde_json::Value {
+    let path = f.env.intake_dir(&f.down).join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    edit(&mut state);
+    std::fs::write(&path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    state
+}
+
+const OTHER_RELEASE: &str =
+    "warning: the update was started by git-intake 0.0.1 and is carried on by git-intake 0.0.0";
+
 #[test]
-fn another_release_of_the_same_format_continues_with_a_warning() {
+fn another_release_of_the_same_format_continues_with_a_warning_once() {
     let f = Fork::new();
     let env = &f.env;
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
-    let path = env.intake_dir(&f.down).join("state.json");
-    let read = || -> serde_json::Value {
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
-    };
     // The state records the release that started the update.
-    assert_eq!(read()["release"], "0.0.0");
+    let state = edit_state(&f, |_| {});
+    assert_eq!(state["release"], "0.0.0");
 
     // The same release carries on silently.
     let verified = f.tool(&["verify"]).success();
@@ -764,18 +774,40 @@ fn another_release_of_the_same_format_continues_with_a_warning() {
         stderr(&verified)
     );
 
-    let mut state = read();
-    state["release"] = "0.0.1".into();
-    std::fs::write(&path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-    let finished = f.tool(&["finish"]).success();
+    // Another release warns once, and before `finish` advises how to use one
+    // release throughout.
+    edit_state(&f, |s| s["release"] = "0.0.1".into());
+    let first = stderr(&f.tool(&["verify"]).success());
+    assert!(first.contains(OTHER_RELEASE), "{first}");
     assert!(
-        stderr(&finished).contains(
-            "warning: the update was started by git-intake 0.0.1 and is carried on by git-intake 0.0.0"
-        ),
-        "{}",
-        stderr(&finished)
+        first.contains("run `git intake abort` and start the update again"),
+        "{first}"
     );
+    assert_eq!(edit_state(&f, |_| {})["release_warned"], "0.0.0");
+    let again = stderr(&f.tool(&["verify"]).success());
+    assert!(!again.contains("warning:"), "{again}");
+    let finished = stderr(&f.tool(&["finish"]).success());
+    assert!(!finished.contains("warning:"), "{finished}");
     env.assert_no_update(&f.down);
+}
+
+#[test]
+fn another_release_waiting_for_the_merge_request_is_not_advised_to_abort() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+
+    // `abort` would withdraw the published merge request branch, so the
+    // warning gives no such advice while the update waits.
+    edit_state(&f, |s| s["release"] = "0.0.1".into());
+    let first = stderr(&f.tool(&["finish"]).success());
+    assert!(first.contains(OTHER_RELEASE), "{first}");
+    assert!(!first.contains("abort"), "{first}");
+    let again = stderr(&f.tool(&["finish"]).success());
+    assert!(!again.contains("warning:"), "{again}");
 }
 
 #[test]
@@ -822,7 +854,7 @@ fn update_with_its_worktree_in_the_git_directory_is_refused() {
             assert!(
                 err.contains(
                     "the update in progress was started by a release that keeps its state in format 3; \
-                     this release (git-intake 0.0.0) understands format 4. Finish or abort the update with the release that started it"
+                     this release (git-intake 0.0.0) understands format 4. Finish or abort the update with a release that keeps format 3 (git-intake v0.3.0 to v0.3.1), then start it again with this release"
                 ),
                 "{args:?} in {}: {err}",
                 dir.display()
