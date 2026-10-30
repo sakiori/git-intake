@@ -1229,13 +1229,9 @@ fn sync_by_push_names_an_update_that_changes_the_pipeline() {
         "upstream: ci",
     );
     let out = stdout(&f.tool(&["sync"]).success());
-    assert!(
-        out.contains(
-            "the update changes its own checks: `.gitlab-ci.yml`; the checks that verify it are \
-             the ones it brings"
-        ),
-        "{out}"
-    );
+    let notice = "the update changes its own checks: `.gitlab-ci.yml`; the checks that verify it are \
+                  the ones it brings";
+    assert_eq!(out.matches(notice).count(), 1, "{out}");
 }
 
 #[test]
