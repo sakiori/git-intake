@@ -37,10 +37,11 @@ None.
 - `finish` in merge-request mode no longer waits, completes or catches up an update after the merge request is opened; `sync` catches up an open merge request, and the next `start` brings the local integration branch up to date after the merge. Users and scripts that ran `finish` again after a merge stop needing to.
 - In merge-request mode `finish` no longer requires `verify`, and a catch-up no longer runs the checks; projects that relied on local verification before review rely on the merge request pipeline instead and use `git intake env` to pass the update's variables to it.
 - In merge-request mode `start` refuses a local integration branch with commits the publish remote lacks, as `sync` does, since they would ride along in the merge request.
-- A sync record counts only on a merge commit whose second parent is its target, so the trailers a squash commit's message copies do not count.
+- A sync record counts only on a merge commit whose second parent is its target, so the trailers a squash commit's message copies do not count; such commits already on an integration branch stop counting as records.
+- An update that changes the CI definition or the configured checks says so in its merge request, because the pipeline that verifies it then runs what it brings.
 - The target variable of a port upstream becomes the newest commit the update takes or decides, the same for `verify` and `env`.
 - Every command refuses to run in a shallow repository; CI jobs fetch the full history.
 - New dependencies: an HTTP client with TLS and a JSON reader for the forge's responses, behind one forge interface.
 - The README's merge request publication, commands, exit status and environment sections change, and gain a section on running updates in CI for GitLab and GitHub, including which tokens trigger the merge request's pipeline.
-- The state format stays 5. An update of format 4 or 5 that waits for its merge request is handed over or withdrawn as above; earlier releases can carry on an update started by `start` of this one, but not one `sync` carried on from a merge request.
+- The state format stays 5. An update of format 4 or 5 that waits for its merge request is handed over or withdrawn as above; earlier releases can carry on an update started by this one, under their own rules.
 - The README states what running upstream code in CI exposes and how to contain it: protected variables, a GitHub token without the Workflows permission, and only the push credential in push-mode jobs.

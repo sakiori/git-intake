@@ -90,43 +90,47 @@ Before every push of an update branch to GitHub, the tool SHALL read the reposit
 - **THEN** `finish` and `sync` refuse, push nothing, and say that the update's merge commits cannot land
 
 ### Requirement: Unconfirmed GitHub merge settings
-When the token cannot read what the GitHub merge settings require, as the classic protection's up-to-date setting without administration access or whether merge commits are allowed without push access, the tool SHALL refuse, pushing nothing, say which requirement could not be confirmed, and name a ruleset, or the access the token lacks, as the ways to let it.
+When the token cannot read what the GitHub merge settings require, as a protected branch's classic protection, its up-to-date checks, merge queue and linear history, without administration access, or whether merge commits are allowed without push access, the tool SHALL refuse, pushing nothing, say which requirement could not be confirmed, and name a ruleset, or the access the token lacks, as the ways to let it.
 
 #### Scenario: Classic protection unreadable
 - **WHEN** a GitHub repository requires up-to-date status checks only through classic branch protection, and the token cannot read it
 - **THEN** `finish` and `sync` refuse, push nothing, say that the requirement could not be confirmed, and name a ruleset or administration read access
 
 ### Requirement: Selectable squash or rebase
-When the forge's settings let the person merging choose a squash or a rebase merge for the update's merge request, the tool SHALL warn, each time it pushes the update, that such a merge drops the update's history.
+When the forge lets a person squash or rebase the update's merge request, by the merge method or a button that rebases the branch, as GitLab's rebase with fast-forward or semi-linear merges and GitHub's update with rebase, the tool SHALL warn, each time it pushes the update, that doing so drops the update's history.
 
 #### Scenario: Squash on request
 - **WHEN** a GitLab project's squash option is `default_off`, or a GitHub repository allows squash merges and no rule limits the integration branch to merge commits
 - **THEN** `finish` and `sync` publish the update and warn that a squash or rebase merge drops its history
 
+### Requirement: Update line
+The update line of a head over a base SHALL lead from the head to the first commit the base contains, stepping from a merge whose first parent the base contains and that carries no sync record, as a catch-up merge or a merged results commit, to its second parent, and from every other commit to its first parent. The update's sync records and copies SHALL be those on that line.
+
+#### Scenario: Upstream with sync records of its own
+- **WHEN** an update merges an upstream whose own history carries sync records of an upstream with the same name
+- **THEN** only the update's own sync merge counts for the update
+
+#### Scenario: Branch updated by the forge
+- **WHEN** a person merged the integration branch into the merge request branch with the forge's update button
+- **THEN** the update line follows the merge request branch's side, and the update's sync records count
+
 ### Requirement: Rewritten merge request branch
-The tool SHALL treat the update's merge request as rewritten when, between its head and the head's merge base with the integration tip, no commit is a merge carrying a sync record and none carries a copy, or when the forge records that its branch was rewritten: on GitHub a force push in the pull request's timeline, on GitLab a version of the merge request whose commits the newest version lacks. `sync` SHALL refuse to act on an open rewritten merge request and name it.
+The tool SHALL treat the update's merge request as rewritten when the forge records a rewrite of its branch, a force push in a GitHub pull request's timeline or a GitLab version whose head the current head does not contain, or, while it is open, when its update line carries no sync record and no copy. `sync` SHALL refuse to act on an open rewritten merge request, naming it and `abort --merge-request`.
 
 #### Scenario: Rebased merge request
 - **WHEN** the merge request branch was rebased with the forge's rebase button
-- **THEN** `sync` refuses, names the merge request, and pushes nothing
+- **THEN** `sync` refuses, names the merge request and `abort --merge-request`, and pushes nothing
 
 #### Scenario: Port copies kept by a rebase
 - **WHEN** a merge request of an update with a follow and a port upstream was rebased, keeping the copies and dropping the sync merge
 - **THEN** `sync` refuses as for any rewritten merge request
 
 ### Requirement: Merge request merged without its history
-A merged update's merge request whose head the integration branch does not contain, or that was rewritten before the merge, SHALL count as merged without its history. When the follow targets `sync` would merge equal the targets of the sync records such a merge request carried, as the forge lists its commits, `sync` SHALL refuse, name it, and say that the targets are recorded by publishing them with `start` and `finish`.
+A merged update's merge request whose final head, as the forge reports it, the integration branch does not contain, or that the forge records as rewritten, SHALL count as merged without its history. When `sync` then proposes the same targets again, it SHALL warn, naming that merge request, and name it in the new merge request's description.
 
 #### Scenario: Squashed merge request
-- **WHEN** the newest merged merge request of the update was squashed and no upstream moved since
-- **THEN** `sync` refuses, names the merge request, says that its squash dropped the sync records, and names `start` and `finish`
-
-### Requirement: Sync records only on merges
-A sync record SHALL count only on a merge commit whose second parent is the record's target.
-
-#### Scenario: Squash message with trailers
-- **WHEN** a squash commit's message ends with `Intake-Upstream` and `Intake-Target` trailers copied from the update's merge
-- **THEN** the trailers do not count as a sync record
+- **WHEN** the most recently merged merge request of the update was squashed and no upstream moved since
+- **THEN** `sync` opens a merge request for the same targets, warns that the squash dropped the sync records, and names the squashed merge request in the new description
 
 ### Requirement: Unattended synchronisation
 `sync` SHALL take the repository's follow upstreams in without an update state. It SHALL refuse when an update is in progress, naming its step and the next command, and when the configuration has no publication setting. A conflict, or in push mode failed checks, SHALL stop it with the update in progress; a refusal SHALL leave no update it created.
@@ -155,7 +159,7 @@ Like `start`, `sync` SHALL read the configuration at `HEAD`, fetch the publish r
 - **THEN** it refuses, names the commit count, and changes nothing
 
 ### Requirement: Upstreams sync cannot take
-`sync` SHALL leave out an upstream it cannot fetch, without a release its `tags` pattern selects, or rewritten, name it with the reason, and take the others. It SHALL leave out port upstreams and name those with pending commits.
+`sync` SHALL leave out every follow upstream for which `start` would refuse when it is the only one selected, as one it cannot fetch, without a release, rewritten, or whose path cannot take it, name it with the reason, and take the others. It SHALL leave out port upstreams and name those with pending commits.
 
 #### Scenario: Unreachable upstream
 - **WHEN** one of two follow upstreams cannot be fetched and the other is behind
@@ -166,7 +170,7 @@ Like `start`, `sync` SHALL read the configuration at `HEAD`, fetch the publish r
 - **THEN** it starts nothing, names the port upstream and its pending commits, and exits with status 0
 
 ### Requirement: Exit status of synchronisation
-`sync` SHALL exit with status 2 when it refused or failed, 1 when it stopped on a conflict or failed checks or left out an upstream it could not fetch, without a release, or rewritten, and 0 otherwise.
+`sync` SHALL exit with status 2 when it refused or failed, 1 when it stopped on a conflict or failed checks or left out a follow upstream it could not take, and 0 otherwise.
 
 #### Scenario: Nothing behind
 - **WHEN** `sync` runs and every follow upstream is current, with no merge request open
@@ -225,7 +229,7 @@ In push mode, `sync` SHALL start an update of every follow upstream the integrat
 - **THEN** `sync` exits with status 1, publishes nothing, and leaves the update in progress, unverified
 
 ### Requirement: Declined update targets
-When the update's merge request is not open and the newest one was closed without merging, `sync` SHALL take, for each upstream, the target of the newest sync record among that merge request's commits as the forge lists them. When these equal the follow targets it would merge, it SHALL start nothing, name the closed merge request, say that it declined these targets, and exit with status 0.
+When the update's merge request is not open and the one closed or merged most recently was closed without merging, `sync` SHALL read the follow targets recorded in its description. When these equal the follow targets it would merge, it SHALL start nothing, name the closed merge request, say that it declined these targets, and exit with status 0. A description without readable targets SHALL decline nothing.
 
 #### Scenario: Merge request closed without merging
 - **WHEN** a person closed the update's merge request without merging and no upstream moved since
@@ -240,7 +244,7 @@ When the update's merge request is not open and the newest one was closed withou
 - **THEN** the update is published and its merge request opened as for any other
 
 ### Requirement: Update branch without an open merge request
-When `git-intake/update` exists on the publish remote and no merge request from it is open, `finish` and `sync` SHALL delete it without force where it points at the head of a closed or merged merge request of the update or at a commit the integration tip contains. When it holds an update no merge request carries, as after an interrupted `finish`, `sync` SHALL carry it on and open its merge request; otherwise `finish` SHALL refuse.
+When `git-intake/update` exists at the fetch URL with no merge request open from it, `finish` and `sync` SHALL treat it as left over when it holds, beyond the integration tip or the head of a closed or merged merge request of the update, only catch-up merges, and delete it on each push URL only while it points at the commit read. `sync` SHALL carry on one holding an update, under the declined targets rule; `finish` SHALL push over one its update head contains; otherwise both SHALL refuse.
 
 #### Scenario: Branch kept after a decline
 - **WHEN** a pull request from `git-intake/update` was closed without merging, GitHub kept its branch, and an upstream moved on
@@ -250,12 +254,16 @@ When `git-intake/update` exists on the publish remote and no merge request from 
 - **WHEN** a CI job pushed `git-intake/update` and was killed before the merge request was opened
 - **THEN** the next `sync` in a fresh clone opens the merge request for that branch without starting another update
 
+#### Scenario: Catch-up left after a decline
+- **WHEN** a catch-up merge was pushed to `git-intake/update` just after its merge request was closed, and the branch was not deleted
+- **THEN** the next `sync` deletes the branch and opens no merge request for the declined targets
+
 #### Scenario: Branch of unknown origin
 - **WHEN** `git-intake/update` holds commits that carry no update and no merge request of the update points at
 - **THEN** `finish` and `sync` refuse, push nothing, and name the branch and the push URL
 
 ### Requirement: Carrying on a merge request's update
-To carry on the update a merge request or its branch holds, `sync` SHALL put the update branch at that head in the update worktree, the base at the head's merge base with the integration tip, and queue as merged or carried out each upstream whose sync record or copy lies between them: a follow upstream with the target of its newest sync record there and the last synced commit at the base as its previous commit, a port upstream with the commits its copies take and its journal decides there.
+To carry on the update a merge request or its branch holds, `sync` SHALL put the update branch at that head in the update worktree, the base at the head's merge base with the integration tip, and queue as merged or carried out each upstream whose sync record or copy is on the update line: a follow upstream with the target of its newest sync record there and the last synced commit at the base as its previous commit, a port upstream with the commits its copies take and its journal decides there.
 
 #### Scenario: Status of a carried-on update
 - **WHEN** `sync` stopped on a catch-up conflict of a merge request opened by another clone, and `status` runs
@@ -296,25 +304,32 @@ In merge-request mode `finish` SHALL move no local branch, catch up with the pub
 - **THEN** `finish` pushes nothing, opens no merge request, removes the update, and says that the update already landed
 
 ### Requirement: Merge request branch on the remote
-`finish` SHALL refuse, pushing nothing and keeping the update, when the update's open merge request has a head the update head does not contain, naming it, `sync` and `abort --merge-request`. It SHALL push only where the branch is not at the update head, and never rewrite or force-push it.
+`finish` SHALL refuse, pushing nothing and keeping the update, when the update's open merge request has a head the update head does not contain, naming it, `abort` followed by `sync` to carry it on, and `abort --merge-request` to withdraw it. It SHALL push only where the branch is not at the update head, and never rewrite or force-push it.
 
 #### Scenario: Merge request of another update open
 - **WHEN** an update started with `start` reaches `finish` while the update's merge request is open with a head the update head does not contain
-- **THEN** `finish` pushes nothing, names the merge request, `sync` and `abort --merge-request`, and keeps the update
+- **THEN** `finish` pushes nothing, names the merge request, `abort` followed by `sync`, and `abort --merge-request`, and keeps the update
 
 ### Requirement: Merge request state before the push
-Just before it pushes to an open merge request's branch, the tool SHALL read the merge request's state and head and the remote's integration branch again, and push nothing unless the merge request is still open at the head it read and the integration branch is as fetched. When the merge request was merged or closed after the push, it SHALL delete the branch it pushed while it is at the pushed commit and refuse.
+Just before it pushes to an open merge request's branch, the tool SHALL read the merge request's state and head and the remote's integration branch again, and push nothing unless all are as read before; a merge request merged or closed meanwhile SHALL end the run with status 0 and say so. Right after the push it SHALL read the state again and, when the merge request is no longer open, delete the branch while it is at the pushed commit.
 
 #### Scenario: Merged during a catch-up
 - **WHEN** the merge request is merged while `sync` catches it up, before the push
-- **THEN** `sync` pushes nothing, opens no merge request, and refuses
+- **THEN** `sync` pushes nothing, opens no merge request, says that the merge request was merged, and exits with status 0
+
+### Requirement: Changes to the update's own checks
+When an update changes the forge's CI definition, `.github/workflows/` on GitHub or the project's CI configuration file on GitLab, or the install command or checks of `.git-intake.toml`, `finish` and `sync` SHALL name those changes in their output and in the merge request's description, since the pipeline that verifies the update then runs what the update brings.
+
+#### Scenario: Upstream changes the pipeline
+- **WHEN** a root upstream's update changes `.gitlab-ci.yml`
+- **THEN** `sync` names the change in its output and in the merge request's description
 
 ### Requirement: Title and description of the merge request
-Whenever it pushes an update for a merge request, the tool SHALL set the merge request's title, naming the updated upstreams, and its description, listing each `follow` upstream's merged range with the upstream tag of its target and each `port` upstream's taken commits and decisions. The title and description SHALL belong to the tool.
+Whenever it pushes an update for a merge request, the tool SHALL set the title, naming the updated upstreams, and the description, listing each `follow` upstream's merged range with the tag of its target and each `port` upstream's taken commits and decisions, ending with a block hidden when rendered that records each follow upstream's target. On GitLab it SHALL ask again for squashing off. The title and description SHALL belong to the tool.
 
 #### Scenario: Description after a catch-up
 - **WHEN** a catch-up merge is pushed to an open merge request whose description a person edited
-- **THEN** the merge request's title and description describe the update at its new head
+- **THEN** the merge request's title and description describe the update at its new head, with the hidden block of its targets
 
 ### Requirement: Local update after publication
 Only after the merge request exists SHALL `finish` remove the update worktree, the update branch, the update's upstream references and the state, name the merge request with its address, and exit successfully; the merge request carries the update from then on. A `finish` interrupted before the merge request exists SHALL keep the update, and run again SHALL push only what is missing and open the merge request.
@@ -328,7 +343,7 @@ Only after the merge request exists SHALL `finish` remove the update worktree, t
 - **THEN** `start` fast-forwards the local integration branch to the publish remote's, and `status` shows every merged upstream's target as its last synced commit
 
 ### Requirement: Withdrawing a merge request
-`abort --merge-request` SHALL, with no update in progress, close through the API the update's open merge request and delete its branch on each push URL where it points at the merge request's head, or delete a branch the update's closed merge request left, and report what remains; with neither it SHALL say that there is nothing to withdraw. `abort` without it SHALL never close a merge request, and with no update in progress SHALL name `abort --merge-request` when one is open.
+`abort --merge-request` SHALL remove a local update in progress, then close through the API the update's open merge request, and delete the update's branch on each push URL while it points at the commit read, open merge request or not, reporting what remains; with neither it SHALL say that there is nothing to withdraw. `abort` without it SHALL never close a merge request, and with no update in progress SHALL name `abort --merge-request` when one is open.
 
 #### Scenario: Withdraw the merge request
 - **WHEN** a merge request opened by `sync` is open and `abort --merge-request` runs on a clone with no update in progress
@@ -342,8 +357,12 @@ Only after the merge request exists SHALL `finish` remove the update worktree, t
 - **WHEN** `abort --merge-request` closed the merge request and stopped before deleting the branch, and runs again
 - **THEN** it deletes the branch the closed merge request left
 
+#### Scenario: Withdraw while carrying on
+- **WHEN** `abort --merge-request` runs while an update carried on from the open merge request stopped on a catch-up conflict
+- **THEN** the local update is removed, the merge request is closed, and its branch is deleted
+
 ### Requirement: Update variables from history
-`env` SHALL set, from history alone, the variables `verify` sets for a commit, `HEAD` unless a revision is named, with the same values. The base SHALL be the commit's merge base with the integration tip: the publish remote's integration branch fetched for the command, or else the local one. The upstream variables SHALL come from the sync records, copies and journal changes after the base and from the integration line at the base.
+`env` SHALL set, from history alone, the variables `verify` sets for a commit, `HEAD` unless a revision is named, with the same values. The base SHALL be the commit's merge base with the integration tip: the publish remote's integration branch fetched for the command, or else the local one. The upstream variables SHALL come from the sync records and copies on the update line, the journal changes after the base, and the integration line at the base.
 
 #### Scenario: Merge request pipeline
 - **WHEN** a pipeline job of an update's merge request runs `git intake env -- ./check.sh` on the merge request's head
@@ -354,7 +373,7 @@ Only after the merge request exists SHALL `finish` remove the update worktree, t
 - **THEN** `GIT_INTAKE_BASE` is that integration tip, `GIT_INTAKE_HEAD` is the merge, and the upstream variables are those of the update
 
 ### Requirement: Commit without an update
-When the integration tip contains the commit, or no commit after the base carries a sync record or a copy, `env` SHALL set no variable, say on standard error that the commit carries no update, and exit with status 0.
+When the integration tip contains the commit, or its update line carries no sync record and no copy, `env` SHALL set no variable, say on standard error that the commit carries no update, and exit with status 0.
 
 #### Scenario: Not an update
 - **WHEN** `env` runs on a commit of the integration branch or of a branch without sync records or copies
@@ -376,7 +395,7 @@ By default `env` SHALL print one `export` assignment per variable, quoted for th
 - **THEN** each line is `NAME=value` with the value unquoted, and `GIT_INTAKE_UPSTREAMS` holds both names separated by a space
 
 ### Requirement: Shallow repository
-Every command SHALL refuse in a shallow repository before it changes anything, saying that the integration line needs the full history and naming `git fetch --unshallow`.
+Every command other than `abort` and `migrate` SHALL refuse in a shallow repository before it changes anything, saying that the integration line needs the full history and naming `git fetch --unshallow`.
 
 #### Scenario: Shallow CI clone
 - **WHEN** `sync` or `env` runs in a clone made with a limited depth
@@ -478,7 +497,7 @@ The tool SHALL read a repository's settings from a `.git-intake.toml` file commi
 - **THEN** the tool refuses to run and names the remote and the upstream
 
 ### Requirement: Resumable state
-The tool SHALL keep the state of an update in the repository's common git directory, visible from every worktree, and the update worktree at `.worktrees/git-intake/update` in the main worktree, never inside the git directory. Unless that path is ignored already, `start` and `sync` SHALL add the line `/.worktrees/` to the repository's `info/exclude` once, without changing a committed ignore file, so that the main checkout does not show the update worktree. Every command SHALL act on that state: `continue` carries out a plan, concludes a resolved merge, copy or catch-up merge, and goes on with the remaining queued upstreams or planned commits; `status` shows the step reached, each queued upstream as merged, at its plan, in conflict or pending, a catch-up merge in conflict or awaiting verification, and what comes next; and `abort` removes the worktree, the update branch, the plan, the update's upstream references, its logs and the state without touching the integration branch. A `follow` upstream SHALL count as merged only when the history of the update branch head carries its sync record for its target, and a `port` upstream as carried out only when its plan has been carried out to the journal commit. Once `finish` has begun moving branches, `abort` SHALL refuse and name `finish` as the way to complete the update. The tool SHALL read an update state of format 4 as its own; the first command that changes the update SHALL write it in format 5 and say that releases before v0.3.6 can no longer carry it on, and the first of `continue`, `verify` and `finish` SHALL warn once that an earlier release started the update, as for another release of the same format. It SHALL refuse an update state in any other format than its own and format 4, older or newer, or without a format, name both formats and, where the state records it, the release that started the update, and advise finishing or aborting the update with a release that keeps that format, naming the releases of each format (1: v0.1.0; 2: v0.2.0 to v0.2.2; 3: v0.3.0 to v0.3.1; 4: v0.3.2 to v0.3.5; 5: from v0.3.6), or for a newer format with the release that started it or a later one that reads it. For format 3, the refusal SHALL name `migrate` first. Only `start` and `sync` SHALL record the release that started the update in the state. The first of `continue`, `verify` and `finish` run by another release of the same format SHALL warn once, without refusing, and record that it warned; it SHALL advise aborting and starting again only before `finish` has moved a branch or pushed the update.
+The tool SHALL keep the state of an update in the repository's common git directory, visible from every worktree, and the update worktree at `.worktrees/git-intake/update` in the main worktree, never inside the git directory. Unless that path is ignored already, `start` and `sync` SHALL add the line `/.worktrees/` to the repository's `info/exclude` once, without changing a committed ignore file, so that the main checkout does not show the update worktree. Every command SHALL act on that state: `continue` carries out a plan, concludes a resolved merge, copy or catch-up merge, and goes on with the remaining queued upstreams or planned commits; `status` shows the step reached, each queued upstream as merged, at its plan, in conflict or pending, a catch-up merge in conflict or, where verification is required, awaiting it, and what comes next; and `abort` removes the worktree, the update branch, the plan, the update's upstream references, its logs and the state without touching the integration branch. A `follow` upstream SHALL count as merged only when the history of the update branch head carries its sync record for its target, and a `port` upstream as carried out only when its plan has been carried out to the journal commit. Once `finish` has begun moving branches, `abort` SHALL refuse and name `finish` as the way to complete the update. The tool SHALL read an update state of format 4 as its own; the first command that changes the update SHALL write it in format 5 and say that releases before v0.3.6 can no longer carry it on, and the first of `continue`, `verify` and `finish` SHALL warn once that an earlier release started the update, as for another release of the same format. It SHALL refuse an update state in any other format than its own and format 4, older or newer, or without a format, name both formats and, where the state records it, the release that started the update, and advise finishing or aborting the update with a release that keeps that format, naming the releases of each format (1: v0.1.0; 2: v0.2.0 to v0.2.2; 3: v0.3.0 to v0.3.1; 4: v0.3.2 to v0.3.5; 5: from v0.3.6), or for a newer format with the release that started it or a later one that reads it. For format 3, the refusal SHALL name `migrate` first. Only `start` and `sync` SHALL record the release that started the update in the state. The first of `continue`, `verify` and `finish` run by another release of the same format SHALL warn once, without refusing, and record that it warned; it SHALL advise aborting and starting again only before `finish` has moved a branch or pushed the update.
 
 #### Scenario: Update worktree in the main worktree
 - **WHEN** `start` creates the update worktree
@@ -556,7 +575,7 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **THEN** the commands receive only the variables of the update, with the update's values
 
 ### Requirement: Guarded publication
-In push mode, and with `--no-publish`, `finish` SHALL require a verified update whose worktree commit is the verified one, or one whose head is a catch-up merge the tool made and has not verified, which it verifies itself; any other unverified head SHALL be refused until `verify` passes. In merge-request mode without `--no-publish` it SHALL require no verification. In `push` mode, unless `--no-publish` is given, it SHALL first fetch the publish remote and refuse with git's reason when the fetch fails: when the remote's integration branch holds commits the local one lacks and the local one holds none the remote lacks, it SHALL bring the local integration branch up to date as `start` does, which does not count as `finish` moving it; when each holds commits the other lacks, it SHALL refuse before moving anything and say that the local commits must be published or reconciled first. When the integration tip contains the update head, `finish` SHALL go on without a catch-up. The integration tip SHALL be the local integration branch's in `push` mode and the publish remote's in `merge-request` mode. When the integration tip is otherwise no longer the base, `finish` SHALL catch up with it, and where it requires verification, verify the result as `verify` does and go on only when the verification passes; it SHALL make at most one catch-up merge per run, and when the integration branch moves again meanwhile it SHALL stop and say to run `finish` again. Before moving any branch it SHALL confirm that the move of the integration branch is a fast-forward, that the verified commit contains the base and every merged target, and that no checkout of the integration branch would lose changes. It SHALL record the planned move, fast-forward the integration branch to the verified commit, push exactly the planned commit without force when the publication mode is `push`, and only after publication succeeds remove the worktree, the update branch, the update's upstream references and the state. An interrupted or failed `finish` SHALL complete the remaining move and the push when run again, and SHALL never publish a commit other than the planned one. When the push was rejected because the publish remote's integration branch moved past the base, a `finish` run again SHALL catch up with the remote's branch from the finishing step, verify the result, fast-forward the local integration branch to it and push it; when the local integration branch moved past the planned commit meanwhile, it SHALL make no catch-up and name `finish --no-publish`. `finish --no-publish` SHALL not fetch, SHALL catch up only with the local integration branch, SHALL in the finishing step land a verified catch-up merge locally, and drop an unverified or conflicted one, recording the resolutions made so far and naming the commits it drops, closing the update at the planned commit, complete the local move and remove the worktree, the update branch, the upstream references and the state without pushing, and report that the integration branch remains unpublished. It SHALL never rewrite or force-push a branch, and SHALL never push to an upstream's URL.
+In push mode, and with `--no-publish`, `finish` SHALL require a verified update whose worktree commit is the verified one, or one whose head is a catch-up merge the tool made and has not verified, which it verifies itself; any other unverified head SHALL be refused until `verify` passes. In merge-request mode without `--no-publish` it SHALL require no verification. In `push` mode, unless `--no-publish` is given, it SHALL first fetch the publish remote and refuse with git's reason when the fetch fails: when the remote's integration branch holds commits the local one lacks and the local one holds none the remote lacks, it SHALL bring the local integration branch up to date as `start` does, which does not count as `finish` moving it; when each holds commits the other lacks, it SHALL refuse before moving anything and say that the local commits must be published or reconciled first. When the integration tip contains the update head, `finish` SHALL go on without a catch-up. The integration tip SHALL be the local integration branch's in `push` mode and the publish remote's in `merge-request` mode. When the integration tip is otherwise no longer the base, `finish` SHALL catch up with it, and where it requires verification, verify the result as `verify` does and go on only when the verification passes; it SHALL make at most one catch-up merge per run, and when the integration branch moves again meanwhile it SHALL stop and say to run `finish` again. In push mode and with `--no-publish`, before moving any branch it SHALL confirm that the move of the integration branch is a fast-forward, that the verified commit contains the base and every merged target, and that no checkout of the integration branch would lose changes. It SHALL record the planned move, fast-forward the integration branch to the verified commit, push exactly the planned commit without force when the publication mode is `push`, and only after publication succeeds remove the worktree, the update branch, the update's upstream references and the state. An interrupted or failed `finish` SHALL complete the remaining move and the push when run again, and SHALL never publish a commit other than the planned one. When the push was rejected because the publish remote's integration branch moved past the base, a `finish` run again SHALL catch up with the remote's branch from the finishing step, verify the result, fast-forward the local integration branch to it and push it; when the local integration branch moved past the planned commit meanwhile, it SHALL make no catch-up and name `finish --no-publish`. `finish --no-publish` SHALL not fetch, SHALL catch up only with the local integration branch, SHALL in the finishing step land a verified catch-up merge locally, and drop an unverified or conflicted one, recording the resolutions made so far and naming the commits it drops, closing the update at the planned commit, complete the local move and remove the worktree, the update branch, the upstream references and the state without pushing, and report that the integration branch remains unpublished. It SHALL never rewrite or force-push a branch, and SHALL never push to an upstream's URL.
 
 #### Scenario: Integration branch moved
 - **WHEN** a commit lands on the integration branch after `start` and `finish` runs on the verified update in push mode
@@ -655,6 +674,7 @@ In push mode, and with `--no-publish`, `finish` SHALL require a verified update 
 #### Scenario: Agent reads the update variables
 - **WHEN** an agent runs `env --json` on an update's head
 - **THEN** it receives an object whose keys are the variable names and whose values are their values, and an empty object for a commit that carries no update
+
 ### Requirement: Migration of an update in progress
 `migrate` SHALL carry an update in progress over from state format 3 to the current format, in place, keeping its branch, commits, merge in progress, index, uncommitted and untracked files, plan, logs and references. An update worktree in the git directory SHALL move with `git worktree move` to `.worktrees/git-intake/update` in the main worktree, under the placement rules of `start`, before the state is written; an update worktree outside the git directory, or that of a bare repository, SHALL stay, and only the state is rewritten. An update worktree already at the destination SHALL be kept: when git still records it at the old path, `migrate` SHALL repair git's record with `git worktree repair` instead of refusing. `migrate` SHALL say that the processes and editors using the old path must be stopped, since the directory moves. A verification recorded before a move, or at a path containing `/.git` that a bare repository keeps, SHALL be dropped unless `finish` has begun. `migrate` SHALL refuse, before changing anything, when no update is in progress, when the state is in a format other than 3, when the main worktree cannot be located, when the destination exists, or when git refuses the move, giving git's reason.
 
@@ -788,4 +808,35 @@ The tool SHALL make a catch-up merge only when the new tip contains the base and
 #### Scenario: Report after a catch-up
 - **WHEN** `report` runs on an update that caught up once with a conflict
 - **THEN** it lists the catch-up merge with its tip and its conflicted files, and each upstream's merged range and own-change sizes are those measured from the base the update started from
+
+### Requirement: Sync record in history
+Every merge commit the tool creates SHALL name the upstream and its target commit in commit trailers, and, when a tag of the upstream's repository points at the target, that tag in the trailer `Intake-Tag`: the tag a revision named, the release a `tags` pattern selected, or otherwise, of the tags at the target, the one with the highest version among those matching the upstream's `tags` pattern whose name is a version after the pattern's literal prefix, or, without such a tag, among those whose name is a semantic version with an optional `v` or `V`; a tag whose name is no version SHALL NOT be recorded this way, even when it matches the pattern. A tag whose name contains a comma SHALL NOT be recorded. The tag SHALL be fixed when `start` fixes the target. Every commit the tool copies from an upstream in `port` mode SHALL name the upstream and the upstream commit it took in the trailers `Intake-Upstream` and `Intake-Taken`. A sync record SHALL count only on a merge commit whose second parent is the record's target. For an upstream in `follow` mode, the tool SHALL derive the last synced commit from its sync records on the integration line, as the target of the newest record whose target no other of its records' targets contains, and SHALL NOT store it in the configuration or outside the history. For such an upstream that carries no sync record, the last synced commit SHALL come from the history, and the tool SHALL show that it does: for a root upstream it is the newest upstream commit the integration branch contains; for a path upstream it is the second parent of the newest merge on the integration line whose second parent belongs to the upstream's branch and which changes the upstream's path, as an import by `git subtree add` or `git subtree pull` leaves. This decision SHALL depend only on the integration branch and the upstream's own branch, never on other upstreams. When a `follow` upstream's last synced commit is no longer contained in its branch, the tool SHALL report that upstream's history as rewritten and SHALL refuse to update it.
+
+#### Scenario: Last synced commit
+- **WHEN** the integration line contains a merge of a `follow` upstream
+- **THEN** `status` shows that upstream's target from the most recent such merge as its last synced commit
+
+#### Scenario: Older record merged later
+- **WHEN** a branch that carries a sync record of an older target is merged into the integration branch after a newer target's record landed
+- **THEN** `status` still shows the newer target as the last synced commit, and nothing between the two targets counts as pending
+
+#### Scenario: Upstream force-pushed
+- **WHEN** a `follow` upstream's branch no longer contains the last synced commit
+- **THEN** `status` reports the upstream as rewritten and `start` refuses to update it
+
+#### Scenario: Target named by a tag
+- **WHEN** an update merges a target that a tag of the upstream's repository points at, chosen by a release pattern, by naming the tag, or by naming the commit
+- **THEN** the merge commit carries `Intake-Tag` with that tag, `report` names it, and `status` shows it as the tag of the last synced commit
+
+#### Scenario: Target without a tag
+- **WHEN** an update merges a target that no tag of the upstream's repository points at
+- **THEN** the merge commit carries no `Intake-Tag` trailer
+
+#### Scenario: Copied commit
+- **WHEN** a port update copies an upstream commit
+- **THEN** the copy carries the upstream's name and the upstream commit's id in its trailers
+
+#### Scenario: Squash message with trailers
+- **WHEN** a squash commit's message ends with `Intake-Upstream` and `Intake-Target` trailers copied from an update's sync merge
+- **THEN** the trailers do not count as a sync record
 
