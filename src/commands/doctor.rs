@@ -322,6 +322,22 @@ fn state_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
         );
         return Ok(());
     };
+    if let Some(mr) = &state.merge_request {
+        // The worktree was removed when the merge request branch was pushed.
+        let detail = if state.finishing.is_some() {
+            format!(
+                "`finish` is completing the update merged through '{}'; run `git intake finish`",
+                mr.branch
+            )
+        } else {
+            format!(
+                "the update waits for its merge request from '{}' into '{}' on '{}'",
+                mr.branch, state.config.integration, mr.remote
+            )
+        };
+        checks.add("update_state", None, CheckStatus::Pass, detail);
+        return Ok(());
+    }
     let mut problems = Vec::new();
     if !registered || !state.worktree.exists() {
         problems.push(format!(

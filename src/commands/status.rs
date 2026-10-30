@@ -19,7 +19,10 @@ use crate::sync_record;
 pub struct StatusDoc {
     pub integration: String,
     pub integration_tip: String,
+    /// The publish remote.
     pub publish: Option<String>,
+    /// `push` or `merge_request`; `null` without a publish remote.
+    pub publish_via: Option<String>,
     pub install: Option<String>,
     pub checks: Vec<String>,
     pub config_working_copy_differs: bool,
@@ -59,7 +62,21 @@ pub struct UpdateView {
     pub verified_commit: Option<String>,
     /// The error of the last rejected push while finishing, if any.
     pub publish_error: Option<String>,
+    /// The merge request the update waits for, in merge-request mode.
+    pub merge_request: Option<MergeRequestView>,
     pub next: String,
+}
+
+#[derive(Serialize)]
+pub struct MergeRequestView {
+    pub remote: String,
+    /// The branch on the publish remote that holds the verified commit.
+    pub source_branch: String,
+    pub target_branch: String,
+    pub commit: String,
+    /// Whether the remote accepted the push options that open the merge
+    /// request; when it did not, the merge request is opened by hand.
+    pub requested: bool,
 }
 
 #[derive(Serialize)]
@@ -132,7 +149,11 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     let doc = StatusDoc {
         integration: config.integration.clone(),
         integration_tip: tip,
-        publish: config.publish.clone(),
+        publish: config.publish.as_ref().map(|p| p.remote.clone()),
+        publish_via: config
+            .publish
+            .as_ref()
+            .map(|p| p.via.as_str().replace('-', "_")),
         install: config.install.clone(),
         checks: config.checks.clone(),
         config_working_copy_differs: loaded.working_copy_differs,
@@ -205,6 +226,13 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
             .filter(|v| v.passed)
             .map(|v| v.commit.clone()),
         publish_error: state.finishing.as_ref().and_then(|f| f.push_error.clone()),
+        merge_request: state.merge_request.as_ref().map(|mr| MergeRequestView {
+            remote: mr.remote.clone(),
+            source_branch: mr.branch.clone(),
+            target_branch: state.config.integration.clone(),
+            commit: mr.commit.clone(),
+            requested: mr.requested,
+        }),
         next: next_step(state, &wt)?,
     })
 }
@@ -219,10 +247,13 @@ fn config_lines(doc: &StatusDoc, out: &mut String) {
         doc.integration,
         abbrev(&doc.integration_tip)
     ));
-    out.push_str(&format!(
-        "publish: {}\n",
-        doc.publish.as_deref().unwrap_or("none")
-    ));
+    match (&doc.publish, &doc.publish_via) {
+        (Some(remote), Some(via)) => out.push_str(&format!(
+            "publish: {remote} (via {})\n",
+            via.replace('_', " ")
+        )),
+        _ => out.push_str("publish: none\n"),
+    }
     out.push_str(&format!(
         "install: {}\n",
         doc.install.as_deref().unwrap_or("none")
@@ -327,7 +358,21 @@ pub fn render_update(u: &UpdateView) -> String {
     ));
     out.push_str(&format!("  base: {}\n", abbrev(&u.base)));
     out.push_str(&format!("  branch: {}\n", u.branch));
-    out.push_str(&format!("  worktree: {}\n", u.worktree.display()));
+    match &u.merge_request {
+        // The worktree is removed once the merge request branch is pushed.
+        Some(mr) => out.push_str(&format!(
+            "  merge request: {} into {} on {}{}\n",
+            mr.source_branch,
+            mr.target_branch,
+            mr.remote,
+            if mr.requested {
+                ""
+            } else {
+                " (the remote did not accept push options; open it by hand)"
+            }
+        )),
+        None => out.push_str(&format!("  worktree: {}\n", u.worktree.display())),
+    }
     for q in &u.upstreams {
         let step = match q.step {
             UpstreamStep::Pending => "pending",

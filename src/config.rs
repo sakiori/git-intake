@@ -12,7 +12,9 @@ pub const FILE_NAME: &str = ".git-intake.toml";
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     integration: String,
-    publish: Option<String>,
+    /// Read as a value first so that the string form of earlier releases gets
+    /// a message showing the table form.
+    publish: Option<toml::Value>,
     install: Option<String>,
     #[serde(default)]
     checks: Vec<String>,
@@ -31,11 +33,48 @@ struct RawUpstream {
     mirror: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPublish {
+    remote: String,
+    #[serde(default)]
+    via: PublishVia,
+}
+
+/// How `finish` publishes the verified update.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PublishVia {
+    /// Push the integration and mirror branches.
+    #[default]
+    Push,
+    /// Push the verified commit to a branch of its own and open a merge
+    /// request into the integration branch.
+    MergeRequest,
+}
+
+impl PublishVia {
+    /// The value as written in the configuration.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PublishVia::Push => "push",
+            PublishVia::MergeRequest => "merge-request",
+        }
+    }
+}
+
+/// Where and how `finish` publishes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Publish {
+    pub remote: String,
+    pub via: PublishVia,
+}
+
 /// A validated configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub integration: String,
-    pub publish: Option<String>,
+    pub publish: Option<Publish>,
     pub install: Option<String>,
     pub checks: Vec<String>,
     pub upstreams: Vec<Upstream>,
@@ -106,9 +145,19 @@ pub fn parse(text: &str) -> Result<Config> {
 
     let integration = raw.integration.trim().to_string();
     check_branch("integration", &integration, &mut problems);
-    if let Some(publish) = &raw.publish {
-        check_remote("publish", publish, &mut problems);
-    }
+    let publish = match raw.publish {
+        None => None,
+        Some(value) => match parse_publish(value) {
+            Ok(publish) => {
+                check_remote("publish remote", &publish.remote, &mut problems);
+                Some(publish)
+            }
+            Err(why) => {
+                problems.push(why);
+                None
+            }
+        },
+    };
     if let Some(install) = &raw.install
         && install.trim().is_empty()
     {
@@ -163,7 +212,7 @@ pub fn parse(text: &str) -> Result<Config> {
 
     check_layout(
         &integration,
-        raw.publish.as_deref(),
+        publish.as_ref().map(|p| p.remote.as_str()),
         &upstreams,
         &mut problems,
     );
@@ -180,10 +229,26 @@ pub fn parse(text: &str) -> Result<Config> {
     }
     Ok(Config {
         integration,
-        publish: raw.publish,
+        publish,
         install: raw.install,
         checks: raw.checks,
         upstreams,
+    })
+}
+
+/// Reads the `[publish]` table.
+fn parse_publish(value: toml::Value) -> std::result::Result<Publish, String> {
+    if let toml::Value::String(remote) = &value {
+        return Err(format!(
+            "publish: expected a table, not a string; write\n      [publish]\n      remote = {remote:?}\n    and add `via = \"merge-request\"` to publish through a merge request"
+        ));
+    }
+    let raw: RawPublish = value
+        .try_into()
+        .map_err(|e: toml::de::Error| format!("publish: {}", e.message()))?;
+    Ok(Publish {
+        remote: raw.remote,
+        via: raw.via,
     })
 }
 
@@ -397,7 +462,6 @@ mod tests {
         let cfg = parse(
             r#"
 integration = "main"
-publish = "origin"
 install = "make deps"
 checks = ["make lint", "make test"]
 
@@ -408,11 +472,21 @@ branch = "main"
 url = "git@example.com:team/app-a.git"
 path = "/apps/app-a/"
 mirror = "upstream-app-a"
+
+[publish]
+remote = "origin"
+via = "merge-request"
 "#,
         )
         .unwrap();
         assert_eq!(cfg.integration, "main");
-        assert_eq!(cfg.publish.as_deref(), Some("origin"));
+        assert_eq!(
+            cfg.publish,
+            Some(Publish {
+                remote: "origin".into(),
+                via: PublishVia::MergeRequest
+            })
+        );
         assert_eq!(cfg.checks.len(), 2);
         let up = &cfg.upstreams[0];
         assert_eq!(up.path.as_deref(), Some("apps/app-a"));
@@ -498,8 +572,51 @@ mirror = "upstream-app-a"
 
     #[test]
     fn rejects_publishing_to_an_upstream_remote() {
-        let text = format!("integration = \"main\"\npublish = \"ra\"\n{UP_A}");
+        let text = format!("integration = \"main\"\n{UP_A}[publish]\nremote = \"ra\"\n");
         assert!(err(&text).contains("never pushes to an upstream"));
+    }
+
+    #[test]
+    fn publish_defaults_to_push() {
+        let cfg = parse(&format!(
+            "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.publish.unwrap().via, PublishVia::Push);
+        let cfg = parse(&format!("integration = \"main\"\n{UP_A}")).unwrap();
+        assert_eq!(cfg.publish, None);
+    }
+
+    #[test]
+    fn rejects_the_string_form_of_publish() {
+        let e = err(&format!(
+            "integration = \"main\"\npublish = \"origin\"\n{UP_A}"
+        ));
+        assert!(e.contains("[publish]"), "{e}");
+        assert!(e.contains("remote = \"origin\""), "{e}");
+    }
+
+    #[test]
+    fn rejects_invalid_publish_tables() {
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\nvia = \"pull-request\"\n"
+        ));
+        assert!(e.contains("unknown variant `pull-request`"), "{e}");
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\nforce = true\n"
+        ));
+        assert!(e.contains("unknown field `force`"), "{e}");
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}[publish]\nvia = \"push\"\n"
+        ));
+        assert!(e.contains("missing field `remote`"), "{e}");
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}[publish]\nremote = \"bad name\"\n"
+        ));
+        assert!(
+            e.contains("publish remote: 'bad name' is not a valid remote name"),
+            "{e}"
+        );
     }
 
     #[test]

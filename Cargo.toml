@@ -6,6 +6,11 @@ description = "Merge-based, verified, resumable updates of a downstream reposito
 readme = "README.md"
 publish = false
 
+# `xtask` holds development tasks, such as generating the manual page, so that
+# their dependencies stay out of the shipped binary.
+[workspace]
+members = ["xtask"]
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }

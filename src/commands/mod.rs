@@ -5,6 +5,7 @@ pub mod doctor;
 pub mod fetch;
 pub mod finish;
 pub mod log;
+pub mod merge_request;
 pub mod report;
 pub mod status;
 pub mod update;
