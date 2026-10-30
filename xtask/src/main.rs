@@ -36,15 +36,16 @@ fn main() -> Result<()> {
     match args.as_slice() {
         [task, dir] if task == "man" => man(Path::new(dir)),
         [task, dir, target] if task == "notices" => notices(Path::new(dir), target),
-        [task, archive, epoch] if task == "check-archive" => check_archive(
+        [task, archive, epoch, forbidden @ ..] if task == "check-archive" => check_archive(
             Path::new(archive),
             epoch
                 .parse()
                 .context("the epoch is not a number of seconds")?,
+            forbidden,
         ),
         _ => bail!(
             "usage: cargo run -p xtask -- man <dir> | notices <dir> <target> | \
-             check-archive <archive> <epoch>"
+             check-archive <archive> <epoch> [<host path>...]"
         ),
     }
 }
@@ -669,26 +670,55 @@ fn notice_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Checks the raw headers of a release archive, a gzip-compressed tar file:
-/// the gzip header records no file name, comment or time, and every tar
-/// header is a plain GNU or ustar header of a file or directory, with no PAX
-/// or GNU extension record, owner and group 0 without names, the
-/// modification time `epoch`, and mode 0755 for directories and executables
-/// or 0644 for other files. A packer that leaked the build host's user,
-/// times or extended attributes fails it.
-fn check_archive(archive: &Path, epoch: u64) -> Result<()> {
+/// Prefixes of absolute paths of a build host that no file of a release
+/// archive may hold: home directories on Linux and macOS, root's home, and
+/// Windows user profiles.
+const HOST_PATHS: &[&str] = &["/Users/", "/home/", "/root/", "C:\\Users"];
+
+/// Occurrences of a host path in a file that are not traces of a build host,
+/// by the archive's file name and the text that holds the path. None is
+/// expected; an entry here names why the text is in the file.
+const ALLOWED_HOST_PATHS: &[(&str, &str)] = &[];
+
+/// Checks a release archive, a gzip-compressed tar file, from its raw bytes:
+///
+/// - the gzip stream, every member of it, records no file name, comment,
+///   extra field or time;
+/// - every tar header is a plain GNU or ustar header of a file or directory,
+///   with no PAX or GNU extension record, no link name and no name prefix,
+///   owner and group 0 without names, the modification time `epoch`, and
+///   mode 0755 for directories and executables or 0644 for other files;
+/// - nothing but the zero blocks that end the archive and pad its last
+///   record follows the last entry;
+/// - no file holds an absolute path of the build host: a prefix of
+///   [`HOST_PATHS`], or one of `forbidden`, such as the workspace, CARGO_HOME
+///   and the toolchain's sysroot of the build, unless [`ALLOWED_HOST_PATHS`]
+///   lists the occurrence.
+///
+/// A packer that leaked the build host's user, times or extended
+/// attributes, or a build that left the host's paths in the binary, fails it.
+fn check_archive(archive: &Path, epoch: u64, forbidden: &[String]) -> Result<()> {
     let bytes = fs::read(archive).with_context(|| format!("cannot read {}", archive.display()))?;
-    if bytes.len() < 10 || bytes[0..3] != [0x1f, 0x8b, 8] {
-        bail!("{} is not a gzip file", archive.display());
-    }
-    if bytes[3] & !0x02 != 0 {
-        bail!("its gzip header carries a file name, comment or extra field");
-    }
-    if bytes[4..8] != [0, 0, 0, 0] {
-        bail!("its gzip header carries a time");
+    let mut member = 0;
+    while member < bytes.len() {
+        let header = &bytes[member..];
+        if header.len() < 10 || header[0..3] != [0x1f, 0x8b, 8] {
+            bail!("{} is not a gzip file", archive.display());
+        }
+        if header[3] & !0x02 != 0 {
+            bail!("its gzip header carries a file name, comment or extra field");
+        }
+        if header[4..8] != [0, 0, 0, 0] {
+            bail!("its gzip header carries a time");
+        }
+        // The length of this member: decode it alone.
+        let mut decoder = flate2::bufread::GzDecoder::new(header);
+        std::io::copy(&mut decoder, &mut std::io::sink()).context("cannot decompress it")?;
+        let rest = decoder.into_inner().len();
+        member = bytes.len() - rest;
     }
     let mut tar = Vec::new();
-    flate2::read::GzDecoder::new(&bytes[..])
+    flate2::read::MultiGzDecoder::new(&bytes[..])
         .read_to_end(&mut tar)
         .context("cannot decompress it")?;
 
@@ -702,11 +732,16 @@ fn check_archive(archive: &Path, epoch: u64) -> Result<()> {
         u64::from_str_radix(if text.is_empty() { "0" } else { &text }, 8)
             .with_context(|| format!("a header field holds '{text}', not an octal number"))
     };
+    let mut patterns: Vec<String> = HOST_PATHS.iter().map(|p| p.to_string()).collect();
+    patterns.extend(forbidden.iter().filter(|p| !p.is_empty()).cloned());
+    let mut traces = Vec::new();
     let mut at = 0;
     let mut entries = 0;
+    let mut ended = false;
     while at + 512 <= tar.len() {
         let header = &tar[at..at + 512];
         if header.iter().all(|&b| b == 0) {
+            ended = true;
             break;
         }
         let name = field(header, 0, 100);
@@ -721,6 +756,12 @@ fn check_archive(archive: &Path, epoch: u64) -> Result<()> {
                 "{name}: an entry of type '{}', such as a PAX or GNU extension record",
                 char::from(other)
             ),
+        }
+        if !field(header, 157, 100).is_empty() {
+            bail!("{name}: a link name");
+        }
+        if !field(header, 345, 155).is_empty() {
+            bail!("{name}: a name prefix");
         }
         let mode = octal(header, 100, 8)? & 0o7777;
         let (uid, gid) = (octal(header, 108, 8)?, octal(header, 116, 8)?);
@@ -737,18 +778,76 @@ fn check_archive(archive: &Path, epoch: u64) -> Result<()> {
         if mode != expected {
             bail!("{name}: mode {mode:o}, not {expected:o}");
         }
-        let size = octal(header, 124, 12)?;
-        at += 512 + size.div_ceil(512) as usize * 512;
+        let size = usize::try_from(octal(header, 124, 12)?)?;
+        let data = tar
+            .get(at + 512..at + 512 + size)
+            .with_context(|| format!("{name}: the archive ends inside it"))?;
+        for pattern in &patterns {
+            for found in find_all(data, pattern.as_bytes()) {
+                let context = text_around(data, found, pattern.len());
+                let allowed = ALLOWED_HOST_PATHS
+                    .iter()
+                    .any(|(file, text)| *file == name && context.contains(text));
+                if !allowed {
+                    traces.push(format!("{name}: {context}"));
+                }
+            }
+        }
+        at += 512 + size.div_ceil(512) * 512;
         entries += 1;
+    }
+    if !ended {
+        bail!(
+            "{} lacks the blocks that end a tar archive",
+            archive.display()
+        );
+    }
+    if tar[at..].iter().any(|&b| b != 0) {
+        bail!(
+            "{} holds data after the end of its tar archive",
+            archive.display()
+        );
     }
     if entries == 0 {
         bail!("{} holds no entry", archive.display());
     }
+    if !traces.is_empty() {
+        let shown = traces.len().min(20);
+        bail!(
+            "{} holds {} absolute paths of the build host, such as:\n{}",
+            archive.display(),
+            traces.len(),
+            traces[..shown].join("\n")
+        );
+    }
     println!(
-        "{}: {entries} entries with deterministic headers",
+        "{}: {entries} entries with deterministic headers and no host path",
         archive.display()
     );
     Ok(())
+}
+
+/// The offsets at which `needle` starts in `haystack`.
+fn find_all<'a>(haystack: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    haystack
+        .windows(needle.len().max(1))
+        .enumerate()
+        .filter(move |(_, w)| !needle.is_empty() && *w == needle)
+        .map(|(at, _)| at)
+}
+
+/// The printable text around a match, for a message.
+fn text_around(data: &[u8], at: usize, len: usize) -> String {
+    let printable = |b: &u8| b.is_ascii_graphic() || *b == b' ';
+    let mut start = at;
+    while start > 0 && at - start < 40 && printable(&data[start - 1]) {
+        start -= 1;
+    }
+    let mut end = at + len;
+    while end < data.len() && end - at < 120 && printable(&data[end]) {
+        end += 1;
+    }
+    String::from_utf8_lossy(&data[start..end]).to_string()
 }
 
 #[cfg(test)]
