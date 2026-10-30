@@ -207,7 +207,7 @@ fn merge(repo: &Repo, state: &mut UpdateState) -> Result<Option<Exit>> {
     save_merge_output(&output_path, &out)?;
     if out.success() {
         let merge = wt.line(&["rev-parse", "HEAD"])?;
-        conclude_at(repo, state, &merge)?;
+        conclude_at(repo, state, &merge, &merge)?;
         return Ok(None);
     }
     if !wt.merge_in_progress()? {
@@ -329,14 +329,20 @@ pub fn conclude(repo: &Repo, state: &mut UpdateState, resolved: bool) -> Result<
     let head = wt.line(&["rev-parse", "HEAD"])?;
     let branch = repo.git.commit(&branch_ref(UPDATE_BRANCH))?;
     if is_catch_up_merge(repo, &integration, &c, &head)? {
-        conclude_at(repo, state, &head)?;
+        conclude_at(repo, state, &head, &head)?;
         return Ok(Concluded::Merged);
     }
     // Moved before the state could say so.
     if let Some(b) = &branch
         && is_catch_up_merge(repo, &integration, &c, b)?
     {
-        conclude_at(repo, state, b)?;
+        conclude_at(repo, state, b, b)?;
+        return Ok(Concluded::Merged);
+    }
+    // Committed, with commits made on top of it, before the update branch
+    // moved: the branch takes them all.
+    if let Some(merge) = merge_below(repo, &integration, &c, &head)? {
+        conclude_at(repo, state, &merge, &head)?;
         return Ok(Concluded::Merged);
     }
     if on_update_branch(&wt)? {
@@ -358,7 +364,8 @@ pub fn conclude(repo: &Repo, state: &mut UpdateState, resolved: bool) -> Result<
     }
     bail!(
         "the catch-up merge with '{integration}' at {} is no longer in progress in {}, and no commit there merges \
-         {} into it; check out '{UPDATE_BRANCH}' there and run `git intake continue`, or run `git intake abort`",
+         {} into it. Point '{UPDATE_BRANCH}' at the commit to keep with `git branch -f`, check it out there and \
+         run `git intake continue`, or run `git intake abort`",
         abbrev(&c.tip),
         state.worktree.display(),
         abbrev(&c.head_before)
@@ -418,36 +425,56 @@ fn is_catch_up_merge(repo: &Repo, integration: &str, c: &CatchUp, commit: &str) 
         && sync_record::catch_up_of(&repo.git, commit)?.as_deref() == Some(integration))
 }
 
-/// Moves the update branch to the catch-up merge `merge` while it is still
-/// at the head the catch-up started from, attaches the update worktree to
-/// it, and records the merge: the base becomes the tip caught up with, the
-/// update is unverified, and its install command and checks are read from
-/// the configuration at the merge.
-fn conclude_at(repo: &Repo, state: &mut UpdateState, merge: &str) -> Result<()> {
+/// The catch-up merge `c` describes among the commits `head` contains and
+/// the recorded tip and head do not, if any.
+fn merge_below(repo: &Repo, integration: &str, c: &CatchUp, head: &str) -> Result<Option<String>> {
+    let listing = repo.git.run(&[
+        "rev-list",
+        "--merges",
+        head,
+        &format!("^{}", c.tip),
+        &format!("^{}", c.head_before),
+        "--",
+    ])?;
+    for merge in crate::git::lines(&listing) {
+        if is_catch_up_merge(repo, integration, c, &merge)? {
+            return Ok(Some(merge));
+        }
+    }
+    Ok(None)
+}
+
+/// Moves the update branch to `head`, the catch-up merge `merge` or a
+/// commit made on top of it, while the branch is still at the head the
+/// catch-up started from, attaches the update worktree to it, and records
+/// the merge: the base becomes the tip caught up with, the update is
+/// unverified, and its install command and checks are read from the
+/// configuration at the merge.
+fn conclude_at(repo: &Repo, state: &mut UpdateState, merge: &str, head: &str) -> Result<()> {
     let c = current(state)?.clone();
     let integration = state.config.integration.clone();
     let git = &repo.git;
     let full = branch_ref(UPDATE_BRANCH);
     let branch = git.commit(&full)?;
-    if branch.as_deref() != Some(merge) {
+    if branch.as_deref() != Some(head) {
         let out = git.raw(&[
             "update-ref",
             "-m",
             "git-intake: catch up",
             &full,
-            merge,
+            head,
             &c.head_before,
         ])?;
         if !out.success() {
             let now = git.commit(&full)?;
             bail!(
                 "'{UPDATE_BRANCH}' is at {}, no longer at {} where the catch-up with '{integration}' at {} started, \
-                 so it was not moved to the catch-up merge {}. No branch moved. Move '{UPDATE_BRANCH}' back to {} \
+                 so it was not moved to {}. No branch moved. Move '{UPDATE_BRANCH}' back to {} \
                  and run `git intake continue`, or run `git intake abort`",
                 now.as_deref().map(abbrev).unwrap_or("nothing"),
                 abbrev(&c.head_before),
                 abbrev(&c.tip),
-                abbrev(merge),
+                abbrev(head),
                 abbrev(&c.head_before)
             );
         }

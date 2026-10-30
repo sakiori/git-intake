@@ -589,17 +589,20 @@ fn no_publish_lands_a_verified_catch_up_of_the_finishing_step_locally() {
 }
 
 #[test]
-fn no_publish_refuses_an_unverified_catch_up_of_the_finishing_step() {
+fn no_publish_drops_an_unverified_catch_up_of_the_finishing_step() {
     let f = Fork::new();
     let env = &f.env;
     let (verified, merge) = concluded_after_a_rejected_push(&f);
-    let err = stderr(&f.tool(&["finish", "--no-publish"]).code(2));
+    let out = stdout(&f.tool(&["finish", "--no-publish"]).success());
     assert!(
-        err.contains(&format!("{} is not verified", &merge[..12])),
-        "{err}"
+        out.contains("dropped the catch-up of the update, which is not verified"),
+        "{out}"
     );
-    assert!(err.contains("run `git intake verify`"), "{err}");
+    // The dropped commit is named, so that it can still be found.
+    assert!(out.contains(&format!("  {} ", &merge[..7])), "{out}");
     assert_eq!(env.rev(&f.down, "main"), verified);
+    assert!(env.has_rev(&f.down, &merge));
+    env.assert_no_update(&f.down);
 }
 
 #[test]
@@ -960,9 +963,11 @@ fn continue_drops_a_catch_up_given_up_by_hand_and_names_verify() {
 
 #[test]
 fn a_concluded_catch_up_is_the_runs_only_catch_up() {
-    let f = Fork::new();
+    let f = Fork::with_checks(&["test -f app.txt", "touch \"$HOME/checked\""]);
     let env = &f.env;
     let (verified, _) = verify_update(&f);
+    let checked = env.path("home").join("checked");
+    fs::remove_file(&checked).unwrap();
     let theirs = conflicting(&f);
     f.tool(&["finish"]).code(1);
     let wt = env.update_worktree(&f.down);
@@ -976,6 +981,8 @@ fn a_concluded_catch_up_is_the_runs_only_catch_up() {
     let out = stdout(&f.tool(&["finish"]).code(1));
     assert!(out.contains("since the catch-up merge was made"), "{out}");
     assert!(!out.contains("catching up with"), "{out}");
+    // It stops before the checks run on the concluded merge.
+    assert!(!checked.exists(), "{out}");
     assert_eq!(env.rev(&f.down, "git-intake/update"), merge);
     assert_eq!(parents(&f, &merge), [theirs, verified]);
     assert_eq!(
@@ -1146,4 +1153,75 @@ fn a_copy_of_a_queued_upstream_is_refused() {
         "{err}"
     );
     assert_eq!(env.rev(&f.down, "git-intake/update"), verified);
+}
+
+#[test]
+fn a_rewound_local_integration_branch_is_refused_as_rewritten() {
+    let f = Fork::new();
+    let env = &f.env;
+    let published = env.rev(&f.publish, "main");
+    // An unpublished local commit, which the update's base holds, is
+    // removed from the integration branch after `verify`.
+    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
+    let (verified, _) = verify_update(&f);
+    env.git(&f.down, &["reset", "-q", "--hard", "HEAD~1"]);
+
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(err.contains("'main' was rewritten"), "{err}");
+    assert_eq!(env.rev(&f.publish, "main"), published);
+    assert!(!env.is_ancestor(&f.publish, &local, "main"));
+    assert_eq!(env.rev(&f.down, "git-intake/update"), verified);
+}
+
+/// A catch-up stopped on a conflict, resolved and committed by hand while
+/// the worktree is detached, with a fix committed on top. Returns the tip,
+/// the verified commit, the catch-up merge and the fix.
+fn committed_on_top_while_detached(f: &Fork) -> (String, String, String, String) {
+    let env = &f.env;
+    let (verified, _) = verify_update(f);
+    let theirs = conflicting(f);
+    f.tool(&["finish"]).code(1);
+    let wt = env.update_worktree(&f.down);
+    fs::write(wt.join("n.txt"), "both\n").unwrap();
+    env.git(&wt, &["add", "n.txt"]);
+    env.git(&wt, &["commit", "-q", "--no-edit"]);
+    let merge = env.rev(&wt, "HEAD");
+    let fix = env.commit(&wt, &[("fix.txt", "fix\n")], "fork: fix after the catch-up");
+    (theirs, verified, merge, fix)
+}
+
+#[test]
+fn finish_keeps_commits_made_on_top_of_a_detached_catch_up_merge() {
+    let f = Fork::new();
+    let env = &f.env;
+    let (theirs, verified, merge, fix) = committed_on_top_while_detached(&f);
+
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(err.contains("run `git intake verify`"), "{err}");
+    assert!(!err.contains("check out"), "{err}");
+    let wt = env.update_worktree(&f.down);
+    assert_eq!(env.rev(&f.down, "git-intake/update"), fix);
+    assert_eq!(
+        env.git(&wt, &["symbolic-ref", "HEAD"]),
+        "refs/heads/git-intake/update"
+    );
+    assert_eq!(parents(&f, &merge), [theirs.clone(), verified]);
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["step"], "merged");
+    assert_eq!(status["update"]["base"], theirs.as_str());
+
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+    assert_eq!(env.rev(&f.publish, "main"), fix);
+}
+
+#[test]
+fn continue_keeps_commits_made_on_top_of_a_detached_catch_up_merge() {
+    let f = Fork::new();
+    let env = &f.env;
+    let (_, _, _, fix) = committed_on_top_while_detached(&f);
+    f.tool(&["continue"])
+        .success()
+        .stdout(contains("next: git intake verify"));
+    assert_eq!(env.rev(&f.down, "git-intake/update"), fix);
 }

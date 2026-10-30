@@ -90,6 +90,7 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     let run = finish::Run {
         moved: false,
         caught,
+        remote_tip: true,
     };
     let commit = match finish::prepare(repo, &mut state, &tip, run, &recheck)? {
         Ready::Publish(head) => head,
@@ -817,6 +818,7 @@ fn catch_up_while_waiting(
     let run = finish::Run {
         moved: false,
         caught,
+        remote_tip: true,
     };
     let head = match finish::prepare(repo, &mut state, &tip, run, &recheck_waiting)? {
         Ready::Publish(head) => head,
@@ -889,13 +891,30 @@ fn recheck_waiting(repo: &Repo, state: &mut UpdateState) -> Result<Option<String
             .as_ref()
             .is_none_or(|h| listed.get(h).is_none_or(|c| pushed.contains(c)))
         && listed.get(&target) == fetched.as_ref();
+    // The base came from the remote's integration branch when the update
+    // caught up with it: a branch that no longer contains it was rewritten.
+    let rewritten = |state: &UpdateState| -> Result<()> {
+        let now = repo
+            .git
+            .commit(&tracking_ref(&mr.remote, &integration))?
+            .unwrap_or_default();
+        if now.is_empty() || !repo.git.is_ancestor(&state.base, &now)? {
+            bail!(
+                "{}\nNothing was pushed",
+                refusal(state, &mr, &Landing::Rewritten { tip: now })
+            );
+        }
+        Ok(())
+    };
     if as_fetched {
+        rewritten(state)?;
         return Ok(None);
     }
     let landing = inspect(repo, state)?;
     repo.save_state(state)?;
     match landing {
         Landing::Landed { .. } | Landing::Waiting { .. } | Landing::Moved { .. } => {
+            rewritten(state)?;
             Ok(Some(format!(
                 "the merge request from '{}' or '{}/{integration}' changed while the update caught up",
                 mr.branch, mr.remote

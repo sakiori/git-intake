@@ -706,6 +706,38 @@ fn a_move_while_a_catch_up_is_verified_pushes_nothing_until_the_next_finish() {
 }
 
 #[test]
+fn a_remote_rewound_below_the_base_refuses_a_pending_catch_up_push() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let base = env.rev(&f.down, "main");
+    let (commit, _) = verified(&f);
+    f.tool(&["finish"]).success();
+    land(&f, &[("n.txt", "theirs\n")], "other: add n");
+    f.tool(&["finish"]).code(1);
+    let wt = env.update_worktree(&f.down);
+    fs::write(wt.join("n.txt"), "both\n").unwrap();
+    env.git(&wt, &["add", "n.txt"]);
+    f.tool(&["continue"]).success();
+    // The remote's integration branch is rewound below the commit the update
+    // caught up with.
+    env.git(&f.publish, &["update-ref", "refs/heads/main", &base]);
+
+    let finish = f.tool(&["finish"]).code(2);
+    let err = stderr(&finish);
+    assert!(err.contains("it was rewritten"), "{err}");
+    assert!(err.contains("Nothing was pushed"), "{err}");
+    assert!(
+        !stdout(&finish).contains("pushed the verified catch-up merge"),
+        "{}",
+        stdout(&finish)
+    );
+    assert_eq!(
+        env.rev(&f.publish, &format!("refs/heads/{MERGE_REQUEST_BRANCH}")),
+        commit
+    );
+}
+
+#[test]
 fn a_merge_request_closed_with_its_branch_kept_is_treated_as_open() {
     let f = Fork::merge_request();
     let env = &f.env;
