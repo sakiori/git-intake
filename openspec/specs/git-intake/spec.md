@@ -63,7 +63,7 @@ The tool SHALL refuse the settings `remote` and `mirror`, naming what replaces t
 - **THEN** the tool refuses to run and names the remote and the upstream
 
 ### Requirement: Sync record in history
-Every merge commit the tool creates SHALL name the upstream and its target commit in commit trailers. Every commit the tool copies from an upstream in `port` mode SHALL name the upstream and the upstream commit it took in the trailers `Intake-Upstream` and `Intake-Taken`. A sync record SHALL count only on a merge commit whose second parent is the record's target.
+Every sync merge the tool creates for a follow upstream SHALL name the upstream and its target commit in commit trailers; a catch-up merge SHALL carry the trailer `Intake-Catch-Up` instead. Every commit the tool copies from an upstream in `port` mode SHALL name the upstream and the upstream commit it took in the trailers `Intake-Upstream` and `Intake-Taken`. A sync record SHALL count only on a merge commit whose second parent is the record's target.
 
 #### Scenario: Copied commit
 - **WHEN** a port update copies an upstream commit

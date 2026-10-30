@@ -10,6 +10,16 @@ It covers three cases:
 
 The tool runs the installed `git` for every repository operation. Each repository describes itself in a committed `.git-intake.toml`. Upstreams are fetched by their URL; the repository keeps no remote, remote-tracking branch or other branch of an upstream.
 
+**Contents:** [How it differs from other tools](#how-it-differs-from-other-tools) · [Installation](#installation) · [Quickstart](#quickstart) · [Releasing](#releasing) · [Configuration](#configuration) · [The update cycle](#the-update-cycle) · [The sync record](#the-sync-record) · [Commands](#commands) · [Exit status](#exit-status) · [Running in CI](#running-in-ci) · [Moving from upstream remotes and mirror branches](#moving-from-upstream-remotes-and-mirror-branches) · [Monorepo migration](#monorepo-migration) · [Safety properties](#safety-properties) · [License](#license)
+
+## How it differs from other tools
+
+- **GitHub's *Sync fork* and `gh repo sync`** update one branch of a fork from its parent repository. `gh repo sync` fast-forwards the branch, or with `--force` resets it hard to the source; on conflicts it refuses, and the web interface offers a pull request instead. git intake takes any number of upstreams by URL, at the root or under their own paths, merges each at a fixed target with a merge commit that records it, has a conflict resolved in a separate worktree, and moves the integration branch only to a tree its checks passed or a pull request's required pipeline tested.
+- **The Pull app** keeps a fork current through pull requests from upstreams in the same fork network on GitHub, merged by a configured method: `merge`, `squash`, `rebase`, `hardreset` or none. git intake is a command-line tool rather than a hosted app, takes upstreams from any URL on any host, never squashes, rebases or resets the integration branch, and can also take chosen upstream commits one by one (port mode).
+- **Copybara** moves code between repositories through transformations, such as moving and rewriting files, and creates new commits in the destination: one squashed commit, one commit per origin change, or a change request, with the origin's revision in a label of the commit message. git intake transforms nothing: in follow mode the upstream's own commits arrive in the merge, and in port mode each copy keeps the upstream commit's author and message.
+- **git subtree** merges a repository into a subdirectory, with its history or squashed, and records `git-subtree-dir` and `git-subtree-split` in commit messages. It is a local merge command; git intake adds fixed targets, recorded conflict resolutions, checks, publication by push or merge request and drift reports on top of the same kind of subtree merge, and takes over a path that `git subtree add` imported.
+- **Renovate and Dependabot** propose pull requests that change version references in manifests and lockfiles, and the commit a git submodule points at. They bring no upstream source history into the repository; git intake is for upstream code the repository holds and changes itself.
+
 ## Installation
 
 Requires Git 2.43 or later (`git merge-tree -X` is used for conflict prediction) and a POSIX `sh`. The tool is a single binary named `git-intake`; with it on the `PATH`, git runs it as `git intake`.
@@ -67,7 +77,7 @@ From a checkout, `cargo install --locked --path .` installs the working tree. `c
 
 `git intake -h`, and `-h` or `--help` after a command (`git intake finish --help`), print the built-in help. `git intake --help` is different: git turns it into `git help intake`, which opens the manual page `git-intake(1)`, so it works only where `man` finds that page.
 
-Every release archive carries the manual pages of that release under `man/man1/`, and mise installs them with the binary. `man` finds them when that `man` directory is on the manual search path. Unless `MANPATH` is set, both man-db and the BSD `man` derive the search path from `PATH`: for every directory on `PATH` they also search its `man` subdirectory. The pages are therefore found when the directory holding `git-intake` itself is on `PATH`, as with `mise activate`, and they then belong to the binary that runs. They are not found through mise's shims, whose directory holds no pages, nor when `MANPATH` is set without an empty component (a leading or trailing `:`, or `::`), which replaces that search.
+Every release archive carries the manual pages of that release under `man/man1/`, and mise installs them with the binary. `cargo install` installs the binary alone and no manual page, and so does `cargo binstall`, which unpacks only the binary of the release archive; take the pages from the release's archive, as under *Direct download*, or write them from a checkout of the release's tag with `cargo run --locked -p xtask -- man <dir>`. `man` finds them when that `man` directory is on the manual search path. Unless `MANPATH` is set, both man-db and the BSD `man` derive the search path from `PATH`: for every directory on `PATH` they also search its `man` subdirectory. The pages are therefore found when the directory holding `git-intake` itself is on `PATH`, as with `mise activate`, and they then belong to the binary that runs. They are not found through mise's shims, whose directory holds no pages, nor when `MANPATH` is set without an empty component (a leading or trailing `:`, or `::`), which replaces that search.
 
 When the current pages are not on the search path, `man` opens any other `git-intake` pages it finds there, such as pages extracted from an earlier release's archive, and they describe that release. `man -w git-intake-verify` names the file `man` opens, and the footer of every page names its release. Remove such leftover pages, or put the current pages first:
 
@@ -78,6 +88,91 @@ export MANPATH="$(mise where gitlab:sakiori-oss/git-intake)/man:$MANPATH"
 `mise where` answers for the directory it runs in, so in a shell startup file this line names the version mise uses there, not the version a repository pins. `git intake <command> -h` always describes the binary that runs.
 
 After a direct download, extracting the pages into `/usr/local/share` puts them on the default search path; extract the pages of every new release there as well, or the old pages stay.
+
+## Quickstart
+
+The repository that receives the changes is the **downstream**; each repository it takes changes from is an **upstream**. The downstream's **integration branch**, usually `main`, is the branch updates land on. An upstream is fetched by its **URL**, given in the configuration; the **publish remote** is a git remote of the downstream itself, such as `origin`, where `finish` pushes the integration branch, and is never an upstream.
+
+The steps below make a fork in throwaway repositories, so they can be run as they are in an empty directory with `git intake` installed. Each `git -C` and `git config` line belongs to the setup; in a real fork, the upstream and the publish remote already exist.
+
+1. An upstream with one commit, a hosted repository for the downstream, and the downstream cloned from the upstream:
+
+   ```sh
+   git init -q -b main upstream
+   git -C upstream config user.name "Sakiori"
+   git -C upstream config user.email "oss@sakiori.app"
+   echo "hello" > upstream/greeting.txt
+   git -C upstream add greeting.txt
+   git -C upstream commit -q -m "feat: greet"
+
+   git init -q --bare -b main downstream.git
+   git clone -q upstream downstream
+   cd downstream
+   git remote remove origin                 # the clone's origin is the upstream: no remote for it
+   git remote add origin ../downstream.git  # the publish remote
+   git config user.name "Sakiori"           # git intake commits merges with git's identity
+   git config user.email "oss@sakiori.app"
+   ```
+
+2. The configuration, committed on the integration branch, with a check that the fork's greeting still says hello:
+
+   ```sh
+   cat > .git-intake.toml <<'EOF'
+   integration = "main"
+   checks = [
+     { name = "greeting", run = "grep -q hello greeting.txt" },
+   ]
+
+   [publish]
+   remote = "origin"
+
+   [[upstream]]
+   name = "upstream"
+   url = "../upstream"   # relative to the downstream's main worktree
+   branch = "main"
+   EOF
+   git add .git-intake.toml
+   git commit -q -m "chore: configure git intake"
+   git push -q -u origin main
+   ```
+
+3. With nothing new upstream, an update has nothing to do:
+
+   ```sh
+   git intake start
+   ```
+
+   ```
+   upstream: current at 1a2b3c4d5e6f
+   every selected upstream is current; nothing to update
+   ```
+
+   It exits with status 0 and creates nothing. `git intake status` shows the upstream as `current`; since the fork has no sync record yet, its last synced commit is the newest upstream commit the integration branch contains.
+
+4. The upstream moves on, and an update takes it in:
+
+   ```sh
+   echo "hello, world" > ../upstream/greeting.txt
+   git -C ../upstream commit -q -am "feat: greet the world"
+
+   git intake status             # upstream: behind by 1
+   git intake start              # merges it in .worktrees/git-intake/update
+   git intake verify             # runs the check there
+   git intake report             # the merged range, conflicts and changes
+   git intake finish --no-publish
+   ```
+
+   `start` merges the upstream at its fetched tip with a sync merge, `sync(upstream): merge upstream/main at <commit>`, `verify` passes the check, and `finish --no-publish` fast-forwards `main` to the verified merge and removes the update without pushing; without `--no-publish`, `finish` also pushes `main` to `origin`. On a conflict, `start` stops with status 1: resolve the files in the update worktree, `git add` them and run `git intake continue`.
+
+5. Every upstream is current again:
+
+   ```sh
+   git intake status --check     # exit status 0: no drift
+   git intake start              # every selected upstream is current; nothing to update
+   git push origin main          # publish what finish --no-publish left local
+   ```
+
+[The update cycle](#the-update-cycle) describes each step in full, and [Running in CI](#running-in-ci) the same cycle run by a scheduled job.
 
 ## Releasing
 
@@ -272,7 +367,7 @@ A check that compares the tree with a baseline, such as a ratchet that may not g
 | `GIT_INTAKE_INTEGRATION` | The name of the integration branch. |
 | `GIT_INTAKE_UPSTREAMS` | The names of the upstreams the update takes, separated by spaces, in the order they were merged or carried out. An upstream that was current at `start` is not among them. |
 | `GIT_INTAKE_UPSTREAM_<NAME>_MODE` | `follow` or `port`. |
-| `GIT_INTAKE_UPSTREAM_<NAME>_TARGET` | Follow mode: the target the update merges. Port mode: the newest upstream commit the update takes or decides on, which is what it moves the upstream to in the journal; commits the plan leaves `later` stay pending, and an update that takes and decides none has no target. A port target is not merged, so it is not an ancestor of `GIT_INTAKE_HEAD`. |
+| `GIT_INTAKE_UPSTREAM_<NAME>_TARGET` | Follow mode: the target the update merges. Port mode: the newest upstream commit this update takes or decides on; this does not advance the journal's base. Commits the plan leaves `later` stay pending, and an update that takes and decides none has no target. A port target is not merged, so it is not an ancestor of `GIT_INTAKE_HEAD`. |
 | `GIT_INTAKE_UPSTREAM_<NAME>_PREVIOUS` | Follow mode only: the last synced commit before the update; absent on a first import or when the history names none. A port upstream has no such commit; its journal names the commit the port started from. |
 
 `<NAME>` is the upstream's name in upper case, with every character other than a letter or a digit replaced by `_`: `app-a` gives `GIT_INTAKE_UPSTREAM_APP_A_TARGET`. Two upstream names that give the same `<NAME>`, such as `app-a` and `app.a`, are refused when the configuration is read. Every commit named stays in the repository while `verify` runs: the base and the head are on the update branch, and an upstream's commits are in the history of `refs/git-intake/upstreams/<name>`, which the update holds. Variables with the `GIT_INTAKE_` prefix that `git intake` itself inherits are not passed on, so a check sees only those of the update it verifies; git commands the tool runs itself never see them.
@@ -597,7 +692,7 @@ Scripts that read the output of `verify` or its log files see the checks' names 
 
 ## The sync record
 
-Every merge commit the tool creates looks like this:
+Every sync merge the tool creates for a follow upstream looks like this; a catch-up merge carries `Intake-Catch-Up` instead (see *Catching up with a moved integration branch*):
 
 ```
 sync(app-a): merge app-a/main at 1a2b3c4 (v2.3.0)
@@ -609,13 +704,14 @@ Intake-Tag: v2.3.0
 
 `Intake-Tag` names the upstream tag that points at the target, and is left out when no tag does. It is the tag a revision named, the release that `tags` selected, or otherwise a tag of the target commit: of the tags that point at it, the highest version among those that match the upstream's `tags` pattern and are a version as described under *Release tags* (prerelease and build metadata allowed), or without such a tag the highest version among the tags whose name is a semantic version with an optional `v` or `V`. A tag whose name is no version, such as `archive/2024` or `vnext`, is not recorded this way, even when it matches the pattern; a tag named on the command line is recorded whatever its name. A tag whose name contains a comma is never recorded, because trailer readers split values at commas. The tag is fixed by `start` with the target, so a tag added or moved later does not change the record.
 
-The trailer is how release tooling learns which upstream release the repository holds, for example a downstream whose version follows the upstream release it merged. The newest sync merge of an upstream named `upstream` names it:
+The trailer is how release tooling learns which upstream release the repository holds, for example a downstream whose version follows the upstream release it merged. `status --json` gives it for each follow upstream as `last_synced_tag`, from the sync record of the last synced commit, read along the integration line as described below, so a squash commit's copied trailers or a record inside an upstream's own history never count. For an upstream named `upstream`:
 
 ```sh
-git log -1 --format='%(trailers:key=Intake-Tag,valueonly)' --grep='^Intake-Upstream: upstream$' main
+set -o pipefail
+tag=$(git intake status --json | jq -r '.upstreams[] | select(.name == "upstream") | .last_synced_tag // empty')
 ```
 
-The output is empty when the newest merge took a commit that no tag names. `status --json` gives the same fact for the last synced commit as `last_synced_tag`, read along the integration line as described below.
+`tag` is empty when the sync record of the last synced commit carries no `Intake-Tag`, when the upstream has no sync record yet, and when no upstream has that name; `// empty` turns the JSON `null` into no output instead of the text `null`. `status` fetches every upstream and exits with status 1 when one cannot be fetched, which `pipefail` passes on.
 
 A sync record counts only on a merge commit whose second parent is its target, as every sync merge the tool makes is: the trailers a squash commit's message copies from the merges it replaced do not count.
 
@@ -632,26 +728,74 @@ A follow upstream's **last synced commit** is the target of its newest sync reco
 | `start [UPSTREAM[=REV]...]` | Starts an update, as described above. A follow upstream named as `UPSTREAM=REV` is taken at the commit REV names instead of its fetched tip (see *Choosing a target*), or without REV, with `tags`, at its newest release (see *Release tags*); a port upstream's plan is limited to the pending commits REV contains. |
 | `continue` | Carries out the edited plan of a port upstream, or concludes the merge, copy or catch-up merge stopped on conflicts, and takes in the rest. It also accepts a merge concluded by hand when the commit keeps the sync record, a copy committed by hand when it keeps both copy trailers, and a catch-up merge committed by hand with its trailer. |
 | `abort [--merge-request]` | Removes the update worktree, branch, plan, upstream references, logs and state, and never touches the forge. With `--merge-request`, then closes the update's open merge request through the forge's API and deletes the update's branch on each push URL while it points at the commit read (see *Abort*). |
-| `verify [--only NAME... \| --skip NAME...]` | Runs `install` and the checks and records the verified commit. With `--only` or `--skip`, runs `install` and only the checks selected by name, as a partial run that never verifies the update unless the selection leaves no check out (see *Running some of the checks*). |
+| `verify [--only NAME]... \| [--skip NAME]...` | Runs `install` and the checks and records the verified commit. With `--only` or `--skip`, repeated to name several checks, as in `verify --only lint --only test` or `verify --skip e2e`, runs `install` and only the checks selected by name, as a partial run that never verifies the update unless the selection leaves no check out (see *Running some of the checks*). |
 | `finish [--no-publish]` | Catches the update up when the integration branch moved. In push mode it verifies the catch-up merge, then fast-forwards and publishes the verified update. In merge-request mode it requires the forge's merge settings, pushes the update to `git-intake/update`, opens its merge request or rewrites the open one, and ends the local update. With `--no-publish` it fetches nothing, makes only the local move of a verified update, closes the update without pushing, and names the unpublished branch. On an update an earlier release left waiting for its merge request, it hands the update over to the merge request. |
 | `sync` | Takes the follow upstreams in without local state: catches the update's open merge request up, or starts an update of every follow upstream that is behind and publishes it, as merge request or by push after `verify` (see *Unattended synchronisation*). |
 | `env [COMMIT] [--dotenv \| --json] [-- COMMAND...]` | Prints the variables `verify` gives the checks for a commit, read from history, or runs a command with them (see *The update variables outside verify*). |
-| `status [--check] [--json]` | Fetches every upstream and shows the configuration, with each check by its name and command, then for every upstream its path, mode, branch, fetched tip and one state. A follow upstream also shows its last synced commit and the number of commits the integration branch lacks, with the state `current`, `behind`, `not imported`, `no release`, `path removed`, `rewritten` or `unavailable`; with `tags`, the tip shown and the commits counted are those of the newest release, and `no release` means the branch has none. A port upstream shows its journal's base and its numbers of taken, decided and pending commits, with the state `current`, `pending`, `no base`, `rewritten` or `unavailable`; `no base` means it has no journal and nothing to start one from, and a rewritten one names the commits off its line. `unavailable` means the upstream could not be fetched, its branch is missing, the tags of an upstream with `tags` could not be listed, or, for a port upstream, its journal is invalid; any upstream that cannot be fetched makes `status` exit with status 1. `path removed` means a synced path upstream, from a record or from history, whose path no longer exists on the integration branch; `start` refuses it and `status --check` counts it as drift. When several states apply, `unavailable` comes first, then `rewritten`, then `path removed`. A path upstream is `not imported` until a sync record for it exists or, without one, while its path is absent or holds content that no merge of the upstream brought in; a root upstream is `not imported` while it shares no history with the integration branch. In merge-request mode it shows the update's open merge request with its number, address and head and whether the head contains the integration tip, naming `sync` when it does not, and the newest merge request of the update merged without its history; when it cannot read the forge, it says why and keeps its exit status. While an update is in progress it also shows the step reached, the base and the base the update started from when a catch-up moved it, the worktree, each queued upstream's target or plan and step, a catch-up merge in conflict or awaiting verification with the tip it catches up with, the update's checks by name, the verified commit, the partial run with its commit, the outcome of each command it ran and the checks it left out, and the next command. |
-| `report [--json]` | For the update in progress, or the one just finished, per upstream. For a follow upstream: the merged range and commit count, the upstream tag of the target, each conflicted file with its resolution source (by hand or by a recorded resolution), and the size of the repository's own changes against that upstream before and after the merge. For a port upstream: the taken commits in the order copied, each with its conflicted files, the git-intake paths its copy left out and, where there are any, the earlier pending commits that change the same files; the commits recorded as present because their copy changed nothing; the skip and have decisions with their notes; and the number of commits left pending. Ranges and sizes are measured from the base the update started from. Each catch-up merge follows with the integration tip it took in and its conflicted files with their resolution source. |
+| `status [--check] [--json]` | Fetches every upstream and shows the configuration, the state of every upstream, the update's merge request in merge-request mode, and the update in progress (see [status](#status)). |
+| `report [--json]` | Summarises the update in progress, or the one just finished, per upstream (see [report](#report)). |
 | `log [UPSTREAM...] [--json]` | Fetches the selected upstreams and lists, for a follow upstream, the commits on its branch that the integration branch does not contain, up to the newest release with `tags`, and for a port upstream its pending commits, oldest first. |
 | `branches [UPSTREAM...] [--json]` | Fetches every branch of the selected upstreams for the command and lists every branch that holds commits the integration branch does not contain, with their number; for a port upstream, commits a copy names as taken do not count. |
-| `doctor [--json]` | Checks the repository and reports each check as pass, fail or warn. It changes nothing but the references of its own fetches, which it removes. Checks: the configuration is valid; the update in progress, if any, holds its references at the tips `start` fetched; no reference under `refs/git-intake/` is left without an update; every upstream's URL can be fetched and its branch exists; every imported path exists on the integration branch; every follow upstream's last synced commit is still contained in its branch; every port upstream's journal is valid and its base and its decided and taken commits that are not retired are still on its branch, naming each one that is not; no git remote names an upstream's repository, with a note when the remote is the one a partial clone fetches missing objects from; no journal belongs to an upstream that is missing or in follow mode; in merge-request mode, the forge is recognised, a token is set and accepted, and the merge settings qualify, with a warning when squash or rebase merges stay selectable; the main checkout is clean; no merge is in progress there; the update state, if any, matches its worktree and branch. It warns about upstreams that still have sync records but were dropped from the configuration. |
+| `doctor [--json]` | Checks the repository and reports each check as pass, fail or warn, changing nothing (see [doctor](#doctor)). |
 | `contribute UPSTREAM[=REV] BRANCH` | Creates the local branch BRANCH at the upstream's fetched tip, or at the commit REV names on its branch, for a contribution to the upstream (see *Contributing to an upstream*). Never pushes. |
 
 `status --check` additionally predicts, with `git merge-tree`, the files a merge of each behind follow upstream's tip, or newest release with `tags`, would conflict in. It creates no worktree, branch or state, and fails unless every upstream is current, so a port upstream with pending commits fails it too. It can run on a schedule and gate a cutover or a port review.
 
+### status
+
+`status` fetches every upstream and shows the configuration, with each check by its name and command, then for every upstream its path, mode, branch, fetched tip and one state. A follow upstream also shows its last synced commit and the number of commits the integration branch lacks, with the state `current`, `behind`, `not imported`, `no release`, `path removed`, `rewritten` or `unavailable`; with `tags`, the tip shown and the commits counted are those of the newest release, and `no release` means the branch has none.
+
+A port upstream shows its journal's base and its numbers of taken, decided and pending commits, with the state `current`, `pending`, `no base`, `rewritten` or `unavailable`; `no base` means it has no journal and nothing to start one from, and a rewritten one names the commits off its line.
+
+`unavailable` means the upstream could not be fetched, its branch is missing, the tags of an upstream with `tags` could not be listed, or, for a port upstream, its journal is invalid; any upstream that cannot be fetched makes `status` exit with status 1. `path removed` means a synced path upstream, from a record or from history, whose path no longer exists on the integration branch; `start` refuses it and `status --check` counts it as drift. When several states apply, `unavailable` comes first, then `rewritten`, then `path removed`. A path upstream is `not imported` until a sync record for it exists or, without one, while its path is absent or holds content that no merge of the upstream brought in; a root upstream is `not imported` while it shares no history with the integration branch.
+
+In merge-request mode it shows the update's open merge request with its number, address and head and whether the head contains the integration tip, naming `sync` when it does not, and the newest merge request of the update merged without its history; when it cannot read the forge, it says why and keeps its exit status.
+
+While an update is in progress it also shows the step reached, the base and the base the update started from when a catch-up moved it, the worktree, each queued upstream's target or plan and step, a catch-up merge in conflict or awaiting verification with the tip it catches up with, the update's checks by name, the verified commit, the partial run with its commit, the outcome of each command it ran and the checks it left out, and the next command.
+
+### report
+
+`report` summarises the update in progress, or the one just finished, per upstream. For a follow upstream: the merged range and commit count, the upstream tag of the target, each conflicted file with its resolution source (by hand or by a recorded resolution), and the size of the repository's own changes against that upstream before and after the merge. For a port upstream: the taken commits in the order copied, each with its conflicted files, the git-intake paths its copy left out and, where there are any, the earlier pending commits that change the same files; the commits recorded as present because their copy changed nothing; the skip and have decisions with their notes; and the number of commits left pending. Ranges and sizes are measured from the base the update started from. Each catch-up merge follows with the integration tip it took in and its conflicted files with their resolution source.
+
+### doctor
+
+`doctor` checks the repository and reports each check as pass, fail or warn. It changes nothing but the references of its own fetches, which it removes. Its checks:
+
+- The configuration is valid.
+- The update in progress, if any, holds its references at the tips `start` fetched.
+- No reference under `refs/git-intake/` is left without an update.
+- Every upstream's URL can be fetched and its branch exists.
+- Every imported path exists on the integration branch.
+- Every follow upstream's last synced commit is still contained in its branch.
+- Every port upstream's journal is valid and its base and its decided and taken commits that are not retired are still on its branch, naming each one that is not.
+- No git remote names an upstream's repository, with a note when the remote is the one a partial clone fetches missing objects from.
+- No journal belongs to an upstream that is missing or in follow mode.
+- In merge-request mode, the forge is recognised, a token is set and accepted, and the merge settings qualify, with a warning when squash or rebase merges stay selectable.
+- The main checkout is clean.
+- No merge is in progress in the main checkout.
+- The update state, if any, matches its worktree and branch.
+
+It warns about upstreams that still have sync records but were dropped from the configuration.
+
 ### JSON output
 
-`status`, `report`, `log`, `branches`, `doctor` and `env` accept `--json`. They then write one JSON document to standard output, with the same facts as the text form under stable snake_case field names, and exit with the same status. A URL in the output, as in every message, carries no credentials: a password is never shown, nor the user of an `http` or `https` URL, where a token is usually written; the user of an SSH URL stays. Notes and errors go to standard error. For example, `status --json` carries `publish` (the publish remote or null), `publish_via` (`push`, `merge_request` or null), `install` (the install command or null) and `checks`, the checks of the configuration at the integration tip, each with `name` and `run`. In merge-request mode it carries `merge_request`, the update's open merge request with `number`, `url`, `head` and `current` (whether the head contains the integration tip), `merged_without_history`, the newest merge request of the update merged without its history with `number` and `url`, each or null, and `forge_error`, why the forge could not be read, or null. An update carried on from a merge request carries `carried_from` with `number`, `url` and `source_branch` in its `update`; an update an earlier release left waiting carries `step` `waiting_for_merge_request` and `merge_request` with `number`, `remote`, `source_branch`, `target_branch` and `commit`. `env --json` prints one object whose keys are the variable names, and `{}` for a commit that carries no update.
+`status`, `report`, `log`, `branches`, `doctor` and `env` accept `--json`. They then write one JSON document to standard output, with the same facts as the text form under stable snake_case field names, and exit with the same status. A URL in the output, as in every message, carries no credentials: a password is never shown, nor the user of an `http` or `https` URL, where a token is usually written; the user of an SSH URL stays. Notes and errors go to standard error. `env --json` prints one object whose keys are the variable names, and `{}` for a commit that carries no update.
 
-Every entry of `status --json` `upstreams` carries `name`, `path`, `url`, `branch`, `mode` (`follow` or `port`), `tip`, `state` (`current`, `behind`, `pending`, `no_base`, `not_imported`, `no_release`, `path_removed`, `rewritten`, `unavailable`) and `detail`. A follow upstream fills `last_synced`, `last_synced_source` (`record`, `history` or null), `last_synced_tag` (the `Intake-Tag` of the newest sync record, or null), `tags` (the configured pattern or null) and `commits_behind`, with `tags` also `release`, `release_tag` and `commits_after_release`, and with `--check` `conflicts`; a port upstream fills `base`, `journal` (whether the journal exists), `taken`, `decided` and `pending`, and when rewritten `off_line`, with `base` (the base when it is off the line, or null) and `commits` (each with `commit` and `recorded_as`: `taken`, `skip` or `have`). Fields that do not apply are null.
+#### status --json
 
-Each queued upstream under `update` in `status --json` carries `name`, `mode`, `fetched`, `rev`, `step` (`plan`, `pending`, `conflict`, `merged`) and `conflicts`; a follow upstream adds `target`, `tag` (the upstream tag that names the target, or null), `kind` and `merge_commit`, a port upstream `plan` (the plan file), `commits` (each with `commit`, `subject`, `verb`, `note`, `copy` — `none`, `conflict`, `commit_failed`, `copied` or `empty` — `copied`, `failure`, git's output when the commit of the copy failed, and `left_out`) and `journal_commit`. The update's `step` is `plan` while a plan waits to be edited, `commit_failed` while a copy whose commit failed waits for `continue`, `catch_up_conflict` while a catch-up merge waits for its conflicts to be resolved and `continue`, and `catch_up` while a catch-up merge awaits its verification; in both, `catch_up` gives the catch-up's `tip`, `head_before`, `merge_commit` and `conflicts`, and is null otherwise. `base` is the integration tip the update lands on and `start_base` the one it started from. `checks` lists the names of the update's checks, `verified_commit` is the commit a full run verified, or null, and `partial_run` is the update's partial run, or null: its `commit`, `install`, the install command's outcome or null when no install command is configured, `checks`, each check it ran with `name` and `outcome`, `left_out`, the names of the checks it left out, and `passed`. An outcome is `passed`, `failed`, or `skipped` when the install command failed; a check left out appears only in `left_out`. `report --json` carries `base`, the integration tip the update started from or was carried on at, `carried_from`, the address of the merge request an update was carried on from, or null, and `catch_ups`, each with `tip`, `merge_commit` and `conflicts`. Each entry of `report --json` `upstreams` carries `mode` and `rev`; a follow upstream fills `kind`, `range_start`, `target`, `tag`, `commits`, `merge_commit`, `conflicts` and the diff sizes, and a port upstream fills `port` with `taken` (each with `commit`, `subject`, `copy`, `copied`, `conflicts`, `left_out` and `earlier_pending`), `unchanged` (each with `commit`, `subject` and `left_out`), `decisions` (each with `commit`, `subject`, `verdict` and `note`), `left_pending` and `journal_commit`. Each entry of `log --json` and `branches --json` carries `mode`; a follow upstream's entry of `log --json` adds `release` and `release_tag`, null without `tags`.
+The document carries `publish` (the publish remote or null), `publish_via` (`push`, `merge_request` or null), `install` (the install command or null) and `checks`, the checks of the configuration at the integration tip, each with `name` and `run`. In merge-request mode it carries `merge_request`, the update's open merge request with `number`, `url`, `head` and `current` (whether the head contains the integration tip), `merged_without_history`, the newest merge request of the update merged without its history with `number` and `url`, each or null, and `forge_error`, why the forge could not be read, or null. An update carried on from a merge request carries `carried_from` with `number`, `url` and `source_branch` in its `update`; an update an earlier release left waiting carries `step` `waiting_for_merge_request` and `merge_request` with `number`, `remote`, `source_branch`, `target_branch` and `commit`.
+
+**Upstreams.** Every entry of `upstreams` carries `name`, `path`, `url`, `branch`, `mode` (`follow` or `port`), `tip`, `state` (`current`, `behind`, `pending`, `no_base`, `not_imported`, `no_release`, `path_removed`, `rewritten`, `unavailable`) and `detail`. A follow upstream fills `last_synced`, `last_synced_source` (`record`, `history` or null), `last_synced_tag` (the `Intake-Tag` of the newest sync record, or null), `tags` (the configured pattern or null) and `commits_behind`, with `tags` also `release`, `release_tag` and `commits_after_release`, and with `--check` `conflicts`; a port upstream fills `base`, `journal` (whether the journal exists), `taken`, `decided` and `pending`, and when rewritten `off_line`, with `base` (the base when it is off the line, or null) and `commits` (each with `commit` and `recorded_as`: `taken`, `skip` or `have`). Fields that do not apply are null.
+
+**The update in progress.** Each queued upstream under `update` carries `name`, `mode`, `fetched`, `rev`, `step` (`plan`, `pending`, `conflict`, `merged`) and `conflicts`; a follow upstream adds `target`, `tag` (the upstream tag that names the target, or null), `kind` and `merge_commit`, a port upstream `plan` (the plan file), `commits` (each with `commit`, `subject`, `verb`, `note`, `copy` — `none`, `conflict`, `commit_failed`, `copied` or `empty` — `copied`, `failure`, git's output when the commit of the copy failed, and `left_out`) and `journal_commit`.
+
+The update's `step` is `plan` while a plan waits to be edited, `commit_failed` while a copy whose commit failed waits for `continue`, `catch_up_conflict` while a catch-up merge waits for its conflicts to be resolved and `continue`, and `catch_up` while a catch-up merge awaits its verification; in both, `catch_up` gives the catch-up's `tip`, `head_before`, `merge_commit` and `conflicts`, and is null otherwise.
+
+`base` is the integration tip the update lands on and `start_base` the one it started from. `checks` lists the names of the update's checks, `verified_commit` is the commit a full run verified, or null, and `partial_run` is the update's partial run, or null: its `commit`, `install`, the install command's outcome or null when no install command is configured, `checks`, each check it ran with `name` and `outcome`, `left_out`, the names of the checks it left out, and `passed`. An outcome is `passed`, `failed`, or `skipped` when the install command failed; a check left out appears only in `left_out`.
+
+#### report --json, log --json and branches --json
+
+`report --json` carries `base`, the integration tip the update started from or was carried on at, `carried_from`, the address of the merge request an update was carried on from, or null, and `catch_ups`, each with `tip`, `merge_commit` and `conflicts`. Each entry of `report --json` `upstreams` carries `mode` and `rev`; a follow upstream fills `kind`, `range_start`, `target`, `tag`, `commits`, `merge_commit`, `conflicts` and the diff sizes, and a port upstream fills `port` with `taken` (each with `commit`, `subject`, `copy`, `copied`, `conflicts`, `left_out` and `earlier_pending`), `unchanged` (each with `commit`, `subject` and `left_out`), `decisions` (each with `commit`, `subject`, `verdict` and `note`), `left_pending` and `journal_commit`. Each entry of `log --json` and `branches --json` carries `mode`; a follow upstream's entry of `log --json` adds `release` and `release_tag`, null without `tags`.
 
 ## Exit status
 
@@ -679,8 +823,8 @@ git-intake-sync:
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   script:
-    - git config user.name "git intake"
-    - git config user.email "git-intake@example.com"
+    - git config user.name "Sakiori"
+    - git config user.email "oss@sakiori.app"
     # Push with the access token in GITLAB_TOKEN instead of the job token,
     # whose pushes start no pipeline.
     - git remote set-url origin "$CI_SERVER_URL/$CI_PROJECT_PATH.git"
@@ -694,7 +838,12 @@ upstream-checks:
     - git intake env -- ./scripts/check.sh
 ```
 
-`GITLAB_TOKEN` is a project or group access token with the `api` scope and the Developer role, or Maintainer where the integration branch's protection requires it; a personal access token works as well. Store it as a **masked and protected** CI/CD variable: protected variables reach only pipelines of protected branches and tags, such as the scheduled pipeline on the default branch, and never the merge request pipeline that runs an update's code. `CI_JOB_TOKEN` cannot open merge requests, and pushes made with it start no pipeline. In a job of the instance that hosts the remote, the tool finds the forge and its API from `CI_SERVER_URL` and `CI_API_V4_URL`, including on an instance installed under a relative URL root.
+`GITLAB_TOKEN` is a project or group access token with the `api` scope and the Developer role, or Maintainer where the integration branch's protection requires it; a personal access token works as well. Store it as a **masked and protected** CI/CD variable. A protected variable reaches pipelines of protected branches and tags, such as the scheduled pipeline on the default branch, and the merge request pipeline that runs an update's code must not get it, which takes two settings:
+
+- Keep the update's branch `git-intake/update` unprotected: no protected-branch rule may match it, including a wildcard rule such as `*` or `git-intake/*`. A pipeline of a protected branch gets the protected variables, and so can a merge request pipeline whose source and target branches are both protected.
+- Keep **Settings > CI/CD > Variables > Allow merge request pipelines to access protected variables and runners** off. With it on, from GitLab 18.1, a merge request pipeline between two protected branches of the project gets the protected variables and runners ([Control access to protected variables and runners](https://docs.gitlab.com/ci/pipelines/merge_request_pipelines/#control-access-to-protected-variables-and-runners)).
+
+See also [protected CI/CD variables](https://docs.gitlab.com/ci/variables/#protect-a-cicd-variable). `CI_JOB_TOKEN` cannot open merge requests, and pushes made with it start no pipeline. In a job of the instance that hosts the remote, the tool finds the forge and its API from `CI_SERVER_URL` and `CI_API_V4_URL`, including on an instance installed under a relative URL root.
 
 `upstream-checks` runs on every merge request pipeline and gets no variable outside an update, so a check can fall back to its usual baseline. A job that hands the variables to later jobs writes them as a dotenv report:
 
@@ -723,19 +872,25 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # The environment holds the App's client id (variable INTAKE_APP_CLIENT_ID)
+    # and private key (secret INTAKE_APP_PRIVATE_KEY); its deployment branch
+    # policy allows only the integration branch.
+    environment: git-intake
     steps:
       - id: app
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ vars.INTAKE_APP_ID }}
+          client-id: ${{ vars.INTAKE_APP_CLIENT_ID }}
           private-key: ${{ secrets.INTAKE_APP_PRIVATE_KEY }}
-      - uses: actions/checkout@v5
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0          # the full history; git intake refuses a shallow clone
           token: ${{ steps.app.outputs.token }}
       - run: |
-          git config user.name "git intake"
-          git config user.email "git-intake@users.noreply.github.com"
+          git config user.name "Sakiori"
+          git config user.email "oss@sakiori.app"
       - run: git intake sync
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -750,13 +905,14 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
       - run: git intake env -- ./scripts/check.sh
 ```
 
-The scheduled job pushes and opens the pull request with a GitHub App installation token, or a fine-grained personal access token with *Contents: write*, *Pull requests: write* and *Metadata: read*, stored as a secret. Not the workflow's `GITHUB_TOKEN`: pushes made with it start no workflow, and pull requests it opens start their runs only after someone with write access approves them, so the pull request would wait untested until a person approves its runs. `actions/checkout` keeps the token it was given for the job's later pushes. A `pull_request` workflow checks out the merge of the pull request into its base by default; `env` then gives the base branch's tip as `GIT_INTAKE_BASE`, which is the base of the tree being tested. To hand the variables to later steps, append them to the environment file: `git intake env --dotenv >> "$GITHUB_ENV"`.
+The scheduled job pushes and opens the pull request with a GitHub App installation token, or a fine-grained personal access token with *Contents: write*, *Pull requests: write* and *Metadata: read*. Keep the App's private key, or the personal access token, as a secret of an [environment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments) (`git-intake` above) whose deployment branches are limited to the integration branch, not as a repository secret: a `pull_request` workflow of a branch of the same repository receives the repository's secrets, and with them could push and open pull requests as the job does, while an environment's secrets reach only a job that names the environment on a branch its policy allows. With a personal access token, store it there as a secret, pass it to `actions/checkout` as `token` and to `git intake sync` as `GH_TOKEN`, and drop the App step. Not the workflow's `GITHUB_TOKEN`: pushes made with it start no workflow, and pull requests it opens start their runs only after someone with write access approves them, so the pull request would wait untested until a person approves its runs. `actions/checkout` keeps the token it was given for the job's later pushes. A `pull_request` workflow checks out the merge of the pull request into its base by default; `env` then gives the base branch's tip as `GIT_INTAKE_BASE`, which is the base of the tree being tested. To hand the variables to later steps, append them to the environment file: `git intake env --dotenv >> "$GITHUB_ENV"`.
 
 ### Code from upstreams in CI
 
