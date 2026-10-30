@@ -308,13 +308,20 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     if let Some(publish) = &config.publish
         && publish.via == PublishVia::MergeRequest
     {
-        match merge_request::overview(repo, publish, &config.integration, &tip) {
-            Ok(o) => {
+        // The merge request is judged against the integration branch it
+        // goes into, the publish remote's, which the local one may lag.
+        let read = merge_request::fetch_integration(git, &publish.remote, &config.integration)
+            .and_then(|remote_tip| {
+                let o = merge_request::overview(repo, publish, &config.integration, &remote_tip)?;
+                Ok((remote_tip, o))
+            });
+        match read {
+            Ok((remote_tip, o)) => {
                 term = o.kind.term();
                 if let Some(open) = o.open {
                     merge_request = Some(OpenRequestView {
                         current: git.object_exists(&open.head)?
-                            && git.is_ancestor(&tip, &open.head)?,
+                            && git.is_ancestor(&remote_tip, &open.head)?,
                         reference: o.kind.reference(open.number),
                         number: open.number,
                         url: open.url,
