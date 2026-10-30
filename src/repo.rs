@@ -121,12 +121,16 @@ impl Repo {
         state::load(&self.paths.state)
     }
 
-    /// The update in progress, or a refusal naming the situation. The
-    /// references the update holds are restored first where they are
+    /// The update in progress, or a refusal naming the situation, for the
+    /// commands that carry it on; they warn when another release started it.
+    /// The references the update holds are restored first where they are
     /// missing.
     pub fn require_state(&self) -> Result<UpdateState> {
         match self.state()? {
             Some(s) => {
+                if let Some(warning) = state::release_warning(&s) {
+                    eprintln!("warning: {warning}");
+                }
                 self.restore_held_references(&s)?;
                 Ok(s)
             }

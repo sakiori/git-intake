@@ -337,7 +337,7 @@ In each case where it proceeds, it deletes the merge request branch from the pub
 
 ### The update state
 
-The update state lives in `<git-common-dir>/git-intake/state.json`, which every worktree shares and no commit can carry. Its format has a version. A state written by a release with another format, such as an update started by a release that kept the update worktree in the git directory, is refused by every command that reads the update, with the advice to finish or abort that update with the release that started it.
+The update state lives in `<git-common-dir>/git-intake/state.json`, which every worktree shares and no commit can carry. Its format has a version, and the state records the release that started the update. A state in any other format, older or newer, is refused by every command that reads the update: it names both formats and the release that started the update when the state records it, and advises finishing or aborting the update with that release (for a newer format, with that release or a later one that reads it). An update started by a release that kept the update worktree in the git directory is such a case. Another release with the same format carries the update on, but `continue`, `verify` and `finish` warn that a different release started it.
 
 ## The sync record
 

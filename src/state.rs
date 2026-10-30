@@ -21,6 +21,10 @@ pub const UPDATE_BRANCH: &str = "git-intake/update";
 /// request.
 const STATE_VERSION: u32 = 4;
 
+/// The release of this binary, as recorded in the states it starts. A build
+/// from source reports `0.0.0`.
+pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
+
 /// The update worktree, relative to the main worktree. It lives under
 /// `.worktrees/<branch>`, where these repositories keep their worktrees, and
 /// never in the git directory: tools such as compilers, bundlers and
@@ -346,6 +350,11 @@ pub struct MergeRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateState {
     pub version: u32,
+    /// The release that started the update. Another release of the same
+    /// state format carries it on with a warning; a state without it was
+    /// started before releases recorded themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<String>,
     /// The configuration read from the integration tip at `start`.
     pub config: Config,
     /// Integration tip at `start`.
@@ -378,6 +387,7 @@ impl UpdateState {
     ) -> Self {
         Self {
             version: STATE_VERSION,
+            release: Some(RELEASE.to_string()),
             config,
             base,
             branch: UPDATE_BRANCH.to_string(),
@@ -405,19 +415,56 @@ impl UpdateState {
 }
 
 /// Reads the state of the update in progress, or `None` when there is none.
-/// A state written by a release with another state format is refused: its
-/// update has to be finished or aborted with that release.
+/// A state in any other format, older or newer, is refused: its update has
+/// to be finished or aborted with a release that understands that format.
 pub fn load(path: &Path) -> Result<Option<UpdateState>> {
     match read(path)? {
         None => Ok(None),
         Some(Versioned::Current(state)) => Ok(Some(*state)),
-        Some(Versioned::Other(version)) => anyhow::bail!(
-            "the update in progress was started by a release that keeps its state in format {version}; \
-             this release understands format {STATE_VERSION}. Finish or abort the update with the release \
-             that started it ({})",
-            path.display()
-        ),
+        Some(Versioned::Other { version, release }) => {
+            anyhow::bail!("{}", other_format(path, version, release.as_deref()))
+        }
     }
+}
+
+/// Why a state of another format is refused, and what to do about it.
+fn other_format(path: &Path, version: Option<u64>, release: Option<&str>) -> String {
+    let this = format!("this release (git-intake {RELEASE}) understands format {STATE_VERSION}");
+    let path = path.display();
+    let Some(version) = version else {
+        return format!(
+            "the update state in {path} names no state format; {this}. Finish or abort the update \
+             with the release that started it"
+        );
+    };
+    let started = match release {
+        Some(r) => format!("the update in progress was started by a release (git-intake {r})"),
+        None => "the update in progress was started by a release".to_string(),
+    };
+    if version > u64::from(STATE_VERSION) {
+        format!(
+            "{started} that keeps its state in format {version}; {this}, an older one. Finish or abort \
+             the update with that release or a later one that understands format {version} ({path})"
+        )
+    } else {
+        format!(
+            "{started} that keeps its state in format {version}; {this}. Finish or abort the update with \
+             the release that started it, then start it again with this release ({path})"
+        )
+    }
+}
+
+/// A warning when another release of the same state format carries on the
+/// update: the update keeps working, but what each release does may differ.
+pub fn release_warning(state: &UpdateState) -> Option<String> {
+    let started = state.release.as_deref()?;
+    (started != RELEASE).then(|| {
+        format!(
+            "the update was started by git-intake {started} and is carried on by git-intake {RELEASE}; \
+             both understand its state, but they may differ in what they do. To use one release \
+             throughout, run `git intake abort` and start the update again"
+        )
+    })
 }
 
 /// Reads the record of the last finished update, or `None` when there is
@@ -431,7 +478,12 @@ pub fn load_finished(path: &Path) -> Result<Option<UpdateState>> {
 
 enum Versioned {
     Current(Box<UpdateState>),
-    Other(String),
+    /// Another format, or none, with the release that wrote it when the
+    /// state records one.
+    Other {
+        version: Option<u64>,
+        release: Option<String>,
+    },
 }
 
 fn read(path: &Path) -> Result<Option<Versioned>> {
@@ -446,9 +498,11 @@ fn read(path: &Path) -> Result<Option<Versioned>> {
     // another release is named as such rather than as unreadable.
     let version = value.get("version").and_then(serde_json::Value::as_u64);
     if version != Some(u64::from(STATE_VERSION)) {
-        return Ok(Some(Versioned::Other(
-            version.map_or("unknown".to_string(), |v| v.to_string()),
-        )));
+        let release = value
+            .get("release")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        return Ok(Some(Versioned::Other { version, release }));
     }
     let state: UpdateState = serde_json::from_value(value).with_context(unreadable)?;
     Ok(Some(Versioned::Current(Box::new(state))))
@@ -566,7 +620,9 @@ mod tests {
         .unwrap();
         let err = format!("{:#}", load(&path).unwrap_err());
         assert!(
-            err.contains("keeps its state in format 2; this release understands format 4"),
+            err.contains(&format!(
+                "keeps its state in format 2; this release (git-intake {RELEASE}) understands format 4"
+            )),
             "{err}"
         );
         assert!(
@@ -574,5 +630,39 @@ mod tests {
             "{err}"
         );
         assert!(load_finished(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_state_of_a_newer_format_names_its_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, r#"{"version": 5, "release": "0.4.0"}"#).unwrap();
+        let err = format!("{:#}", load(&path).unwrap_err());
+        assert!(
+            err.contains(
+                "started by a release (git-intake 0.4.0) that keeps its state in format 5"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains("with that release or a later one that understands format 5"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn another_release_of_the_same_format_is_warned_about() {
+        let mut state = UpdateState::new(config(), "b".repeat(40), PathBuf::from("wt"), vec![]);
+        assert_eq!(state.release.as_deref(), Some(RELEASE));
+        assert_eq!(release_warning(&state), None);
+        state.release = Some("0.0.1-other".to_string());
+        assert!(
+            release_warning(&state)
+                .unwrap()
+                .starts_with("the update was started by git-intake 0.0.1-other")
+        );
+        // A state from before releases recorded themselves names none.
+        state.release = None;
+        assert_eq!(release_warning(&state), None);
     }
 }

@@ -681,7 +681,7 @@ fn state_files_of_another_format_are_named_or_ignored() {
         assert!(
             err.contains(
                 "the update in progress was started by a release that keeps its state in format 2; \
-                 this release understands format 4. Finish or abort the update with the release that started it"
+                 this release (git-intake 0.0.0) understands format 4. Finish or abort the update with the release that started it"
             ),
             "{args:?}: {err}"
         );
@@ -689,6 +689,93 @@ fn state_files_of_another_format_are_named_or_ignored() {
     assert!(dir.join("state.json").exists(), "the state is kept");
     let doctor = stdout(&f.tool(&["doctor"]).code(1));
     assert!(doctor.contains("keeps its state in format 2"), "{doctor}");
+}
+
+#[test]
+fn state_of_a_newer_or_unknown_format_is_refused() {
+    let f = Fork::new();
+    let env = &f.env;
+    let dir = env.intake_dir(&f.down);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.json");
+    let commands = [
+        vec!["status"],
+        vec!["continue"],
+        vec!["verify"],
+        vec!["finish"],
+        vec!["abort"],
+        vec!["start"],
+        vec!["report"],
+    ];
+
+    // A newer release's state is refused, and the release that wrote it is
+    // named when the state records it.
+    let newer = r#"{"version": 99, "release": "9.9.9", "shape": "unknown to this release"}"#;
+    std::fs::write(&path, newer).unwrap();
+    for args in &commands {
+        let err = stderr(&f.tool(args).code(2));
+        assert!(
+            err.contains(
+                "the update in progress was started by a release (git-intake 9.9.9) that keeps its state in format 99; \
+                 this release (git-intake 0.0.0) understands format 4, an older one"
+            ),
+            "{args:?}: {err}"
+        );
+        assert!(
+            err.contains("Finish or abort the update with that release or a later one"),
+            "{args:?}: {err}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+
+    // A state without a format version is refused as well.
+    let unversioned = r#"{"config": {"integration": "main"}}"#;
+    std::fs::write(&path, unversioned).unwrap();
+    for args in &commands {
+        let err = stderr(&f.tool(args).code(2));
+        assert!(
+            err.contains(
+                "names no state format; this release (git-intake 0.0.0) understands format 4"
+            ),
+            "{args:?}: {err}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), unversioned);
+}
+
+#[test]
+fn another_release_of_the_same_format_continues_with_a_warning() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    f.tool(&["start"]).success();
+    let path = env.intake_dir(&f.down).join("state.json");
+    let read = || -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+    };
+    // The state records the release that started the update.
+    assert_eq!(read()["release"], "0.0.0");
+
+    // The same release carries on silently.
+    let verified = f.tool(&["verify"]).success();
+    assert!(
+        !stderr(&verified).contains("warning:"),
+        "{}",
+        stderr(&verified)
+    );
+
+    let mut state = read();
+    state["release"] = "0.0.1".into();
+    std::fs::write(&path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    let finished = f.tool(&["finish"]).success();
+    assert!(
+        stderr(&finished).contains(
+            "warning: the update was started by git-intake 0.0.1 and is carried on by git-intake 0.0.0"
+        ),
+        "{}",
+        stderr(&finished)
+    );
+    env.assert_no_update(&f.down);
 }
 
 #[test]
@@ -715,6 +802,7 @@ fn update_with_its_worktree_in_the_git_directory_is_refused() {
     let mut state: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     state["version"] = 3.into();
+    state.as_object_mut().unwrap().remove("release");
     state["worktree"] = old.to_string_lossy().into_owned().into();
     let written = serde_json::to_string_pretty(&state).unwrap();
     std::fs::write(&path, &written).unwrap();
@@ -734,7 +822,7 @@ fn update_with_its_worktree_in_the_git_directory_is_refused() {
             assert!(
                 err.contains(
                     "the update in progress was started by a release that keeps its state in format 3; \
-                     this release understands format 4. Finish or abort the update with the release that started it"
+                     this release (git-intake 0.0.0) understands format 4. Finish or abort the update with the release that started it"
                 ),
                 "{args:?} in {}: {err}",
                 dir.display()
