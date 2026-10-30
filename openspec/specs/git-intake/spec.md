@@ -794,7 +794,7 @@ An upstream's name SHALL be usable in a git reference name, as `refs/git-intake/
 - **THEN** the tool refuses to run, names both upstreams and `GIT_INTAKE_UPSTREAM_APP_A_*`, and starts no update
 
 ### Requirement: Same repository by URL
-Where the tool compares a remote or URL with an upstream's URL, it SHALL compare each as configured and as git resolves it with its URL rewriting, and URLs naming the same repository SHALL count as equal: local paths and `file://` URLs, whatever their host, resolved against the main worktree as git finds a repository and made canonical; other URLs, the scp-like form read as `ssh`, by scheme, host in lower case, port unless default and path without end `/` and `.git`, credentials ignored.
+Where the tool compares a remote or URL with an upstream's URL, it SHALL compare each as configured and as git resolves it with its URL rewriting, the address of a `<transport>::<address>` URL standing for it, and URLs naming the same repository SHALL count as equal. A local path or `file://` URL, whatever its host, SHALL name the common git directory git reports for it, or for it with `.git` appended, which a linked worktree names too, made canonical; other URLs compare as hosted URLs.
 
 #### Scenario: Relative and absolute paths
 - **WHEN** the publish remote's URL is a relative path to an upstream's repository, configured by its absolute path
@@ -819,6 +819,25 @@ Where the tool compares a remote or URL with an upstream's URL, it SHALL compare
 #### Scenario: URL with credentials or a local host
 - **WHEN** the publish remote's push URL is an upstream's `https` URL with a user and password, or `file://localhost/` and the path of an upstream's repository
 - **THEN** the tool refuses to run, names the remote and the upstream, and shows no credentials
+
+#### Scenario: Linked worktree of an upstream
+- **WHEN** the publish remote's push URL is the path of a linked worktree of an upstream's repository
+- **THEN** the tool refuses to run and names the remote and the upstream
+
+### Requirement: Same hosted repository
+Hosted URLs, the scp-like form read as `ssh`, SHALL count as naming the same repository when host and path match, whatever the scheme and the credentials: the host in lower case without a trailing `.`, a port unless it is the scheme's default, and the path without doubled or trailing `/`, a `.git` suffix in any case, and a leading `~/`; the path's case SHALL not count on `github.com` and `gitlab.com`.
+
+#### Scenario: Another scheme
+- **WHEN** an upstream's URL is `https://example.com/team/up.git` and the publish remote's push URL is `ssh://git@example.com/team/up`
+- **THEN** the tool refuses to run and names the remote and the upstream, and `sync` and `finish` push nothing
+
+#### Scenario: Home directory
+- **WHEN** one URL is `example.com:team/up` and the other `ssh://example.com/~/team/up`
+- **THEN** they name the same repository
+
+#### Scenario: Path case on a host that ignores it
+- **WHEN** one URL is `https://github.com/Team/Up` and the other `git@github.com:team/up.git`
+- **THEN** they name the same repository, while the same paths on another host do not
 
 ### Requirement: Contribution branch
 `contribute <upstream>[=<revision>] <branch>` SHALL fetch the upstream and create the local branch `<branch>` at the fetched tip, or at the commit the revision names on the fetched branch as `start` resolves it, without the rules that compare the commit with the last synced commit. It SHALL set no tracking branch, change no checkout and never push the branch. It SHALL refuse when `<branch>` exists or is not a valid branch name.
@@ -1735,7 +1754,7 @@ In push mode, and with `--no-publish`, `finish` on an update whose head has only
 - **THEN** `finish` runs every check on the catch-up merge and publishes it when they pass
 
 ### Requirement: Place of the update worktree in a tree
-Before any branch moves, `finish` SHALL refuse an update whose head, after a merge, copy or catch-up, has anything but a directory at `.worktrees` or `.worktrees/git-intake`, or anything at `.worktrees/git-intake/update`, naming the path and why. A checkout of a branch in the main worktree SHALL never follow a move to such a tree. Names SHALL be compared without case where the checkout ignores case.
+Before any branch moves, `finish` SHALL refuse an update whose head, after a merge, copy or catch-up, has anything but a directory at `.worktrees` or `.worktrees/git-intake`, or anything at `.worktrees/git-intake/update`, naming the path and why. A checkout of a branch in the main worktree SHALL never follow a move to such a tree. Names SHALL be compared under full Unicode case folding, whatever `core.ignoreCase` says.
 
 #### Scenario: Upstream brings a link
 - **WHEN** an upstream's tree has `.worktrees` as a symbolic link, and `finish` runs on the verified update
@@ -1744,6 +1763,10 @@ Before any branch moves, `finish` SHALL refuse an update whose head, after a mer
 #### Scenario: Upstream brings a file at the update worktree
 - **WHEN** an upstream's tree has a file at `.worktrees/git-intake/update`
 - **THEN** `finish` refuses and names `.worktrees/git-intake/update`, and no branch moves
+
+#### Scenario: Name in another case
+- **WHEN** an upstream's tree has a symbolic link at `.worktrees/git-intaKe`, written with the Kelvin sign
+- **THEN** `finish` refuses and names it, and no branch moves
 
 ### Requirement: Removing only what the tool created
 Before it removes the update worktree, the tool SHALL check that its path is the tool's placement, reached from the main worktree or git directory through directories alone, and that git registers it there for the repository. It SHALL refuse to remove a registered worktree that fails this check, removing nothing, and SHALL leave and name a directory git does not register, unless it is empty.
@@ -1761,14 +1784,14 @@ Before it removes the update worktree, the tool SHALL check that its path is the
 - **THEN** `start` refuses, naming the directory and saying to remove it
 
 ### Requirement: Removing the tool's files
-The tool SHALL remove its state, plan and logs only inside its directory in the repository's common git directory, reached through directories alone, and SHALL refuse, removing nothing, when a directory on the way is a symbolic link or not a directory. A symbolic link inside it SHALL be removed itself, never what it points to.
+The tool SHALL remove its state, plan and logs only inside its directory in the repository's common git directory, reached through directories alone, and SHALL refuse, removing nothing, when a directory on the way is a symbolic link or not a directory, or the path holds `.` or `..`. A symbolic link inside it SHALL be removed itself, never what it points to.
 
 #### Scenario: Tool directory that is a link
 - **WHEN** `<git-common-dir>/git-intake` is a symbolic link to another directory, and the update's logs are removed
 - **THEN** the tool refuses, and the other directory keeps its files
 
 ### Requirement: Pushes never reach an upstream
-Before every push and every deletion of a branch on the publish remote, the tool SHALL resolve where git pushes, the remote's push URLs or else its URLs after git's rewriting, or a URL by the rule `git push` applies to it, and SHALL refuse, pushing nothing and moving no branch, when one names an upstream's repository, naming the remote, the URL and the upstream.
+Before every push and every deletion of a branch on the publish remote, the tool SHALL resolve where git pushes, the remote's push URLs or else its URLs after git's rewriting, or a URL by the rule `git push` applies to it, a name being a remote whenever git resolves it as one, and SHALL refuse, pushing nothing and moving no branch, when one names an upstream's repository, naming the remote, the URL and the upstream.
 
 #### Scenario: Remote changed during an update
 - **WHEN** after `start` the publish remote is given a push URL, or a `url.<base>.pushInsteadOf` rewriting, that names the upstream's repository, and `finish` runs
@@ -1779,7 +1802,7 @@ Before every push and every deletion of a branch on the publish remote, the tool
 - **THEN** `sync` refuses before it starts an update, and nothing reaches the upstream's repository
 
 ### Requirement: Messages without credentials
-Every message the tool shows, in text or JSON, on standard output or standard error, SHALL pass one sanitising step that removes the password of every URL and the user of an `http` or `https` URL, and replaces every value of a token variable the tool reads, wherever it appears. Git command lines in messages, including those of git commands that cannot be started, SHALL pass the same step.
+Every message the tool shows, in text or JSON, on standard output or standard error, SHALL pass one sanitising step that removes the password of every URL and the user of an `http` or `https` URL, and replaces every value of at least eight characters of a token variable the tool reads, wherever it appears. Git command lines in messages, including those of git commands that cannot be started, SHALL pass the same step.
 
 #### Scenario: Forge quotes the token
 - **WHEN** the forge answers with a message that contains the token, and `doctor`, `doctor --json` or `finish` reports it
@@ -1792,3 +1815,14 @@ Every message the tool shows, in text or JSON, on standard output or standard er
 #### Scenario: Git cannot be started
 - **WHEN** a git command whose arguments hold a URL with credentials cannot be started
 - **THEN** the message names the command without the credentials
+
+#### Scenario: Short token value
+- **WHEN** a token variable is set to a value of one character
+- **THEN** the output, in text or JSON, is unchanged by it
+
+### Requirement: Upstream URL without credentials
+The tool SHALL refuse an upstream whose URL carries a password, or the user of an `http` or `https` URL, naming the upstream and showing the URL without them, so that no credential is committed with the configuration or recorded with an update. The user of an SSH URL names an account and SHALL be accepted.
+
+#### Scenario: Token in an upstream's URL
+- **WHEN** an upstream's URL is `https://user:secret@example.com/up.git`
+- **THEN** every command refuses the configuration, names the upstream and shows `https://example.com/up.git`, and no output shows `secret`
