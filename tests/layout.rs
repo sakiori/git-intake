@@ -8,7 +8,7 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::{Env, FORK_FILE, Fork, Mono, Upstream, stderr};
+use common::{Env, FORK_FILE, Fork, Mono, Upstream, stderr, stdout};
 use predicates::str::contains;
 
 /// Note printed when a command removes the update worktree it was run from.
@@ -649,6 +649,44 @@ fn abort_from_a_linked_worktree_removes_an_update_whose_start_was_interrupted() 
     assert!(!wt.exists(), "the update worktree remains");
     assert!(!env.has_rev(&down, "refs/heads/git-intake/update"));
     assert!(!git_dir.join("git-intake").join("worktree").exists());
+}
+
+#[test]
+fn own_worktree_on_the_update_branch_is_left_alone() {
+    let f = Fork::new();
+    let env = &f.env;
+    let mine = env.path("mine");
+    env.git(
+        &f.down,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "git-intake/update",
+            &mine.to_string_lossy(),
+            "main",
+        ],
+    );
+    fs::write(mine.join("draft.txt"), "uncommitted\n").unwrap();
+    let mine = fs::canonicalize(&mine).unwrap();
+    let advice = "remove that worktree or switch it to another branch";
+    for args in [vec!["abort"], vec!["start"]] {
+        let err = stderr(&f.tool(&args).code(2));
+        assert!(err.contains(&mine.display().to_string()), "{args:?}: {err}");
+        assert!(err.contains(advice), "{args:?}: {err}");
+    }
+    let doctor = stdout(&f.tool(&["doctor"]).code(1));
+    assert!(doctor.contains(advice), "{doctor}");
+    f.tool(&["status"]).success();
+    assert_eq!(
+        fs::read_to_string(mine.join("draft.txt")).unwrap(),
+        "uncommitted\n"
+    );
+    assert_eq!(
+        env.git(&mine, &["branch", "--show-current"]),
+        "git-intake/update"
+    );
 }
 
 #[test]

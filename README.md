@@ -321,7 +321,7 @@ The merge request's head decides what was merged. GitLab keeps it as `refs/merge
 
 ### Abort
 
-`abort` removes the worktree, the update branch, the plan, the update's upstream references, its logs and the state at any step before `finish` moves the integration branch, which stays exactly as it was; a port's journal is unchanged. Resolutions already made by hand in a stopped merge or copy are recorded first, so a retry reapplies them.
+`abort` removes the worktree, the update branch, the plan, the update's upstream references, its logs and the state at any step before `finish` moves the integration branch, which stays exactly as it was; a port's journal is unchanged. Resolutions already made by hand in a stopped merge or copy are recorded first, so a retry reapplies them. A worktree that has `git-intake/update` checked out anywhere other than where `start` places the update worktree belongs to the user: `abort`, `start` and `doctor` name it and leave it for the user to remove or switch.
 
 While the update waits for its merge request, `abort` first checks the publish remote's integration branch as `finish` does:
 

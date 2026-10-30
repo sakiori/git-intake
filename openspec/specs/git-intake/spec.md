@@ -98,6 +98,10 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **WHEN** the user aborts an update before `finish` has moved any branch
 - **THEN** the integration branch is as before `start`, and no worktree, update branch, plan, upstream reference or log of the update remains
 
+#### Scenario: User's worktree on the update branch
+- **WHEN** no update is in progress and a worktree other than the tool's update worktree has `git-intake/update` checked out
+- **THEN** `abort` and `start` refuse and `doctor` fails, each naming that worktree and saying to remove or switch it, and the worktree and its uncommitted changes are kept
+
 #### Scenario: State of an earlier release
 - **WHEN** an update started by a release with another state format is in progress, such as one that kept the update worktree in the git directory
 - **THEN** every command that reads the update refuses and says to finish or abort it with that release
