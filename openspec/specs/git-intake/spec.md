@@ -60,7 +60,7 @@ Every merge commit the tool creates SHALL name the upstream and its target commi
 - **THEN** `status` reports the upstream as rewritten and `start` refuses to update it
 
 ### Requirement: Fixed target and isolated merge
-`start` SHALL accept upstream names and select every configured upstream when none is named. It SHALL fetch the selected upstreams, record each fetched upstream tip as that upstream's target and the current integration tip as the base, and queue, in configuration order, the selected upstreams whose target the base does not yet contain. It SHALL create a dedicated worktree on a new branch from the base and merge each queued target in turn with its own merge commit: at the repository root for an upstream without a path, and under the upstream's path otherwise. A target SHALL NOT change for the rest of the update. `start` SHALL refuse when an update is already in progress, when the main checkout or the integration branch has uncommitted changes, when the integration branch is behind its published counterpart, or when a selected upstream is unknown or rewritten.
+`start` SHALL accept upstream names, each optionally followed by `=` and a revision, and select every configured upstream when none is named. It SHALL fetch the selected upstreams, record as each upstream's target the commit its revision names, or the fetched upstream tip when no revision is given, record the current integration tip as the base, and queue, in configuration order, the selected upstreams whose target the base does not yet contain. A revision, without a leading `refs/tags/` or `tags/`, SHALL name a tag of the upstream's remote when that remote has a tag of that name, and otherwise resolve as a revision of the repository; the tool SHALL fetch no tag into the repository, and SHALL refuse a revision that resolves through one of the repository's own tags, or whose tag it cannot look up on the remote. `start` SHALL refuse a revision that names no commit, a target that the fetched upstream branch does not contain, a target older than the upstream's last synced commit, a target that does not contain the last synced commit, and a target that does not contain the upstream's existing mirror branch, naming the upstream and the revision. It SHALL create a dedicated worktree on a new branch from the base and merge each queued target in turn with its own merge commit: at the repository root for an upstream without a path, and under the upstream's path otherwise. A target SHALL NOT change for the rest of the update, and `status` and `report` SHALL show the revision a target was named by. `start` SHALL refuse when an update is already in progress, when the main checkout or the integration branch has uncommitted changes, when the integration branch is behind its published counterpart, or when a selected upstream is unknown, named more than once, or rewritten.
 
 #### Scenario: Clean merge
 - **WHEN** every queued target merges without conflicts
@@ -109,6 +109,58 @@ Every merge commit the tool creates SHALL name the upstream and its target commi
 #### Scenario: File on the import path
 - **WHEN** a leading component of a queued upstream's path is a file at the base
 - **THEN** `start` refuses instead of replacing the file
+
+#### Scenario: Chosen commit
+- **WHEN** `start` names an upstream with a commit of its fetched branch that is older than the branch tip
+- **THEN** that commit is the upstream's target: the update merges, verifies and publishes it, its sync record names it, and the mirror branch moves to it
+
+#### Scenario: Chosen tag
+- **WHEN** the revision is a tag of the upstream's remote on the upstream's branch, and the repository holds a tag of the same name on another commit
+- **THEN** the commit of the upstream's tag is the target, and no tag is added to the repository
+
+#### Scenario: Tag named with its prefix
+- **WHEN** the revision is `refs/tags/<tag>` or `tags/<tag>` and the upstream's remote has the tag
+- **THEN** the commit of the upstream's tag is the target
+
+#### Scenario: Own tag instead of an upstream tag
+- **WHEN** the upstream's remote has no tag of the revision's name, and the revision resolves through a tag of the repository, by itself or in an expression, even when a branch has the same name
+- **THEN** `start` refuses and names the repository's tag, and creates nothing
+
+#### Scenario: Expression on an upstream tag
+- **WHEN** the revision is an expression on a tag that only the upstream's remote has, such as `<tag>~1`
+- **THEN** `start` refuses because the revision names no commit in the repository, and creates nothing
+
+#### Scenario: Remote unreachable for the tag lookup
+- **WHEN** the upstream's remote cannot be asked for the tag after the fetch
+- **THEN** `start` refuses, names the upstream and the remote with git's error, and creates nothing
+
+#### Scenario: Mirror ahead of the target
+- **WHEN** an upstream's mirror branch holds a commit that its target does not contain
+- **THEN** `start` refuses, names the mirror branch and the target, and creates nothing
+
+#### Scenario: Revision outside the upstream branch
+- **WHEN** the revision names no commit, or a commit the fetched upstream branch does not contain
+- **THEN** `start` refuses, names the upstream, the revision and the branch, and creates nothing
+
+#### Scenario: Target already taken in
+- **WHEN** the revision names the upstream's last synced commit, or another commit of the branch that the integration branch already contains and that contains the last synced commit
+- **THEN** `start` reports the upstream as current and creates nothing for it
+
+#### Scenario: Target older than the last sync
+- **WHEN** the revision names a commit that the last synced commit contains
+- **THEN** `start` refuses and explains that an update never moves an upstream back
+
+#### Scenario: Target beside the last sync
+- **WHEN** the revision names a commit of the upstream branch that does not contain the last synced commit, such as a commit of a side branch merged after the last sync
+- **THEN** `start` refuses and names the last synced commit the target lacks
+
+#### Scenario: Conflict at a chosen target
+- **WHEN** the merge of a chosen target stops on conflicts, and the user resolves them and runs `continue` and then `verify` and `finish`
+- **THEN** the merge records the chosen target, not the branch tip, and the mirror branch moves to it
+
+#### Scenario: Several upstreams at chosen points
+- **WHEN** `start` names one upstream with a revision and another without
+- **THEN** the first is merged at the commit its revision names and the second at its fetched tip, in one update
 
 ### Requirement: Recorded resolutions
 The tool SHALL enable git's recorded conflict resolution for the repository before merging, so a resolution made in one update or attempt is reapplied when the same conflict recurs.
@@ -199,6 +251,10 @@ The tool SHALL keep the state of an update in the repository's common git direct
 #### Scenario: Zero drift
 - **WHEN** `status --check` runs and every upstream is current
 - **THEN** it reports every upstream as current and exits successfully
+
+#### Scenario: Synced to a chosen target
+- **WHEN** the last update of an upstream merged a chosen target that lies three commits before the fetched branch tip
+- **THEN** `status` shows that target as the last synced commit, the tip, the state behind and three commits
 
 ### Requirement: Pending commits
 `log` SHALL list, for the named upstreams or all of them, the commits on the fetched upstream branch that the integration branch does not contain.
