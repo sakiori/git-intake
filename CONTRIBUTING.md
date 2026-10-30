@@ -26,7 +26,7 @@ The behaviour of `git intake` is specified with [OpenSpec](https://github.com/Fi
 
 ## Commits
 
-Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `test:`, `ci:`, `chore:` and so on, with `!` for a breaking change). Release versions and the changelog are computed from them, so the type matters: in `0.x` a breaking change raises the minor version, and a feature, fix, performance change or revert the patch version.
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `test:`, `ci:`, `chore:` and so on, with `!` for a breaking change). Release versions and the changelog are computed from them, so the type matters: in `0.x` a breaking change raises the minor version, and a feature, fix, performance change or revert the patch version. Other types, such as `docs`, `test`, `ci` or `chore`, ask for no release. Dependabot's updates follow the same rule: a cargo dependency update changes the shipped binary and is committed as `fix(deps)`, a GitHub Actions update as `ci`.
 
 ## Security
 
