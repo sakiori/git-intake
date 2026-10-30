@@ -825,7 +825,7 @@ Where the tool compares a remote or URL with an upstream's URL, it SHALL compare
 - **THEN** the tool refuses to run and names the remote and the upstream
 
 ### Requirement: Same hosted repository
-Hosted URLs, the scp-like form read as `ssh`, SHALL count as naming the same repository when host and path match, whatever the scheme and the credentials: the host in lower case without a trailing `.`, a port unless it is the scheme's default, and the path without doubled or trailing `/`, a `.git` suffix in any case, and a leading `~/`; the path's case SHALL not count on `github.com` and `gitlab.com`.
+Hosted URLs, the scp-like form read as `ssh`, SHALL count as naming the same repository when host and path match, whatever the scheme and the credentials: the host in lower case without a trailing `.`, a port unless it is the scheme's default, and the path without doubled or trailing `/`, a `.git` suffix in any case, a leading `~/`, and its case. An `ssh` URL SHALL also match by the host and port `ssh -G` resolves for its host, when it answers.
 
 #### Scenario: Another scheme
 - **WHEN** an upstream's URL is `https://example.com/team/up.git` and the publish remote's push URL is `ssh://git@example.com/team/up`
@@ -835,9 +835,13 @@ Hosted URLs, the scp-like form read as `ssh`, SHALL count as naming the same rep
 - **WHEN** one URL is `example.com:team/up` and the other `ssh://example.com/~/team/up`
 - **THEN** they name the same repository
 
-#### Scenario: Path case on a host that ignores it
+#### Scenario: Path in another case
 - **WHEN** one URL is `https://github.com/Team/Up` and the other `git@github.com:team/up.git`
-- **THEN** they name the same repository, while the same paths on another host do not
+- **THEN** they name the same repository, as on any other host
+
+#### Scenario: SSH host alias
+- **WHEN** an upstream's URL is `ssh://git@example.com/up.git`, the SSH client's configuration makes the host `up-alias` stand for `example.com`, and the publish remote's push URL is `ssh://up-alias/up.git`
+- **THEN** the tool refuses to run, and `sync` and `finish` push nothing
 
 ### Requirement: Contribution branch
 `contribute <upstream>[=<revision>] <branch>` SHALL fetch the upstream and create the local branch `<branch>` at the fetched tip, or at the commit the revision names on the fetched branch as `start` resolves it, without the rules that compare the commit with the last synced commit. It SHALL set no tracking branch, change no checkout and never push the branch. It SHALL refuse when `<branch>` exists or is not a valid branch name.
