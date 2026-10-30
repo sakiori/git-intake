@@ -1,0 +1,47 @@
+# cargo-deny configuration: `cargo deny check` checks the dependency graph for
+# security advisories, licenses, banned or duplicated crates and sources.
+
+[graph]
+# The platforms the tool supports: the release targets, and the Linux targets
+# that CI and source builds use. Windows is not supported.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+# Every RustSec advisory, unmaintained and unsound crates included, fails the
+# check; a yanked version in the lockfile does too.
+yanked = "deny"
+
+[licenses]
+# The licenses of the dependency tree, all compatible with the MIT license of
+# the binary.
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.93
+unused-allowed-license = "deny"
+
+[licenses.private]
+# xtask is never published.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

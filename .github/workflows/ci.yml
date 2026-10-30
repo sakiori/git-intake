@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, so that a new RustSec advisory, a new stable toolchain or a new
+  # runner image fails here rather than in the next change.
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: git --version
+      - run: cargo test --workspace --locked
+
+  # The test job runs the runner's current git. This one runs the tests against
+  # older releases built from source: the oldest the README supports, and the
+  # one Debian stable ships.
+  git:
+    name: test (git ${{ matrix.version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: 2.43.0
+            sha256: 5446603e73d911781d259e565750dcd277a42836c8e392cac91cf137aa9b76ec
+          - version: 2.47.3
+            sha256: 9c2eb1250781b3e5bfef098572d07fdf132d67e6c065e4307332ade9819a1501
+    runs-on: ubuntu-latest
+    env:
+      GIT_VERSION: ${{ matrix.version }}
+      GIT_SHA256: ${{ matrix.sha256 }}
+      GIT_PREFIX_DIR: ${{ github.workspace }}/../git-${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.GIT_PREFIX_DIR }}
+          key: git-${{ matrix.version }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Build git ${{ matrix.version }}
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libcurl4-openssl-dev libexpat1-dev zlib1g-dev
+          src="$RUNNER_TEMP/git-src"
+          mkdir -p "$src"
+          archive="$src/git-$GIT_VERSION.tar.xz"
+          curl --fail --silent --show-error --location --output "$archive" \
+            "https://mirrors.edge.kernel.org/pub/software/scm/git/git-$GIT_VERSION.tar.xz"
+          echo "$GIT_SHA256  $archive" | sha256sum --check -
+          tar -C "$src" -xJf "$archive"
+          make -C "$src/git-$GIT_VERSION" -j"$(nproc)" prefix="$GIT_PREFIX_DIR" \
+            NO_GETTEXT=YesPlease NO_TCLTK=YesPlease NO_PERL=YesPlease NO_PYTHON=YesPlease \
+            install
+      - run: echo "$GIT_PREFIX_DIR/bin" >> "$GITHUB_PATH"
+      - run: |
+          git --version
+          git --version | grep -Fqx "git version $GIT_VERSION"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test --workspace --locked
+
+  # Builds the workspace with the toolchain that `rust-version` in Cargo.toml
+  # names, the minimum supported Rust version.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: msrv
+        run: |
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          [ -n "$version" ] || { echo "cannot read rust-version from Cargo.toml" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --workspace --all-targets --locked
+
+  # Advisories (the RustSec database that cargo-audit reads), licenses, bans
+  # and sources, as deny.toml configures them.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --locked check
