@@ -24,7 +24,7 @@ pub const API_VERSION: &str = "2022-11-28";
 const DESCRIPTION_LIMIT: usize = 65_536;
 
 /// Where GitHub Actions reads its workflows.
-const WORKFLOWS: &str = ".github/workflows/";
+pub(crate) const WORKFLOWS: &str = ".github/workflows/";
 
 pub struct GitHub {
     location: Location,

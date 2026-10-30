@@ -1217,3 +1217,23 @@ fn finish_refuses_an_open_merge_request_whose_branch_is_gone() {
     assert!(f.forge().changes().is_empty());
     assert!(env.update_worktree(&f.down).exists(), "the update is kept");
 }
+
+#[test]
+fn sync_by_push_names_an_update_that_changes_the_pipeline() {
+    let f = Fork::new();
+    let env = &f.env;
+    f.reconfigure("via = \"push\"", "via = \"push\"\nforge = \"gitlab\"");
+    env.push_upstream(
+        &f.up,
+        &[(".gitlab-ci.yml", "test:\n  script: [make]\n")],
+        "upstream: ci",
+    );
+    let out = stdout(&f.tool(&["sync"]).success());
+    assert!(
+        out.contains(
+            "the update changes its own checks: `.gitlab-ci.yml`; the checks that verified it ran \
+             what the update brings"
+        ),
+        "{out}"
+    );
+}

@@ -440,6 +440,24 @@ pub fn guard<'a>(
     }
 }
 
+/// Names, for publication by push, the changes the update makes to its own
+/// checks, as publication through a merge request names them: the checks
+/// that verified the update ran what it brings.
+pub fn name_check_changes_for_push(repo: &Repo, state: &UpdateState, head: &str) -> Result<()> {
+    let ci_paths = match &state.config.publish {
+        Some(publish) => crate::forge::ci_paths_without_api(&repo.git, publish)?,
+        None => Vec::new(),
+    };
+    let changes = check_changes(&repo.git, state, head, &ci_paths)?;
+    if !changes.is_empty() {
+        println!(
+            "the update changes its own checks: {}; the checks that verified it ran what the update brings",
+            changes.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// The changes the update makes, from its base to `head`, to its own
 /// checks: the forge's CI definition at `ci_paths`, and the install command
 /// and checks of the configuration.

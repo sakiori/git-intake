@@ -101,8 +101,14 @@ fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Resu
                 remote_tip: false,
             };
             let moves = match prepare(repo, &mut state, &tip, run, &recheck)? {
-                Ready::Publish(_) => plan(repo, &state, &tip)?,
-                Ready::Holds(head) => held(repo, &state, &tip, &head)?,
+                Ready::Publish(head) => {
+                    merge_request::name_check_changes_for_push(repo, &state, &head)?;
+                    plan(repo, &state, &tip)?
+                }
+                Ready::Holds(head) => {
+                    merge_request::name_check_changes_for_push(repo, &state, &head)?;
+                    held(repo, &state, &tip, &head)?
+                }
                 Ready::Stop(exit) => return Ok(exit),
             };
             let f = Finishing {

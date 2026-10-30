@@ -17,7 +17,7 @@ use super::{Forge, Kind, Location, MergeRequest, Review, State, endpoint, instan
 const DESCRIPTION_LIMIT: usize = 1_048_576;
 
 /// The CI definition of a project that names none.
-const DEFAULT_CI_FILE: &str = ".gitlab-ci.yml";
+pub(crate) const DEFAULT_CI_FILE: &str = ".gitlab-ci.yml";
 
 pub struct GitLab {
     location: Location,

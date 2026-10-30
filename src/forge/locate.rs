@@ -142,6 +142,33 @@ impl Surroundings<'_> {
 const SETTINGS_HINT: &str = "set `forge` (`gitlab` or `github`) and `api` (the base URL of its REST API) \
      in the [publish] table of .git-intake.toml";
 
+/// The kind of forge of a publish remote on `host`: the setting `forge`,
+/// else the host, else the CI job the tool runs in when the job's server is
+/// that host.
+fn kind_of(publish: &Publish, host: &str, around: &Surroundings) -> Option<Kind> {
+    match publish.forge {
+        Some(ForgeKind::Gitlab) => Some(Kind::GitLab),
+        Some(ForgeKind::Github) => Some(Kind::GitHub),
+        None if host == "gitlab.com" => Some(Kind::GitLab),
+        None if host == "github.com" || host.ends_with(".ghe.com") => Some(Kind::GitHub),
+        None if around.job_host(Kind::GitLab).as_deref() == Some(host) => Some(Kind::GitLab),
+        None if around.job_host(Kind::GitHub).as_deref() == Some(host) => Some(Kind::GitHub),
+        None => None,
+    }
+}
+
+/// The kind of forge of the publish remote whose fetch URL is `url`, when
+/// the tool can tell it without the forge's API; `None` otherwise.
+pub fn kind(publish: &Publish, url: Option<&str>, around: &Surroundings) -> Option<Kind> {
+    match publish.forge {
+        Some(ForgeKind::Gitlab) => return Some(Kind::GitLab),
+        Some(ForgeKind::Github) => return Some(Kind::GitHub),
+        None => {}
+    }
+    let parsed = parse_remote_url(url?)?;
+    kind_of(publish, &parsed.host, around)
+}
+
 /// Locates the forge of the publish remote whose fetch URL is `url`.
 pub fn locate(
     publish: &Publish,
@@ -161,19 +188,11 @@ pub fn locate(
         ));
     };
     let host = parsed.host.clone();
-    let kind = match publish.forge {
-        Some(ForgeKind::Gitlab) => Kind::GitLab,
-        Some(ForgeKind::Github) => Kind::GitHub,
-        None if host == "gitlab.com" => Kind::GitLab,
-        None if host == "github.com" || host.ends_with(".ghe.com") => Kind::GitHub,
-        None if around.job_host(Kind::GitLab).as_deref() == Some(host.as_str()) => Kind::GitLab,
-        None if around.job_host(Kind::GitHub).as_deref() == Some(host.as_str()) => Kind::GitHub,
-        None => {
-            return Err(format!(
-                "the publish remote '{remote}' is on '{host}', which the tool does not recognise as GitLab or GitHub; \
-                 {SETTINGS_HINT}"
-            ));
-        }
+    let Some(kind) = kind_of(publish, &host, around) else {
+        return Err(format!(
+            "the publish remote '{remote}' is on '{host}', which the tool does not recognise as GitLab or GitHub; \
+             {SETTINGS_HINT}"
+        ));
     };
     let in_job = around.job_host(kind).as_deref() == Some(host.as_str());
     let api = match &publish.api {
