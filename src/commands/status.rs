@@ -69,6 +69,8 @@ pub struct UpdateView {
 
 #[derive(Serialize)]
 pub struct MergeRequestView {
+    /// The merge request's number, when the remote's reply named it.
+    pub number: Option<u64>,
     pub remote: String,
     /// The branch on the publish remote that holds the verified commit.
     pub source_branch: String,
@@ -227,6 +229,7 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
             .map(|v| v.commit.clone()),
         publish_error: state.finishing.as_ref().and_then(|f| f.push_error.clone()),
         merge_request: state.merge_request.as_ref().map(|mr| MergeRequestView {
+            number: mr.number,
             remote: mr.remote.clone(),
             source_branch: mr.branch.clone(),
             target_branch: state.config.integration.clone(),
@@ -361,7 +364,8 @@ pub fn render_update(u: &UpdateView) -> String {
     match &u.merge_request {
         // The worktree is removed once the merge request branch is pushed.
         Some(mr) => out.push_str(&format!(
-            "  merge request: {} into {} on {}{}\n",
+            "  merge request{}: {} into {} on {}{}\n",
+            mr.number.map(|n| format!(" !{n}")).unwrap_or_default(),
             mr.source_branch,
             mr.target_branch,
             mr.remote,

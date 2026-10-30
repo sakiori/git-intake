@@ -173,6 +173,13 @@ pub struct MergeRequest {
     /// the merge request transferred the branch; when it did not, the user
     /// opens the merge request.
     pub requested: bool,
+    /// The number of the merge request, when the remote's reply named it.
+    /// Its head as the remote keeps it decides what the merge landed.
+    #[serde(default)]
+    pub number: Option<u64>,
+    /// Where the merge request branch pointed when last seen on the remote.
+    #[serde(default)]
+    pub last_seen_head: Option<String>,
 }
 
 /// An update from `start` to `finish`.

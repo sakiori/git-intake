@@ -9,7 +9,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use common::{Fork, recorded_push_options, stderr, stdout};
+use common::{Fork, MERGE_REQUEST_NUMBER, recorded_push_options, stderr, stdout};
 use predicates::str::contains;
 
 /// A fork in merge-request mode with one verified update. Returns the
@@ -105,6 +105,7 @@ fn merge_request_opened_waits_and_completes_after_a_merge_commit() {
     assert_eq!(update["merge_request"]["target_branch"], "main");
     assert_eq!(update["merge_request"]["commit"], commit.as_str());
     assert_eq!(update["merge_request"]["requested"], true);
+    assert_eq!(update["merge_request"]["number"], MERGE_REQUEST_NUMBER);
     assert!(
         update["next"]
             .as_str()
@@ -121,7 +122,7 @@ fn merge_request_opened_waits_and_completes_after_a_merge_commit() {
         "{text}"
     );
     assert!(
-        text.contains(&format!("merge request: {branch} into main on origin")),
+        text.contains(&format!("merge request !7: {branch} into main on origin")),
         "{text}"
     );
     f.tool(&["start"])
@@ -561,7 +562,13 @@ fn merge_request_branch_changed_before_the_merge_is_refused() {
 
     let merged = merge_on_forge(&f, &branch);
     let err = stderr(&f.tool(&["finish"]).code(2));
-    assert!(err.contains("differs from the verified tree"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "the merge request's head is {}, not the verified commit",
+            &extra[..12]
+        )),
+        "{err}"
+    );
     assert_eq!(env.rev(&f.down, "main"), base);
     assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
     assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
@@ -654,4 +661,215 @@ fn interrupted_opening_does_not_claim_a_merge_request() {
     f.tool(&["finish"])
         .code(1)
         .stdout(contains("open the merge request if it is not open yet"));
+}
+
+/// Where the remote keeps the merge request's head, as GitLab does.
+fn set_merge_request_head(f: &Fork, commit: &str) {
+    f.env.git(
+        &f.publish,
+        &[
+            "update-ref",
+            &format!("refs/merge-requests/{MERGE_REQUEST_NUMBER}/head"),
+            commit,
+        ],
+    );
+}
+
+/// The forge's reviewer adds a commit to the merge request branch; returns it.
+fn add_to_merge_request_branch(f: &Fork, branch: &str) -> String {
+    let env = &f.env;
+    let forge = forge(f);
+    env.git(&forge, &["fetch", "-q", "origin"]);
+    env.git(
+        &forge,
+        &[
+            "checkout",
+            "-q",
+            "-B",
+            "review",
+            &format!("origin/{branch}"),
+        ],
+    );
+    let extra = env.commit(&forge, &[("review.txt", "r\n")], "review: unverified");
+    env.git(&forge, &["push", "-q", "origin", &format!("HEAD:{branch}")]);
+    env.git(&forge, &["checkout", "-q", "main"]);
+    extra
+}
+
+/// A commit landed on the remote's integration branch after `commit`.
+fn land_on_top(f: &Fork, commit: &str) -> String {
+    let env = &f.env;
+    env.git(&f.publish, &["update-ref", "refs/heads/main", commit]);
+    let forge = forge(f);
+    let later = env.commit(&forge, &[("later.txt", "l\n")], "later: other work");
+    push_forge_main(f, &forge);
+    later
+}
+
+#[test]
+fn fast_forward_of_a_changed_merge_request_is_refused_by_its_head() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let base = env.rev(&f.down, "main");
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    f.tool(&["finish"])
+        .success()
+        .stdout(contains("'origin' opened merge request !7"));
+    set_merge_request_head(&f, &commit);
+
+    // A commit lands on the merge request branch; the remote moves the
+    // merge request's head with it, merges by fast-forward and removes the
+    // branch.
+    let extra = add_to_merge_request_branch(&f, &branch);
+    set_merge_request_head(&f, &extra);
+    env.git(&f.publish, &["update-ref", "refs/heads/main", &extra]);
+    env.git(
+        &f.publish,
+        &["update-ref", "-d", &format!("refs/heads/{branch}")],
+    );
+
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(
+        err.contains(&format!(
+            "the merge request's head is {}, not the verified commit",
+            &extra[..12]
+        )),
+        "{err}"
+    );
+    assert_eq!(env.rev(&f.down, "main"), base);
+    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
+    assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
+    f.tool(&["abort"]).success().stdout(contains(format!(
+        "holds an unverified merge: the merge request's head {} landed instead of the verified commit",
+        &extra[..12]
+    )));
+    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn fast_forward_of_a_changed_branch_is_refused_without_the_merge_request_head() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let base = env.rev(&f.down, "main");
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    f.tool(&["finish"]).success();
+
+    // The remote keeps no merge request head; the branch is still listed.
+    let extra = add_to_merge_request_branch(&f, &branch);
+    env.git(&f.publish, &["update-ref", "refs/heads/main", &extra]);
+
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(
+        err.contains(&format!(
+            "the merge request's head is {}, not the verified commit",
+            &extra[..12]
+        )),
+        "{err}"
+    );
+    assert_eq!(env.rev(&f.down, "main"), base);
+    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
+}
+
+#[test]
+fn branch_as_last_seen_judges_once_it_is_gone() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    f.tool(&["finish"]).success();
+
+    let extra = add_to_merge_request_branch(&f, &branch);
+    // `finish` sees the changed branch while waiting.
+    f.tool(&["finish"]).code(1).stdout(contains(
+        "the merge request branch no longer points at the verified commit",
+    ));
+    env.git(&f.publish, &["update-ref", "refs/heads/main", &extra]);
+    env.git(
+        &f.publish,
+        &["update-ref", "-d", &format!("refs/heads/{branch}")],
+    );
+    f.tool(&["finish"]).code(2).stderr(contains(format!(
+        "the merge request's head is {}, not the verified commit",
+        &extra[..12]
+    )));
+}
+
+#[test]
+fn fast_forward_with_later_work_completes_when_the_head_is_verified() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, target) = verified(&f);
+    let branch = mr_branch(&commit);
+    f.tool(&["finish"]).success();
+    set_merge_request_head(&f, &commit);
+    let later = land_on_top(&f, &commit);
+    env.git(
+        &f.publish,
+        &["update-ref", "-d", &format!("refs/heads/{branch}")],
+    );
+
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(!out.contains("could not be attributed"), "{out}");
+    assert_eq!(env.rev(&f.down, "main"), later);
+    assert_eq!(env.rev(&f.publish, "upstream-main"), target);
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn without_a_merge_request_number_later_work_is_reported_as_unattributed() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    // A remote without push options names no merge request.
+    env.git(
+        &f.publish,
+        &["config", "receive.advertisePushOptions", "false"],
+    );
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    f.tool(&["finish"]).success();
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(
+        status["update"]["merge_request"]["number"],
+        serde_json::Value::Null
+    );
+    let later = land_on_top(&f, &commit);
+    env.git(
+        &f.publish,
+        &["update-ref", "-d", &format!("refs/heads/{branch}")],
+    );
+
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(
+        out.contains("1 commit above the verified commit on 'origin/main' could not be attributed"),
+        "{out}"
+    );
+    assert!(out.contains("later: other work"), "{out}");
+    assert_eq!(env.rev(&f.down, "main"), later);
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn missing_merge_request_head_falls_back_to_the_branch() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    // The number is known, but the remote keeps no head for it.
+    f.tool(&["finish"])
+        .success()
+        .stdout(contains("opened merge request !7"));
+    let later = land_on_top(&f, &commit);
+    env.git(
+        &f.publish,
+        &["update-ref", "-d", &format!("refs/heads/{branch}")],
+    );
+    f.tool(&["finish"])
+        .success()
+        .stdout(contains("could not be attributed to the merge request"))
+        .stdout(contains("later: other work"));
+    assert_eq!(env.rev(&f.down, "main"), later);
+    env.assert_no_update(&f.down);
 }

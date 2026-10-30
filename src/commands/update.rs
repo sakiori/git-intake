@@ -662,7 +662,7 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
             // `finish` plans its moves only once the verified tree landed.
             None
         } else {
-            Some(merge_request::inspect(repo, state, mr)?)
+            Some(merge_request::inspect(repo, &mut state.clone())?)
         };
         match landing {
             None | Some(Landing::Landed { .. }) => bail!(
@@ -670,7 +670,9 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
                  Run `git intake finish` to complete it",
                 mr.branch
             ),
-            Some(Landing::Unverified { tip, landing }) => unverified = Some((tip, landing)),
+            Some(Landing::Unverified { tip, landing, head }) => {
+                unverified = Some((tip, landing, head))
+            }
             Some(_) => {}
         }
         merge_request::delete_branch(&repo.git, mr)?;
@@ -688,15 +690,23 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
     match state {
         Some(state) => {
             println!("update aborted; {}", unchanged_branches(&state));
-            if let (Some(mr), Some((tip, landing))) = (&merge_request, &unverified) {
+            if let (Some(mr), Some((tip, landing, head))) = (&merge_request, &unverified) {
                 let integration = &state.config.integration;
+                let how = match head {
+                    Some(head) => format!(
+                        "the merge request's head {} landed instead of the verified commit",
+                        abbrev(head)
+                    ),
+                    None => format!(
+                        "{} brought in '{}' without the verified tree",
+                        abbrev(landing),
+                        mr.branch
+                    ),
+                };
                 println!(
-                    "'{}/{integration}' at {} holds an unverified merge: {} brought in '{}' without the verified tree; \
-                     review it before building on it",
+                    "'{}/{integration}' at {} holds an unverified merge: {how}; review it before building on it",
                     mr.remote,
-                    abbrev(tip),
-                    abbrev(landing),
-                    mr.branch
+                    abbrev(tip)
                 );
             } else if let Some(mr) = merge_request {
                 let integration = &state.config.integration;

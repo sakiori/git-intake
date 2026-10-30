@@ -46,8 +46,10 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     args.push(publish.remote.clone());
     args.push(refspec.clone());
     let out = repo.git.raw(&args)?;
+    let mut number = None;
     let (requested, options_refused) = if out.success() {
         relay_remote_messages(&out.stderr);
+        number = merge_request_number(&out.stderr);
         // The remote applies push options only to a push that updates a ref:
         // a branch already in place, as after an interrupted `finish`, opens
         // no merge request.
@@ -79,6 +81,8 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
         branch: branch.clone(),
         commit: commit.clone(),
         requested,
+        number: number.filter(|_| requested),
+        last_seen_head: Some(commit.clone()),
     };
     state.merge_request = Some(mr.clone());
     repo.save_state(&state)?;
@@ -94,6 +98,9 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
             "asked '{}' to open a merge request from '{branch}' into '{integration}'",
             publish.remote
         );
+        if let Some(n) = mr.number {
+            println!("'{}' opened merge request !{n}", publish.remote);
+        }
     } else if options_refused {
         println!(
             "'{}' does not accept push options, so no merge request was opened; open one from '{branch}' into '{integration}'",
@@ -108,6 +115,20 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     println!("no local branch moved; the update waits for the merge request");
     println!("next: {}", waiting_next(&mr, &integration));
     Ok(Exit::Success)
+}
+
+/// The number of the merge request the remote's reply links to, as GitLab
+/// prints it (`https://<host>/<project>/-/merge_requests/<number>`). A link
+/// to create one (`.../-/merge_requests/new?...`) names no number.
+fn merge_request_number(stderr: &str) -> Option<u64> {
+    const MARKER: &str = "/-/merge_requests/";
+    stderr.lines().find_map(|line| {
+        let rest = &line[line.find(MARKER)? + MARKER.len()..];
+        let rest = rest.trim_end();
+        (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| rest.parse().ok())
+            .flatten()
+    })
 }
 
 /// Whether `git push --porcelain` output reports that the push updated the
@@ -126,27 +147,58 @@ fn transferred(porcelain: &str, branch: &str) -> bool {
 /// What the publish remote's integration branch shows about the merge request.
 pub enum Landing {
     /// It received the verified commit by fast-forward, or a merge of it
-    /// whose tree is the verified tree.
-    Landed { tip: String },
-    /// It contains the verified commit, but the commit that brought it in
-    /// does not carry the verified tree.
-    Unverified { tip: String, landing: String },
+    /// whose tree is the verified tree. `unattributed` lists commits above a
+    /// fast-forwarded verified commit when neither the merge request's head
+    /// nor its branch could tell whether they came with it.
+    Landed {
+        tip: String,
+        unattributed: Vec<String>,
+    },
+    /// It contains the verified commit, but the merge request's head was
+    /// another commit (`head`), or the commit that brought it in does not
+    /// carry the verified tree.
+    Unverified {
+        tip: String,
+        landing: String,
+        head: Option<String>,
+    },
     /// It changed without receiving the verified commit; `squash` when a
     /// commit with the verified tree, or the update's sync records, landed.
     Changed { tip: String, squash: bool },
     /// The merge request branch is gone and nothing was merged.
     Closed,
-    /// Not merged yet; `branch` is where the merge request branch points.
-    Waiting { branch: String },
+    /// Not merged yet; `head` is the merge request's head, or where its
+    /// branch points, and `from_merge_request` says which.
+    Waiting {
+        head: String,
+        from_merge_request: bool,
+    },
 }
 
 /// Fetches the publish remote's integration branch and classifies it.
-pub fn inspect(repo: &Repo, state: &UpdateState, mr: &MergeRequest) -> Result<Landing> {
+/// Records where the merge request branch was last seen in the state.
+pub fn inspect(repo: &Repo, state: &mut UpdateState) -> Result<Landing> {
     let git = &repo.git;
-    let integration = &state.config.integration;
-    // The branch is looked up before the integration branch is fetched: a
+    let mr = state
+        .merge_request
+        .clone()
+        .context("the update does not wait for a merge request")?;
+    let integration = state.config.integration.clone();
+    // The heads are looked up before the integration branch is fetched: a
     // merge that removes the branch afterwards is then seen by the fetch.
-    let branch = remote_branch(git, &mr.remote, &mr.branch)?;
+    let branch_ref_name = branch_ref(&mr.branch);
+    let head_ref = mr.number.map(|n| format!("refs/merge-requests/{n}/head"));
+    let mut wanted = vec![branch_ref_name.clone()];
+    wanted.extend(head_ref.clone());
+    let listed = remote_refs(git, &mr.remote, &wanted)?;
+    let branch = listed.get(&branch_ref_name).cloned();
+    // The head the remote keeps for the merge request outlives its branch.
+    let mr_head = head_ref.and_then(|r| listed.get(&r).cloned());
+    if let (Some(b), Some(m)) = (&branch, state.merge_request.as_mut()) {
+        m.last_seen_head = Some(b.clone());
+    }
+    let seen_branch = branch.clone().or(mr.last_seen_head.clone());
+
     let out = git.raw(&[
         "fetch",
         "--quiet",
@@ -154,8 +206,8 @@ pub fn inspect(repo: &Repo, state: &UpdateState, mr: &MergeRequest) -> Result<La
         &mr.remote,
         &format!(
             "+{}:{}",
-            branch_ref(integration),
-            tracking_ref(&mr.remote, integration)
+            branch_ref(&integration),
+            tracking_ref(&mr.remote, &integration)
         ),
     ])?;
     if !out.success() {
@@ -166,12 +218,32 @@ pub fn inspect(repo: &Repo, state: &UpdateState, mr: &MergeRequest) -> Result<La
         );
     }
     let tip = git
-        .commit(&tracking_ref(&mr.remote, integration))?
+        .commit(&tracking_ref(&mr.remote, &integration))?
         .with_context(|| format!("'{}' has no branch '{integration}'", mr.remote))?;
     let verified_tree = tree(git, &mr.commit)?;
 
     if git.is_ancestor(&mr.commit, &tip)? {
         let landing = landing_commit(git, &tip, &state.base, &mr.commit)?;
+        // A merge request whose final head is not the verified commit did not
+        // land the verified tree, whichever merge method was used. Without
+        // its head, the branch as last seen stands in for it when the
+        // integration branch took it in.
+        let mut changed_head = mr_head.clone().filter(|h| *h != mr.commit);
+        if changed_head.is_none()
+            && mr_head.is_none()
+            && let Some(h) = seen_branch.as_ref().filter(|h| **h != mr.commit)
+            && git.object_exists(h)?
+            && git.is_ancestor(h, &tip)?
+        {
+            changed_head = Some(h.clone());
+        }
+        if changed_head.is_some() {
+            return Ok(Landing::Unverified {
+                tip,
+                landing,
+                head: changed_head,
+            });
+        }
         let landed = landing == mr.commit || {
             let parents = parents(git, &landing)?;
             let mut contained = true;
@@ -180,11 +252,26 @@ pub fn inspect(repo: &Repo, state: &UpdateState, mr: &MergeRequest) -> Result<La
             }
             contained && tree(git, &landing)? == verified_tree
         };
-        return Ok(if landed {
-            Landing::Landed { tip }
+        if !landed {
+            return Ok(Landing::Unverified {
+                tip,
+                landing,
+                head: None,
+            });
+        }
+        let unattributed = if landing == mr.commit && mr_head.is_none() && branch.is_none() {
+            crate::git::lines(&git.run(&[
+                "log",
+                "--first-parent",
+                "--format=%h %s",
+                &tip,
+                &format!("^{}", mr.commit),
+                "--",
+            ])?)
         } else {
-            Landing::Unverified { tip, landing }
-        });
+            Vec::new()
+        };
+        return Ok(Landing::Landed { tip, unattributed });
     }
     if tip != state.base && !git.is_ancestor(&tip, &mr.commit)? {
         let mut squash = false;
@@ -201,7 +288,16 @@ pub fn inspect(repo: &Repo, state: &UpdateState, mr: &MergeRequest) -> Result<La
     }
     Ok(match branch {
         None => Landing::Closed,
-        Some(branch) => Landing::Waiting { branch },
+        Some(branch) => match mr_head {
+            Some(head) => Landing::Waiting {
+                head,
+                from_merge_request: true,
+            },
+            None => Landing::Waiting {
+                head: branch,
+                from_merge_request: false,
+            },
+        },
     })
 }
 
@@ -212,7 +308,18 @@ fn refusal(state: &UpdateState, mr: &MergeRequest, landing: &Landing) -> String 
     let remote_branch = format!("{}/{integration}", mr.remote);
     let verified = abbrev(&mr.commit);
     match landing {
-        Landing::Unverified { tip, landing } => format!(
+        Landing::Unverified {
+            tip,
+            head: Some(head),
+            ..
+        } => format!(
+            "'{remote_branch}' at {} contains the verified commit {verified}, but the merge request's head is {}, \
+             not the verified commit: the merge request carried commits that were never verified. No branch moved. \
+             Run `git intake abort` to end this update, then bring '{integration}' up to date and run `git intake start`",
+            abbrev(tip),
+            abbrev(head)
+        ),
+        Landing::Unverified { tip, landing, .. } => format!(
             "'{remote_branch}' at {} contains the verified commit {verified}, but what the integration branch received \
              with {} differs from the verified tree: the merge request branch received other commits, or the merge request \
              was merged after '{integration}' moved. No branch moved. That merge was never verified; run `git intake abort` \
@@ -263,10 +370,15 @@ pub fn complete(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Result
             f.clone()
         }
         None => {
-            let tip = match inspect(repo, &state, &mr)? {
-                Landing::Landed { tip } => tip,
-                Landing::Waiting { branch } => {
-                    report_waiting(&state, &mr, &branch, no_publish);
+            let landing = inspect(repo, &mut state)?;
+            repo.save_state(&state)?;
+            let (tip, unattributed) = match landing {
+                Landing::Landed { tip, unattributed } => (tip, unattributed),
+                Landing::Waiting {
+                    head,
+                    from_merge_request,
+                } => {
+                    report_waiting(&state, &mr, &head, from_merge_request, no_publish);
                     return Ok(Exit::Negative);
                 }
                 other => bail!("{}", refusal(&state, &mr, &other)),
@@ -277,6 +389,27 @@ pub fn complete(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Result
                 abbrev(&tip),
                 abbrev(&mr.commit)
             );
+            if !unattributed.is_empty() {
+                const SHOWN: usize = 5;
+                println!(
+                    "the merge request's head is unknown, so {} commit{} above the verified commit on '{}/{integration}' \
+                     could not be attributed to the merge request; check that {} not part of it:",
+                    unattributed.len(),
+                    plural(unattributed.len() as u64),
+                    mr.remote,
+                    if unattributed.len() == 1 {
+                        "it was"
+                    } else {
+                        "they were"
+                    }
+                );
+                for c in unattributed.iter().take(SHOWN) {
+                    println!("  {c}");
+                }
+                if unattributed.len() > SHOWN {
+                    println!("  and {} more", unattributed.len() - SHOWN);
+                }
+            }
             let mut moves = Vec::new();
             if let Some(m) = integration_move(&repo.git, &integration, &mr.remote, &tip)? {
                 moves.push(m);
@@ -338,18 +471,29 @@ pub fn complete(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Result
     finish::close(repo, state, unpublished)
 }
 
-fn report_waiting(state: &UpdateState, mr: &MergeRequest, branch: &str, no_publish: bool) {
+fn report_waiting(
+    state: &UpdateState,
+    mr: &MergeRequest,
+    head: &str,
+    from_merge_request: bool,
+    no_publish: bool,
+) {
     let integration = &state.config.integration;
     println!(
         "the update waits for the merge request from '{}' into '{integration}' on '{}'",
         mr.branch, mr.remote
     );
-    if branch != mr.commit {
+    if head != mr.commit {
         println!(
-            "the merge request branch no longer points at the verified commit {} but at {}; merging it would not land \
+            "{} no longer points at the verified commit {} but at {}; merging it would not land \
              the verified tree, and `finish` would refuse it. Restore the branch to {}, or run `git intake abort`",
+            if from_merge_request {
+                "the merge request's head"
+            } else {
+                "the merge request branch"
+            },
             abbrev(&mr.commit),
-            abbrev(branch),
+            abbrev(head),
             abbrev(&mr.commit)
         );
     } else if !mr.requested {
@@ -476,17 +620,37 @@ fn carried_records(
 /// exist there.
 pub fn remote_branch(git: &Git, remote: &str, branch: &str) -> Result<Option<String>> {
     let full = branch_ref(branch);
-    let out = git.raw(&["ls-remote", "--heads", remote, &full])?;
+    Ok(remote_refs(git, remote, std::slice::from_ref(&full))?.remove(&full))
+}
+
+/// The commits the remote's refs with exactly these names point at; a ref
+/// the remote does not have is absent from the result.
+fn remote_refs(
+    git: &Git,
+    remote: &str,
+    names: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut args = vec!["ls-remote".to_string(), remote.to_string()];
+    args.extend(names.iter().cloned());
+    let out = git.raw(&args)?;
     if !out.success() {
         bail!(
-            "cannot list the branches of the publish remote '{remote}': {}",
+            "cannot list the refs of the publish remote '{remote}': {}",
             out.into_error()
         );
     }
-    Ok(out.stdout.lines().find_map(|line| {
-        let (oid, name) = line.split_once('\t')?;
-        (name.trim() == full).then(|| oid.trim().to_string())
-    }))
+    Ok(out
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let (oid, name) = line.split_once('\t')?;
+            let name = name.trim();
+            names
+                .iter()
+                .any(|n| n == name)
+                .then(|| (name.to_string(), oid.trim().to_string()))
+        })
+        .collect())
 }
 
 /// Deletes the merge request branch from the publish remote while it still
@@ -624,5 +788,30 @@ fn relay_remote_messages(stderr: &str) {
         {
             println!("remote:{}", rest.trim_end());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_merge_request_number_from_the_reply() {
+        let reply = "remote: \nremote: View merge request for git-intake/update-0123456789ab:\n\
+                     remote:   https://gitlab.example.com/group/project/-/merge_requests/42        \n";
+        assert_eq!(merge_request_number(reply), Some(42));
+        let create = "remote: To create a merge request for git-intake/update-0123456789ab, visit:\n\
+                      remote:   https://gitlab.example.com/group/project/-/merge_requests/new?merge_request%5Bsource_branch%5D=x\n";
+        assert_eq!(merge_request_number(create), None);
+        assert_eq!(merge_request_number(""), None);
+    }
+
+    #[test]
+    fn porcelain_tells_an_update_from_an_up_to_date_branch() {
+        let b = "git-intake/update-0123456789ab";
+        let new = format!("To ../r.git\n*\tabc:refs/heads/{b}\t[new branch]\nDone\n");
+        let same = format!("To ../r.git\n=\tabc:refs/heads/{b}\t[up to date]\nDone\n");
+        assert!(transferred(&new, b));
+        assert!(!transferred(&same, b));
     }
 }
