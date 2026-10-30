@@ -4,7 +4,9 @@
 mod cli;
 mod commands;
 mod config;
+mod description;
 mod drift;
+mod forge;
 mod git;
 mod integration_line;
 mod output;
@@ -14,6 +16,7 @@ mod state;
 mod sync_record;
 mod tags;
 mod target;
+mod update_line;
 mod upstreams;
 
 use std::process::ExitCode;
