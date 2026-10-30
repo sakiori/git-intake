@@ -1,0 +1,188 @@
+# Releases are managed by release-plz. Every push to main updates the release
+# pull request, which raises the version in Cargo.toml and Cargo.lock and adds
+# the release's entry to CHANGELOG.md, computed from the Conventional Commits
+# since the last release. Merging that pull request releases: release-plz
+# publishes the crate to crates.io through Trusted Publishing, pushes the tag
+# vX.Y.Z and creates a draft GitHub Release with the changelog entry. The build
+# jobs then attach an archive git-intake-vX.Y.Z-<target>.tar.gz per target,
+# with the binary at its root and the manual pages under man/man1/, a .sha256
+# next to each, and a build provenance attestation of each archive; the last
+# job publishes the release.
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-pr:
+    if: github.repository_owner == 'sakiori'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: release-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      # Pull requests opened with the workflow's own token start no workflow
+      # runs, so the release pull request is opened with a GitHub App's token,
+      # whose pull requests run CI.
+      - id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
+        with:
+          command: release-pr
+          version: 0.3.174
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  release:
+    if: github.repository_owner == 'sakiori'
+    runs-on: ubuntu-latest
+    # crates.io's Trusted Publishing configuration names this environment, so
+    # only this job can obtain a publish token.
+    environment: release
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      # Without CARGO_REGISTRY_TOKEN, release-plz obtains a short-lived token
+      # through crates.io's Trusted Publishing with the job's OIDC token.
+      - id: release-plz
+        uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
+        with:
+          command: release
+          version: 0.3.174
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - id: tag
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          tag=$(printf '%s' "${RELEASES:-[]}" | jq -r '.[] | select(.package_name == "git-intake") | .tag')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: release
+    if: needs.release.outputs.tag != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static Linux binaries, cross-compiled with cargo-zigbuild as the
+          # GitLab release builds were.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            build-tool: cargo-zigbuild
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            build-tool: cargo-zigbuild
+          # A macOS binary links the system's Security framework, so it is
+          # built on macOS.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            build-tool: cargo
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            build-tool: cargo
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      TAG: ${{ needs.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.release.outputs.tag }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - if: matrix.build-tool == 'cargo-zigbuild'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          use-cache: false
+      - if: matrix.build-tool == 'cargo-zigbuild'
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-zigbuild@0.23.4
+      # The manual pages of the release, generated on the build host.
+      - run: cargo run --locked --quiet -p xtask -- man man/man1
+      # Builds the binary and packs it with man/ at the archive root. The
+      # upload follows the checksum and the attestation below.
+      - id: archive
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
+        with:
+          bin: git-intake
+          target: ${{ matrix.target }}
+          build-tool: ${{ matrix.build-tool }}
+          archive: $bin-$tag-$target
+          include: man
+          locked: true
+          ref: refs/tags/${{ needs.release.outputs.tag }}
+          dry-run: true
+          dry-run-intended: true
+      - id: checksum
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.tar }}
+        run: |
+          [ -f "$ARCHIVE" ] || { echo "no archive $ARCHIVE" >&2; exit 1; }
+          shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          cat "$ARCHIVE.sha256"
+          tar -tzf "$ARCHIVE"
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.archive.outputs.tar }}
+      - env:
+          ARCHIVE: ${{ steps.archive.outputs.tar }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --repo "$GITHUB_REPOSITORY" --clobber
+
+  # The release stays a draft until every archive and its checksum are
+  # attached, so that it is never seen incomplete.
+  publish:
+    needs: [release, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.release.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

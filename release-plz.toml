@@ -1,0 +1,19 @@
+# release-plz configuration; .github/workflows/release.yml runs it.
+
+[workspace]
+# Release only when a release pull request is merged, not on every push.
+release_always = false
+# The release workflow publishes the GitHub Release once every archive, its
+# checksum and its attestation are in place.
+git_release_draft = true
+# A binary has no library API for cargo-semver-checks to compare.
+semver_check = false
+
+[[package]]
+name = "git-intake"
+git_tag_name = "v{{ version }}"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "xtask"
+release = false
