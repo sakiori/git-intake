@@ -36,44 +36,23 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     let commit = moves[0].new.clone();
     let integration = state.config.integration.clone();
     let branch = format!("{MERGE_REQUEST_BRANCH_PREFIX}{}", abbrev(&commit));
-    let refspec = format!("{commit}:{}", branch_ref(&branch));
 
-    let mut args: Vec<String> = vec!["push".into(), "--porcelain".into()];
-    for option in push_options(&repo.git, &state, &integration, &commit)? {
-        args.push("-o".into());
-        args.push(option);
-    }
-    args.push(publish.remote.clone());
-    args.push(refspec.clone());
-    let out = repo.git.raw(&args)?;
-    let mut number = None;
-    let (requested, options_refused) = if out.success() {
-        relay_remote_messages(&out.stderr);
-        number = merge_request_number(&out.stderr, &branch);
-        // The remote applies push options only to a push that updates a ref:
-        // a branch already in place, as after an interrupted `finish`, opens
-        // no merge request.
-        (transferred(&out.stdout, &branch), false)
-    } else if out.stderr.contains(NO_PUSH_OPTIONS) {
-        // Refused before anything was written: push the branch alone.
-        let retry = repo.git.raw(&["push", &publish.remote, &refspec])?;
-        if !retry.success() {
-            bail!(
-                "pushing the merge request branch '{branch}' to '{}' failed: {}\n\
-                 Nothing moved, and the update stays verified; fix the cause and run `git intake finish` again",
-                publish.remote,
-                retry.into_error()
-            );
-        }
-        relay_remote_messages(&retry.stderr);
-        (false, true)
-    } else {
-        bail!(
-            "pushing the merge request branch '{branch}' to '{}' failed: {}\n\
+    // A branch already in place, as after an interrupted `finish`, needs no
+    // push. Pushing it again with options would update no ref, and git then
+    // writes the options to a remote that has stopped reading, which can end
+    // the push with SIGPIPE.
+    let in_place = match remote_branch(&repo.git, &publish.remote, &branch) {
+        Ok(at) => at.as_deref() == Some(commit.as_str()),
+        Err(err) => bail!(
+            "cannot check whether the merge request branch '{branch}' is on '{}': {err:#}\n\
              Nothing moved, and the update stays verified; fix the cause and run `git intake finish` again",
-            publish.remote,
-            out.into_error()
-        );
+            publish.remote
+        ),
+    };
+    let (requested, options_refused, number) = if in_place {
+        (false, false, None)
+    } else {
+        push_merge_request_branch(repo, &state, &publish, &branch, &commit)?
     };
 
     let mr = MergeRequest {
@@ -115,6 +94,58 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     println!("no local branch moved; the update waits for the merge request");
     println!("next: {}", waiting_next(&mr, &integration));
     Ok(Exit::Success)
+}
+
+/// Pushes the verified commit to the merge request branch, asking the remote
+/// to open the merge request. Returns whether it was asked for, whether the
+/// remote refused push options, and the number its reply names.
+fn push_merge_request_branch(
+    repo: &Repo,
+    state: &UpdateState,
+    publish: &Publish,
+    branch: &str,
+    commit: &str,
+) -> Result<(bool, bool, Option<u64>)> {
+    let refspec = format!("{commit}:{}", branch_ref(branch));
+    let mut args: Vec<String> = vec!["push".into(), "--porcelain".into()];
+    for option in push_options(&repo.git, state, &state.config.integration, commit)? {
+        args.push("-o".into());
+        args.push(option);
+    }
+    args.push(publish.remote.clone());
+    args.push(refspec.clone());
+    let out = repo.git.raw(&args)?;
+    Ok(if out.success() {
+        relay_remote_messages(&out.stderr);
+        // The remote applies push options only to a push that updates a ref:
+        // a branch that appeared since it was looked up opens no merge
+        // request.
+        (
+            transferred(&out.stdout, branch),
+            false,
+            merge_request_number(&out.stderr, branch),
+        )
+    } else if out.stderr.contains(NO_PUSH_OPTIONS) {
+        // Refused before anything was written: push the branch alone.
+        let retry = repo.git.raw(&["push", &publish.remote, &refspec])?;
+        if !retry.success() {
+            bail!(
+                "pushing the merge request branch '{branch}' to '{}' failed: {}\n\
+                 Nothing moved, and the update stays verified; fix the cause and run `git intake finish` again",
+                publish.remote,
+                retry.into_error()
+            );
+        }
+        relay_remote_messages(&retry.stderr);
+        (false, true, None)
+    } else {
+        bail!(
+            "pushing the merge request branch '{branch}' to '{}' failed: {}\n\
+             Nothing moved, and the update stays verified; fix the cause and run `git intake finish` again",
+            publish.remote,
+            out.into_error()
+        );
+    })
 }
 
 /// The number of the merge request the remote's reply names for `branch`.

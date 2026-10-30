@@ -650,6 +650,16 @@ fn interrupted_opening_does_not_claim_a_merge_request() {
             &format!("{commit}:refs/heads/{branch}"),
         ],
     );
+    // The branch is found in place and nothing is pushed: a push would fail.
+    let missing = env.path("no-such-remote.git");
+    env.git(
+        &f.down,
+        &[
+            "config",
+            "remote.origin.pushurl",
+            &missing.to_string_lossy(),
+        ],
+    );
 
     f.tool(&["finish"]).success().stdout(contains(format!(
         "'{branch}' was already on 'origin', so this push asked for no merge request; \
