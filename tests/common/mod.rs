@@ -359,6 +359,45 @@ impl Env {
     }
 }
 
+/// Turns `state`, an update state as this release writes it, into the shape
+/// a release of state format `version` wrote, started by `release`: checks as
+/// plain commands, a verification as that release recorded it, and no
+/// partial run.
+pub fn as_earlier_release(state: &mut serde_json::Value, version: u64, release: &str) {
+    state["version"] = version.into();
+    state["release"] = release.into();
+    let checks: Vec<serde_json::Value> = state["config"]["checks"]
+        .as_array()
+        .map(|c| c.iter().map(|c| c["run"].clone()).collect())
+        .unwrap_or_default();
+    state["config"]["checks"] = checks.into();
+    if let Some(v) = state.get("verification").filter(|v| !v.is_null()) {
+        let results: Vec<serde_json::Value> = v["checks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| {
+                serde_json::json!({
+                    "kind": "check",
+                    "command": c["name"],
+                    "outcome": c["outcome"],
+                    "exit_code": c["exit_code"],
+                    "log": c["log"],
+                })
+            })
+            .collect();
+        state["verification"] = serde_json::json!({
+            "commit": v["commit"],
+            "passed": v["passed"],
+            "results": results,
+            "problems": [],
+        });
+    }
+    if let Some(object) = state.as_object_mut() {
+        object.remove("partial_run");
+    }
+}
+
 /// Output text of an assertion.
 pub fn stdout(a: &Assert) -> String {
     String::from_utf8_lossy(&a.get_output().stdout).into_owned()
@@ -382,25 +421,42 @@ pub struct Fork {
 pub const FORK_FILE: &str = "app.txt";
 pub const FORK_CONTENT: &str = "one\ntwo\nthree\n";
 
+/// The check of a fork, by its name and command.
+pub const FORK_CHECK: (&str, &str) = ("app", "test -f app.txt");
+
+/// The `checks` line of a configuration with `checks`, each a name and the
+/// command it runs.
+pub fn checks_line(checks: &[(&str, &str)]) -> String {
+    format!(
+        "checks = [{}]",
+        checks
+            .iter()
+            .map(|(name, run)| format!("{{ name = {name:?}, run = {run:?} }}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 impl Fork {
     pub fn new() -> Self {
-        Self::with_checks(&["test -f app.txt"])
+        Self::with_checks(&[FORK_CHECK])
     }
 
-    pub fn with_checks(checks: &[&str]) -> Self {
+    /// A fork with `checks`, each a name and the command it runs.
+    pub fn with_checks(checks: &[(&str, &str)]) -> Self {
         Self::build(checks, "push", "follow", None)
     }
 
     /// A fork that takes its upstream in port mode, publishing by push.
     pub fn port() -> Self {
-        Self::build(&["test -f app.txt"], "push", "port", None)
+        Self::build(&[FORK_CHECK], "push", "port", None)
     }
 
     /// A fork that takes its upstream in port mode and publishes through
     /// merge requests, like [`Fork::merge_request`].
     pub fn port_merge_request() -> Self {
         Self::build(
-            &["test -f app.txt"],
+            &[FORK_CHECK],
             "merge-request",
             "port",
             Some(forge::Kind::GitLab),
@@ -411,7 +467,7 @@ impl Fork {
     /// settings qualify, reached as from one of its CI jobs.
     pub fn merge_request() -> Self {
         Self::build(
-            &["test -f app.txt"],
+            &[FORK_CHECK],
             "merge-request",
             "follow",
             Some(forge::Kind::GitLab),
@@ -422,14 +478,14 @@ impl Fork {
     /// settings qualify, reached as from one of its Actions jobs.
     pub fn github() -> Self {
         Self::build(
-            &["test -f app.txt"],
+            &[FORK_CHECK],
             "merge-request",
             "follow",
             Some(forge::Kind::GitHub),
         )
     }
 
-    fn build(checks: &[&str], via: &str, mode: &str, kind: Option<forge::Kind>) -> Self {
+    fn build(checks: &[(&str, &str)], via: &str, mode: &str, kind: Option<forge::Kind>) -> Self {
         let env = Env::new();
         let up = env.upstream("upstream", &[(FORK_FILE, FORK_CONTENT)]);
         let publish = match kind {
@@ -468,15 +524,11 @@ impl Fork {
                 );
             }
         }
-        let checks = checks
-            .iter()
-            .map(|c| format!("{c:?}"))
-            .collect::<Vec<_>>()
-            .join(", ");
         let config = format!(
-            "integration = \"main\"\ninstall = \"true\"\nchecks = [{checks}]\n\n\
+            "integration = \"main\"\ninstall = \"true\"\n{}\n\n\
              [publish]\nremote = \"origin\"\nvia = \"{via}\"\n\n\
              [[upstream]]\nname = \"upstream\"\nurl = {:?}\nbranch = \"main\"\nmode = \"{mode}\"\n",
+            checks_line(checks),
             up.url()
         );
         env.commit(
@@ -501,6 +553,15 @@ impl Fork {
     /// The fake forge of a fork in merge-request mode.
     pub fn forge(&self) -> &forge::FakeForge {
         self.forge.as_ref().expect("a fork in merge-request mode")
+    }
+
+    /// Commits and publishes on the integration branch the configuration
+    /// with its checks as plain commands, the form of earlier releases.
+    pub fn plain_checks(&self) {
+        self.reconfigure(
+            &checks_line(&[FORK_CHECK]),
+            &format!("checks = [{:?}]", FORK_CHECK.1),
+        );
     }
 
     /// The committed configuration with `from` replaced by `to`, committed
@@ -702,7 +763,8 @@ impl Mono {
 
 pub fn mono_config(a: &Upstream, b: &Upstream, extra: &str) -> String {
     format!(
-        "integration = \"main\"\nchecks = [\"test -f apps/a/a.txt\", \"test -f apps/b/b.txt\"]\n\n\
+        "integration = \"main\"\nchecks = [{{ name = \"a\", run = \"test -f apps/a/a.txt\" }}, \
+         {{ name = \"b\", run = \"test -f apps/b/b.txt\" }}]\n\n\
          [[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n\n\
          [[upstream]]\nname = \"app-b\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/b\"\n{extra}",
         a.url(),

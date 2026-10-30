@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::fs;
 use std::path::Path;
 
 use common::forge::TOKEN;
@@ -51,7 +52,7 @@ fn finish_opens_the_merge_request_and_ends_the_update() {
     let f = Fork::merge_request();
     let env = &f.env;
     // Merge-request mode runs no check: the merge request's pipeline does.
-    f.reconfigure("checks = [\"test -f app.txt\"]", "checks = [\"false\"]");
+    f.reconfigure("run = \"test -f app.txt\"", "run = \"false\"");
     let main = env.rev(&f.down, "main");
     let (head, target) = started(&f);
 
@@ -429,7 +430,7 @@ fn github_merge_settings_hidden_from_the_token_are_refused() {
 fn a_moved_integration_branch_is_caught_up_without_the_checks() {
     let f = Fork::merge_request();
     let env = &f.env;
-    f.reconfigure("checks = [\"test -f app.txt\"]", "checks = [\"false\"]");
+    f.reconfigure("run = \"test -f app.txt\"", "run = \"false\"");
     let (head, _) = started(&f);
     let forge = common::forge(env, &f.publish);
     env.commit(&forge, &[("other.txt", "o\n")], "other: lands first");
@@ -866,5 +867,75 @@ fn a_squash_with_the_trailers_does_not_count_as_a_sync_record() {
     assert!(
         out.contains("was merged without the update's history"),
         "{out}"
+    );
+}
+
+#[test]
+fn checks_the_update_changes_are_named_in_the_merge_request() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    f.reconfigure(
+        &common::checks_line(&[common::FORK_CHECK]),
+        &common::checks_line(&[common::FORK_CHECK, ("lint", "true")]),
+    );
+    started(&f);
+    // The update adds the check `audit`, gives `app` another command and
+    // removes `lint`.
+    let wt = env.update_worktree(&f.down);
+    let cfg = fs::read_to_string(wt.join(".git-intake.toml"))
+        .unwrap()
+        .replace(
+            &common::checks_line(&[common::FORK_CHECK, ("lint", "true")]),
+            &common::checks_line(&[("app", "test -s app.txt"), ("audit", "true")]),
+        );
+    env.commit(
+        &wt,
+        &[(".git-intake.toml", &cfg)],
+        "fork: change the checks",
+    );
+    let out = stdout(&f.tool(&["finish"]).success());
+    let named = "the check `audit` added to `.git-intake.toml`, the check `lint` removed from \
+                 `.git-intake.toml`, the check `app` given another command in `.git-intake.toml`";
+    assert!(
+        out.contains(&format!("the update changes its own checks: {named}")),
+        "{out}"
+    );
+    let description = f.forge().mr(1).description;
+    assert!(description.contains(named), "{description}");
+}
+
+#[test]
+fn checks_only_reordered_are_named_as_such() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    f.reconfigure(
+        &common::checks_line(&[common::FORK_CHECK]),
+        &common::checks_line(&[common::FORK_CHECK, ("lint", "true")]),
+    );
+    started(&f);
+    let wt = env.update_worktree(&f.down);
+    let cfg = fs::read_to_string(wt.join(".git-intake.toml"))
+        .unwrap()
+        .replace(
+            &common::checks_line(&[common::FORK_CHECK, ("lint", "true")]),
+            &common::checks_line(&[("lint", "true"), common::FORK_CHECK]),
+        );
+    env.commit(
+        &wt,
+        &[(".git-intake.toml", &cfg)],
+        "fork: reorder the checks",
+    );
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(
+        out.contains(
+            "the update changes its own checks: the order of the checks of `.git-intake.toml`;"
+        ),
+        "{out}"
+    );
+
+    let description = f.forge().mr(1).description;
+    assert!(
+        description.contains("the order of the checks of `.git-intake.toml`"),
+        "{description}"
     );
 }

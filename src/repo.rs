@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Config};
 use crate::git::{Git, branch_ref};
-use crate::state::{self, Paths, UpdateState};
+use crate::state::{self, Paths, Stored, UpdateState};
 
 pub struct Repo {
     /// Runs every repository-wide git command. It is bound to the main
@@ -38,9 +38,6 @@ pub struct Repo {
     head: Option<String>,
     /// Whether this command removed the update worktree it was started in.
     left_removed_directory: Cell<bool>,
-    /// Whether this command said that it wrote a state of format 4 in the
-    /// current format.
-    noted_format: Cell<bool>,
 }
 
 /// Where the repository's main worktree is.
@@ -116,7 +113,6 @@ impl Repo {
             toplevel,
             head,
             left_removed_directory: Cell::new(false),
-            noted_format: Cell::new(false),
         })
     }
 
@@ -151,9 +147,17 @@ impl Repo {
         self.head.as_deref()
     }
 
-    /// The update in progress, if any.
-    pub fn state(&self) -> Result<Option<UpdateState>> {
+    /// The update in progress as the state file holds it, if any: an update
+    /// of this release, or one of an earlier release waiting for its merge
+    /// request.
+    pub fn stored(&self) -> Result<Option<Stored>> {
         state::load(&self.paths.state)
+    }
+
+    /// The update in progress, if any. An update of an earlier release
+    /// waiting for its merge request is refused, naming `finish`.
+    pub fn state(&self) -> Result<Option<UpdateState>> {
+        state::load_update(&self.paths.state)
     }
 
     /// The update in progress, or a refusal naming the situation, for the
@@ -161,15 +165,26 @@ impl Repo {
     /// The references the update holds are restored first where they are
     /// missing.
     pub fn require_state(&self) -> Result<UpdateState> {
+        Ok(self.require_state_checked(|_| Ok(()))?.0)
+    }
+
+    /// [`Self::require_state`] with `check` run on the update first, so
+    /// that a refusal of `check` changes nothing: no warning is recorded and
+    /// no reference is restored. Returns what `check` gives with the update.
+    pub fn require_state_checked<T>(
+        &self,
+        check: impl FnOnce(&UpdateState) -> Result<T>,
+    ) -> Result<(UpdateState, T)> {
         match self.state()? {
             Some(mut s) => {
+                let checked = check(&s)?;
                 if let Some(warning) = state::release_warning(&s) {
                     eprintln!("warning: {warning}");
                     s.release_warned = Some(state::RELEASE.to_string());
                     self.save_state(&s)?;
                 }
                 self.restore_held_references(&s)?;
-                Ok(s)
+                Ok((s, checked))
             }
             None => bail!("no update is in progress; run `git intake start` to begin one"),
         }
@@ -184,16 +199,9 @@ impl Repo {
         Ok(())
     }
 
-    /// Writes the state of the update in progress, always in the current
-    /// format; the first time a state read in format 4 is written, says that
-    /// earlier releases can no longer carry the update on.
+    /// Writes the state of the update in progress.
     pub fn save_state(&self, state: &UpdateState) -> Result<()> {
-        let (current, upgraded) = state::in_current_format(state);
-        state::save(&self.paths.state, &current)?;
-        if upgraded && !self.noted_format.replace(true) {
-            eprintln!("note: {}", state::format_note());
-        }
-        Ok(())
+        state::save(&self.paths.state, state)
     }
 
     /// Every worktree of the repository, the main one first. Git lists the
@@ -270,8 +278,8 @@ impl Repo {
     }
 
     fn resolve_update_worktree(&self) -> Result<Resolved> {
-        if let Some(state) = state::load(&self.paths.state).ok().flatten() {
-            return Ok(Resolved::Update(Some(state.worktree)));
+        if let Some(stored) = state::load(&self.paths.state).ok().flatten() {
+            return Ok(Resolved::Update(Some(stored.worktree().to_path_buf())));
         }
         // The first entry is the main worktree, which is never the update's.
         if let Some(w) = self
@@ -388,50 +396,6 @@ impl Repo {
         fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))
     }
 
-    /// Moves the update worktree from `old` to `new` with `git worktree
-    /// move`, which keeps its branch, index, merge in progress and files,
-    /// creating the directories that hold `new`. When git refuses, the
-    /// directories made for it are removed again and git's reason is given.
-    pub fn move_update_worktree(&self, old: &Path, new: &Path) -> Result<()> {
-        let made: Vec<&Path> = new
-            .ancestors()
-            .skip(1)
-            .take_while(|dir| fs::symlink_metadata(dir).is_err())
-            .collect();
-        if let Some(parent) = new.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
-        let out = self.git.raw(&[
-            "worktree",
-            "move",
-            &old.to_string_lossy(),
-            &new.to_string_lossy(),
-        ])?;
-        if !out.success() {
-            for dir in made {
-                let _ = fs::remove_dir(dir);
-            }
-            bail!(
-                "git refused to move the update worktree from {} to {}: {}",
-                old.display(),
-                new.display(),
-                out.stderr.trim()
-            );
-        }
-        Ok(())
-    }
-
-    /// The repository's common git directory.
-    pub fn common_dir(&self) -> &Path {
-        &self.common
-    }
-
-    /// Whether the tool was started in the worktree at `dir`.
-    pub fn started_in(&self, dir: &Path) -> bool {
-        self.toplevel.as_deref() == Some(canonical(dir).as_path())
-    }
-
     /// Whether the update worktree is registered with git.
     pub fn update_worktree_registered(&self) -> Result<bool> {
         let Some(wt) = self.update_worktree()? else {
@@ -486,8 +450,8 @@ impl Repo {
     /// Finds the integration branch: from the update in progress, else from
     /// the configuration committed at HEAD.
     fn integration_branch(&self) -> Result<String> {
-        if let Some(state) = self.state()? {
-            return Ok(state.config.integration);
+        if let Some(stored) = self.stored()? {
+            return Ok(stored.integration().to_string());
         }
         let committed = match &self.head {
             Some(head) => self.git.show_file(head, config::FILE_NAME)?,
@@ -689,7 +653,8 @@ impl Repo {
         Ok(vec![format!("plan {}", plan.display())])
     }
 
-    /// Removes the update's logs: the verification logs and saved merge output.
+    /// Removes the update's logs: those of the verification and of the
+    /// partial run, and saved merge output.
     pub fn remove_logs(&self) -> Result<Vec<String>> {
         let logs = &self.paths.logs;
         if !logs.exists() {
@@ -697,6 +662,18 @@ impl Repo {
         }
         fs::remove_dir_all(logs).with_context(|| format!("cannot remove {}", logs.display()))?;
         Ok(vec![format!("logs {}", logs.display())])
+    }
+
+    /// Drops the partial run of the update with its logs, as a full run and
+    /// a catch-up merge do.
+    pub fn drop_partial_run(&self, state: &mut UpdateState) -> Result<()> {
+        state.partial_run = None;
+        let logs = &self.paths.partial_logs;
+        if logs.exists() {
+            fs::remove_dir_all(logs)
+                .with_context(|| format!("cannot remove {}", logs.display()))?;
+        }
+        Ok(())
     }
 }
 
@@ -724,8 +701,7 @@ fn locate_main_worktree(
     if let Some(top) = started_in {
         return Ok(MainWorktree::At(top.to_path_buf()));
     }
-    // A state in the previous format records it too, for `migrate`. An
-    // unreadable state, or one of another format, gives no record and is
+    // An unreadable state, or one of another format, gives no record and is
     // not reported here. `continue`, `verify`, `finish` and `abort` read the
     // state before they need the main worktree and stop on its error; `start`
     // refuses on it as well. Read-only commands carry on: run outside the

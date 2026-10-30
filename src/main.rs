@@ -44,15 +44,15 @@ fn run(command: Command) -> anyhow::Result<Exit> {
     let repo = repo::Repo::open()?;
     // The integration line needs the full history: a shallow clone cuts it
     // off, and an upstream's last sync record may lie below the cut. Only
-    // the commands that end or carry over an update work without it.
-    if !matches!(command, Command::Abort { .. } | Command::Migrate) {
+    // `abort`, which ends an update, works without it.
+    if !matches!(command, Command::Abort { .. }) {
         repo.refuse_shallow()?;
     }
     let result = match command {
         Command::Start { upstreams } => commands::update::start(&repo, &upstreams),
         Command::Continue => commands::update::resume(&repo),
         Command::Abort { merge_request } => commands::update::abort(&repo, merge_request),
-        Command::Verify => commands::verify::run(&repo),
+        Command::Verify { only, skip } => commands::verify::run(&repo, &only, &skip),
         Command::Finish { no_publish } => commands::finish::run(&repo, no_publish),
         Command::Sync => commands::sync::run(&repo),
         Command::Env {
@@ -61,7 +61,6 @@ fn run(command: Command) -> anyhow::Result<Exit> {
             json,
             command,
         } => commands::env::run(&repo, rev.as_deref(), dotenv, json, &command),
-        Command::Migrate => commands::migrate::run(&repo),
         Command::Status { check, json } => commands::status::run(&repo, check, json),
         Command::Report { json } => commands::report::run(&repo, json),
         Command::Log { upstreams, json } => commands::log::run(&repo, &upstreams, json),

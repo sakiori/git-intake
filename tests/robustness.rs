@@ -260,7 +260,7 @@ fn template_pair() -> (Env, common::Upstream, std::path::PathBuf) {
     env.git(&down, &["remote", "remove", "origin"]);
     let up = common::Upstream { bare, work };
     let cfg = format!(
-        "integration = \"main\"\nchecks = [\"test -f apps/a/a.txt\"]\n\n[[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n",
+        "integration = \"main\"\nchecks = [{{ name = \"a\", run = \"test -f apps/a/a.txt\" }}]\n\n[[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n",
         up.url()
     );
     env.commit(&down, &[(".git-intake.toml", &cfg)], "mono: configuration");
@@ -378,11 +378,7 @@ fn verify_rejects_an_invalid_merged_configuration() {
         "{}",
         stdout(&v)
     );
-    assert!(
-        stdout(&v).contains("skipped  test -f app.txt"),
-        "{}",
-        stdout(&v)
-    );
+    assert!(stdout(&v).contains("skipped  app"), "{}", stdout(&v));
 
     env.commit(
         &wt,
@@ -511,7 +507,7 @@ fn path_imported_by_subtree_add_is_adopted() {
     let up = env.upstream("app-a", &[("a.txt", "a1\na2\n")]);
     let down = env.work("mono");
     let cfg = format!(
-        "integration = \"main\"\nchecks = [\"test -f apps/a/a.txt\"]\n\n[[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n",
+        "integration = \"main\"\nchecks = [{{ name = \"a\", run = \"test -f apps/a/a.txt\" }}]\n\n[[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n",
         up.url()
     );
     env.commit(&down, &[(".git-intake.toml", &cfg)], "mono: configuration");

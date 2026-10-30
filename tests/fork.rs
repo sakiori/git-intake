@@ -42,19 +42,14 @@ fn full_cycle_merges_verifies_and_publishes() {
     assert!(text.contains("next: git intake verify"), "{text}");
     assert!(text.contains(&format!("target {}", &t1[..12])), "{text}");
 
-    f.tool(&["verify"]).success().stdout(contains("verified"));
-    assert!(
-        env.intake_dir(&f.down)
-            .join("logs")
-            .join("01-install.log")
-            .exists()
-    );
-    assert!(
-        env.intake_dir(&f.down)
-            .join("logs")
-            .join("02-check.log")
-            .exists()
-    );
+    f.tool(&["verify"])
+        .success()
+        .stdout(contains("verified"))
+        .stdout(contains("passed   install command"))
+        .stdout(contains("passed   app"));
+    let logs = env.intake_dir(&f.down).join("logs").join("verify");
+    assert!(logs.join("install.log").exists());
+    assert!(logs.join("check-app.log").exists());
 
     f.tool(&["finish"])
         .success()
@@ -195,16 +190,13 @@ fn start_reads_the_configuration_again_after_a_fast_forward() {
     // The new tip adds a check.
     let cfg = fs::read_to_string(other.join(".git-intake.toml"))
         .unwrap()
-        .replace(
-            "checks = [\"test -f app.txt\"]",
-            "checks = [\"test -f n.txt\"]",
-        );
+        .replace("run = \"test -f app.txt\"", "run = \"test -f n.txt\"");
     env.commit(&other, &[(".git-intake.toml", &cfg)], "other: check n");
     env.git(&other, &["push", "-q", "origin", "main"]);
     f.tool(&["start"]).success();
     f.tool(&["verify"])
         .success()
-        .stdout(contains("passed   test -f n.txt"));
+        .stdout(contains("passed   app"));
     f.tool(&["abort"]).success();
 
     // A new tip that names another publish remote: the fast-forward is kept,
@@ -253,16 +245,12 @@ fn commit_after_verify_blocks_finish() {
 
 #[test]
 fn failed_check_leaves_update_unverified() {
-    let f = Fork::with_checks(&["test -f missing.txt", "true"]);
+    let f = Fork::with_checks(&[("missing", "test -f missing.txt"), ("true", "true")]);
     let env = &f.env;
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
     let v = f.tool(&["verify"]).code(1);
-    assert!(
-        stdout(&v).contains("FAILED   test -f missing.txt"),
-        "{}",
-        stdout(&v)
-    );
+    assert!(stdout(&v).contains("FAILED   missing"), "{}", stdout(&v));
     assert!(stdout(&v).contains("passed   true"));
     f.tool(&["finish"]).code(2).stderr(contains("failed"));
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
@@ -271,8 +259,7 @@ fn failed_check_leaves_update_unverified() {
 
 #[test]
 fn failed_install_skips_checks() {
-    let env_checks = ["true"];
-    let f = Fork::with_checks(&env_checks);
+    let f = Fork::with_checks(&[("true", "true")]);
     let env = &f.env;
     // Replace the install command with a failing one.
     let cfg = std::fs::read_to_string(f.down.join(".git-intake.toml"))
@@ -288,7 +275,7 @@ fn failed_install_skips_checks() {
     f.tool(&["start"]).success();
     let v = f.tool(&["verify"]).code(1);
     let out = stdout(&v);
-    assert!(out.contains("FAILED   exit 3  (exit 3;"), "{out}");
+    assert!(out.contains("FAILED   install command  (exit 3;"), "{out}");
     assert!(out.contains("skipped  true"), "{out}");
 }
 
@@ -480,7 +467,7 @@ fn stacked_downstream_branch_follows_another_fork() {
     env.git(&stacked, &["checkout", "-q", "-b", "develop"]);
     env.git(&stacked, &["remote", "remove", "upstream"]);
     let config = format!(
-        "integration = \"develop\"\nchecks = [\"test -f app.txt\"]\n\n[[upstream]]\nname = \"upstream\"\nurl = {:?}\nbranch = \"main\"\n",
+        "integration = \"develop\"\nchecks = [{{ name = \"app\", run = \"test -f app.txt\" }}]\n\n[[upstream]]\nname = \"upstream\"\nurl = {:?}\nbranch = \"main\"\n",
         f.publish.to_string_lossy()
     );
     env.commit(
@@ -609,7 +596,7 @@ fn merge_concluded_by_hand_is_accepted_by_continue() {
 
 #[test]
 fn checks_that_modify_tracked_files_fail_verification() {
-    let f = Fork::with_checks(&["echo more >> app.txt"]);
+    let f = Fork::with_checks(&[("more", "echo more >> app.txt")]);
     let env = &f.env;
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
@@ -672,7 +659,7 @@ fn abort_removes_logs_and_the_update_references() {
     );
     f.tool(&["verify"]).success();
     let logs = env.intake_dir(&f.down).join("logs");
-    assert!(logs.join("01-install.log").exists());
+    assert!(logs.join("verify").join("install.log").exists());
 
     let abort = f.tool(&["abort"]).success();
     let out = stdout(&abort);

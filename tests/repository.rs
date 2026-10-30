@@ -13,13 +13,16 @@ fn status_shows_configuration_values() {
     assert!(out.contains("integration: main at"), "{out}");
     assert!(out.contains("publish: origin (via push)"), "{out}");
     assert!(out.contains("install: true"), "{out}");
-    assert!(out.contains("checks:\n  test -f app.txt"), "{out}");
+    assert!(out.contains("checks:\n  app: test -f app.txt"), "{out}");
     let json = f.env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(json["integration"], "main");
     assert_eq!(json["publish"], "origin");
     assert_eq!(json["publish_via"], "push");
     assert_eq!(json["install"], "true");
-    assert_eq!(json["checks"], serde_json::json!(["test -f app.txt"]));
+    assert_eq!(
+        json["checks"],
+        serde_json::json!([{"name": "app", "run": "test -f app.txt"}])
+    );
     assert_eq!(json["config_working_copy_differs"], false);
     assert_eq!(json["update"], serde_json::Value::Null);
     let up = &json["upstreams"][0];
@@ -65,7 +68,10 @@ fn uncommitted_configuration_edit_is_ignored_with_a_notice() {
     assert!(!stdout(&status).contains("edited check"));
     let json = f.env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(json["config_working_copy_differs"], true);
-    assert_eq!(json["checks"], serde_json::json!(["test -f app.txt"]));
+    assert_eq!(
+        json["checks"],
+        serde_json::json!([{"name": "app", "run": "test -f app.txt"}])
+    );
 }
 
 #[test]
@@ -83,7 +89,10 @@ fn configuration_is_read_from_the_integration_tip() {
         "feature: edit config",
     );
     let json = env.tool_json(&f.down, &["status", "--json"], 0);
-    assert_eq!(json["checks"], serde_json::json!(["test -f app.txt"]));
+    assert_eq!(
+        json["checks"],
+        serde_json::json!([{"name": "app", "run": "test -f app.txt"}])
+    );
 }
 
 #[test]
@@ -681,7 +690,7 @@ fn state_files_of_another_format_are_named_or_ignored() {
         assert!(
             err.contains(
                 "the update in progress was started by a release that keeps its state in format 2; \
-                 this release (git-intake 0.0.0) understands format 5. Finish or abort the update with a release that keeps format 2 (git-intake v0.2.0 to v0.2.2), then start it again with this release"
+                 this release (git-intake 0.0.0) understands format 6. Finish or abort the update with a release that keeps format 2 (git-intake v0.2.0 to v0.2.2), then start it again with this release"
             ),
             "{args:?}: {err}"
         );
@@ -689,6 +698,64 @@ fn state_files_of_another_format_are_named_or_ignored() {
     assert!(dir.join("state.json").exists(), "the state is kept");
     let doctor = stdout(&f.tool(&["doctor"]).code(1));
     assert!(doctor.contains("keeps its state in format 2"), "{doctor}");
+}
+
+#[test]
+fn state_of_an_earlier_release_that_does_not_wait_is_refused() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    let path = env.intake_dir(&f.down).join("state.json");
+    let current: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let commands = [
+        vec!["status"],
+        vec!["continue"],
+        vec!["verify"],
+        vec!["finish"],
+        vec!["abort"],
+        vec!["start"],
+        vec!["sync"],
+        vec!["report"],
+    ];
+    for (version, advice) in [
+        (
+            5,
+            "Finish or abort the update with a release that keeps format 5 (git-intake v0.3.6)",
+        ),
+        (
+            4,
+            "Finish or abort the update with a release that keeps format 4 (git-intake v0.3.2 to v0.3.5, \
+             also carried on by v0.3.6)",
+        ),
+        (
+            3,
+            "Finish or abort the update with a release that keeps format 3 (git-intake v0.3.0 to v0.3.1), \
+             or carry it over with `git intake migrate` of git-intake v0.3.6 and finish or abort it with that release",
+        ),
+    ] {
+        let mut state = current.clone();
+        common::as_earlier_release(&mut state, version, "0.3.6");
+        let text = state.to_string();
+        std::fs::write(&path, &text).unwrap();
+        for args in &commands {
+            let err = stderr(&f.tool(args).code(2));
+            assert!(
+                err.contains(&format!(
+                    "the update in progress was started by a release (git-intake 0.3.6) that keeps its state in \
+                     format {version}; this release (git-intake 0.0.0) understands format 6. {advice}"
+                )),
+                "{version} {args:?}: {err}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{args:?}");
+        }
+        assert!(
+            env.update_worktree(&f.down).exists(),
+            "the worktree is kept"
+        );
+    }
 }
 
 #[test]
@@ -717,7 +784,7 @@ fn state_of_a_newer_or_unknown_format_is_refused() {
         assert!(
             err.contains(
                 "the update in progress was started by a release (git-intake 9.9.9) that keeps its state in format 99; \
-                 this release (git-intake 0.0.0) understands format 5, an older one"
+                 this release (git-intake 0.0.0) understands format 6, an older one"
             ),
             "{args:?}: {err}"
         );
@@ -735,7 +802,7 @@ fn state_of_a_newer_or_unknown_format_is_refused() {
         let err = stderr(&f.tool(args).code(2));
         assert!(
             err.contains(
-                "names no state format; this release (git-intake 0.0.0) understands format 5"
+                "names no state format; this release (git-intake 0.0.0) understands format 6"
             ),
             "{args:?}: {err}"
         );

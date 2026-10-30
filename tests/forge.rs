@@ -190,7 +190,7 @@ fn start_refuses_unpublished_local_commits_in_merge_request_mode() {
 }
 
 #[test]
-fn every_command_but_abort_and_migrate_refuses_a_shallow_clone() {
+fn every_command_but_abort_refuses_a_shallow_clone() {
     let f = Fork::new();
     let env = &f.env;
     let dir = env.path("shallow");
@@ -205,14 +205,25 @@ fn every_command_but_abort_and_migrate_refuses_a_shallow_clone() {
             &dir.to_string_lossy(),
         ],
     );
-    for args in [&["status"][..], &["doctor"], &["start"], &["log"], &["env"]] {
+    for args in [
+        &["status"][..],
+        &["doctor"],
+        &["start"],
+        &["log"],
+        &["env"],
+        &["verify"],
+        &["finish"],
+    ] {
         let err = stderr(&env.tool(&dir, args).code(2));
         assert!(err.contains("`git fetch --unshallow`"), "{args:?}: {err}");
     }
     env.tool(&dir, &["abort"]).success();
+    // `migrate` is no longer a command.
     env.tool(&dir, &["migrate"])
         .code(2)
-        .stderr(predicates::str::contains("nothing to migrate"));
+        .stderr(predicates::str::contains(
+            "unrecognized subcommand 'migrate'",
+        ));
 }
 
 #[test]

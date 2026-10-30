@@ -593,6 +593,7 @@ fn conclude_at(repo: &Repo, state: &mut UpdateState, merge: &str, head: &str) ->
     done.step = CatchUpStep::Merged;
     state.base = c.tip.clone();
     state.verification = None;
+    repo.drop_partial_run(state)?;
     repo.save_state(state)?;
     println!(
         "caught up with '{integration}' at {} as {}",
@@ -609,8 +610,5 @@ pub fn unverified_head(state: &UpdateState, head: &str) -> bool {
         .catch_ups
         .last()
         .is_some_and(|c| c.step == CatchUpStep::Merged && c.merge_commit.as_deref() == Some(head))
-        && !state
-            .verification
-            .as_ref()
-            .is_some_and(|v| v.passed && v.commit == head)
+        && !state.verified_at(head)
 }

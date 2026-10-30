@@ -79,9 +79,15 @@ pub fn restore_held(git: &Git, state: &UpdateState) -> Result<Vec<String>> {
 
 /// Removes the references an update holds. Returns their names.
 pub fn release(git: &Git, state: &UpdateState) -> Result<Vec<String>> {
+    release_refs(git, state.upstreams.iter().map(|q| q.name.as_str()))
+}
+
+/// Removes the references an update holds for the upstreams `names`.
+/// Returns their names.
+pub fn release_refs<'a>(git: &Git, names: impl Iterator<Item = &'a str>) -> Result<Vec<String>> {
     let mut removed = Vec::new();
-    for name in held_by(state).into_keys() {
-        if git.commit(&name)?.is_some() {
+    for name in names.map(upstream_ref) {
+        if !removed.contains(&name) && git.commit(&name)?.is_some() {
             git.run(&["update-ref", "-d", &name])?;
             removed.push(name);
         }

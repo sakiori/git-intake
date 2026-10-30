@@ -10,13 +10,16 @@ use crate::commands::merge_request;
 use crate::commands::update::{
     blocking_prefix, described, next_step, no_release, plural, step_name, unrelated_content,
 };
-use crate::config::{Mode, PublishVia, Upstream};
+use crate::config::{Check, Mode, PublishVia, Upstream};
 use crate::drift::{self, Drift, DriftState, SyncSource};
 use crate::git::{Git, abbrev, branch_ref};
 use crate::output::{Render, emit, table};
 use crate::port::{self, OffLine, Standing, Verb};
 use crate::repo::Repo;
-use crate::state::{ConflictFile, CopyStep, MergeKind, UpdateState, UpstreamStep, Work};
+use crate::state::{
+    CheckOutcome, ConflictFile, CopyStep, MergeKind, Stored, UpdateState, UpstreamStep, Waiting,
+    Work,
+};
 use crate::sync_record::{self, Record};
 use crate::tags::{TagPattern, UpstreamTags};
 use crate::upstreams::Fetches;
@@ -30,7 +33,9 @@ pub struct StatusDoc {
     /// `push` or `merge_request`; `null` without a publish remote.
     pub publish_via: Option<String>,
     pub install: Option<String>,
-    pub checks: Vec<String>,
+    /// The checks of the configuration at the integration tip, each with its
+    /// `name` and the command it runs, `run`.
+    pub checks: Vec<Check>,
     pub config_working_copy_differs: bool,
     /// Whether `--check` predicted conflicts and gated on drift.
     pub checked: bool,
@@ -168,7 +173,14 @@ pub struct UpdateView {
     pub branch: String,
     pub worktree: PathBuf,
     pub upstreams: Vec<QueuedView>,
+    /// The names of the update's checks, in their order: those of the
+    /// configuration at `start`, or at the last catch-up merge.
+    pub checks: Vec<String>,
+    /// The commit a full run of the checks verified.
     pub verified_commit: Option<String>,
+    /// The last run that left out some of the checks, which never verifies
+    /// the update, or `null`.
+    pub partial_run: Option<PartialRunView>,
     /// The error of the last rejected push while finishing, if any.
     pub publish_error: Option<String>,
     /// The merge request an earlier release left the update waiting for.
@@ -179,6 +191,25 @@ pub struct UpdateView {
     /// The catch-up merge of the steps `catch_up_conflict` and `catch_up`.
     pub catch_up: Option<CatchUpView>,
     pub next: String,
+}
+
+#[derive(Serialize)]
+pub struct PartialRunView {
+    /// The commit it ran on.
+    pub commit: String,
+    /// The install command's outcome, or `null` when none is configured.
+    pub install: Option<CheckOutcome>,
+    /// The checks it ran, in their order.
+    pub checks: Vec<CheckOutcomeView>,
+    /// The names of the checks it left out.
+    pub left_out: Vec<String>,
+    pub passed: bool,
+}
+
+#[derive(Serialize)]
+pub struct CheckOutcomeView {
+    pub name: String,
+    pub outcome: CheckOutcome,
 }
 
 #[derive(Serialize)]
@@ -337,11 +368,12 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
             Err(err) => forge_error = Some(format!("{err:#}")),
         }
     }
-    let update = match repo.state()? {
-        Some(state) => {
+    let update = match repo.stored()? {
+        Some(Stored::Update(state)) => {
             repo.restore_held_references(&state)?;
             Some(update_view(&state)?)
         }
+        Some(Stored::Waiting(w)) => Some(waiting_view(&w)),
         None => None,
     };
     let doc = StatusDoc {
@@ -582,19 +614,29 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
                 view
             })
             .collect(),
+        checks: state.config.checks.iter().map(|c| c.name.clone()).collect(),
         verified_commit: state
             .verification
             .as_ref()
             .filter(|v| v.passed)
             .map(|v| v.commit.clone()),
-        publish_error: state.finishing.as_ref().and_then(|f| f.push_error.clone()),
-        merge_request: state.merge_request.as_ref().map(|mr| MergeRequestView {
-            number: mr.number,
-            remote: mr.remote.clone(),
-            source_branch: mr.branch.clone(),
-            target_branch: state.config.integration.clone(),
-            commit: mr.commit.clone(),
+        partial_run: state.partial_run.as_ref().map(|p| PartialRunView {
+            commit: p.run.commit.clone(),
+            install: p.run.install.as_ref().map(|i| i.outcome),
+            checks: p
+                .run
+                .checks
+                .iter()
+                .map(|c| CheckOutcomeView {
+                    name: c.name.clone(),
+                    outcome: c.result.outcome,
+                })
+                .collect(),
+            left_out: p.left_out.clone(),
+            passed: p.run.passed,
         }),
+        publish_error: state.finishing.as_ref().and_then(|f| f.push_error.clone()),
+        merge_request: None,
         carried_from: state.carried_from.as_ref().map(|c| CarriedView {
             number: c.number,
             url: c.url.clone(),
@@ -612,6 +654,35 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
             }),
         next: next_step(state, &wt)?,
     })
+}
+
+/// An update of an earlier release that waits for its merge request, as far
+/// as this release reads it. Its queued upstreams are not shown: their
+/// targets and steps are the earlier release's, which this release does not
+/// read.
+fn waiting_view(w: &Waiting) -> UpdateView {
+    UpdateView {
+        step: "waiting_for_merge_request".to_string(),
+        base: w.base.clone(),
+        start_base: w.start_base.clone(),
+        branch: w.branch.clone(),
+        worktree: w.worktree.clone(),
+        upstreams: Vec::new(),
+        checks: Vec::new(),
+        verified_commit: None,
+        partial_run: None,
+        publish_error: None,
+        merge_request: Some(MergeRequestView {
+            number: w.merge_request.number,
+            remote: w.merge_request.remote.clone(),
+            source_branch: w.merge_request.branch.clone(),
+            target_branch: w.integration.clone(),
+            commit: w.merge_request.commit.clone(),
+        }),
+        carried_from: None,
+        catch_up: None,
+        next: w.next(),
+    }
 }
 
 fn opt_abbrev(oid: &Option<String>) -> String {
@@ -648,7 +719,7 @@ fn config_lines(doc: &StatusDoc, out: &mut String) {
     } else {
         out.push_str("checks:\n");
         for c in &doc.checks {
-            out.push_str(&format!("  {c}\n"));
+            out.push_str(&format!("  {}: {}\n", c.name, c.run));
         }
     }
 }
@@ -900,8 +971,32 @@ pub fn render_update(u: &UpdateView) -> String {
             out.push_str(&format!("    {}  ({})\n", f.path, f.resolution.describe()));
         }
     }
+    if !u.checks.is_empty() {
+        out.push_str(&format!("  checks: {}\n", u.checks.join(", ")));
+    }
     if let Some(v) = &u.verified_commit {
         out.push_str(&format!("  verified: {}\n", abbrev(v)));
+    }
+    if let Some(p) = &u.partial_run {
+        let mut outcomes: Vec<String> = Vec::new();
+        if let Some(install) = p.install {
+            outcomes.push(format!("install command {}", install.as_str()));
+        }
+        outcomes.extend(
+            p.checks
+                .iter()
+                .map(|c| format!("{} {}", c.name, c.outcome.as_str())),
+        );
+        if outcomes.is_empty() {
+            outcomes.push("nothing run".to_string());
+        }
+        out.push_str(&format!(
+            "  partial run at {}, which does not verify the update: {}; {}; left out: {}\n",
+            abbrev(&p.commit),
+            if p.passed { "passed" } else { "failed" },
+            outcomes.join(", "),
+            p.left_out.join(", ")
+        ));
     }
     if let Some(e) = &u.publish_error {
         out.push_str(&format!("  publish rejected: {e}\n"));

@@ -47,7 +47,6 @@ use crate::upstreams::{self, Fetches};
 
 pub fn run(repo: &Repo) -> Result<Exit> {
     if let Some(state) = repo.state()? {
-        merge_request::refuse_earlier(&state)?;
         let wt = Git::worktree(&state.worktree);
         bail!(
             "an update is in progress, at the step {}; next: {}. `git intake sync` starts nothing while it lasts",

@@ -51,7 +51,7 @@ fn ci_clone(f: &Fork, name: &str) -> PathBuf {
 /// A fork in merge-request mode whose upstream has one new commit, and the
 /// check `false`, which `sync` never runs in merge-request mode.
 fn behind(f: &Fork) -> String {
-    f.reconfigure("checks = [\"test -f app.txt\"]", "checks = [\"false\"]");
+    f.reconfigure("run = \"test -f app.txt\"", "run = \"false\"");
     f.env
         .push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n")
 }
@@ -196,7 +196,7 @@ fn a_pending_port_upstream_is_named_and_not_taken() {
 /// A fork whose upstream and integration branch both change `app.txt`'s
 /// first line, so that the update conflicts.
 fn conflicting(f: &Fork) {
-    f.reconfigure("checks = [\"test -f app.txt\"]", "checks = [\"false\"]");
+    f.reconfigure("run = \"test -f app.txt\"", "run = \"false\"");
     f.env.push_upstream(
         &f.up,
         &[("app.txt", "upstream\ntwo\nthree\n")],
@@ -350,7 +350,7 @@ fn a_fix_pushed_to_the_merge_request_stays_in_the_update() {
 fn a_catch_up_conflict_keeps_the_merge_request_s_head() {
     let f = Fork::merge_request();
     let env = &f.env;
-    f.reconfigure("checks = [\"test -f app.txt\"]", "checks = [\"false\"]");
+    f.reconfigure("run = \"test -f app.txt\"", "run = \"false\"");
     env.push_upstream(
         &f.up,
         &[("app.txt", "upstream\ntwo\nthree\n")],
@@ -401,7 +401,7 @@ fn a_catch_up_conflict_keeps_the_merge_request_s_head() {
 fn abort_of_a_carried_on_update_keeps_the_merge_request() {
     let f = Fork::merge_request();
     let env = &f.env;
-    f.reconfigure("checks = [\"test -f app.txt\"]", "checks = [\"false\"]");
+    f.reconfigure("run = \"test -f app.txt\"", "run = \"false\"");
     env.push_upstream(
         &f.up,
         &[("app.txt", "upstream\ntwo\nthree\n")],
@@ -425,7 +425,7 @@ fn abort_of_a_carried_on_update_keeps_the_merge_request() {
 fn finish_refuses_a_carried_on_update_whose_merge_request_closed() {
     let f = Fork::merge_request();
     let env = &f.env;
-    f.reconfigure("checks = [\"test -f app.txt\"]", "checks = [\"false\"]");
+    f.reconfigure("run = \"test -f app.txt\"", "run = \"false\"");
     env.push_upstream(
         &f.up,
         &[("app.txt", "upstream\ntwo\nthree\n")],
@@ -920,7 +920,7 @@ fn push_mode_sync_verifies_and_publishes() {
     let env = &f.env;
     let target = env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     let out = stdout(&f.tool(&["sync"]).success());
-    assert!(out.contains("passed   test -f app.txt"), "{out}");
+    assert!(out.contains("passed   app"), "{out}");
     assert!(out.contains("pushed main to 'origin'"), "{out}");
     assert!(env.is_ancestor(&f.publish, &target, "main"));
     env.assert_no_update(&f.down);
@@ -928,7 +928,7 @@ fn push_mode_sync_verifies_and_publishes() {
 
 #[test]
 fn push_mode_sync_stops_on_failed_checks() {
-    let f = Fork::with_checks(&["false"]);
+    let f = Fork::with_checks(&[("false", "false")]);
     let env = &f.env;
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     let published = env.rev(&f.publish, "main");
@@ -985,7 +985,7 @@ fn in_update_worktree_hook(repo: &Path, name: &str, script: &str) {
 /// this clone, resolved and concluded with `continue`.
 fn resolved_catch_up(f: &Fork) {
     let env = &f.env;
-    f.reconfigure("checks = [\"test -f app.txt\"]", "checks = [\"false\"]");
+    f.reconfigure("run = \"test -f app.txt\"", "run = \"false\"");
     env.push_upstream(
         &f.up,
         &[("app.txt", "upstream\ntwo\nthree\n")],
