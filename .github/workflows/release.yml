@@ -61,9 +61,11 @@ jobs:
             echo "::error::Cargo.toml holds the placeholder version 0.0.0; RELEASING.md describes the cutover."
             exit 1
           fi
-      # Pull requests opened with the workflow's own token start no workflow
-      # runs, so the release pull request is opened with a GitHub App's token,
-      # whose pull requests run CI.
+      # The workflow's own GITHUB_TOKEN would not do: the runs of a pull
+      # request it opens or updates wait until someone with write access
+      # approves them, and its pushes start no workflow. The release pull
+      # request is therefore opened and updated with a GitHub App's token,
+      # whose pull requests run CI at once.
       - id: app-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
@@ -72,19 +74,40 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
       - run: .github/scripts/install-release-plz.sh "$RUNNER_TEMP/release-plz"
-      # The release pull request's commit is made as the App's bot user.
-      - env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-        run: |
-          id=$(gh api "users/$APP_SLUG%5Bbot%5D" --jq .id)
-          git config --global user.name "${APP_SLUG}[bot]"
-          git config --global user.email "${id}+${APP_SLUG}[bot]@users.noreply.github.com"
       - env:
           GIT_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           release-plz release-pr --forge github \
-            --repo-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --output json
+            --repo-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --output json | tee "$RUNNER_TEMP/release-pr.json"
+      # On GitHub, release-plz commits through the API, so the commit names
+      # the App. The project's commits are authored and committed as
+      # Sakiori <oss@sakiori.app>: the release pull request's single commit is
+      # made again with that identity, the same tree and message, and pushed
+      # over the one release-plz made, under a lease on it.
+      - name: Commit the release pull request as the project
+        env:
+          GIT_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          branch=$(jq -r '.prs[0].head_branch // empty' "$RUNNER_TEMP/release-pr.json")
+          if [ -z "$branch" ]; then
+            echo "::notice::no release pull request is open"
+            exit 0
+          fi
+          case "$branch" in release-plz-*) ;; *) echo "::error::unexpected release branch $branch"; exit 1 ;; esac
+          auth=$(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          header="AUTHORIZATION: basic $auth"
+          git -c "http.extraheader=$header" fetch --no-tags origin "+refs/heads/$branch:refs/release-pr"
+          made=$(git rev-parse refs/release-pr)
+          if [ "$(git log -1 --format='%an <%ae>|%cn <%ce>' "$made")" = "Sakiori <oss@sakiori.app>|Sakiori <oss@sakiori.app>" ]; then
+            echo "::notice::$made is the project's commit already"
+            exit 0
+          fi
+          git -c advice.detachedHead=false checkout -q --detach "$made"
+          git -c user.name=Sakiori -c user.email=oss@sakiori.app commit -q --amend --no-edit --reset-author
+          git -c "http.extraheader=$header" push --force-with-lease="refs/heads/$branch:$made" \
+            origin "HEAD:refs/heads/$branch"
+          git log -1 --format='%H %an <%ae> / %cn <%ce>'
 
   release:
     if: github.repository_owner == 'sakiori'
@@ -124,19 +147,32 @@ jobs:
             exit 1
           fi
       # The crate is published before any binary is built, and a published
-      # version cannot be replaced. release-plz releases the last commit of the
-      # merged release pull request, so CI's release builds of every target
-      # must have passed on that commit. A commit that is not the merge of a
-      # release pull request releases nothing and needs no check.
-      - name: Require the release builds of the release pull request
+      # version cannot be replaced, so this step finds the commit release-plz
+      # will release and requires CI's release builds of every target on it.
+      # release-plz 0.3.174 takes the first pull request associated with the
+      # commit whose branch starts with release-plz-, lists its commits with
+      # one unpaginated request, which returns the first 30, and releases the
+      # last one returned. That is the pull request's head only while it has
+      # 30 commits or fewer, and release-plz keeps its own pull request to one,
+      # so publication is refused unless the two agree. A commit that is not
+      # the merge of a release pull request releases nothing and needs no
+      # check.
+      - name: Require the release builds of the commit release-plz releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
-            --jq '[.[] | select(.merged_at != null and (.head.ref | startswith("release-plz-")))] | first | .head.sha // empty')
-          if [ -z "$head" ]; then
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq '[.[] | select(.head.ref | startswith("release-plz-"))] | first // empty')
+          if [ -z "$pr" ]; then
             echo "::notice::$GITHUB_SHA is not the merge of a release pull request"
             exit 0
+          fi
+          number=$(jq -r .number <<< "$pr")
+          head=$(jq -r .head.sha <<< "$pr")
+          released=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number/commits" --jq 'last | .sha // empty')
+          if [ "$released" != "$head" ]; then
+            echo "::error::release-plz would release ${released:-nothing}, not $head, the head of release pull request #$number on which the release builds ran; keep release pull requests to release-plz's own commit. Nothing was published."
+            exit 1
           fi
           # release-plz releases the pull request's last commit only when the
           # merge kept it; a squash or rebase merge would release a commit
