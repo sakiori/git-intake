@@ -64,8 +64,12 @@
 - **THEN** the commit of the upstream's tag is the target
 
 #### Scenario: Own tag instead of an upstream tag
-- **WHEN** the upstream's remote has no tag of the revision's name, and the revision resolves through a tag of the repository, by itself or in an expression
+- **WHEN** the upstream's remote has no tag of the revision's name, and the revision resolves through a tag of the repository, by itself or in an expression, even when a branch has the same name
 - **THEN** `start` refuses and names the repository's tag, and creates nothing
+
+#### Scenario: Expression on an upstream tag
+- **WHEN** the revision is an expression on a tag that only the upstream's remote has, such as `<tag>~1`
+- **THEN** `start` refuses because the revision names no commit in the repository, and creates nothing
 
 #### Scenario: Remote unreachable for the tag lookup
 - **WHEN** the upstream's remote cannot be asked for the tag after the fetch
