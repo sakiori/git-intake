@@ -14,7 +14,7 @@ The tool runs the installed `git` for every repository operation. Each repositor
 
 Requires Git 2.43 or later (`git merge-tree -X` is used for conflict prediction) and a POSIX `sh`. The tool is a single binary named `git-intake`; with it on the `PATH`, git runs it as `git intake`.
 
-Releases provide prebuilt binaries for the targets `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` and `aarch64-apple-darwin`. The musl binaries are statically linked and run on any Linux distribution and in minimal CI images.
+Releases provide prebuilt binaries for the targets `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. They are statically linked and run on any Linux distribution and in minimal CI images. On macOS, install from source (below): the tool verifies the forge's TLS certificate against the keychain through the system's Security framework, so its macOS binary is built on macOS.
 
 ### With mise
 
