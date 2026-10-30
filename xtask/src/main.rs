@@ -515,10 +515,11 @@ fn check_copyright_lines(crates: &[(String, String, PathBuf)], text: &str) -> Re
 /// - the word `copyright`, in any letter case, followed by a year, `©`, `ⓒ`
 ///   or `(c)` in either case, as in clap's `Copyright ⓒ 2015-2016 …`;
 /// - a line that starts, past its comment markers and an optional
-///   `Portions`, with `Copyright` or `COPYRIGHT`, an optional `:`, and a
-///   holder, a word that starts with a capital letter, as in
-///   `Copyright The Rust Project Developers`, unless that word is one of
-///   license prose, such as `COPYRIGHT HOLDERS` or `Copyright Notice`;
+///   `Portions` in any letter case, with `copyright` in any letter case, an
+///   optional `:`, and a holder, a word that starts with a capital letter,
+///   as in `Copyright The Rust Project Developers` or `copyright Example
+///   Author.`, unless that word is one of license prose, such as
+///   `COPYRIGHT HOLDERS` or `copyright notice`;
 /// - a line that starts with `©` or `ⓒ`.
 fn is_copyright_line(line: &str) -> bool {
     const PROSE: &[&str] = &[

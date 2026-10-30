@@ -581,11 +581,21 @@ fn concluded_after_a_rejected_push(f: &Fork) -> (String, String) {
 fn no_publish_lands_a_verified_catch_up_of_the_finishing_step_locally() {
     let f = Fork::new();
     let env = &f.env;
+    // The update also changes the pipeline, which the landing names.
+    f.reconfigure("via = \"push\"", "via = \"push\"\nforge = \"gitlab\"");
+    env.push_upstream(
+        &f.up,
+        &[(".gitlab-ci.yml", "test:\n  script: [make]\n")],
+        "upstream: ci",
+    );
     let (verified, merge) = concluded_after_a_rejected_push(&f);
     f.tool(&["verify"]).success();
-    f.tool(&["finish", "--no-publish"])
-        .success()
-        .stdout(contains("lands the verified catch-up of the update"));
+    let out = stdout(&f.tool(&["finish", "--no-publish"]).success());
+    assert!(
+        out.contains("lands the verified catch-up of the update"),
+        "{out}"
+    );
+    assert_eq!(out.matches(CI_NOTICE).count(), 1, "{out}");
     assert_eq!(env.rev(&f.down, "main"), merge);
     assert!(env.is_ancestor(&f.down, &verified, "main"));
     env.assert_no_update(&f.down);
@@ -1243,10 +1253,14 @@ fn a_catch_up_after_a_rejected_push_names_the_update_s_own_checks() {
     land(&f, &[("other.txt", "o\n")], "other: published meanwhile");
 
     // The resumed finish catches up and publishes another head, and names
-    // the change again.
+    // the change again, once, before it verifies the catch-up merge.
     let out = stdout(&f.tool(&["finish"]).success());
     assert!(out.contains("resuming finish"), "{out}");
-    assert!(out.contains(CI_NOTICE), "{out}");
+    assert_eq!(out.matches(CI_NOTICE).count(), 1, "{out}");
+    let verifying = out
+        .find("verifying")
+        .expect("the catch-up merge is verified");
+    assert!(out.find(CI_NOTICE).unwrap() < verifying, "{out}");
     env.assert_no_update(&f.down);
 }
 

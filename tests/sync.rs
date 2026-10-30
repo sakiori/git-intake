@@ -1258,12 +1258,9 @@ fn sync_by_push_names_the_update_s_own_checks_when_they_fail() {
     env.git(&f.up.work, &["push", "-q", "origin", "main"]);
 
     let out = stdout(&f.tool(&["sync"]).code(1));
-    assert!(
-        out.contains(
-            "the update changes its own checks: `.gitlab-ci.yml`; the checks that verify it are \
-             the ones it brings"
-        ),
-        "{out}"
-    );
-    assert!(out.contains("the checks failed"), "{out}");
+    let notice = "the update changes its own checks: `.gitlab-ci.yml`; the checks that verify it are \
+                  the ones it brings";
+    assert_eq!(out.matches(notice).count(), 1, "{out}");
+    let failed = out.find("the checks failed").expect("the checks fail");
+    assert!(out.find(notice).unwrap() < failed, "{out}");
 }

@@ -271,6 +271,7 @@ fn by_push(repo: &Repo, config: Config) -> Result<Exit> {
     let exit = plan.exit();
     let mut state = begin(repo, config, &base, worktree, plan.queue)?;
     drop(fetches);
+    let mut announced = merge_request::Announced::default();
     let verified = (|| -> Result<Option<Exit>> {
         match advance(repo, &mut state)? {
             Advanced::Merged => {}
@@ -279,7 +280,7 @@ fn by_push(repo: &Repo, config: Config) -> Result<Exit> {
         let head = Git::worktree(&state.worktree).line(&["rev-parse", "HEAD"])?;
         // Named before the checks run, since they run what the update
         // brings whether they pass or fail.
-        merge_request::announce_check_changes(repo, &state, &head)?;
+        announced.check_changes(repo, &state, &head)?;
         if !verify::verify_head(repo, &mut state, &head)? {
             println!(
                 "the checks failed; nothing was published, and the update stays in progress, unverified, in {}. \
@@ -296,7 +297,7 @@ fn by_push(repo: &Repo, config: Config) -> Result<Exit> {
             Err(err)
         }
         Ok(Some(stop)) => Ok(stop),
-        Ok(None) => Ok(match finish::run(repo, false)? {
+        Ok(None) => Ok(match finish::run_announced(repo, false, &mut announced)? {
             Exit::Success => exit,
             other => other,
         }),
