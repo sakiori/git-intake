@@ -78,11 +78,11 @@ After a partial run, `verify` SHALL exit as a full run with the same outcomes wo
 `status` SHALL list the update's checks by name and show the partial run, with its commit, the checks it ran and left out, and the outcome of each, apart from the verified commit.
 
 #### Scenario: Partial run in the text form
-- **WHEN** `status` runs after `verify --only lint` failed on the head
+- **WHEN** the update's checks are `lint` and `test`, the head is unverified, and `status` runs after `verify --only lint` failed on it
 - **THEN** it lists `lint` and `test`, shows the partial run at the head with `lint` failed and `test` left out, and shows no verified commit
 
 ### Requirement: Partial runs in JSON
-`status --json` SHALL carry `checks` as a list of objects with `name` and `run`, and, in `update`, `partial_run` with `commit`, `install` as the install command's outcome or null without one, `checks` as a list of objects with `name` and `outcome`, `left_out` as the names left out and `passed`, or null without one. An outcome SHALL be `passed`, `failed`, or `skipped`, for a check skipped because the install command failed; a check a selection leaves out SHALL be named only in `left_out`.
+`status --json` SHALL carry `checks` as a list of objects with `name` and `run`, and `update.partial_run` with `commit`, `install` as the install command's outcome, or null when no install command is configured, `checks` as a list of objects with `name` and `outcome`, `left_out` as the names left out and `passed`, or null without one. An outcome SHALL be `passed`, `failed`, or `skipped` when the install command failed; a check left out SHALL appear only in `left_out`.
 
 #### Scenario: Partial run in JSON
 - **WHEN** a full run verified the head, and `status --json` runs after `verify --skip test` then passed on it
@@ -102,7 +102,7 @@ In push mode, and with `--no-publish`, `finish` on an update whose head has only
 ## MODIFIED Requirements
 
 ### Requirement: Fork configuration
-The tool SHALL read a repository's settings from a `.git-intake.toml` file committed on the integration branch: the integration branch, an optional publication setting with the publish remote, the mode `push` or `merge-request`, and, for merge-request mode, an optional forge `gitlab` or `github` and an optional API base URL, an install command, an ordered list of named checks as "Named checks" describes them, and an ordered list of upstreams. Each upstream SHALL have a unique name, a URL, a branch, a mode `follow` or `port` with `follow` as the default, optionally a path inside the repository, and, in `follow` mode, optionally a `tags` pattern: a glob over the upstream's tag names that selects its release tags. No two upstreams SHALL have the same URL and branch. An upstream without a path is taken at the repository root. The tool SHALL read the committed file from the integration branch tip, not from a working tree, and SHALL refuse to run when the file is missing or invalid, naming the problem. It SHALL refuse the settings `remote` and `mirror`, naming what replaces them, an upstream in `port` mode with a path or a `tags` pattern, a `tags` pattern that is not a valid glob or that starts with `refs/` or `tags/`, a forge other than `gitlab` or `github`, an API base that is not an `https` URL, and a publish remote whose fetch or push URL names a configured upstream's repository.
+The tool SHALL read a repository's settings from a `.git-intake.toml` file committed on the integration branch: the integration branch, an optional publication setting with the publish remote, the mode `push` or `merge-request`, and, for merge-request mode, an optional forge `gitlab` or `github` and an optional API base URL, an install command, an ordered list of named checks as "Named checks" describes them, and an ordered list of upstreams. Each upstream SHALL have a unique name, a URL, a branch, a mode `follow` or `port` with `follow` as the default, optionally a path inside the repository, and, in `follow` mode, optionally a `tags` pattern: a glob over the upstream's tag names that selects its release tags. No two upstreams SHALL have the same URL and branch. An upstream without a path is taken at the repository root. The tool SHALL read the committed file from the integration branch tip, not from a working tree, and SHALL refuse to run when the file is missing or invalid, naming the problem, except where "Resumable state" lets `finish` and `abort` act on an update waiting from an earlier release. It SHALL refuse the settings `remote` and `mirror`, naming what replaces them, an upstream in `port` mode with a path or a `tags` pattern, a `tags` pattern that is not a valid glob or that starts with `refs/` or `tags/`, a forge other than `gitlab` or `github`, an API base that is not an `https` URL, and a publish remote whose fetch or push URL names a configured upstream's repository.
 
 #### Scenario: Valid configuration
 - **WHEN** the integration branch carries a valid configuration
@@ -149,7 +149,7 @@ The tool SHALL read a repository's settings from a `.git-intake.toml` file commi
 - **THEN** the tool refuses to run and names the remote and the upstream
 
 ### Requirement: Verification of the published tree
-`verify` SHALL require the configuration at the update worktree head to be valid and to name the same integration branch, then run the configured install command and every check in the update worktree once every queued upstream is merged or its plan carried out, write each command's output to a log named after the install command or the check, report pass or fail per command, naming each check by its name, and record the worktree commit it verified. In a full run, a failed check, or one skipped because the install command failed, SHALL leave the update unverified. The checks of an update SHALL be those of the configuration it recorded: the one at the integration tip at `start`, or at its last catch-up merge. A full run SHALL run every one of them, and only a full run SHALL verify the update; wherever an update is required to be verified, a partial run SHALL not count.
+`verify` SHALL require the configuration at the update worktree head to be valid and to name the same integration branch, then run the install command and the update's checks, all of them or those a selection names, in the update worktree once every queued upstream is merged or its plan carried out, write each command's output to a log named after the install command or the check, report pass or fail per command, naming each check by its name, and record the worktree commit it verified. In a full run, a failed check, or one skipped because the install command failed, SHALL leave the update unverified. The checks of an update SHALL be those of the configuration it recorded: the one at the integration tip at `start`, or at its last catch-up merge. A full run SHALL run every one of them, and only a full run SHALL verify the update; wherever an update is required to be verified, a partial run SHALL not count.
 
 #### Scenario: Checks pass
 - **WHEN** every check succeeds
@@ -198,9 +198,13 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **WHEN** an update started by a release with state format 5 is in progress and does not wait for its merge request
 - **THEN** every command that reads the update refuses, changes nothing, and says to finish or abort it with v0.3.6
 
-#### Scenario: Waiting update with the old configuration
-- **WHEN** an update of format 5 waits for its open merge request and the integration tip still lists its checks as plain commands
-- **THEN** `finish` hands it over, `abort --merge-request` withdraws it, and the state file is never rewritten in between
+#### Scenario: Hand-over with the old configuration
+- **WHEN** an update of format 5 waits for its open merge request, the integration tip still lists its checks as plain commands, and `finish` runs
+- **THEN** `finish` hands the update over, and the state file is unchanged until it is removed
+
+#### Scenario: Withdrawal with the old configuration
+- **WHEN** an update of format 5 waits for its open merge request, the integration tip still lists its checks as plain commands, and `abort --merge-request` runs
+- **THEN** it withdraws the merge request, and the state file is unchanged until it is removed
 
 #### Scenario: State of format 4
 - **WHEN** an update started by a release with state format 4 is in progress and does not wait for its merge request
@@ -223,7 +227,7 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **THEN** the first of `continue`, `verify` and `finish` it runs warns once that another release started it, advises `abort` only before `finish` has moved a branch or pushed the update, and every command carries on
 
 ### Requirement: Changes to the update's own checks
-When an update changes the forge's CI definition, `.github/workflows/` on GitHub or the project's CI configuration file on GitLab, or the install command or checks of `.git-intake.toml`, `finish` and `sync` SHALL name those changes in their output and in the merge request's description, naming each check added, removed or given another command by its name, and saying when only their order changed; a renamed check SHALL count as one removed and one added, and when the configuration at the base or at the head cannot be read, the checks SHALL be named as changed without names, since the pipeline that verifies the update then runs what the update brings.
+When an update changes the forge's CI definition, `.github/workflows/` on GitHub or the project's CI configuration file on GitLab, or the install command or checks of `.git-intake.toml`, `finish` and `sync` SHALL name those changes in their output and in the merge request's description, naming each check added, removed or given another command by its name, and saying when only their order changed; a renamed check SHALL count as one removed and one added, and when `.git-intake.toml` differs between the base and the head and either side cannot be read, its install command and checks SHALL be named as changed without names, since the pipeline that verifies the update then runs what the update brings.
 
 #### Scenario: Upstream changes the pipeline
 - **WHEN** a root upstream's update changes `.gitlab-ci.yml`
