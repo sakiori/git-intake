@@ -231,7 +231,7 @@ The commit, however it was named, must be on the fetched upstream branch: the to
 - a target that does not contain `L`, such as a commit of a side branch that the upstream merged after `L`, is refused, because the last synced commit only moves forward;
 - otherwise the upstream is queued at that target.
 
-The rest of the update does not change: the sync record names the target, and `status` and `report` show the revision next to the target. Afterwards `status` shows the upstream as `behind`, by the commits between the target and the fetched tip.
+The rest of the update does not change: the sync record names the target, and `status` and `report` show the revision next to the target, unless the revision is the target's own commit id. Afterwards `status` shows the upstream as `behind`, by the commits between the target and the fetched tip.
 
 ### Port mode
 

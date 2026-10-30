@@ -614,7 +614,7 @@ A follow update SHALL create a dedicated worktree on a new branch from the base 
 - **THEN** the tool names the upstream, lists the conflicted files, leaves the merge in progress in the worktree, reports which upstreams are merged and which are still pending, and tells the user to resolve the conflicts and run `continue`
 
 ### Requirement: Fixed follow target
-A target SHALL NOT change for the rest of the update, and `status` and `report` SHALL show the revision a target was named by.
+A target SHALL NOT change for the rest of the update, and `status` and `report` SHALL show the revision a target was named by. Where the target is shown as its abbreviated commit, a revision that is that commit's own id, full or abbreviated, SHALL NOT be repeated next to it.
 
 #### Scenario: Upstream moved during the update
 - **WHEN** an upstream receives new commits after `start`

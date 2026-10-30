@@ -1186,9 +1186,17 @@ fn head(wt: &Git) -> Result<Option<String>> {
 /// revision it was named by, if any.
 pub fn described(target: &str, rev: Option<&str>) -> String {
     match rev {
-        Some(rev) => format!("{} ({rev})", abbrev(target)),
-        None => abbrev(target).to_string(),
+        Some(rev) if !names_by_id(rev, target) => format!("{} ({rev})", abbrev(target)),
+        _ => abbrev(target).to_string(),
     }
+}
+
+/// Whether `rev` is `target`'s own commit id, full or abbreviated, which
+/// adds nothing next to the abbreviated target.
+fn names_by_id(rev: &str, target: &str) -> bool {
+    rev.len() >= 4
+        && rev.bytes().all(|b| b.is_ascii_hexdigit())
+        && target.starts_with(&rev.to_ascii_lowercase())
 }
 
 pub fn plural(n: u64) -> &'static str {
@@ -1206,6 +1214,21 @@ pub fn list_or_none(items: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_revision_is_shown_unless_it_is_the_target_id() {
+        let target = "782fe977deb6a1b2c3d4e5f60718293a4b5c6d7e";
+        assert_eq!(described(target, None), "782fe977deb6");
+        assert_eq!(described(target, Some("782fe977deb6")), "782fe977deb6");
+        assert_eq!(described(target, Some("782FE97")), "782fe977deb6");
+        assert_eq!(described(target, Some(target)), "782fe977deb6");
+        assert_eq!(described(target, Some("v1.2")), "782fe977deb6 (v1.2)");
+        assert_eq!(
+            described(target, Some("782fe977~1")),
+            "782fe977deb6 (782fe977~1)"
+        );
+        assert_eq!(described(target, Some("abcdef")), "782fe977deb6 (abcdef)");
+    }
 
     #[test]
     fn rerere_reports_are_parsed() {
