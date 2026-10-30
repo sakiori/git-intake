@@ -40,9 +40,9 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     // A branch already in place, as after an interrupted `finish`, needs no
     // push. Pushing it again with options would update no ref, and git then
     // writes the options to a remote that has stopped reading, which can end
-    // the push with SIGPIPE.
-    let in_place = match remote_branch(&repo.git, &publish.remote, &branch) {
-        Ok(at) => at.as_deref() == Some(commit.as_str()),
+    // the push with SIGPIPE. It is looked up where the push would go.
+    let in_place = match pushed_branch(&repo.git, &publish.remote, &branch) {
+        Ok(at) => holds(&at, &commit),
         Err(err) => bail!(
             "cannot check whether the merge request branch '{branch}' is on '{}': {err:#}\n\
              Nothing moved, and the update stays verified; fix the cause and run `git intake finish` again",
@@ -702,11 +702,35 @@ fn carried_records(
     Ok(found)
 }
 
-/// The commit a branch of the remote points at, or `None` when it does not
-/// exist there.
-pub fn remote_branch(git: &Git, remote: &str, branch: &str) -> Result<Option<String>> {
+/// The commit `branch` points at, or `None` where it does not exist, on each
+/// URL a push to `remote` goes to: its push URLs, or else its URL, as `git
+/// push` resolves them. A remote may be fetched from one place and pushed to
+/// another, and what decides a push must be read where the push goes.
+fn pushed_branch(git: &Git, remote: &str, branch: &str) -> Result<Vec<Option<String>>> {
+    let out = git.raw(&["remote", "get-url", "--push", "--all", remote])?;
+    if !out.success() {
+        bail!(
+            "cannot read where the publish remote '{remote}' pushes to: {}",
+            out.into_error()
+        );
+    }
     let full = branch_ref(branch);
-    Ok(remote_refs(git, remote, std::slice::from_ref(&full))?.remove(&full))
+    crate::git::lines(&out.stdout)
+        .iter()
+        .map(|url| Ok(remote_refs(git, url, std::slice::from_ref(&full))?.remove(&full)))
+        .collect()
+}
+
+/// Whether every place a push goes to holds `commit`.
+fn holds(at: &[Option<String>], commit: &str) -> bool {
+    !at.is_empty() && at.iter().all(|c| c.as_deref() == Some(commit))
+}
+
+/// The first place that does not hold `commit`, as what it holds instead.
+fn deviation(at: Vec<Option<String>>, commit: &str) -> Option<String> {
+    at.into_iter()
+        .find(|c| c.as_deref() != Some(commit))
+        .flatten()
 }
 
 /// The commits the remote's refs with exactly these names point at; a ref
@@ -756,9 +780,10 @@ pub fn delete_branch(git: &Git, mr: &MergeRequest) -> Result<()> {
             abbrev(&c)
         ),
     };
-    let current = remote_branch(git, &mr.remote, &mr.branch)?;
-    if current.as_deref() != Some(mr.commit.as_str()) {
-        describe(current);
+    // The branch is judged where the deletion is pushed.
+    let current = pushed_branch(git, &mr.remote, &mr.branch)?;
+    if !holds(&current, &mr.commit) {
+        describe(deviation(current, &mr.commit));
         return Ok(());
     }
     // The lease makes the deletion conditional on the verified commit; it
@@ -778,8 +803,8 @@ pub fn delete_branch(git: &Git, mr: &MergeRequest) -> Result<()> {
         );
         return Ok(());
     }
-    let current = remote_branch(git, &mr.remote, &mr.branch)?;
-    if current.as_deref() == Some(mr.commit.as_str()) {
+    let current = pushed_branch(git, &mr.remote, &mr.branch)?;
+    if holds(&current, &mr.commit) {
         bail!(
             "cannot delete the merge request branch '{}' from '{}': {}",
             mr.branch,
@@ -787,7 +812,7 @@ pub fn delete_branch(git: &Git, mr: &MergeRequest) -> Result<()> {
             out.into_error()
         );
     }
-    describe(current);
+    describe(deviation(current, &mr.commit));
     Ok(())
 }
 

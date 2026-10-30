@@ -9,7 +9,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use common::{Fork, MERGE_REQUEST_NUMBER, recorded_push_options, stderr, stdout};
+use common::{
+    Fork, MERGE_REQUEST_NUMBER, accept_push_options, recorded_push_options, stderr, stdout,
+};
 use predicates::str::contains;
 
 /// A fork in merge-request mode with one verified update. Returns the
@@ -650,16 +652,20 @@ fn interrupted_opening_does_not_claim_a_merge_request() {
             &format!("{commit}:refs/heads/{branch}"),
         ],
     );
-    // The branch is found in place and nothing is pushed: a push would fail.
-    let missing = env.path("no-such-remote.git");
+    // Pushes go to a repository that holds the branch as well and cannot
+    // receive any push: the branch is found in place there, and nothing is
+    // pushed.
+    let push_side = push_side(&f);
     env.git(
         &f.down,
         &[
-            "config",
-            "remote.origin.pushurl",
-            &missing.to_string_lossy(),
+            "push",
+            "-q",
+            &push_side.to_string_lossy(),
+            &format!("{commit}:refs/heads/{branch}"),
         ],
     );
+    env.git(&f.down, &["config", "remote.origin.receivepack", "false"]);
 
     f.tool(&["finish"]).success().stdout(contains(format!(
         "'{branch}' was already on 'origin', so this push asked for no merge request; \
@@ -671,6 +677,45 @@ fn interrupted_opening_does_not_claim_a_merge_request() {
     f.tool(&["finish"])
         .code(1)
         .stdout(contains("open the merge request if it is not open yet"));
+}
+
+/// A repository the publish remote pushes to while it is still fetched from
+/// its own URL.
+fn push_side(f: &Fork) -> PathBuf {
+    let env = &f.env;
+    let dir = env.bare("push-side");
+    accept_push_options(env, &dir);
+    env.git(
+        &f.down,
+        &["config", "remote.origin.pushurl", &dir.to_string_lossy()],
+    );
+    dir
+}
+
+#[test]
+fn branch_only_on_the_fetch_side_is_pushed_where_pushes_go() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    env.git(
+        &f.down,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{commit}:refs/heads/{branch}"),
+        ],
+    );
+    let push_side = push_side(&f);
+
+    f.tool(&["finish"]).success().stdout(contains(format!(
+        "asked 'origin' to open a merge request from '{branch}' into 'main'"
+    )));
+    assert_eq!(env.rev(&push_side, &format!("refs/heads/{branch}")), commit);
+    assert!(recorded_push_options(&push_side).contains(&"merge_request.create".to_string()));
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["merge_request"]["requested"], true);
 }
 
 /// Where the remote keeps the merge request's head, as GitLab does.
