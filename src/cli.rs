@@ -19,10 +19,12 @@ use clap::{Parser, Subcommand};
         gets published, and the integration branch moves only by fast-forward. The repository \
         describes itself in a .git-intake.toml committed on its integration branch.",
     after_long_help = "Exit status: 0 on success; 1 on a negative result (drift found by status --check, \
-        a failed doctor check, a failed verify, an upstream that could not be fetched, a stop on \
-        conflicts, an integration branch that moved again while finish verified a catch-up merge, or \
-        an upstream sync left out); 2 on an error (invalid configuration, a refused command, a git or \
-        forge failure, or invalid usage). env -- <command> exits with the command's status."
+        a failed doctor check, a failed verify, an upstream that status, log or branches could not \
+        fetch, a stop on conflicts or on the failed commit of a copy, failed checks in finish or \
+        sync, an integration branch that moved again while finish made or verified a catch-up \
+        merge, or an upstream sync left out); 2 on an error (invalid configuration, a refused \
+        command, such as start with an upstream that cannot be fetched, a git or forge failure, or \
+        invalid usage). env -- <command> exits with the command's status."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -51,8 +53,9 @@ pub enum Command {
     /// A port upstream gets a plan of its pending commits, limited to those REV contains when one
     /// is named; the update stops for the plan to be edited, and `continue` carries it out.
     Start {
-        /// Upstream names, each optionally with the revision to take it at; all upstreams at their
-        /// fetched tips when none is given
+        /// Upstream names, each optionally with the revision to take it at; all upstreams when none
+        /// is given. A follow upstream named without a revision is taken at its fetched tip, or with
+        /// `tags` at its newest release tag
         #[arg(value_name = "UPSTREAM[=REV]", value_parser = parse_upstream_target)]
         upstreams: Vec<UpstreamTarget>,
     },
