@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::config::Upstream;
-use crate::git::{Git, abbrev, tracking_ref};
+use crate::git::{Git, abbrev};
 use crate::sync_record::Record;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -12,6 +12,11 @@ use crate::sync_record::Record;
 pub enum DriftState {
     Current,
     Behind,
+    /// A port upstream with commits nobody has decided on yet.
+    Pending,
+    /// A port upstream without a journal or a last synced commit to start
+    /// one from.
+    NoBase,
     NotImported,
     /// A synced path upstream whose path no longer exists on the integration branch.
     PathRemoved,
@@ -24,6 +29,8 @@ impl DriftState {
         match self {
             DriftState::Current => "current",
             DriftState::Behind => "behind",
+            DriftState::Pending => "pending",
+            DriftState::NoBase => "no base",
             DriftState::NotImported => "not imported",
             DriftState::PathRemoved => "path removed",
             DriftState::Rewritten => "rewritten",
@@ -66,32 +73,19 @@ impl Drift {
     }
 }
 
-/// The fetched tip of an upstream, or why there is none.
-pub fn fetched_tip(git: &Git, up: &Upstream) -> Result<std::result::Result<String, String>> {
-    if git.remote_url(&up.remote)?.is_none() {
-        return Ok(Err(format!("remote '{}' does not exist", up.remote)));
-    }
-    match git.commit(&tracking_ref(&up.remote, &up.branch))? {
-        Some(tip) => Ok(Ok(tip)),
-        None => Ok(Err(format!(
-            "branch '{}' of remote '{}' has not been fetched or does not exist",
-            up.branch, up.remote
-        ))),
-    }
-}
-
-/// Evaluates one upstream against the integration tip using the fetched
-/// remote-tracking ref.
+/// Evaluates one follow upstream against the integration tip, given its
+/// freshly fetched tip or why it could not be fetched.
 pub fn evaluate(
     git: &Git,
     integration_tip: &str,
     up: &Upstream,
     last: Option<&Record>,
+    fetched: std::result::Result<&str, &str>,
 ) -> Result<Drift> {
     let recorded = last.map(|r| r.target.clone());
-    let tip = match fetched_tip(git, up)? {
-        Ok(tip) => tip,
-        Err(why) => return Ok(Drift::unavailable(recorded, why)),
+    let tip = match fetched {
+        Ok(tip) => tip.to_string(),
+        Err(why) => return Ok(Drift::unavailable(recorded, why.to_string())),
     };
     if let Some(ls) = &recorded
         && (!git.object_exists(ls)? || !git.is_ancestor(ls, &tip)?)

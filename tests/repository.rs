@@ -1,4 +1,5 @@
-//! Configuration, remotes, doctor and machine-readable output.
+//! Configuration, upstreams fetched by URL, doctor and machine-readable
+//! output.
 
 mod common;
 
@@ -25,16 +26,29 @@ fn status_shows_configuration_values() {
     for key in [
         "name",
         "path",
+        "url",
         "branch",
+        "mode",
         "last_synced",
         "tip",
         "commits_behind",
         "state",
+        "base",
+        "taken",
+        "decided",
+        "pending",
     ] {
         assert!(up.get(key).is_some(), "missing {key}: {up}");
     }
     assert_eq!(up["path"], serde_json::Value::Null);
-    assert_eq!(up["mirror"], "upstream-main");
+    assert_eq!(up["url"], f.up.url().as_str());
+    assert_eq!(up["mode"], "follow");
+    assert_eq!(up["pending"], serde_json::Value::Null);
+    assert!(up.get("remote").is_none() && up.get("mirror").is_none());
+    assert!(
+        out.contains("upstream  /     follow  main"),
+        "the table shows the mode and the branch: {out}"
+    );
 }
 
 #[test]
@@ -93,11 +107,12 @@ fn invalid_configuration_is_refused() {
         "upstream 'app-b' path 'apps/a/b' lies inside upstream 'app-a' path 'apps/a'",
     ));
 
-    let dup = mono_config(&m.a, &m.b, "").replace("remote = \"app-b\"", "remote = \"app-a\"");
-    env.commit(&m.down, &[(".git-intake.toml", &dup)], "bad: shared remote");
-    m.tool(&["fetch"])
-        .code(2)
-        .stderr(contains("2 upstreams share the remote 'app-a'"));
+    let dup = mono_config(&m.a, &m.b, "").replace(&m.b.url(), &m.a.url());
+    env.commit(&m.down, &[(".git-intake.toml", &dup)], "bad: shared source");
+    m.tool(&["branches"]).code(2).stderr(contains(format!(
+        "2 upstreams share the URL '{}' and the branch 'main'",
+        m.a.url()
+    )));
 
     let root = mono_config(&m.a, &m.b, "").replace("path = \"apps/b\"\n", "");
     env.commit(
@@ -164,120 +179,314 @@ fn publish_setting_is_a_table_with_a_mode() {
 }
 
 #[test]
-fn remote_with_a_different_url_is_refused() {
+fn removed_and_invalid_upstream_settings_are_refused() {
     let m = Mono::new();
     let env = &m.env;
-    env.git(
-        &m.down,
-        &[
-            "remote",
-            "add",
-            "app-a",
-            "https://example.com/elsewhere.git",
-        ],
+
+    // A configuration of the previous release: a remote and a mirror.
+    let old = mono_config(&m.a, &m.b, "").replace(
+        &format!("url = {:?}\n", m.a.url()),
+        "remote = \"app-a\"\nmirror = \"mirror-a\"\n",
     );
-    // Only the mismatched upstream is refused; the others are fetched.
-    let fetch = m.tool(&["fetch"]).code(1);
-    let err = stdout(&fetch);
-    assert!(err.contains("app-a: refused: "), "{err}");
-    assert!(err.contains("app-b: fetched app-b/main"), "{err}");
-    assert!(env.has_rev(&m.down, "refs/remotes/app-b/main"));
+    env.commit(
+        &m.down,
+        &[(".git-intake.toml", &old)],
+        "old: remote and mirror",
+    );
+    let err = stderr(&m.tool(&["status"]).code(2));
     assert!(
         err.contains(
-            "upstream 'app-a': remote 'app-a' points to https://example.com/elsewhere.git"
+            "upstream 'app-a' remote: upstreams are fetched by their URL and the tool keeps no remote for them; \
+             replace `remote` with `url` set to that remote's URL"
         ),
         "{err}"
     );
     assert!(
-        err.contains(&format!("the configuration says {}", m.a.url())),
+        err.contains(
+            "upstream 'app-a' mirror: mirror branches are no longer kept; remove `mirror`"
+        ),
         "{err}"
     );
-    assert_eq!(
-        env.git(&m.down, &["remote", "get-url", "app-a"]),
-        "https://example.com/elsewhere.git",
-        "the remote is not rewritten"
-    );
-    assert!(!env.has_rev(&m.down, "refs/remotes/app-a/main"));
+
+    let no_url = mono_config(&m.a, &m.b, "").replace(&format!("url = {:?}\n", m.b.url()), "");
+    env.commit(&m.down, &[(".git-intake.toml", &no_url)], "bad: no url");
     m.tool(&["start"])
         .code(2)
-        .stderr(contains("points to https://example.com/elsewhere.git"));
-    m.tool(&["doctor"]).code(1).stdout(contains(
-        "[FAIL] app-a: upstream 'app-a': remote 'app-a' points to",
-    ));
-}
+        .stderr(contains("upstream 'app-b': `url` is required"));
 
-#[test]
-fn missing_remote_without_url_is_refused() {
-    let m = Mono::new();
-    let env = &m.env;
-    let cfg = mono_config(&m.a, &m.b, "").replace(
-        &format!("url = {:?}\npath = \"apps/b\"", m.b.url()),
-        "path = \"apps/b\"",
+    let port_path = mono_config(&m.a, &m.b, "")
+        .replace("path = \"apps/b\"", "path = \"apps/b\"\nmode = \"port\"");
+    env.commit(
+        &m.down,
+        &[(".git-intake.toml", &port_path)],
+        "bad: port under a path",
     );
-    env.commit(&m.down, &[(".git-intake.toml", &cfg)], "mono: no url for b");
-    m.tool(&["fetch"])
-        .code(1)
-        .stdout(contains("app-a: fetched app-a/main"))
-        .stdout(contains(
-            "app-b: refused: upstream 'app-b': remote 'app-b' does not exist and no url is configured",
-        ));
-    m.tool(&["start"]).code(2).stderr(contains(
-        "remote 'app-b' does not exist and no url is configured",
+    m.tool(&["log"]).code(2).stderr(contains(
+        "upstream 'app-b': an upstream in `port` mode is taken at the repository root and cannot have a path",
     ));
-    m.env.assert_no_update(&m.down);
+
+    let bad_name = mono_config(&m.a, &m.b, "").replace("name = \"app-b\"", "name = \"app.lock\"");
+    env.commit(
+        &m.down,
+        &[(".git-intake.toml", &bad_name)],
+        "bad: a name git cannot use",
+    );
+    m.tool(&["status"]).code(2).stderr(contains(
+        "upstream 'app.lock': 'app.lock' cannot name a git reference",
+    ));
+    env.assert_no_update(&m.down);
 }
 
 #[test]
-fn first_fetch_adds_remotes_and_one_unreachable_upstream_fails() {
+fn publish_remote_at_an_upstream_url_is_refused() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.git(&f.down, &["remote", "set-url", "origin", &f.up.url()]);
+    let err = stderr(&f.tool(&["status"]).code(2));
+    assert!(
+        err.contains(&format!(
+            "publish remote 'origin' has the URL {}, which names the repository of upstream 'upstream' ({}); \
+             the tool never pushes to an upstream",
+            f.up.url(),
+            f.up.url()
+        )),
+        "{err}"
+    );
+    // A relative path to the same repository, from the main worktree.
+    env.git(
+        &f.down,
+        &["remote", "set-url", "origin", "../upstream.git/"],
+    );
+    f.tool(&["status"]).code(2).stderr(contains(
+        "has the URL ../upstream.git/, which names the repository of upstream 'upstream'",
+    ));
+    // Pushing to the upstream's repository counts as well.
+    env.git(
+        &f.down,
+        &["remote", "set-url", "origin", &f.publish.to_string_lossy()],
+    );
+    f.tool(&["status"]).success();
+    env.git(
+        &f.down,
+        &[
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "origin",
+            &f.up.url(),
+        ],
+    );
+    f.tool(&["start"])
+        .code(2)
+        .stderr(contains("publish remote 'origin' has the URL"));
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn local_paths_and_ssh_urls_are_matched_as_git_reads_them() {
+    let f = Fork::new();
+    let env = &f.env;
+    // Git finds `../upstream` at `../upstream.git`.
+    env.git(&f.down, &["remote", "set-url", "origin", "../upstream"]);
+    f.tool(&["status"]).code(2).stderr(contains(
+        "has the URL ../upstream, which names the repository of upstream 'upstream'",
+    ));
+
+    // The scp-like form and the `ssh://` form of one hosted repository.
+    env.git(
+        &f.down,
+        &["remote", "set-url", "origin", &f.publish.to_string_lossy()],
+    );
+    f.reconfigure(
+        &format!("url = {:?}", f.up.url()),
+        "url = \"git@example.com:team/upstream.git\"",
+    );
+    env.git(
+        &f.down,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "ssh://git@Example.com:22/team/upstream",
+        ],
+    );
+    f.tool(&["status"]).code(2).stderr(contains(
+        "has the URL ssh://git@Example.com:22/team/upstream, which names the repository of upstream 'upstream'",
+    ));
+}
+
+#[test]
+fn hosted_urls_naming_the_same_repository_count_as_one() {
+    let f = Fork::new();
+    let env = &f.env;
+    f.reconfigure(
+        &format!("url = {:?}", f.up.url()),
+        "url = \"https://Example.com/team/upstream.git\"",
+    );
+    env.git(
+        &f.down,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.com/team/upstream/",
+        ],
+    );
+    f.tool(&["status"]).code(2).stderr(contains(
+        "which names the repository of upstream 'upstream'",
+    ));
+    env.git(
+        &f.down,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.com/team/other.git",
+        ],
+    );
+    env.git(
+        &f.down,
+        &[
+            "remote",
+            "add",
+            "mirror",
+            "https://EXAMPLE.com/team/upstream",
+        ],
+    );
+    // The hosted URL is served from the local upstream, in this test's own
+    // git configuration, so that doctor's fetch stays local.
+    std::fs::write(
+        env.path("gitconfig"),
+        format!(
+            "[url {:?}]\n\tinsteadOf = https://Example.com/team/upstream.git\n",
+            f.up.url()
+        ),
+    )
+    .unwrap();
+    let doctor = stdout(&f.tool(&["doctor"]).code(1));
+    assert!(
+        doctor.contains("[pass] upstream: branch 'main' of"),
+        "{doctor}"
+    );
+    assert!(
+        doctor.contains(
+            "[FAIL] upstream: git remote 'mirror' names the repository of upstream 'upstream' \
+             (https://Example.com/team/upstream.git)"
+        ),
+        "{doctor}"
+    );
+}
+
+#[test]
+fn remote_at_an_upstream_url_is_neither_used_nor_changed_and_doctor_names_it() {
     let m = Mono::new();
     let env = &m.env;
-    let ok = stdout(&m.tool(&["fetch"]).success());
-    assert!(ok.contains("app-a: added remote 'app-a'"), "{ok}");
-    assert!(ok.contains("app-a: fetched app-a/main"), "{ok}");
-    assert!(ok.contains("app-b: fetched app-b/main"), "{ok}");
-
-    // app-b becomes unreachable.
-    let gone = env.path("gone.git");
+    env.git(&m.down, &["remote", "add", "app-a", &m.a.url()]);
     env.git(
         &m.down,
-        &["remote", "set-url", "app-b", &gone.to_string_lossy()],
+        &[
+            "config",
+            "remote.app-a.fetch",
+            "+refs/heads/*:refs/remotes/app-a/*",
+        ],
     );
-    let cfg = mono_config(&m.a, &m.b, "").replace(&m.b.url(), &gone.to_string_lossy());
-    env.commit(&m.down, &[(".git-intake.toml", &cfg)], "mono: b moved");
-    let a2 = env.push_upstream(&m.a, &[("x.txt", "x\n")], "app-a: x");
-    let failed = m.tool(&["fetch"]).code(1);
-    let out = stdout(&failed);
-    assert!(out.contains("app-a: fetched app-a/main"), "{out}");
+    let json = env.tool_json(&m.down, &["status", "--json"], 0);
+    assert_eq!(
+        json["upstreams"][0]["tip"],
+        env.rev(&m.a.bare, "main").as_str()
+    );
     assert!(
-        out.contains("app-b: fetch failed: `git fetch --quiet --prune --no-tags app-b` failed"),
-        "{out}"
+        !env.has_rev(&m.down, "refs/remotes/app-a/main"),
+        "the remote was not fetched"
     );
-    assert_eq!(env.rev(&m.down, "refs/remotes/app-a/main"), a2);
+    assert_eq!(env.git(&m.down, &["remote", "get-url", "app-a"]), m.a.url());
+    env.assert_no_update(&m.down);
 
-    let check = env.tool_json(&m.down, &["status", "--check", "--json"], 1);
-    assert_eq!(check["upstreams"][1]["state"], "unavailable");
+    let doctor = stdout(&m.tool(&["doctor"]).code(1));
     assert!(
-        check["upstreams"][1]["detail"]
-            .as_str()
-            .unwrap()
-            .starts_with("fetch failed")
+        doctor.contains(&format!(
+            "[FAIL] app-a: git remote 'app-a' names the repository of upstream 'app-a' ({})",
+            m.a.url()
+        )),
+        "{doctor}"
     );
-    m.tool(&["start"])
-        .code(2)
-        .stderr(contains("cannot fetch the selected upstreams"));
+    assert!(
+        doctor.contains("remove it with `git remote remove app-a`"),
+        "{doctor}"
+    );
+    assert!(!doctor.contains("partial clone"), "{doctor}");
+
+    // The remote a partial clone fetches missing objects from.
+    env.git(&m.down, &["config", "remote.app-a.promisor", "true"]);
+    let doctor = stdout(&m.tool(&["doctor"]).code(1));
+    assert!(
+        doctor.contains(
+            "This partial clone fetches missing objects from 'app-a': fetch the objects the history still lacks \
+             before removing the remote"
+        ),
+        "{doctor}"
+    );
+    env.git(&m.down, &["remote", "remove", "app-a"]);
+    m.tool(&["doctor"]).success().stdout(contains(
+        "[pass] no git remote names an upstream's repository",
+    ));
 }
 
 #[test]
-fn status_marks_missing_remote_unavailable() {
+fn one_unreachable_upstream_is_unavailable_and_start_creates_nothing() {
     let m = Mono::new();
-    let json = m.env.tool_json(&m.down, &["status", "--json"], 0);
-    assert_eq!(json["upstreams"][0]["state"], "unavailable");
+    let env = &m.env;
+    let gone = env.path("gone.git");
+    let cfg = mono_config(&m.a, &m.b, "").replace(&m.b.url(), &gone.to_string_lossy());
+    env.commit(&m.down, &[(".git-intake.toml", &cfg)], "mono: b moved");
+
+    let status = env.tool_json(&m.down, &["status", "--json"], 1);
+    assert_eq!(status["upstreams"][0]["state"], "not_imported");
     assert_eq!(
-        json["upstreams"][0]["detail"],
-        "remote 'app-a' does not exist"
+        status["upstreams"][0]["tip"],
+        env.rev(&m.a.bare, "main").as_str()
     );
-    let log = m.env.tool_json(&m.down, &["log", "--json"], 0);
-    assert_eq!(log["upstreams"][0]["available"], false);
+    let b = &status["upstreams"][1];
+    assert_eq!(b["state"], "unavailable");
+    let detail = b["detail"].as_str().unwrap();
+    assert!(detail.starts_with("fetch failed: `git fetch"), "{detail}");
+    assert!(detail.contains(&*gone.to_string_lossy()), "{detail}");
+    let text = stdout(&m.tool(&["status"]).code(1));
+    assert!(text.contains("app-b: fetch failed:"), "{text}");
+    let log = env.tool_json(&m.down, &["log", "--json"], 1);
+    assert_eq!(log["upstreams"][0]["available"], true);
+    assert_eq!(log["upstreams"][1]["available"], false);
+
+    m.tool(&["start"])
+        .code(2)
+        .stderr(contains("cannot fetch the selected upstreams"))
+        .stderr(contains("upstream 'app-b':"));
+    env.assert_no_update(&m.down);
+}
+
+#[test]
+fn reading_commands_leave_no_reference_remote_or_branch_behind() {
+    let m = Mono::new();
+    let env = &m.env;
+    m.import_all();
+    env.push_upstream(&m.a, &[("x.txt", "x\n")], "app-a: x");
+    let refs_before = env.git(&m.down, &["for-each-ref", "--format=%(refname)"]);
+    for args in [
+        vec!["status"],
+        vec!["status", "--check"],
+        vec!["log"],
+        vec!["branches"],
+        vec!["doctor"],
+    ] {
+        env.tool(&m.down, &args);
+        assert_eq!(
+            env.git(&m.down, &["for-each-ref", "--format=%(refname)"]),
+            refs_before,
+            "{args:?} left references behind"
+        );
+        assert_eq!(env.git(&m.down, &["remote"]), "", "{args:?} added a remote");
+    }
 }
 
 #[test]
@@ -292,7 +501,22 @@ fn doctor_healthy_and_dropped_upstream() {
         "{out}"
     );
     assert!(
-        out.contains("[pass] app-a: remote 'app-a' exists with the configured url"),
+        out.contains(&format!(
+            "[pass] app-a: branch 'main' of {} was fetched at",
+            m.a.url()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("[pass] no reference under refs/git-intake/ is left without an update"),
+        "{out}"
+    );
+    assert!(
+        out.contains("[pass] no git remote names an upstream's repository"),
+        "{out}"
+    );
+    assert!(
+        out.contains("[pass] every journal belongs to an upstream in port mode"),
         "{out}"
     );
     assert!(
@@ -311,6 +535,7 @@ fn doctor_healthy_and_dropped_upstream() {
     assert!(out.contains("[pass] no update is in progress"), "{out}");
     assert!(out.contains("all checks passed"), "{out}");
     assert!(!out.contains("FAIL"), "{out}");
+    env.assert_no_update(&m.down);
 
     // app-b is dropped from the configuration.
     let cfg = mono_config(&m.a, &m.b, "");
@@ -436,13 +661,32 @@ fn state_files_of_another_format_are_named_or_ignored() {
     f.tool(&["report"]).code(2).stderr(contains(
         "no update is in progress or finished; nothing to report",
     ));
-    // An update in progress from an earlier release is refused by name.
+    // An update in progress from the previous release, which kept remotes
+    // and mirrors, is refused by every command that reads the update.
     std::fs::write(
         dir.join("state.json"),
-        r#"{"version": 1, "config": {"integration": "main", "publish": "origin"}}"#,
+        r#"{"version": 2, "config": {"integration": "main", "upstreams": [{"name": "upstream", "remote": "upstream", "branch": "main", "mirror": "upstream-main"}]}, "upstreams": [{"name": "upstream", "target": "0000000000000000000000000000000000000000"}]}"#,
     )
     .unwrap();
-    f.tool(&["status"]).code(2).stderr(contains(
-        "the update in progress was started by a release that keeps its state in format 1",
-    ));
+    for args in [
+        vec!["status"],
+        vec!["continue"],
+        vec!["verify"],
+        vec!["finish"],
+        vec!["abort"],
+        vec!["start"],
+        vec!["report"],
+    ] {
+        let err = stderr(&f.tool(&args).code(2));
+        assert!(
+            err.contains(
+                "the update in progress was started by a release that keeps its state in format 2; \
+                 this release understands format 3. Finish or abort the update with the release that started it"
+            ),
+            "{args:?}: {err}"
+        );
+    }
+    assert!(dir.join("state.json").exists(), "the state is kept");
+    let doctor = stdout(&f.tool(&["doctor"]).code(1));
+    assert!(doctor.contains("keeps its state in format 2"), "{doctor}");
 }

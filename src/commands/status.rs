@@ -7,15 +7,17 @@ use serde::Serialize;
 
 use crate::Exit;
 use crate::commands::update::{
-    blocking_prefix, described, next_step, step_name, unrelated_content,
+    blocking_prefix, described, next_step, plural, step_name, unrelated_content,
 };
+use crate::config::{Mode, Upstream};
 use crate::drift::{self, Drift, DriftState, SyncSource};
 use crate::git::{Git, abbrev, branch_ref};
 use crate::output::{Render, emit, table};
-use crate::remotes;
+use crate::port::{self, OffLine, Standing, Verb};
 use crate::repo::Repo;
-use crate::state::{ConflictFile, MergeKind, UpdateState, UpstreamStep};
-use crate::sync_record;
+use crate::state::{ConflictFile, CopyStep, MergeKind, UpdateState, UpstreamStep, Work};
+use crate::sync_record::{self, Record};
+use crate::upstreams::Fetches;
 
 #[derive(Serialize)]
 pub struct StatusDoc {
@@ -28,7 +30,7 @@ pub struct StatusDoc {
     pub install: Option<String>,
     pub checks: Vec<String>,
     pub config_working_copy_differs: bool,
-    /// Whether `--check` fetched the upstreams and predicted conflicts.
+    /// Whether `--check` predicted conflicts and gated on drift.
     pub checked: bool,
     pub all_current: bool,
     pub upstreams: Vec<UpstreamStatus>,
@@ -39,19 +41,69 @@ pub struct StatusDoc {
 pub struct UpstreamStatus {
     pub name: String,
     pub path: Option<String>,
-    pub remote: String,
+    pub url: String,
     pub branch: String,
-    pub url: Option<String>,
-    pub mirror: Option<String>,
-    pub last_synced: Option<String>,
-    /// `record` or `history`; `null` when nothing is synced.
-    pub last_synced_source: Option<SyncSource>,
+    pub mode: Mode,
+    /// The fetched tip; `null` when the upstream could not be fetched.
     pub tip: Option<String>,
-    pub commits_behind: Option<u64>,
     pub state: DriftState,
     pub detail: Option<String>,
-    /// Files a merge of the tip would conflict in; only with `--check`.
+    /// Follow mode: the last synced commit.
+    pub last_synced: Option<String>,
+    /// Follow mode: `record` or `history`; `null` when nothing is synced.
+    pub last_synced_source: Option<SyncSource>,
+    /// Follow mode: commits of the tip the integration branch lacks.
+    pub commits_behind: Option<u64>,
+    /// Port mode: the journal's base, or the last synced commit a new
+    /// journal would start from.
+    pub base: Option<String>,
+    /// Port mode: whether the journal exists on the integration branch.
+    pub journal: Option<bool>,
+    /// Port mode: commits after the base that copies took.
+    pub taken: Option<u64>,
+    /// Port mode: commits after the base the journal decides.
+    pub decided: Option<u64>,
+    /// Port mode: commits after the base nobody has decided on yet.
+    pub pending: Option<u64>,
+    /// Port mode, when rewritten: what is no longer on the upstream's
+    /// first-parent line.
+    pub off_line: Option<OffLineView>,
+    /// Files a merge of the tip would conflict in; only with `--check`, for
+    /// a follow upstream.
     pub conflicts: Option<Vec<String>>,
+}
+
+impl UpstreamStatus {
+    fn new(up: &Upstream, tip: Option<String>, state: DriftState) -> Self {
+        Self {
+            name: up.name.clone(),
+            path: up.path.clone(),
+            url: up.url.clone(),
+            branch: up.branch.clone(),
+            mode: up.mode,
+            tip,
+            state,
+            detail: None,
+            last_synced: None,
+            last_synced_source: None,
+            commits_behind: None,
+            base: None,
+            journal: None,
+            taken: None,
+            decided: None,
+            pending: None,
+            off_line: None,
+            conflicts: None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct OffLineView {
+    /// The base, when it is no longer on the line.
+    pub base: Option<String>,
+    /// Taken or decided commits no longer on the line and not retired.
+    pub commits: Vec<OffLine>,
 }
 
 #[derive(Serialize)]
@@ -86,30 +138,49 @@ pub struct MergeRequestView {
 #[derive(Serialize)]
 pub struct QueuedView {
     pub name: String,
-    pub target: String,
-    /// The revision `start` was given for the target; `null` for the fetched tip.
+    pub mode: Mode,
+    /// The upstream tip `start` fetched, which the update's reference keeps.
+    pub fetched: String,
+    /// Follow mode: the fixed target.
+    pub target: Option<String>,
+    /// The revision `start` was given: the target of a follow upstream, the
+    /// limit of a port plan; `null` for the fetched tip.
     pub rev: Option<String>,
-    pub kind: MergeKind,
+    /// Follow mode: how the upstream is merged.
+    pub kind: Option<MergeKind>,
     pub step: UpstreamStep,
+    /// Follow mode: the merge commit.
     pub merge_commit: Option<String>,
+    /// The conflicted files of the merge or copy that stopped.
     pub conflicts: Vec<ConflictFile>,
+    /// Port mode: the plan file.
+    pub plan: Option<PathBuf>,
+    /// Port mode: the planned commits, oldest first.
+    pub commits: Option<Vec<PlannedView>>,
+    /// Port mode: the commit that recorded the decisions in the journal.
+    pub journal_commit: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct PlannedView {
+    pub commit: String,
+    pub subject: String,
+    /// `take`, `skip`, `have` or `later`; `null` until the plan is read.
+    pub verb: Option<Verb>,
+    pub note: Option<String>,
+    /// `none`, `conflict`, `commit_failed`, `copied` or `empty`.
+    pub copy: CopyStep,
+    pub copied: Option<String>,
+    /// What git said when the commit of the copy failed.
+    pub failure: Option<String>,
+    /// Paths the copy left out: `.git-intake.toml` and `.git-intake/`.
+    pub left_out: Vec<String>,
 }
 
 pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     let loaded = repo.load_config()?;
     let config = &loaded.config;
     let git = &repo.git;
-
-    let mut fetch_errors = vec![None; config.upstreams.len()];
-    if check {
-        for (i, up) in config.upstreams.iter().enumerate() {
-            fetch_errors[i] = match remotes::ensure_one(git, up)? {
-                Err(why) => Some(why),
-                Ok(_) => remotes::fetch(git, up)?.err(),
-            };
-        }
-    }
-
     let tip = git
         .commit(&branch_ref(&config.integration))?
         .with_context(|| {
@@ -118,38 +189,32 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
                 config.integration
             )
         })?;
-    let latest = sync_record::latest(&sync_record::records(git, &tip, config)?);
+
+    let mut fetches = Fetches::new(repo);
+    let mut fetched = Vec::new();
+    for up in &config.upstreams {
+        fetched.push(fetches.upstream(up)?);
+    }
+    let fetch_failed = fetched.iter().any(|f| f.is_err());
+    let tips: Vec<String> = fetched.iter().filter_map(|f| f.clone().ok()).collect();
+    let latest = sync_record::latest(&sync_record::records(git, &tip, &tips)?);
     let mut upstreams = Vec::new();
-    for (i, up) in config.upstreams.iter().enumerate() {
-        let mut d: Drift = drift::evaluate(git, &tip, up, latest.get(&up.name))?;
-        if let Some(why) = fetch_errors[i].take() {
-            d.state = DriftState::Unavailable;
-            d.detail = Some(format!("fetch failed: {why}"));
-        }
-        let conflicts = if check {
-            Some(predicted(git, &tip, up, &mut d)?)
-        } else {
-            None
-        };
-        upstreams.push(UpstreamStatus {
-            name: up.name.clone(),
-            path: up.path.clone(),
-            remote: up.remote.clone(),
-            branch: up.branch.clone(),
-            url: up.url.clone(),
-            mirror: up.mirror.clone(),
-            last_synced: d.last_synced,
-            last_synced_source: d.last_synced_source,
-            tip: d.tip,
-            commits_behind: d.commits_behind,
-            state: d.state,
-            detail: d.detail,
-            conflicts,
+    for (up, fetched) in config.upstreams.iter().zip(&fetched) {
+        let fetched = fetched.as_deref().map_err(String::as_str);
+        let last = latest.get(&up.name);
+        upstreams.push(match up.mode {
+            Mode::Follow => follow_status(git, &tip, up, last, fetched, check)?,
+            Mode::Port => port_status(git, &tip, up, last, fetched, &tips),
         });
     }
+    drop(fetches);
+
     let all_current = upstreams.iter().all(|u| u.state == DriftState::Current);
     let update = match repo.state()? {
-        Some(state) => Some(update_view(&state)?),
+        Some(state) => {
+            repo.restore_held_references(&state)?;
+            Some(update_view(&state)?)
+        }
         None => None,
     };
     let doc = StatusDoc {
@@ -169,21 +234,98 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
         update,
     };
     emit(&doc, json)?;
-    Ok(if check && !all_current {
+    Ok(if fetch_failed || (check && !all_current) {
         Exit::Negative
     } else {
         Exit::Success
     })
 }
 
-/// Predicted conflicts for one upstream; may add a detail when a merge could
-/// not run at all.
-fn predicted(
+fn follow_status(
     git: &Git,
     tip: &str,
-    up: &crate::config::Upstream,
-    d: &mut Drift,
-) -> Result<Vec<String>> {
+    up: &Upstream,
+    last: Option<&Record>,
+    fetched: std::result::Result<&str, &str>,
+    check: bool,
+) -> Result<UpstreamStatus> {
+    let mut d: Drift = drift::evaluate(git, tip, up, last, fetched)?;
+    if let Err(why) = fetched {
+        d.detail = Some(format!("fetch failed: {why}"));
+    }
+    let conflicts = if check {
+        Some(predicted(git, tip, up, &mut d)?)
+    } else {
+        None
+    };
+    let mut status = UpstreamStatus::new(up, d.tip, d.state);
+    status.detail = d.detail;
+    status.last_synced = d.last_synced;
+    status.last_synced_source = d.last_synced_source;
+    status.commits_behind = d.commits_behind;
+    status.conflicts = conflicts;
+    Ok(status)
+}
+
+fn port_status(
+    git: &Git,
+    tip: &str,
+    up: &Upstream,
+    last: Option<&Record>,
+    fetched: std::result::Result<&str, &str>,
+    tips: &[String],
+) -> UpstreamStatus {
+    let upstream_tip = match fetched {
+        Ok(t) => t,
+        Err(why) => {
+            let mut s = UpstreamStatus::new(up, None, DriftState::Unavailable);
+            s.detail = Some(format!("fetch failed: {why}"));
+            return s;
+        }
+    };
+    let mut s = UpstreamStatus::new(up, Some(upstream_tip.to_string()), DriftState::Pending);
+    match port::standing(git, tip, up, last, upstream_tip, tips) {
+        Err(err) => {
+            s.state = DriftState::Unavailable;
+            s.detail = Some(format!("{err:#}"));
+        }
+        Ok(Standing::NoBase) => {
+            s.state = DriftState::NoBase;
+            s.journal = Some(false);
+            s.detail = Some(port::no_base_advice(&up.name));
+        }
+        Ok(Standing::Rewritten(rewrite)) => {
+            s.state = DriftState::Rewritten;
+            s.detail = Some(rewrite.describe(&up.name));
+            s.off_line = Some(OffLineView {
+                base: rewrite.base.clone(),
+                commits: rewrite.commits,
+            });
+        }
+        Ok(Standing::Known(a)) => {
+            let pending = a.pending().len() as u64;
+            s.base = Some(a.base.clone());
+            s.journal = Some(a.journal);
+            s.taken = Some(a.taken.len() as u64);
+            s.decided = Some(a.decided.len() as u64);
+            s.pending = Some(pending);
+            if pending == 0 {
+                s.state = DriftState::Current;
+            }
+            if !a.journal {
+                s.detail = Some(format!(
+                    "no journal yet; the first update that carries out a plan starts it at the last synced commit {}",
+                    abbrev(&a.base)
+                ));
+            }
+        }
+    }
+    s
+}
+
+/// Predicted conflicts for one follow upstream; may add a detail when a
+/// merge could not run at all.
+fn predicted(git: &Git, tip: &str, up: &Upstream, d: &mut Drift) -> Result<Vec<String>> {
     let Some(upstream_tip) = d.tip.clone() else {
         return Ok(Vec::new());
     };
@@ -217,14 +359,49 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
         upstreams: state
             .upstreams
             .iter()
-            .map(|q| QueuedView {
-                name: q.name.clone(),
-                target: q.target.clone(),
-                rev: q.rev.clone(),
-                kind: q.kind,
-                step: q.step,
-                merge_commit: q.merge_commit.clone(),
-                conflicts: q.conflicts.clone(),
+            .map(|q| {
+                let mut view = QueuedView {
+                    name: q.name.clone(),
+                    mode: Mode::Follow,
+                    fetched: q.fetched.clone(),
+                    target: None,
+                    rev: q.rev.clone(),
+                    kind: None,
+                    step: q.step,
+                    merge_commit: None,
+                    conflicts: q.conflicts().to_vec(),
+                    plan: None,
+                    commits: None,
+                    journal_commit: None,
+                };
+                match &q.work {
+                    Work::Follow(f) => {
+                        view.target = Some(f.target.clone());
+                        view.kind = Some(f.kind);
+                        view.merge_commit = f.merge_commit.clone();
+                    }
+                    Work::Port(p) => {
+                        view.mode = Mode::Port;
+                        view.plan = Some(p.plan.clone());
+                        view.journal_commit = p.journal_commit.clone();
+                        view.commits = Some(
+                            p.commits
+                                .iter()
+                                .map(|c| PlannedView {
+                                    commit: c.commit.clone(),
+                                    subject: c.subject.clone(),
+                                    verb: c.verb,
+                                    note: c.note.clone(),
+                                    copy: c.copy,
+                                    copied: c.copied.clone(),
+                                    failure: c.failure.clone(),
+                                    left_out: c.left_out.clone(),
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+                view
             })
             .collect(),
         verified_commit: state
@@ -288,7 +465,8 @@ impl Render for StatusDoc {
                 vec![
                     u.name.clone(),
                     u.path.clone().unwrap_or_else(|| "/".into()),
-                    format!("{}/{}", u.remote, u.branch),
+                    u.mode.as_str().to_string(),
+                    u.branch.clone(),
                     opt_abbrev(&u.last_synced),
                     opt_abbrev(&u.tip),
                     u.commits_behind
@@ -302,6 +480,7 @@ impl Render for StatusDoc {
             &[
                 "UPSTREAM",
                 "PATH",
+                "MODE",
                 "BRANCH",
                 "LAST SYNCED",
                 "TIP",
@@ -311,6 +490,15 @@ impl Render for StatusDoc {
             &rows,
         ));
         for u in &self.upstreams {
+            if let (Some(base), Some(taken), Some(decided), Some(pending)) =
+                (&u.base, u.taken, u.decided, u.pending)
+            {
+                out.push_str(&format!(
+                    "{}: base {}, {taken} taken, {decided} decided, {pending} pending\n",
+                    u.name,
+                    abbrev(base)
+                ));
+            }
             if u.last_synced_source == Some(SyncSource::History) {
                 out.push_str(&format!(
                     "{}: no sync record yet; last synced is the newest upstream commit the integration branch contains\n",
@@ -323,19 +511,18 @@ impl Render for StatusDoc {
             if let Some(conflicts) = &u.conflicts
                 && u.state == DriftState::Behind
             {
+                let behind = u.commits_behind.unwrap_or_default();
                 if conflicts.is_empty() {
                     out.push_str(&format!(
-                        "{}: {} commit{} behind, would merge without conflicts\n",
+                        "{}: {behind} commit{} behind, would merge without conflicts\n",
                         u.name,
-                        u.commits_behind.unwrap_or_default(),
-                        crate::commands::update::plural(u.commits_behind.unwrap_or_default())
+                        plural(behind)
                     ));
                 } else {
                     out.push_str(&format!(
-                        "{}: {} commit{} behind, would conflict in:\n",
+                        "{}: {behind} commit{} behind, would conflict in:\n",
                         u.name,
-                        u.commits_behind.unwrap_or_default(),
-                        crate::commands::update::plural(u.commits_behind.unwrap_or_default())
+                        plural(behind)
                     ));
                     for f in conflicts {
                         out.push_str(&format!("  {f}\n"));
@@ -383,16 +570,57 @@ pub fn render_update(u: &UpdateView) -> String {
         None => out.push_str(&format!("  worktree: {}\n", u.worktree.display())),
     }
     for q in &u.upstreams {
-        let step = match q.step {
-            UpstreamStep::Pending => "pending",
-            UpstreamStep::Conflict => "in conflict",
-            UpstreamStep::Merged => "merged",
-        };
-        out.push_str(&format!(
-            "  {}: target {}, {step}\n",
-            q.name,
-            described(&q.target, q.rev.as_deref())
-        ));
+        let step = q.step.describe(q.mode == Mode::Port);
+        match (&q.target, &q.plan, &q.commits) {
+            (Some(target), _, _) => out.push_str(&format!(
+                "  {}: target {}, {step}\n",
+                q.name,
+                described(target, q.rev.as_deref())
+            )),
+            (None, Some(plan), Some(commits)) => {
+                let n = commits.len() as u64;
+                out.push_str(&format!(
+                    "  {}: plan {} ({n} commit{}{}), {step}\n",
+                    q.name,
+                    plan.display(),
+                    plural(n),
+                    q.rev
+                        .as_deref()
+                        .map(|r| format!(" up to {r}"))
+                        .unwrap_or_default()
+                ));
+                if q.step != UpstreamStep::Plan {
+                    for c in commits {
+                        let verb = c.verb.map(Verb::as_str).unwrap_or("later");
+                        let outcome = match (c.copy, &c.copied) {
+                            (CopyStep::Copied, Some(copy)) => {
+                                format!(", copied as {}", abbrev(copy))
+                            }
+                            (CopyStep::Empty, _) => {
+                                ", changed nothing: recorded as present".to_string()
+                            }
+                            (CopyStep::Conflict, _) => ", in conflict".to_string(),
+                            (CopyStep::CommitFailed, _) => ", its commit failed".to_string(),
+                            _ => String::new(),
+                        };
+                        out.push_str(&format!(
+                            "    {verb} {} {}{outcome}\n",
+                            abbrev(&c.commit),
+                            c.subject
+                        ));
+                        if !c.left_out.is_empty() {
+                            out.push_str(&format!("      left out: {}\n", c.left_out.join(", ")));
+                        }
+                        if let Some(failure) = &c.failure {
+                            for line in failure.lines() {
+                                out.push_str(&format!("      {line}\n"));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => out.push_str(&format!("  {}: {step}\n", q.name)),
+        }
         if q.step == UpstreamStep::Conflict {
             for c in &q.conflicts {
                 out.push_str(&format!("    {}  ({})\n", c.path, c.resolution.describe()));

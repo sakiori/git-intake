@@ -1,11 +1,12 @@
 //! One module per command or command group.
 
 pub mod branches;
+pub mod contribute;
 pub mod doctor;
-pub mod fetch;
 pub mod finish;
 pub mod log;
 pub mod merge_request;
+pub mod port_plan;
 pub mod report;
 pub mod status;
 pub mod update;

@@ -1,12 +1,18 @@
 //! `branches`: upstream branches that hold work the integration branch lacks.
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::Exit;
+use crate::commands::update::plural;
+use crate::config::Mode;
 use crate::git::{branch_ref, lines};
 use crate::output::{Render, emit};
 use crate::repo::Repo;
+use crate::sync_record;
+use crate::upstreams::Fetches;
 
 #[derive(Serialize)]
 pub struct BranchesDoc {
@@ -18,8 +24,9 @@ pub struct BranchesDoc {
 #[derive(Serialize)]
 pub struct UpstreamBranches {
     pub name: String,
-    pub remote: String,
+    pub url: String,
     pub path: Option<String>,
+    pub mode: Mode,
     pub available: bool,
     pub detail: Option<String>,
     pub branches: Vec<UnmergedBranch>,
@@ -30,9 +37,13 @@ pub struct UnmergedBranch {
     pub branch: String,
     /// Whether this is the branch the configuration tracks.
     pub tracked: bool,
+    /// Commits the integration branch lacks; for a port upstream, other than
+    /// those a copy names as taken.
     pub unmerged_commits: u64,
 }
 
+/// Fetches every branch of the selected upstreams for this command only, and
+/// counts what each holds that the integration branch lacks.
 pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
     let config = repo.load_config()?.config;
     let selected = config.select(names)?;
@@ -45,34 +56,45 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
                 config.integration
             )
         })?;
+    let mut fetches = Fetches::new(repo);
     let mut upstreams = Vec::new();
     for up in selected {
         let mut entry = UpstreamBranches {
             name: up.name.clone(),
-            remote: up.remote.clone(),
+            url: up.url.clone(),
             path: up.path.clone(),
+            mode: up.mode,
             available: true,
             detail: None,
             branches: Vec::new(),
         };
-        if git.remote_url(&up.remote)?.is_none() {
-            entry.available = false;
-            entry.detail = Some(format!("remote '{}' does not exist", up.remote));
-            upstreams.push(entry);
-            continue;
-        }
-        let prefix = format!("refs/remotes/{}/", up.remote);
-        let refs = lines(&git.run(&["for-each-ref", "--format=%(refname)", &prefix])?);
-        if refs.is_empty() {
-            entry.available = false;
-            entry.detail = Some(format!("remote '{}' has not been fetched", up.remote));
-        }
-        for r in refs {
-            let branch = r.strip_prefix(&prefix).unwrap_or(&r).to_string();
-            if branch == "HEAD" {
+        let refs = match fetches.branches(up)? {
+            Ok(refs) => refs,
+            Err(why) => {
+                entry.available = false;
+                entry.detail = Some(format!("fetch failed: {why}"));
+                upstreams.push(entry);
                 continue;
             }
-            let n = git.count(&integration, &r)?;
+        };
+        let taken: HashSet<String> = match up.mode {
+            Mode::Follow => HashSet::new(),
+            Mode::Port => {
+                let fetched: Vec<String> = refs.iter().map(|(_, r)| r.clone()).collect();
+                sync_record::taken(git, &integration, &fetched, &up.name)?
+                    .into_iter()
+                    .collect()
+            }
+        };
+        for (branch, r) in refs {
+            let n = if taken.is_empty() {
+                git.count(&integration, &r)?
+            } else {
+                lines(&git.run(&["rev-list", &r, "--not", &integration, "--"])?)
+                    .iter()
+                    .filter(|c| !taken.contains(*c))
+                    .count() as u64
+            };
             if n > 0 {
                 entry.branches.push(UnmergedBranch {
                     tracked: branch == up.branch,
@@ -83,13 +105,19 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
         }
         upstreams.push(entry);
     }
+    drop(fetches);
+    let fetch_failed = upstreams.iter().any(|u| !u.available);
     let doc = BranchesDoc {
         integration: config.integration.clone(),
         unmerged_work: upstreams.iter().any(|u| !u.branches.is_empty()),
         upstreams,
     };
     emit(&doc, json)?;
-    Ok(Exit::Success)
+    Ok(if fetch_failed {
+        Exit::Negative
+    } else {
+        Exit::Success
+    })
 }
 
 impl Render for BranchesDoc {
@@ -116,10 +144,10 @@ impl Render for BranchesDoc {
                 let n = b.unmerged_commits;
                 out.push_str(&format!(
                     "  {}/{}  {} unmerged commit{}{}\n",
-                    u.remote,
+                    u.name,
                     b.branch,
                     n,
-                    crate::commands::update::plural(n),
+                    plural(n),
                     if b.tracked { " (tracked branch)" } else { "" }
                 ));
             }

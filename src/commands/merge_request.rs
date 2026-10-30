@@ -14,10 +14,13 @@ use crate::commands::finish;
 use crate::commands::update::{plural, require_worktree};
 use crate::config::Publish;
 use crate::git::{Git, abbrev, branch_ref, tracking_ref};
+use crate::port::Verb;
 use crate::repo::Repo;
 use crate::state::{
-    Finishing, MERGE_REQUEST_BRANCH_PREFIX, MergeKind, MergeRequest, PlannedMove, UpdateState,
+    CopyStep, Finishing, MERGE_REQUEST_BRANCH_PREFIX, MergeKind, MergeRequest, PlannedMove,
+    UpdateState, Work,
 };
+use crate::sync_record::{TAKEN_TRAILER, TARGET_TRAILER};
 
 /// What git prints when the receiving end does not accept push options.
 /// Git runs with `LC_ALL=C`, so the message is stable.
@@ -549,7 +552,6 @@ pub fn complete(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Result
             if let Some(m) = integration_move(&repo.git, &integration, &mr.remote, &tip)? {
                 moves.push(m);
             }
-            moves.extend(finish::plan_mirrors(repo, &state)?);
             finish::validate_checkouts(repo, &moves)?;
             let f = Finishing {
                 moves,
@@ -565,45 +567,10 @@ pub fn complete(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Result
     for m in &finishing.moves {
         finish::apply(repo, m)?;
     }
-    let mirrors: Vec<PlannedMove> = finishing
-        .moves
-        .iter()
-        .filter(|m| m.branch != integration)
-        .cloned()
-        .collect();
-    let names: Vec<String> = mirrors.iter().map(|m| m.branch.clone()).collect();
-
-    let mut unpublished = Vec::new();
-    if no_publish {
-        if !names.is_empty() {
-            println!(
-                "not published to '{}' (advanced locally only): {}",
-                mr.remote,
-                names.join(", ")
-            );
-        }
-        unpublished = names;
-    } else {
-        if !mirrors.is_empty() {
-            if let Err(err) = finish::push_exact(repo, &mr.remote, &mirrors)? {
-                if let Some(f) = state.finishing.as_mut() {
-                    f.push_error = Some(err.clone());
-                }
-                repo.save_state(&state)?;
-                bail!(
-                    "'{integration}' is up to date with the merged merge request and the local mirror branches are advanced, \
-                     but pushing them to '{}' was rejected: {err}\n\
-                     No mirror branch was published, and the update stays in its finishing step. Run `git intake finish` \
-                     to retry the same push, or `git intake finish --no-publish` to close the update locally and publish \
-                     the mirror branches by hand. Never force-push.",
-                    mr.remote
-                );
-            }
-            println!("pushed {} to '{}'", names.join(", "), mr.remote);
-        }
+    if !no_publish {
         delete_branch(&repo.git, &mr)?;
     }
-    finish::close(repo, state, unpublished)
+    finish::close(repo, state, Vec::new())
 }
 
 fn report_waiting(
@@ -718,10 +685,10 @@ fn integration_move(
     })
 }
 
-/// Names of the queued upstreams whose sync record for this update's target
-/// appears on `tip` outside the verified commit, as a squash or a rebase
-/// leaves it. The whole message is searched, because a squash commit joins
-/// the messages of the commits it replaces.
+/// Names of the queued upstreams whose sync record for this update's target,
+/// or the trailer of one of its copies, appears on `tip` outside the verified
+/// commit, as a squash or a rebase leaves it. The whole message is searched,
+/// because a squash commit joins the messages of the commits it replaces.
 fn carried_records(
     git: &Git,
     state: &UpdateState,
@@ -730,22 +697,30 @@ fn carried_records(
 ) -> Result<Vec<String>> {
     let mut found = Vec::new();
     for q in &state.upstreams {
-        let out = git.run(&[
-            "log",
-            "--format=%H",
-            "--fixed-strings",
-            &format!(
-                "--grep={}: {}",
-                crate::sync_record::TARGET_TRAILER,
-                q.target
-            ),
-            tip,
-            "--not",
-            verified,
-            "--",
-        ])?;
-        if !out.trim().is_empty() {
-            found.push(q.name.clone());
+        let trailers: Vec<String> = match &q.work {
+            Work::Follow(f) => vec![format!("{TARGET_TRAILER}: {}", f.target)],
+            Work::Port(p) => p
+                .commits
+                .iter()
+                .filter(|c| c.copy == CopyStep::Copied)
+                .map(|c| format!("{TAKEN_TRAILER}: {}", c.commit))
+                .collect(),
+        };
+        for trailer in trailers {
+            let out = git.run(&[
+                "log",
+                "--format=%H",
+                "--fixed-strings",
+                &format!("--grep={trailer}"),
+                tip,
+                "--not",
+                verified,
+                "--",
+            ])?;
+            if !out.trim().is_empty() {
+                found.push(q.name.clone());
+                break;
+            }
         }
     }
     Ok(found)
@@ -939,23 +914,60 @@ fn push_options(
             .upstream(&q.name)
             .map(|u| u.source())
             .unwrap_or_default();
-        let range = match (q.kind, &q.previous) {
-            (MergeKind::Import, _) => format!("full history up to {}", abbrev(&q.target)),
-            (_, Some(p)) => format!("{}..{}", abbrev(p), abbrev(&q.target)),
-            (_, None) => match git.merge_base(&state.base, &q.target)? {
-                Some(b) => format!("{}..{}", abbrev(&b), abbrev(&q.target)),
-                None => format!("up to {}", abbrev(&q.target)),
-            },
-        };
-        ranges.push(format!(
-            "{} from {source}: {range} ({} commit{})",
-            q.name,
-            q.commits,
-            plural(q.commits)
-        ));
+        match &q.work {
+            Work::Follow(f) => {
+                let range = match (f.kind, &f.previous) {
+                    (MergeKind::Import, _) => format!("full history up to {}", abbrev(&f.target)),
+                    (_, Some(p)) => format!("{}..{}", abbrev(p), abbrev(&f.target)),
+                    (_, None) => match git.merge_base(&state.base, &f.target)? {
+                        Some(b) => format!("{}..{}", abbrev(&b), abbrev(&f.target)),
+                        None => format!("up to {}", abbrev(&f.target)),
+                    },
+                };
+                ranges.push(format!(
+                    "{} from {source}: {range} ({} commit{})",
+                    q.name,
+                    f.commits,
+                    plural(f.commits)
+                ));
+            }
+            Work::Port(p) => {
+                let list = |pick: &dyn Fn(&crate::state::PlannedCommit) -> bool| {
+                    let picked: Vec<&str> = p
+                        .commits
+                        .iter()
+                        .filter(|c| pick(c))
+                        .map(|c| abbrev(&c.commit))
+                        .collect();
+                    if picked.is_empty() {
+                        "none".to_string()
+                    } else {
+                        picked.join(" ")
+                    }
+                };
+                let taken: Vec<&str> = p
+                    .takes
+                    .iter()
+                    .map(|t| &p.commits[*t])
+                    .filter(|c| c.copy == CopyStep::Copied)
+                    .map(|c| abbrev(&c.commit))
+                    .collect();
+                ranges.push(format!(
+                    "{} from {source}, ported: took {}; skipped {}; already present {}",
+                    q.name,
+                    if taken.is_empty() {
+                        "none".to_string()
+                    } else {
+                        taken.join(" ")
+                    },
+                    list(&|c| c.verb == Some(Verb::Skip)),
+                    list(&|c| c.verb == Some(Verb::Have) || c.copy == CopyStep::Empty)
+                ));
+            }
+        }
     }
     let description = format!(
-        "Upstream merges verified by git intake. {}. Verified commit: {commit}. \
+        "Upstream changes verified by git intake. {}. Verified commit: {commit}. \
          Merge {MERGE_METHOD}, so that the verified commit is what lands on {integration}.",
         ranges.join("; ")
     );

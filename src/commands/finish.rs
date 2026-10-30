@@ -1,10 +1,10 @@
 //! `finish`: fast-forward and publish a verified update.
 //!
-//! `finish` is re-entrant. It validates every ref move first, persists the
-//! planned moves in the update state, and only then moves refs. Running it
-//! again after an interruption or a rejected push completes the remaining
-//! moves (a branch already at its planned value counts as done), publishes
-//! exactly the planned commits, and cleans up. `--no-publish` closes the
+//! `finish` is re-entrant. It validates the move of the integration branch
+//! first, persists it in the update state, and only then moves it. Running it
+//! again after an interruption or a rejected push completes the move (a
+//! branch already at its planned value counts as done), publishes exactly
+//! the planned commit, and cleans up. `--no-publish` closes the
 //! update locally without pushing. In merge-request mode publication goes
 //! through [`merge_request`](super::merge_request) instead.
 
@@ -18,7 +18,8 @@ use crate::commands::update::require_worktree;
 use crate::config::PublishVia;
 use crate::git::{Git, abbrev, branch_ref};
 use crate::repo::{Repo, bullet};
-use crate::state::{self, Finishing, PlannedMove, UpdateState};
+use crate::state::{self, Finishing, PlannedMove, UpdateState, Work};
+use crate::upstreams;
 
 pub fn run(repo: &Repo, no_publish: bool) -> Result<Exit> {
     let state = repo.require_state()?;
@@ -32,7 +33,7 @@ pub fn run(repo: &Repo, no_publish: bool) -> Result<Exit> {
     finish_by_push(repo, state, no_publish)
 }
 
-/// Moves the branches locally and, in push mode, pushes them.
+/// Moves the integration branch locally and, in push mode, pushes it.
 fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Result<Exit> {
     let finishing = match &state.finishing {
         Some(f) => {
@@ -78,10 +79,10 @@ fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Resu
                 }
                 repo.save_state(&state)?;
                 bail!(
-                    "the local branches are advanced, but pushing to '{publish}' was rejected: {err}\n\
+                    "the local integration branch is advanced, but pushing to '{publish}' was rejected: {err}\n\
                      Nothing was published, and the update stays in its finishing step. Run `git intake finish` \
                      to retry the same push, or `git intake finish --no-publish` to close the update locally. \
-                     If '{publish}' holds work the local branches lack, close the update with `finish --no-publish`, \
+                     If '{publish}' holds work the local branch lacks, close the update with `finish --no-publish`, \
                      merge that work, and publish the result through a new verified update or the repository's usual review. \
                      Never force-push."
                 );
@@ -93,9 +94,9 @@ fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Resu
     close(repo, state, unpublished)
 }
 
-/// Pushes exactly the planned commits in one atomic push without force:
-/// whatever the local branches point to now is never published by this
-/// update. Returns git's error when the remote rejects the push.
+/// Pushes exactly the planned commits without force: whatever the local
+/// branches point to now is never published by this update. Returns git's
+/// error when the remote rejects the push.
 pub fn push_exact(
     repo: &Repo,
     remote: &str,
@@ -119,7 +120,8 @@ pub fn push_exact(
 }
 
 /// Completes an update: keeps it as the last update for `report` and
-/// removes the worktree, the update branch and the state.
+/// removes the worktree, the update branch, the plan, the update's upstream
+/// references and the state.
 pub fn close(repo: &Repo, mut state: UpdateState, unpublished: Vec<String>) -> Result<Exit> {
     state.finished = true;
     if let Some(f) = state.finishing.as_mut() {
@@ -128,18 +130,21 @@ pub fn close(repo: &Repo, mut state: UpdateState, unpublished: Vec<String>) -> R
     }
     state::save(&repo.paths.last_update, &state)?;
     repo.remove_update_artifacts()?;
+    repo.remove_plan()?;
+    upstreams::release(&repo.git, &state)?;
     state::remove(&repo.paths.state)?;
     println!("update finished");
     Ok(Exit::Success)
 }
 
-/// Validates the update and plans every branch move; moves nothing.
+/// Validates the update and plans the move of the integration branch;
+/// moves nothing.
 pub fn plan(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
     let git = &repo.git;
     let open: Vec<&str> = state.unmerged().iter().map(|u| u.name.as_str()).collect();
     if !open.is_empty() {
         bail!(
-            "upstreams are not merged yet: {}; run `git intake continue`",
+            "upstreams are not merged, or their plans not carried out, yet: {}; run `git intake continue`",
             open.join(", ")
         );
     }
@@ -170,14 +175,15 @@ pub fn plan(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
     let tip = git.commit(&branch_ref(&integration))?;
     if tip.as_deref() != Some(state.base.as_str()) {
         bail!(
-            "'{integration}' moved from {} to {} since the update started; the update must merge the new integration tip and be verified again: \
+            "'{integration}' moved from {} to {} since the update started; the update must take the new integration tip and be verified again: \
              run `git intake abort`, then `git intake start` (recorded resolutions are reapplied), `verify` and `finish`",
             abbrev(&state.base),
             tip.as_deref().map(abbrev).unwrap_or("nothing")
         );
     }
-    // Branches only fast-forward: the verified commit must contain the base
-    // and every merged target.
+    // The integration branch only fast-forwards: the verified commit must
+    // contain the base, every merged target, and every copy and journal
+    // commit of a port.
     if !git.is_ancestor(&state.base, &head)? {
         bail!(
             "the update branch at {} does not contain the base {}; '{integration}' can only fast-forward. \
@@ -186,62 +192,38 @@ pub fn plan(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
             abbrev(&state.base)
         );
     }
-    let missing: Vec<String> = state
-        .upstreams
-        .iter()
-        .filter(|q| !git.is_ancestor(&q.target, &head).unwrap_or(false))
-        .map(|q| format!("{} at {}", q.name, abbrev(&q.target)))
-        .collect();
+    let mut missing = Vec::new();
+    for q in &state.upstreams {
+        let commits: Vec<&String> = match &q.work {
+            Work::Follow(f) => vec![&f.target],
+            Work::Port(p) => p
+                .commits
+                .iter()
+                .filter_map(|c| c.copied.as_ref())
+                .chain(p.journal_commit.as_ref())
+                .collect(),
+        };
+        for c in commits {
+            if !git.is_ancestor(c, &head)? {
+                missing.push(format!("{} at {}", q.name, abbrev(c)));
+            }
+        }
+    }
     if !missing.is_empty() {
         bail!(
-            "the update branch at {} does not contain the targets of:\n{}\nrun `git intake abort` and start again",
+            "the update branch at {} does not contain the targets, copies or journal commits of:\n{}\n\
+             run `git intake abort` and start again",
             abbrev(&head),
             bullet(&missing)
         );
     }
 
-    let mut moves = vec![PlannedMove {
+    let moves = vec![PlannedMove {
         branch: integration.clone(),
         old: Some(state.base.clone()),
         new: head.clone(),
     }];
-    moves.extend(plan_mirrors(repo, state)?);
     validate_checkouts(repo, &moves)?;
-    Ok(moves)
-}
-
-/// Plans each merged upstream's mirror move to its target; moves nothing.
-pub fn plan_mirrors(repo: &Repo, state: &UpdateState) -> Result<Vec<PlannedMove>> {
-    let git = &repo.git;
-    let mut moves = Vec::new();
-    for q in &state.upstreams {
-        let Some(mirror) = state
-            .config
-            .upstream(&q.name)
-            .and_then(|u| u.mirror.clone())
-        else {
-            continue;
-        };
-        let old = git.commit(&branch_ref(&mirror))?;
-        if let Some(old) = &old {
-            if *old == q.target {
-                continue;
-            }
-            if !git.is_ancestor(old, &q.target)? {
-                bail!(
-                    "mirror branch '{mirror}' at {} is not contained in upstream '{}' target {}; it cannot be fast-forwarded",
-                    abbrev(old),
-                    q.name,
-                    abbrev(&q.target)
-                );
-            }
-        }
-        moves.push(PlannedMove {
-            branch: mirror,
-            old,
-            new: q.target.clone(),
-        });
-    }
     Ok(moves)
 }
 

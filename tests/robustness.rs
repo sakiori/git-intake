@@ -131,68 +131,50 @@ fn finish_never_moves_integration_backwards_or_without_targets() {
     env.git(&wt, &["reset", "-q", "--hard", &base]);
     env.commit(&wt, &[("x.txt", "x\n")], "no upstream here");
     f.tool(&["verify"]).success();
-    f.tool(&["finish"])
-        .code(2)
-        .stderr(contains("does not contain the targets of"));
+    f.tool(&["finish"]).code(2).stderr(contains(
+        "does not contain the targets, copies or journal commits of",
+    ));
     assert_eq!(env.rev(&f.down, "main"), base);
-    assert!(!env.has_rev(&f.down, "refs/heads/upstream-main"));
 }
 
 #[test]
 fn finish_validates_every_checkout_before_moving_anything() {
     let f = Fork::new();
     let env = &f.env;
-    // The mirror exists and is checked out in another worktree.
-    env.git(&f.down, &["branch", "upstream-main", "upstream/main"]);
-    let mirror_wt = env.path("mirror-wt");
-    env.git(
-        &f.down,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            &mirror_wt.to_string_lossy(),
-            "upstream-main",
-        ],
-    );
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
     let base = env.rev(&f.down, "main");
 
-    // An untracked file the mirror's fast-forward would overwrite.
-    fs::write(mirror_wt.join("n.txt"), "mine\n").unwrap();
+    // An untracked file the fast-forward of the main checkout would overwrite.
+    fs::write(f.down.join("n.txt"), "mine\n").unwrap();
     f.tool(&["finish"])
         .code(2)
-        .stderr(contains("'upstream-main' is checked out in"))
+        .stderr(contains("'main' is checked out in"))
         .stderr(contains("cannot follow the fast-forward"));
     assert_eq!(env.rev(&f.down, "main"), base, "nothing moved");
     assert_eq!(env.rev(&f.publish, "main"), base, "nothing published");
 
-    fs::remove_file(mirror_wt.join("n.txt")).unwrap();
+    fs::remove_file(f.down.join("n.txt")).unwrap();
     f.tool(&["finish"]).success();
-    assert_eq!(fs::read_to_string(mirror_wt.join("n.txt")).unwrap(), "n\n");
-    assert!(!env.has_rev(&f.down, "refs/heads/git-intake/update"));
-    assert!(!env.intake_dir(&f.down).join("state.json").exists());
+    assert_eq!(fs::read_to_string(f.down.join("n.txt")).unwrap(), "n\n");
+    env.assert_no_update(&f.down);
 }
 
 #[test]
 fn interrupted_finish_resumes_and_blocks_abort() {
     let f = Fork::new();
     let env = &f.env;
-    let target = env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
     let base = env.rev(&f.down, "main");
     let head = env.rev(&env.update_worktree(&f.down), "HEAD");
 
-    // finish planned its moves and moved the integration branch, then stopped.
+    // finish planned its move and moved the integration branch, then stopped.
     edit_state(&f.down, |s| {
         s["finishing"] = serde_json::json!({
-            "moves": [
-                {"branch": "main", "old": base, "new": head},
-                {"branch": "upstream-main", "old": null, "new": target},
-            ],
+            "moves": [{"branch": "main", "old": base, "new": head}],
             "push_error": null,
         });
     });
@@ -218,8 +200,7 @@ fn interrupted_finish_resumes_and_blocks_abort() {
         .success()
         .stdout(contains("resuming finish"))
         .stdout(contains(format!("main: at {}", &head[..12])))
-        .stdout(contains("pushed main, upstream-main to 'origin'"));
-    assert_eq!(env.rev(&f.down, "upstream-main"), target);
+        .stdout(contains("pushed main to 'origin'"));
     assert_eq!(env.rev(&f.publish, "main"), head);
     env.assert_no_update(&f.down);
 }
@@ -279,7 +260,7 @@ fn template_pair() -> (Env, common::Upstream, std::path::PathBuf) {
     env.git(&down, &["remote", "remove", "origin"]);
     let up = common::Upstream { bare, work };
     let cfg = format!(
-        "integration = \"main\"\nchecks = [\"test -f apps/a/a.txt\"]\n\n[[upstream]]\nname = \"app-a\"\nremote = \"app-a\"\nbranch = \"main\"\nurl = {:?}\npath = \"apps/a\"\n",
+        "integration = \"main\"\nchecks = [\"test -f apps/a/a.txt\"]\n\n[[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n",
         up.url()
     );
     env.commit(&down, &[(".git-intake.toml", &cfg)], "mono: configuration");
@@ -289,7 +270,6 @@ fn template_pair() -> (Env, common::Upstream, std::path::PathBuf) {
 #[test]
 fn upstream_sharing_a_template_ancestor_is_imported() {
     let (env, _up, down) = template_pair();
-    env.tool(&down, &["fetch"]).success();
     let status = env.tool_json(&down, &["status", "--json"], 0);
     assert_eq!(status["upstreams"][0]["state"], "not_imported");
     env.tool(&down, &["doctor"])
@@ -455,7 +435,7 @@ fn rerun_finish_publishes_only_the_planned_commits() {
             "main: at {}, which contains",
             &local[..12]
         )))
-        .stdout(contains("pushed main, upstream-main to 'origin'"));
+        .stdout(contains("pushed main to 'origin'"));
     assert_eq!(
         env.rev(&f.publish, "main"),
         planned,
@@ -473,7 +453,7 @@ fn rerun_finish_publishes_only_the_planned_commits() {
 fn finish_no_publish_closes_an_update_the_remote_always_rejects() {
     let f = Fork::new();
     let env = &f.env;
-    let target = env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
     let planned = env.rev(&env.update_worktree(&f.down), "HEAD");
@@ -487,27 +467,22 @@ fn finish_no_publish_closes_an_update_the_remote_always_rejects() {
     f.tool(&["finish", "--no-publish"])
         .success()
         .stdout(contains(
-            "not published to 'origin' (advanced locally only): main, upstream-main",
+            "not published to 'origin' (advanced locally only): main",
         ))
         .stdout(contains("update finished"));
     assert_eq!(env.rev(&f.down, "main"), planned);
-    assert_eq!(env.rev(&f.down, "upstream-main"), target);
     assert_eq!(
         env.rev(&f.publish, "main"),
         published,
         "the remote is unchanged"
     );
-    assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
     env.assert_no_update(&f.down);
     let report = env.tool_json(&f.down, &["report", "--json"], 0);
     assert_eq!(report["in_progress"], false);
-    assert_eq!(
-        report["unpublished"],
-        serde_json::json!(["main", "upstream-main"])
-    );
-    f.tool(&["report"]).success().stdout(contains(
-        "not published (advanced locally only): main, upstream-main",
-    ));
+    assert_eq!(report["unpublished"], serde_json::json!(["main"]));
+    f.tool(&["report"])
+        .success()
+        .stdout(contains("not published (advanced locally only): main"));
 }
 
 #[test]
@@ -536,12 +511,11 @@ fn path_imported_by_subtree_add_is_adopted() {
     let up = env.upstream("app-a", &[("a.txt", "a1\na2\n")]);
     let down = env.work("mono");
     let cfg = format!(
-        "integration = \"main\"\nchecks = [\"test -f apps/a/a.txt\"]\n\n[[upstream]]\nname = \"app-a\"\nremote = \"app-a\"\nbranch = \"main\"\nurl = {:?}\npath = \"apps/a\"\n",
+        "integration = \"main\"\nchecks = [\"test -f apps/a/a.txt\"]\n\n[[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n",
         up.url()
     );
     env.commit(&down, &[(".git-intake.toml", &cfg)], "mono: configuration");
-    env.tool(&down, &["fetch"]).success();
-    let first = env.rev(&down, "refs/remotes/app-a/main");
+    let first = fetch_branch(&env, &down, &up);
     // What `git subtree add --prefix=apps/a` does: no sync record.
     env.git(
         &down,
@@ -552,13 +526,10 @@ fn path_imported_by_subtree_add_is_adopted() {
             "ours",
             "--no-commit",
             "--allow-unrelated-histories",
-            "app-a/main",
+            &first,
         ],
     );
-    env.git(
-        &down,
-        &["read-tree", "--prefix=apps/a/", "-u", "app-a/main"],
-    );
+    env.git(&down, &["read-tree", "--prefix=apps/a/", "-u", &first]);
     env.git(&down, &["commit", "-q", "-m", "Add 'apps/a/' from app-a"]);
 
     let status = env.tool_json(&down, &["status", "--json"], 0);
@@ -568,7 +539,6 @@ fn path_imported_by_subtree_add_is_adopted() {
     assert_eq!(u["last_synced_source"], "history");
 
     let second = env.push_upstream(&up, &[("a.txt", "a1\na2-up\n")], "app-a: change");
-    env.tool(&down, &["fetch"]).success();
     let status = env.tool_json(&down, &["status", "--json"], 0);
     let u = &status["upstreams"][0];
     assert_eq!(u["state"], "behind");
@@ -675,8 +645,8 @@ fn twins() -> Twins {
     let down = env.work("mono");
     let cfg = format!(
         "integration = \"main\"\n\n\
-         [[upstream]]\nname = \"app-a\"\nremote = \"app-a\"\nbranch = \"main\"\nurl = {:?}\npath = \"apps/a\"\n\n\
-         [[upstream]]\nname = \"app-b\"\nremote = \"app-b\"\nbranch = \"main\"\nurl = {:?}\npath = \"apps/b\"\n",
+         [[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n\n\
+         [[upstream]]\nname = \"app-b\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/b\"\n",
         a.url(),
         b.url()
     );
@@ -718,7 +688,6 @@ fn ancestry_shared_only_through_a_template_is_not_an_import() {
         &[("apps/b/own.txt", "the monorepo's own code\n")],
         "mono: own apps/b",
     );
-    env.tool(&t.down, &["fetch"]).success();
 
     // Before app-a is imported.
     assert_b_unrelated(&t);
@@ -739,12 +708,11 @@ fn ancestry_shared_only_through_a_template_is_not_an_import() {
 fn subtree_add_import_sharing_a_template_is_adopted() {
     let t = twins();
     let env = &t.env;
-    env.tool(&t.down, &["fetch"]).success();
     env.tool(&t.down, &["start", "app-a"]).success();
     env.tool(&t.down, &["verify"]).success();
     env.tool(&t.down, &["finish"]).success();
     // app-b imported by other means, as `git subtree add` does.
-    let b1 = env.rev(&t.down, "refs/remotes/app-b/main");
+    let b1 = fetch_branch(env, &t.down, &t.b);
     env.git(
         &t.down,
         &[
@@ -754,13 +722,10 @@ fn subtree_add_import_sharing_a_template_is_adopted() {
             "ours",
             "--no-commit",
             "--allow-unrelated-histories",
-            "app-b/main",
+            &b1,
         ],
     );
-    env.git(
-        &t.down,
-        &["read-tree", "--prefix=apps/b/", "-u", "app-b/main"],
-    );
+    env.git(&t.down, &["read-tree", "--prefix=apps/b/", "-u", &b1]);
     env.git(&t.down, &["commit", "-q", "-m", "Add 'apps/b/' from app-b"]);
 
     let status = env.tool_json(&t.down, &["status", "--json"], 0);
@@ -770,7 +735,6 @@ fn subtree_add_import_sharing_a_template_is_adopted() {
     assert_eq!(b["last_synced_source"], "history");
 
     let b2 = env.push_upstream(&t.b, &[("app-b.txt", "own\nmore\n")], "app-b: more");
-    env.tool(&t.down, &["fetch"]).success();
     let status = env.tool_json(&t.down, &["status", "--json"], 0);
     assert_eq!(status["upstreams"][1]["state"], "behind");
     assert_eq!(status["upstreams"][1]["last_synced"], b1.as_str());
@@ -900,6 +864,13 @@ fn recovered_conflict_keeps_recorded_resolution_labels() {
 
 /// Imports an upstream at `prefix` the way `git subtree add` does: an `ours`
 /// merge plus `read-tree`, with no sync record.
+/// Fetches an upstream's `main` without keeping any reference to it, as an
+/// import by hand would; returns the fetched commit.
+fn fetch_branch(env: &Env, repo: &Path, up: &common::Upstream) -> String {
+    env.git(repo, &["fetch", "-q", &up.url(), "main"]);
+    env.rev(repo, "FETCH_HEAD")
+}
+
 fn subtree_add(env: &Env, repo: &Path, prefix: &str, rev: &str) {
     env.git(
         repo,
@@ -947,8 +918,6 @@ fn unrelated_path_is_refused_whichever_upstreams_are_fetched() {
             &clone.to_string_lossy(),
         ],
     );
-    env.tool(&clone, &["fetch", "app-b"]).success();
-    assert!(!env.has_rev(&clone, "refs/remotes/app-a/main"));
     let status = env.tool_json(&clone, &["status", "--json"], 0);
     let b = &status["upstreams"][1];
     assert_eq!(b["state"], "not_imported", "{b}");
@@ -965,9 +934,8 @@ fn unrelated_path_is_refused_whichever_upstreams_are_fetched() {
 fn import_without_record_survives_another_upstream_merging_it() {
     let t = twins();
     let env = &t.env;
-    env.tool(&t.down, &["fetch"]).success();
-    let a1 = env.rev(&t.down, "refs/remotes/app-a/main");
-    subtree_add(env, &t.down, "apps/a", "app-a/main");
+    let a1 = fetch_branch(env, &t.down, &t.a);
+    subtree_add(env, &t.down, "apps/a", &a1);
     env.tool(&t.down, &["start", "app-b"]).success();
     env.tool(&t.down, &["verify"]).success();
     env.tool(&t.down, &["finish"]).success();
@@ -976,7 +944,6 @@ fn import_without_record_survives_another_upstream_merging_it() {
     env.git(&t.b.work, &["fetch", "-q", &t.a.url(), "main"]);
     env.git(&t.b.work, &["merge", "-q", "--no-edit", "FETCH_HEAD"]);
     env.git(&t.b.work, &["push", "-q", "origin", "HEAD:main"]);
-    env.tool(&t.down, &["fetch"]).success();
     env.tool(&t.down, &["start", "app-b"]).success();
     env.tool(&t.down, &["verify"]).success();
     env.tool(&t.down, &["finish"]).success();
@@ -988,7 +955,6 @@ fn import_without_record_survives_another_upstream_merging_it() {
     assert_eq!(a["last_synced_source"], "history");
 
     let a2 = env.push_upstream(&t.a, &[("app-a.txt", "own\nmore\n")], "app-a: more");
-    env.tool(&t.down, &["fetch"]).success();
     let status = env.tool_json(&t.down, &["status", "--json"], 0);
     let a = &status["upstreams"][0];
     assert_eq!(a["state"], "behind", "{a}");
@@ -1013,21 +979,14 @@ fn import_without_record_survives_another_upstream_merging_it() {
 fn subtree_pull_merge_without_record_is_the_newest_sync() {
     let t = twins();
     let env = &t.env;
-    env.tool(&t.down, &["fetch"]).success();
-    subtree_add(env, &t.down, "apps/a", "app-a/main");
+    let a1 = fetch_branch(env, &t.down, &t.a);
+    subtree_add(env, &t.down, "apps/a", &a1);
     // A later `git subtree pull`-style merge, again without a record.
     let a2 = env.push_upstream(&t.a, &[("app-a.txt", "own\n2\n")], "app-a: 2");
-    env.tool(&t.down, &["fetch"]).success();
+    fetch_branch(env, &t.down, &t.a);
     env.git(
         &t.down,
-        &[
-            "merge",
-            "-q",
-            "--no-edit",
-            "-X",
-            "subtree=apps/a",
-            "app-a/main",
-        ],
+        &["merge", "-q", "--no-edit", "-X", "subtree=apps/a", &a2],
     );
     assert_eq!(
         fs::read_to_string(t.down.join("apps/a/app-a.txt")).unwrap(),
@@ -1041,7 +1000,6 @@ fn subtree_pull_merge_without_record_is_the_newest_sync() {
     assert_eq!(a["last_synced_source"], "history");
 
     env.push_upstream(&t.a, &[("app-a.txt", "own\n2\n3\n")], "app-a: 3");
-    env.tool(&t.down, &["fetch"]).success();
     let status = env.tool_json(&t.down, &["status", "--json"], 0);
     assert_eq!(status["upstreams"][0]["state"], "behind");
     assert_eq!(status["upstreams"][0]["commits_behind"], 1);
@@ -1090,8 +1048,8 @@ fn synced_upstream_with_removed_path_is_reported_as_path_removed() {
 
     // Imported by other means, synced from history.
     let t = twins();
-    t.env.tool(&t.down, &["fetch"]).success();
-    subtree_add(&t.env, &t.down, "apps/a", "app-a/main");
+    let a1 = fetch_branch(&t.env, &t.down, &t.a);
+    subtree_add(&t.env, &t.down, "apps/a", &a1);
     t.env.git(&t.down, &["rm", "-q", "-r", "apps/a"]);
     t.env
         .git(&t.down, &["commit", "-q", "-m", "mono: remove apps/a"]);
