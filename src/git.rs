@@ -32,13 +32,60 @@ impl fmt::Display for GitError {
             Some(code) => format!("exit status {code}"),
             None => "terminated by a signal".to_string(),
         };
-        write!(f, "`git {}` failed ({code})", self.args.join(" "))?;
+        // The arguments and git's message may name a URL with credentials.
+        write!(
+            f,
+            "`git {}` failed ({code})",
+            redacted(&self.args.join(" "))
+        )?;
         let stderr = self.stderr.trim();
         if !stderr.is_empty() {
-            write!(f, ": {stderr}")?;
+            write!(f, ": {}", redacted(stderr))?;
         }
         Ok(())
     }
+}
+
+/// `text` with the credentials removed from every URL in it: a password
+/// always, and for `http` and `https` a user without one, which is where a
+/// token is usually written (`https://<token>@host/path`). Another scheme's
+/// user, as `git` in `ssh://git@host/path`, stays, as it does in the
+/// scp-like form `git@host:path`. A credential written into a remote's or
+/// an upstream's URL thus never reaches a message.
+pub fn redacted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        let scheme: String = head[..at]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || "+.-".contains(*c))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let end = tail
+            .find(|c: char| "/?#".contains(c) || c.is_whitespace() || "'\"`<>()[]".contains(c))
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        match authority.rsplit_once('@') {
+            None => out.push_str(authority),
+            Some((user, host)) => {
+                let user = user.split_once(':').map_or(user, |(name, _)| name);
+                if !(scheme == "http" || scheme == "https") && !user.is_empty() {
+                    out.push_str(user);
+                    out.push('@');
+                }
+                out.push_str(host);
+            }
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 impl std::error::Error for GitError {}
@@ -363,6 +410,33 @@ mod tests {
             parse_porcelain_z(" M caf\u{e9}.txt\0R  new name\0old name\0M  q\"uote.txt\0"),
             vec!["caf\u{e9}.txt", "new name", "q\"uote.txt"]
         );
+    }
+
+    #[test]
+    fn credentials_in_urls_are_removed() {
+        assert_eq!(
+            redacted("push to https://user:s3cret@gitlab.example.com/g/app.git failed"),
+            "push to https://gitlab.example.com/g/app.git failed"
+        );
+        assert_eq!(
+            redacted("https://ghp_token@github.com/team/app.git"),
+            "https://github.com/team/app.git"
+        );
+        // Another scheme keeps its user, and loses only a password.
+        assert_eq!(
+            redacted("'ssh://git@host:22/x' and ssh://deploy:s3cret@host/y"),
+            "'ssh://git@host:22/x' and ssh://deploy@host/y"
+        );
+        // The authority ends at a path, a query or a fragment.
+        assert_eq!(
+            redacted("https://host?u=a@b and https://host#a@b"),
+            "https://host?u=a@b and https://host#a@b"
+        );
+        assert_eq!(
+            redacted("git@example.com:team/app.git"),
+            "git@example.com:team/app.git"
+        );
+        assert_eq!(redacted("no url here"), "no url here");
     }
 
     #[test]

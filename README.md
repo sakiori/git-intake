@@ -1,6 +1,6 @@
 # git-intake
 
-`git intake` keeps a downstream repository current with one or more upstreams. It takes upstream changes by merge commits or by copying chosen upstream commits, never rewrites history and never force-pushes. The work happens in a separate worktree. A conflict is resolved once, and the repository's own checks run on exactly the tree that gets published. The integration branch moves only by fast-forward, after verification.
+`git intake` keeps a downstream repository current with one or more upstreams. It takes upstream changes by merge commits or by copying chosen upstream commits, never rewrites history and never force-pushes. The work happens in a separate worktree. A conflict is resolved once, and the repository's own checks run on exactly the tree that gets published: `verify` runs them before an update is pushed, and a merge request's pipeline runs them on an update published for review, on a forge whose settings merge only a tree that pipeline tested. The integration branch moves only by fast-forward. `git intake sync` carries the whole cycle out unattended, as a scheduled CI job.
 
 It covers three cases:
 
@@ -14,7 +14,7 @@ The tool runs the installed `git` for every repository operation. Each repositor
 
 Requires Git 2.43 or later (`git merge-tree -X` is used for conflict prediction) and a POSIX `sh`. The tool is a single binary named `git-intake`; with it on the `PATH`, git runs it as `git intake`.
 
-Releases provide prebuilt binaries for the targets `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` and `aarch64-apple-darwin`. The musl binaries are statically linked and run on any Linux distribution and in minimal CI images.
+Releases provide prebuilt binaries for the targets `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. They are statically linked and run on any Linux distribution and in minimal CI images. On macOS, install from source (below): the tool verifies the forge's TLS certificate against the keychain through the system's Security framework, so its macOS binary is built on macOS.
 
 ### With mise
 
@@ -99,6 +99,8 @@ checks = ["pnpm lint", "pnpm test"]   # run in order by verify
 [publish]                             # optional: where and how finish publishes
 remote = "origin"                     # the publish remote, a git remote of the repository
 via = "push"                          # optional: "push" (default) or "merge-request"
+# forge = "gitlab"                    # optional, merge-request mode: "gitlab" or "github", when the URL does not tell
+# api = "https://gitlab.example.com/api/v4"  # optional, merge-request mode: the forge's REST API on the remote's host
 
 [[upstream]]
 name = "app-a"                        # unique; used on the command line, in sync records, trailers and check variables
@@ -119,14 +121,14 @@ Validation rules. The tool refuses to run when any of them is broken, and it nam
 - An upstream at the root must be the only upstream.
 - An upstream in `port` mode is taken at the repository root and may not have a path.
 - `tags` belongs to an upstream in `follow` mode. It is a glob over tag names (`*`, `?` and `[...]`, matched against the whole name), written without `refs/tags/`, such as `v*` or `release-[0-9]*`.
-- `publish` is a table: `remote` is required, and `via` is `push` or `merge-request`. Write it as the `[publish]` section shown above, after the top-level keys (a section header ends the top level, so keys written below it belong to the section), or inline as `publish = { remote = "origin", via = "merge-request" }`. The string form `publish = "origin"` is rejected with the form to write instead.
+- `publish` is a table: `remote` is required, `via` is `push` or `merge-request`, `forge` is `gitlab` or `github`, and `api` is an `https` URL with a host and without credentials, query or fragment (see *The forge*). Write it as the `[publish]` section shown above, after the top-level keys (a section header ends the top level, so keys written below it belong to the section), or inline as `publish = { remote = "origin", via = "merge-request" }`. The string form `publish = "origin"` is rejected with the form to write instead.
 - The publish remote may not be fetched from or pushed to (its `url` or any `pushurl`) a URL that names an upstream's repository, because the tool never pushes to an upstream. Two URLs name the same repository when a local path or `file://` URL resolves, against the main worktree and the way git finds a repository (`<path>/.git`, `<path>`, then `<path>.git`), to the same directory, so `../up`, `../up.git/` and the absolute path of that directory match; or when any other URL matches once the scp-like form `user@host:path` is read as `ssh://user@host/path`, scheme and host are put in lower case, a default port such as `:22` or `:443` is dropped, and a leading `/` and a trailing `/` and `.git` of the path are dropped. `doctor` compares the URLs of every remote with the upstreams' URLs the same way.
 
 ### Upstreams by URL
 
 An upstream is fetched with `git fetch --no-tags <url> +refs/heads/<branch>:<reference>`, in the main worktree so that a relative URL means what it means there, into a reference under `refs/git-intake/`. That lives outside `refs/heads` and `refs/remotes`, so no branch listing, checkout, `git push --all` or hosting tool sees it, and no remote exists for a tool to take as the place to open pull requests in.
 
-The references exist only while something needs them. Every command that fetches, `status`, `log`, `branches`, `doctor`, `contribute` and `start`, fetches into a namespace of its own, `refs/git-intake/read/<token>/`, and removes it before it exits, whatever its outcome; every run contacts the upstreams. `branches` fetches every branch of an upstream there. An update holds `refs/git-intake/upstreams/<name>` for each queued upstream, at the tip `start` fetched, so that its targets and planned commits stay in the repository even if the upstream moves or becomes unreachable; `continue`, `verify` and `finish` never fetch an upstream. Only `start` writes those references and only `finish` or `abort` removes them: a command that reads an upstream during the update fetches into its own namespace and never touches them. `start` saves the update before it writes them; if it is killed in between, `status`, `continue`, `verify` and `finish` restore the missing references from the update state, at the tips `start` fetched, and say so. `doctor` reports an update reference that is missing or elsewhere, and leaves alone, with a warning to keep it, a reference that still holds the commit of a missing one. It reports any other reference under `refs/git-intake/` that no update accounts for, such as the namespace of a command that was killed; nothing uses it, and `git update-ref -d <reference>` removes it.
+The references exist only while something needs them. Every command that fetches, `status`, `log`, `branches`, `doctor`, `contribute`, `start` and `sync`, fetches into a namespace of its own, `refs/git-intake/read/<token>/`, and removes it before it exits, whatever its outcome; every run contacts the upstreams. `branches` fetches every branch of an upstream there. An update holds `refs/git-intake/upstreams/<name>` for each queued upstream, at the tip `start` fetched, so that its targets and planned commits stay in the repository even if the upstream moves or becomes unreachable; `continue`, `verify` and `finish` never fetch an upstream. Only `start` and `sync` write those references, and only `finish`, `abort` and `sync` remove them; an update `sync` carries on from a merge request holds each follow upstream's reference at its target: a command that reads an upstream during the update fetches into its own namespace and never touches them. `start` saves the update before it writes them; if it is killed in between, `status`, `continue`, `verify` and `finish` restore the missing references from the update state, at the tips `start` fetched, and say so. `doctor` reports an update reference that is missing or elsewhere, and leaves alone, with a warning to keep it, a reference that still holds the commit of a missing one. It reports any other reference under `refs/git-intake/` that no update accounts for, such as the namespace of a command that was killed; nothing uses it, and `git update-ref -d <reference>` removes it.
 
 ### Modes
 
@@ -147,8 +149,10 @@ git intake continue     # carry out the plan
 git intake continue     # conclude the merge or copy, take in the rest
 git intake verify       # run install and checks on the result
 git intake finish       # catch up if the integration branch moved, fast-forward, publish, clean up
-# with via = "merge-request": finish opens a merge request and the update waits;
-# once the merge request is merged, run finish again to complete the update
+# with via = "merge-request": verify is optional; finish pushes the update, opens its merge
+# request and ends the local update; the merge request carries it from then on
+
+git intake sync         # all of it, unattended, as a scheduled CI job runs it
 ```
 
 Every command works the same from any directory of the repository: the main checkout, a linked worktree, or the update worktree itself. This holds for a submodule and for a repository whose git directory lies outside its checkout as well. Git operations on the repository as a whole, such as fetching, pushing and moving branches, run in the main worktree, so a relative URL means what it means there. A revision named to `start` or `contribute` is resolved in the worktree the command runs in. When `finish` or `abort` removes the update worktree it was run from, the command still completes and notes that the current directory is gone; change to another directory before the next command.
@@ -162,6 +166,8 @@ Git cannot locate the main worktree of a repository whose git directory lies out
 - the repository is bare and the path of its update worktree contains `/.git`, as when the bare repository is itself a directory named `.git`; run the tool in a clone with a checkout instead;
 - the main checkout or a checkout of the integration branch has uncommitted changes to tracked files;
 - the publish remote cannot be fetched, or the integration branch and its counterpart on the publish remote each hold commits the other lacks; `start` names how many on each side, and the local commits must be published or reconciled first;
+- the repository is a shallow clone (every command but `abort` and `migrate` refuses one, naming `git fetch --unshallow`);
+- in merge-request mode, the forge cannot be reached as `finish` needs it, for example without a token; the local integration branch holds commits the publish remote's lacks, which would ride along in the merge request; or the update's merge request into the integration branch is open, which `sync` carries on and `abort --merge-request` withdraws;
 - a selected upstream is unknown, named more than once, cannot be fetched, or was rewritten;
 - a revision named for an upstream is refused, as described under *Choosing a target* below, or the upstream's URL cannot be asked for its tags;
 - an upstream with `tags`, named without a revision, has no release tag on its fetched branch (see *Release tags*);
@@ -197,7 +203,7 @@ On a conflict the tool stops with exit status 1. It names the upstream, lists th
 
 When it passes, `verify` records the commit it verified.
 
-`finish` checks the following before moving any ref:
+In push mode, and with `--no-publish`, `finish` checks the following before moving any ref (in merge-request mode see *Publication through a merge request*):
 
 - every upstream is merged or its plan carried out;
 - the worktree head is the verified commit, so any commit added after `verify` needs a new `verify`, or a catch-up merge the tool made and has not verified yet, which `finish` verifies itself;
@@ -217,7 +223,7 @@ If the push is rejected, nothing is published, the local integration branch stay
 
 ### Catching up with a moved integration branch
 
-Other work often lands on the integration branch while an update waits for a conflict resolution, a long verification or a review. The update branch belongs to the tool, so instead of starting over, `finish` takes the new integration tip in with a **catch-up merge**: a merge commit whose first parent is the new integration tip and whose second parent is the update branch head, marked with a trailer:
+Other work often lands on the integration branch while an update waits for a conflict resolution, a long verification or a review. The update branch belongs to the tool, so instead of starting over, `finish`, or `sync` for an open merge request, takes the new integration tip in with a **catch-up merge**: a merge commit whose first parent is the new integration tip and whose second parent is the update branch head, marked with a trailer:
 
 ```
 catch-up: merge main at 1a2b3c4 into the update
@@ -229,13 +235,13 @@ Every resolution and fix already on the update branch stays exactly as it is, in
 
 The tool records the tip it catches up with in the update state, checks it out detached in the update worktree, merges the update head into it, and then moves the update branch from the head it recorded to the merge with `git update-ref` against that head, refusing and naming both commits when the branch moved meanwhile; the worktree is then on the update branch again. After an interruption, `status`, `continue` and `finish` recognise a catch-up merge in progress or already committed from the recorded tip, and never make a committed one again. A catch-up merge committed by hand while the worktree is detached, with or without commits made on top of it, is kept: the update branch moves to the worktree's commit and the worktree is on the branch again, and commits on top of the catch-up merge need `verify`. A catch-up given up by hand, with the merge aborted and the update branch checked out again in the update worktree, is no longer recorded once `continue` or `finish` sees it: a commit made there needs `verify`, and `finish` catches up afresh when the integration branch is still ahead.
 
-A conflicted catch-up stops `finish` with exit status 1 in the step `catch_up_conflict`, naming the conflicted files and which side is which: the integration branch is *ours*, the update *theirs*. Resolve the files, stage them, and run `continue`, which commits the catch-up merge with its trailer and names `finish`. The next `finish` verifies the catch-up merge as `verify` does and publishes it; failing checks stop it as `verify` does, with the update unverified at the catch-up merge in the step `catch_up`, and a commit added on top of the catch-up merge needs `verify` as usual. After a catch-up, verification runs the install command and the checks of the configuration at the catch-up merge, so a check added on the integration branch meanwhile verifies the result. `finish` makes at most one catch-up merge per run, and concluding a catch-up merge left by an earlier run counts as that one: when the integration branch moves again meanwhile, it moves no branch to the update and says to run it again, which catches up once more. In merge-request mode, a remote tip that the base already contains is not a move, as when the publish remote lacks commits the local integration branch holds: the merge request carries them.
+A conflicted catch-up stops `finish` or `sync` with exit status 1 in the step `catch_up_conflict`, naming the conflicted files and which side is which: the integration branch is *ours*, the update *theirs*. Resolve the files, stage them, and run `continue`, which commits the catch-up merge with its trailer and names `finish`. In merge-request mode the next `finish` publishes the catch-up merge without running the checks, which the merge request's pipeline runs. In push mode it verifies the catch-up merge as `verify` does and publishes it; failing checks stop it as `verify` does, with the update unverified at the catch-up merge in the step `catch_up`, and a commit added on top of the catch-up merge needs `verify` as usual. After a catch-up, verification runs the install command and the checks of the configuration at the catch-up merge, so a check added on the integration branch meanwhile verifies the result. `finish` makes at most one catch-up merge per run, and concluding a catch-up merge left by an earlier run counts as that one: when the integration branch moves again meanwhile, it moves no branch to the update and says to run it again, which catches up once more. In merge-request mode, a remote tip that the base already contains is not a move, as when the publish remote lacks commits the local integration branch holds: the merge request carries them.
 
-A catch-up takes the integration branch's own work in. In push mode the integration tip is the local branch, whose tip at `start` is the base, so a local branch rewound below the base counts as rewritten and is refused. Some commits would change what the update means rather than add to it, and a catch-up refuses them, merges nothing and names `abort`, after which `start` plans the update from the new history; once `finish` has moved the integration branch, it names `finish --no-publish` instead:
+A catch-up takes the integration branch's own work in. In push mode the integration tip is the local branch, whose tip at `start` is the base, so a local branch rewound below the base counts as rewritten and is refused. Some commits would change what the update means rather than add to it, and a catch-up refuses them, merges nothing and names `abort`, after which `start` plans the update from the new history; once `finish` has moved the integration branch, it names `finish --no-publish` instead, and for `sync` it names the merge request, `abort --merge-request` with the warning that withdrawing declines its targets, and `start` and `finish` to publish them again:
 
 - a publish remote's tip that moved forward from the tip the update last took but lacks commits of the local integration branch that the base holds and that were never published, as in merge-request mode with unpublished local commits: the refusal names those commits; publish them or reconcile the integration branch with the remote, then `start` again;
 - any other tip that does not contain the base: the integration branch was rewritten;
-- a commit that carries a sync record or a copy of an upstream the update takes in, as when another clone took that upstream in;
+- a commit that carries a sync record or a copy of an upstream the update takes in, as when another clone took that upstream in; a sync record counts only on a merge whose second parent is its target;
 - a change of the journal of a port upstream the update takes;
 - a change of `.git-intake.toml` other than its install command and checks, such as an upstream or the publication setting, which the update fixed at `start`.
 
@@ -252,7 +258,7 @@ A check that compares the tree with a baseline, such as a ratchet that may not g
 | `GIT_INTAKE_INTEGRATION` | The name of the integration branch. |
 | `GIT_INTAKE_UPSTREAMS` | The names of the upstreams the update takes, separated by spaces, in the order they were merged or carried out. An upstream that was current at `start` is not among them. |
 | `GIT_INTAKE_UPSTREAM_<NAME>_MODE` | `follow` or `port`. |
-| `GIT_INTAKE_UPSTREAM_<NAME>_TARGET` | Follow mode: the target the update merges. Port mode: the newest commit of the plan; after the update, every upstream commit up to it is taken, decided, or left pending by the plan. A port target is not merged, so it is not an ancestor of `GIT_INTAKE_HEAD`. |
+| `GIT_INTAKE_UPSTREAM_<NAME>_TARGET` | Follow mode: the target the update merges. Port mode: the newest upstream commit the update takes or decides on, which is what it moves the upstream to in the journal; commits the plan leaves `later` stay pending, and an update that takes and decides none has no target. A port target is not merged, so it is not an ancestor of `GIT_INTAKE_HEAD`. |
 | `GIT_INTAKE_UPSTREAM_<NAME>_PREVIOUS` | Follow mode only: the last synced commit before the update; absent on a first import or when the history names none. A port upstream has no such commit; its journal names the commit the port started from. |
 
 `<NAME>` is the upstream's name in upper case, with every character other than a letter or a digit replaced by `_`: `app-a` gives `GIT_INTAKE_UPSTREAM_APP_A_TARGET`. Two upstream names that give the same `<NAME>`, such as `app-a` and `app.a`, are refused when the configuration is read. Every commit named stays in the repository while `verify` runs: the base and the head are on the update branch, and an upstream's commits are in the history of `refs/git-intake/upstreams/<name>`, which the update holds. Variables with the `GIT_INTAKE_` prefix that `git intake` itself inherits are not passed on, so a check sees only those of the update it verifies; git commands the tool runs itself never see them.
@@ -268,7 +274,7 @@ checks = [
 ]
 ```
 
-A script that the repository's own CI also runs can fall back to its usual baseline outside an update: `"${GIT_INTAKE_UPSTREAM_UPSTREAM_TARGET:-$(git merge-base origin/main HEAD)}"`.
+A script that the repository's own CI also runs can fall back to its usual baseline outside an update: `"${GIT_INTAKE_UPSTREAM_UPSTREAM_TARGET:-$(git merge-base origin/main HEAD)}"`. A merge request pipeline gets the same variables from `git intake env` (see *The update variables outside verify*).
 
 ### Choosing a target
 
@@ -392,52 +398,165 @@ git intake contribute example-app=v1.4 fix-watcher   # a branch at the upstream'
 
 ### Publication through a merge request
 
-With `via = "merge-request"`, nobody needs to push to the integration branch, so it can stay protected. `finish` applies the same checks as above, with the publish remote's integration branch as the integration tip: it fetches it, and when it moved past the base, catches up with it and verifies the result first. It then publishes the verified commit itself, without moving any local branch:
+With `via = "merge-request"`, nobody needs to push to the integration branch, so it can stay protected. Once published, the merge request is the update: its pipeline verifies the update, the forge merges it, and `git intake sync` keeps it current, from any clone or from a CI job. The tool reaches the forge, GitLab or GitHub, through its REST API, and requires that the forge merges only a tree its required pipeline tested. `finish` requires no local verification in this mode; `verify` still runs the checks locally for whoever wants them before the review.
 
-1. It pushes the verified commit, without force, to the branch `git-intake/update` on the publish remote, the name of the local update branch. Before the first push of an update, that branch must be absent where each push URL points, or at a commit the base contains, as one left by a merge request merged with its branch kept, or at a commit the update head contains, as one left by this update's own interrupted first push; this is checked before any catch-up or verification; otherwise `finish` pushes nothing, refuses, and names the branch and the push URL, since the branch may carry a merge request the tool knows nothing of. Two clones that update the same repository at the same time share the branch: the first push wins, and the other is rejected as not a fast-forward. When the remote's integration branch already contains the verified commit, `finish` completes the update as after a merge, and deletes a `git-intake/update` that an interrupted first push left at that commit.
-2. With the same push it asks the remote to open a merge request from that branch into the integration branch, through git push options (`merge_request.create`, `merge_request.target`, `merge_request.title`, `merge_request.description`, `merge_request.remove_source_branch`, `merge_request.squash=false`), which GitLab applies while it receives the push. The merge request is opened with squashing off whatever the project's default; GitLab before 17.2 ignores that option and applies its default. The title names the updated upstreams. The description lists each follow upstream's merged range with the upstream tag of its target, each port upstream's taken commits, skipped commits and commits already present, and the verified commit. The tool shows what the remote replies, such as the address of the new merge request, and records the merge request's number from the address GitLab gives under `View merge request for <branch>:` for the pushed branch (`.../-/merge_requests/<number>`); `status` shows it as `!<number>`.
-3. It removes the update worktree, keeps the update in the step `waiting_for_merge_request`, and exits with status 0. `status` shows the merge request branch and the next command; `start` refuses while the update waits, and `continue` and `verify` work only on a catch-up the update makes meanwhile.
+`finish` then does the following, moving no local branch:
 
-A remote applies push options only to a push that updates the branch. When the branch is already on the remote with the verified commit, as after an interrupted `finish`, the tool finds it there (looking where pushes go, which a remote's `pushurl` may set apart from where it fetches), pushes nothing and asks for no merge request; it then says so and names the merge request to open unless one is open. A remote that does not support push options refuses them before anything is written (`the receiving end does not support push options`); the tool then pushes the branch without options and names the merge request to open: from `git-intake/update` into the integration branch, with squashing off.
+1. It reaches the forge of the publish remote (see *The forge* below), and refuses, pushing nothing, when it cannot: the forge is not recognised, no token is set, or the forge rejects the token or a request, with the forge's status and message.
+2. It fetches the publish remote's integration branch. When that already contains the update head, the update landed by other means: `finish` pushes nothing, opens no merge request, removes the update and says so. When it moved past the base, `finish` catches up with it (see *Catching up with a moved integration branch*), without running the checks.
+3. It reads the forge's merge settings and refuses, pushing nothing, unless they guarantee that only a tree the required pipeline tested is merged (see *Merge settings* below).
+4. It pushes the update head, without force, to the branch `git-intake/update` on the publish remote: on each push URL where the branch is not at the update head already. The fetch URL decides the forge; further push URLs receive the branch as mirrors.
+5. Through the API it opens the merge request from that branch into the integration branch, on GitLab with squashing off and the branch removed on merge, or rewrites the title and description of the update's open merge request. Both forges refuse a second merge request from the same branch; when another run opened one meanwhile, `finish` rewrites that one.
+6. It removes the update worktree, the update branch, the plan, the update's references and the state, and names the merge request with its address. The merge request carries the update from then on.
 
-An update that waits for a merge request opened by a release of state format 4 keeps its branch `git-intake/update-<commit>`, named after the first twelve hex digits of its verified commit; `finish` and `abort` act on that branch, and a catch-up pushes to it.
+A `finish` interrupted before the merge request exists keeps the update; run again, it pushes only where the branch is missing and opens the merge request. Messages speak of a merge request on GitLab and of a pull request on GitHub.
 
-Merge the merge request **with a merge commit or by fast-forward**, and leave its branch as it is. What lands must be one of the update's verified commits pushed to the branch itself, or a merge of it whose tree is that commit's tree. A squash or a rebase replaces the verified commit with commits that were never verified, and a rebase also rewrites the upstream merges and copies. A commit added to the merge request branch, or a merge commit made after other work landed on the integration branch, gives a tree that was never verified. In GitLab, set the project's merge method to *Merge commit with semi-linear history* or *Fast-forward merge*, which merge only a branch that contains the current target, and leave squashing off for these merge requests. With the plain *Merge commit* method, merge only while the integration branch is still at the update's base; when it moved, run `finish` first, which catches the merge request up. Where the project's or the target branch rule's squash setting is *Require*, GitLab squashes every merge request, whatever the merge request asks for, so such a project cannot take updates through merge requests: any other squash setting works, or publish by push. The tool cannot read that setting through git; it refuses the squash once it has landed, and says why.
+`finish` refuses, pushing nothing and keeping the update, when a merge request of the update into another branch is open, or when the update's merge request is open with a head this update does not contain, as when another clone published another update. `git intake abort` followed by `git intake sync` then carries that merge request on; `git intake abort --merge-request` withdraws it, which also removes this update and declines its targets until `start` and `finish` publish them again. When `git-intake/update` is on the remote without an open merge request, `finish` pushes over a branch the update head contains, deletes one that holds nothing but catch-up merges beyond the integration tip or beyond the head of a closed or merged merge request of the update, and refuses any other, naming the branch, the push URL and `abort --merge-request`, since it may be someone's work. A deletion is pushed with a lease on the commit read on each push URL, so a commit pushed meanwhile is never lost.
 
-Then run `finish` again. It looks up the merge request's head and branch on the publish remote, fetches the remote's integration branch, finds on its first-parent line the commit that brought a pushed commit in, and acts on the first of the outcomes below that holds. The update keeps every commit it pushed to the branch: the verified commit of the first push and each catch-up merge, so a merge request merged before the integration branch moved is recognised whichever of them it carried.
+`finish --no-publish` keeps its meaning: it requires a verified update, makes only the local move, and closes the update without pushing.
 
-The merge request's head decides what was merged. GitLab keeps it as `refs/merge-requests/<number>/head`, which follows every push to the merge request branch and stays after the branch is removed. A merge request whose head is not the verified commit did not land the verified tree, whichever merge method was used: a commit added to the branch and merged by fast-forward leaves the verified commit on the integration branch, but with an unverified commit on top. The merge request branch counts as well, as listed now or, once it is gone, as the tool last saw it (when it pushed the branch, or at a later `finish`): if the integration branch took it in at another commit than the verified one, the update is refused even when the merge request's head matches. Without a number, or on a remote that keeps no such reference, the branch is all the tool can judge by. That fallback cannot tell a commit added to the branch after it was last seen and merged by fast-forward from work that landed on the integration branch afterwards: when it completes such a fast-forward, `finish` lists the commits above the verified commit that it could not attribute, so that they can be checked.
+#### The forge
 
-- **The verified tree landed.** The integration branch received one of the pushed commits, by fast-forward or through a merge whose tree is that commit's tree and whose parents it contains, and the merge request's head is that commit. `finish` fast-forwards the local integration branch to the remote one, with the same care for its checkouts as in push mode, deletes the merge request branch if it still exists, and removes the update.
-- **Another head landed.** The integration branch received one of the pushed commits, but the merge request's head was another commit. `finish` refuses and moves no branch; that merge was never verified. `abort` then ends the update (below).
-- **Merged by squash or rebase.** The integration branch carries, without any of the pushed commits, a commit with a pushed commit's tree, or the update's sync records or copy trailers. `finish` refuses, moves no branch, makes no catch-up and pushes nothing, even while the branch and the head still hold the verified commit. Run `abort`, then `start`, which brings the local integration branch up to date: the upstreams are taken in again on the new tip and recorded properly.
-- **What landed differs from the verified tree.** A pushed commit came in through a merge with another tree, as when the merge request was merged with a merge commit after other work landed. `finish` refuses and moves no branch, and `abort` ends the update.
-- **Unpublished local commits.** The integration branch moved forward from the tip the update last took, but lacks commits of the local integration branch that the base holds and that were never published. `finish` refuses, names those commits, and names `abort`; publish them or reconcile the local integration branch with the remote, then `start` again.
-- **The integration branch was rewritten.** It no longer contains the base otherwise; `finish` refuses and names `abort`.
-- **The merge request branch is gone and nothing landed.** The merge request was closed or its branch deleted; `finish` refuses, and `abort` ends the update.
-- **The merge request's head or branch moved.** It no longer points at the verified commit: `finish` says so and exits with status 1, because merging it would not land the verified tree, so the update cannot complete until someone restores the branch or runs `abort`.
-- **The integration branch moved past the base.** Other work landed before the merge. `finish` checks out the update branch in the update worktree again, catches up with the remote's integration branch (see *Catching up with a moved integration branch*), and verifies the catch-up merge. Just before pushing, it checks again that the merge request's head and branch and the remote's integration branch are as it fetched them. It then pushes the catch-up merge, without force, to the same branch, with push options that bring the merge request's title and description up to date and ask for no new merge request (no `merge_request.create`), so a push that races with the merge cannot open a second one. The open merge request then carries the new verified commit, the update keeps waiting for it, and `finish` exits with status 0. A conflict or failed checks stop `finish` with status 1 and push nothing: the merge request keeps its head, and the update keeps waiting for it in the catch-up step, where `continue`, `verify` and `abort` work. When the merge request is merged during the catch-up, before the push, `finish` pushes nothing, and since that merge could not land a verified tree on the moved integration branch, it refuses as above.
-- **Nothing landed yet.** `finish` reports that the update waits for the merge request and what to do next, changes nothing, and exits with status 0: waiting is the expected step, not a failure. A script that needs to know whether work is pending runs `status --check`, which fails until the update completes because its upstreams are not current yet, or reads `update.step` from `status --json`.
+The forge is that of the publish remote's fetch URL as git uses it, after its `url.<base>.insteadOf` rewriting (as `git remote get-url` reports it): the merge request is opened on the forge where the branch actually lands, and a shorthand that `insteadOf` expands, such as `gh:team/app`, names the forge it expands to. The publication setting is always read from the configuration at the integration branch tip, never from an update's head, which carries content merged from upstreams: otherwise an upstream could point the token at a host of its choosing.
 
-Without the forge's API, a merge request closed with its branch kept looks open: `finish` keeps waiting, and `abort` deletes the branch and names the merge request to close.
+- **The kind of forge** comes from the setting `forge` (`gitlab` or `github`); else from the URL's host: `gitlab.com` is GitLab, `github.com` and a `ghe.com` subdomain are GitHub; else from the CI job the tool runs in, when the job's server is the remote's host: a GitLab CI job whose `CI_SERVER_URL`, or a GitHub Actions job whose `GITHUB_SERVER_URL`, names that host.
+- **The API base** is the setting `api`, an `https` URL on the remote's own host: for an SSH host alias, the host the SSH configuration names for it (as `ssh -G` resolves it; an IP address is no alias), and for GitHub also `api.<host>`. Without the setting, in a CI job of the remote's host, it is the job's `CI_API_V4_URL` or `GITHUB_API_URL`, which must name the same host (or `api.<host>` for GitHub) and be `https` unless the job's server itself is reached by plain HTTP; otherwise `https://<host>/api/v4` for GitLab, `https://api.github.com` for github.com, `https://api.<host>` for a `ghe.com` host, and `https://<host>/api/v3` for GitHub Enterprise Server.
+- **The project** is the URL's path without credentials and `.git`, less the path the API base carries before `/api/v4` or `/api/v3`, which covers a GitLab installed under a relative URL root.
 
-`finish --no-publish` keeps its meaning in this mode: it makes the local move and pushes nothing. Before the merge request is opened, it closes the update locally as in push mode. While the update waits, it refuses with status 2: the verified commit is already published on the merge request branch, and before the merge there is no local move to make, so it would close nothing. Merge the merge request and run `finish --no-publish` again, or withdraw it with `abort`. After the merge, it fast-forwards the local integration branch, leaves the merge request branch in place, and removes the update.
+An SSH host alias, or an SSH URL of a GitLab under a relative URL root, names neither the forge nor its API; set both:
+
+```toml
+[publish]
+remote = "origin"
+via = "merge-request"
+forge = "gitlab"
+api = "https://gitlab.example.com/gitlab/api/v4"
+```
+
+A remote on a host the tool does not recognise, without these settings, is refused by the commands that need the forge, naming `forge` and `api`; so is an `api` on another host than the remote's.
+
+An `https` API is reached with rustls, and its certificate is checked by the operating system's verifier, which trusts the system's certificate store (on Linux the system bundle, or the file `SSL_CERT_FILE` names), so a self-managed forge behind a private certificate authority works once its root is trusted there. The proxy of `ALL_PROXY`, `HTTPS_PROXY` or `HTTP_PROXY` is used, with `NO_PROXY`, in upper or lower case. A redirect to another host is followed without the token. GitHub requests ask for the API version `2022-11-28`, which every supported GitHub Enterprise Server release knows.
+
+#### Tokens
+
+The token comes from the environment only, under the names the forges' own command-line tools use:
+
+| Forge | Variables, in order | Sent as |
+| --- | --- | --- |
+| GitLab | `GITLAB_TOKEN` | `PRIVATE-TOKEN` header |
+| github.com and `ghe.com` hosts | `GH_TOKEN`, `GITHUB_TOKEN` | `Authorization: Bearer` |
+| GitHub Enterprise Server | `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`; in an Actions job of that server also `GH_TOKEN`, `GITHUB_TOKEN` | `Authorization: Bearer` |
+
+A github.com token is never sent to an Enterprise Server, except the token an Actions job of that server is given. Without a token, `start`, `finish` and `sync` refuse before they push anything and name the variables. The tool never prints, stores or logs the token, and sends it only to the API's host.
+
+The token must be able to open merge requests:
+
+- **GitLab**: a project or group access token, or a personal access token, with the `api` scope and at least the Developer role; Maintainer where the integration branch's protection requires it for pushing. Reading the merge settings needs only read access to the project. The CI job token cannot open merge requests, and the pushes it may make where a project allows them start no pipeline.
+- **GitHub**: a GitHub App installation token, or a fine-grained personal access token, with *Pull requests: write* to open, rewrite and close pull requests, *Contents: write*, which also lets the token see the repository's merge settings, and *Metadata: read*, which the rulesets need. Add *Administration: read* only when the integration branch's requirements live in classic branch protection. Not Actions' `GITHUB_TOKEN`: pushes made with it start no workflow, and pull requests it opens start their runs only after someone approves them, so the pull request would sit untested.
+
+Pushing goes through git with the remote's own configuration, an SSH key or a credential helper, as before: the tool never puts the API token into git's configuration. The credential that pushes must be one whose pushes start the forge's pipeline.
+
+#### Merge settings
+
+The guarantee needs two things: the merge cannot happen without a successful pipeline, and the tree that pipeline tested is the tree that lands. Squash and rebase merges are excluded besides, because they drop the merge commits whose trailers are the sync records. `finish` and `sync` read the settings before every push of the update branch, and `doctor` reads them too; a refusal names each setting to change.
+
+On **GitLab**, every field the tool reads is visible to any token that can read the project:
+
+- *Pipelines must succeed* is on (`only_allow_merge_if_pipeline_succeeds`), and *Skipped pipelines are considered successful* is off (`allow_merge_on_skipped_pipeline`): a skipped pipeline tests nothing.
+- The merge method is *Merge commit with semi-linear history* (`rebase_merge`) or *Fast-forward merge* (`ff`). GitLab then merges only a branch that contains the target branch, so the merged tree is the tree of the head the pipeline tested. The plain *Merge commit* method is refused, even with merged results pipelines: GitLab requires the pipeline to match the merge request's head, not the current target branch, so a merged results pipeline can be outdated when the merge happens.
+- Merge trains are off: whether a train lands the commit it tested could not be confirmed, and with fast-forward or semi-linear history its refs are rebased.
+- *Enable automatic rebase prior to merge* is off (`automatic_rebase_enabled`; an instance without the setting counts as off): a rebase drops the update's merge commits. `sync` keeps the branch mergeable by catch-up merges instead.
+- *Squash commits when merging* is not *Require* (`squash_option` `always`). *Encourage* and *Allow* let the person merging tick squash, which the tool cannot prevent: the description asks not to, and `doctor` warns. GitLab Premium's per-branch squash setting is readable only through an experimental GraphQL field, so the tool does not read it; a squash that happens anyway shows as a merge request merged without its history (below).
+
+On **GitHub**, for the integration branch:
+
+- A status check is required, naming at least one check, with *Require branches to be up to date before merging* (strict), through a ruleset or classic branch protection. GitHub then merges a pull request only when its head contains the base branch and its checks passed on that head. Without strict, a `pull_request` workflow tests the merge as it was when it started, which can be outdated.
+- No merge queue applies: GitHub does not say whether a queue lands the commit it tested or makes a new one.
+- No rule requires a linear history, which forbids merge commits.
+- Merge commits are allowed: the repository's `allow_merge_commit`, or a ruleset's pull request rule that allows `merge`.
+
+The rules come from `GET /repos/{owner}/{repo}/rules/branches/{branch}`, which returns the active rules of repository and organisation rulesets to any token that can read the repository. Classic branch protection is readable only with administration access, and the repository's merge settings only with push access; absent, they are unknown, not false. Whatever the token cannot read and the rules do not settle cannot be confirmed: the tool refuses, says which requirement it could not confirm, and names both ways out, a ruleset or the access the token lacks. Squash or rebase merges that stay selectable are warnings of `doctor`.
+
+The guarantee is the forge's, and so is its limit: people the forge lets bypass its rules, administrators on GitHub without enforcement for them or bypass actors of a ruleset, can merge anything, as they can push anything.
+
+#### Title and description
+
+The title names the updated upstreams. The description lists each follow upstream's merged range with the upstream tag of its target, and each port upstream's taken, skipped and already present commits. It says to merge the merge request without squashing it and without rebasing its branch, including with the forge's rebase or update-with-rebase buttons, because either drops the update's history, and to keep it current with `git intake sync`. When the update changes its own checks, the forge's CI definition (the project's CI configuration file on GitLab, `.gitlab-ci.yml` unless the project names another, and `.github/workflows/` on GitHub) or the install command or checks of `.git-intake.toml`, `finish` and `sync` name those changes in their output and in the description, since the pipeline that is supposed to verify the update then runs what the update brings.
+
+The title and description belong to the tool: every push of the update rewrites them, and on GitLab asks again for squashing off. The description ends with a block that renders as nothing and records each follow upstream's target:
+
+```
+<!-- git-intake targets
+upstream 0123456789abcdef0123456789abcdef01234567
+-->
+```
+
+`sync` reads it back: from a merge request closed without merging, to tell the targets a person declined, and from a merged one, to tell whether the merge kept the update's history. A description without a readable block, as one an earlier release wrote or a person edited, records nothing. A description longer than the forge takes is shortened before the block.
+
+#### Merging
+
+Merge the merge request with a merge commit or by fast-forward, as the settings above allow. A commit someone adds to the merge request branch, a fix for instance, is welcome: the pipeline checks it and the update keeps it. After the merge there is nothing to do locally. The local integration branch does not move when the merge request is merged; the next `start` or `sync` brings it up to date by fast-forward, and the merged sync records count on the integration line however the merge request was merged.
+
+A merge request **merged without its history** is one whose final head, as the forge reports it, the integration branch does not contain, or whose recorded follow targets lack a sync record on the integration line: a squash, or a rebase before a fast-forward merge. `status` names the newest one, and `sync` proposes the same targets again, with a warning that names it, and names it in the new merge request's description: the new merge request carries little more than the sync records, and merging it records them. Every retry waits for a person to merge it, so a project that squashes everything gets one open merge request, not a loop. A sync record counts only on a merge commit whose second parent is its target, so the trailers a squash commit's message copies, as GitHub's squash merge writes them, do not count.
+
+#### Updates left waiting by an earlier release
+
+Releases before this one kept an update alive on the machine that opened its merge request (state formats 4 and 5, in the step `waiting_for_merge_request`) and completed it with a second `finish`. The first `finish` of this release hands such an update over: it finds the merge request through the API, by the number the earlier release recorded or else by its branch, which may be `git-intake/update-<commit>` in format 4, says whether it is open, merged or closed, records the resolutions of a catch-up step it stopped in, and removes the update worktree, branch, references and state. The merge request and its branch stay as they are, and `sync` carries the merge request on. `abort` removes such an update, keeps the merge request and says what became of it; `abort --merge-request` withdraws the merge request as well. Every other command shows the update as waiting, left by an earlier release, and names `finish`.
+
+### Unattended synchronisation
+
+`git intake sync` takes the repository's follow upstreams in without any local state: it is what a scheduled CI job runs, and what a person runs to take over where a job stopped. Each run derives everything from the publish remote, its forge and the upstreams, and carries the update as far as it can.
+
+Like `start`, it reads the configuration at `HEAD`, which needs a `[publish]` setting, fetches the publish remote and fast-forwards a local integration branch strictly behind the remote's, refusing when the two diverged. In a CI clone, with `HEAD` detached at a commit of the integration branch and no local integration branch, it creates that branch at the remote's. It reads the configuration again at the new tip. In merge-request mode it refuses a local integration branch with commits the remote lacks, since they would ride along in the merge request unannounced. It refuses while an update is in progress, naming its step and the next command.
+
+In **merge-request mode** `sync` runs no install command and no check: the merge request's pipeline verifies the update.
+
+- **The update's merge request is open.** `sync` fetches its head. When the head contains the integration tip, nothing changes: it says that the update waits for the merge request and names the upstreams that moved on since, which the next update takes; a follow target stays fixed for the life of an update. When the integration branch moved past the head, `sync` carries the merge request's update on locally, catches it up with the integration tip by a catch-up merge, and publishes it as `finish` does: the merge request's head becomes the catch-up merge, pushed without force, with the merge request's head as its second parent, including any fix someone pushed onto it, and the title and description are rewritten. Just before the push it reads the merge request's state and head and the remote's integration branch again: a merge request merged or closed meanwhile ends the run with status 0, any other change with status 2 and the advice to run again. Right after the push it reads the state once more and, when the merge request is no longer open, deletes the branch the push recreated while it is still at the pushed commit.
+- **A rewritten merge request** is left alone: one whose head lacks the sync record of a follow target its description records, as the forge's rebase button leaves it, or, without readable targets, whose head carries no update. A person amending their own fix by force keeps the sync merges and is not rewritten. `sync` refuses, names the merge request, and says that withdrawing it with `abort --merge-request` declines its targets, and that `start` and `finish` publish them again by hand.
+- **No merge request is open.** `sync` plans an update of every follow upstream the integration branch lacks the target of, the fetched tip or, with `tags`, the newest release, as `start` would with no upstream named, merges them, and publishes the update as `finish` does. It starts nothing when every follow upstream is current.
+- **Declined targets.** When the merge request closed or merged most recently was closed without merging and its description recorded every follow target `sync` would merge, a person declined those targets: `sync` starts nothing, names the closed merge request and exits with status 0. The next update comes when an upstream moves on, or by hand with `start` and `finish`.
+- **The update's branch without an open merge request.** GitHub keeps the branch of a closed pull request, a job can be killed between the push and the merge request, and a withdrawal can stop between closing and deleting. A branch that holds nothing but catch-up merges beyond the integration tip or beyond the head of a closed or merged merge request of the update is deleted, under a lease on the commit read, and the run goes on. A branch that holds an update no merge request carries is carried on and gets its merge request, unless its targets were declined, which `sync` refuses so that the branch, perhaps with a person's fix, is not silently ignored. Anything else is refused, naming the branch, the push URL and `abort --merge-request`, because the branch may be someone's work.
+
+In **push mode** there is no merge request: `sync` starts the update, runs `verify`, and when the checks pass runs `finish`, which pushes the integration branch.
+
+Upstreams that `start` would refuse were they the only one selected, because they cannot be fetched, have no release or were rewritten, or because their path cannot take them, are left out and named, so that one broken source does not stop the others; the run then exits with status 1 for the job to show. Port upstreams are never taken by `sync`, since their plans are reviewed by a person; those with pending commits are named.
+
+A conflict, in an upstream merge or a catch-up merge, stops `sync` exactly as it stops `start`, with exit status 1 and the update in progress in the update worktree; so do failed checks in push mode. In CI the job fails and its clone is discarded. A person then runs `sync` in their own clone, meets the same stop while nothing moved, resolves it, and runs `continue` and `finish`; for a catch-up of an open merge request, `finish` pushes the result to the same merge request. Every other end, a refusal such as a catch-up precondition included, removes the update `sync` created, so the next scheduled run meets the same situation rather than an update in progress.
+
+Recreating an update from history is possible because an update describes itself (see *The update line* below). What history does not carry, the logs and the conflicts of earlier steps, `report` cannot show for an update carried on from a merge request, and says so. Such an update records the merge request it was carried on from, and `finish` refuses to publish it once that merge request is no longer open, keeping the update and naming `abort`.
+
+Two runs at once share one branch: the first push wins, and the second is rejected as not a fast-forward, which `sync` reports with status 2 and the advice to run it again; it opens no merge request. `sync` exits with status 2 when it refused or failed, 1 when it stopped on a conflict or failed checks or left out a follow upstream, and 0 otherwise.
+
+### The update line
+
+Several rules need to know which commits are an update's: `env`, carrying an update on, and telling a rewritten merge request. Every commit between the head and the base is the wrong answer, because a sync merge brings in the upstream's whole history, which may carry sync records of its own. The **update line** walks from the head along first parents, as the update branch grows, through the commits the base lacks, and crosses to the second parent only at a catch-up merge, which carries `Intake-Catch-Up`, and at a head that merges the update into a commit the base contains without a sync record, as a merged results pipeline tests. A merge the forge's update button makes has the branch's previous head as its first parent and stays on the line. The update's own commits are the sync merges, copies and changes to a port upstream's journal on that line; a line without any carries no update.
+
+### The update variables outside verify
+
+A merge request pipeline runs its own jobs, on a fresh clone without an update state. `git intake env` gives them the variables `verify` gives the checks (see *The environment of the checks*), for `HEAD` or a named commit, read from history alone:
+
+```sh
+git intake env -- ./scripts/check.sh   # run a command with the variables
+git intake env --dotenv > intake.env   # NAME=value lines, for a dotenv report or $GITHUB_ENV
+git intake env --json                  # one JSON object
+git intake env                         # export lines, quoted for the shell
+```
+
+The integration tip is the publish remote's integration branch, fetched for the command, or the local integration branch when no publish remote is configured; a failed fetch refuses with git's reason. For a commit H, the base is the merge base of H and that tip: the tip the update started from, or the one it last caught up with, and for a merged results pipeline, whose commit merges the update into the target, that target, which is the base of the tree being tested. The upstreams and their targets come from the update line, their previous synced commits from the integration line at the base, so the values are those `verify` gives for the same commit.
+
+With a command after `--`, `env` runs it with the variables, without the `GIT_INTAKE_` variables it inherited, and exits with the command's status; when it cannot read the variables, as in a shallow clone or when the publish remote cannot be fetched, it exits with status 2 without running the command. A commit the integration tip contains, or whose update line carries no update, gets no variable: `env` says so on standard error and exits with status 0, `--json` prints `{}`, and a command after `--` runs without any `GIT_INTAKE_` variable, so a check that falls back to its usual baseline outside an update keeps working in a pipeline that fetches the full history.
+
+Prefer `env -- <command>` or a `--dotenv` file. `eval "$(git intake env)"` loses `env`'s exit status: when it fails, the shell evaluates nothing and the check runs without its variables.
 
 ### Abort
 
-`abort` removes the worktree, the update branch, the plan, the update's upstream references, its logs and the state at any step before `finish` moves the integration branch, including a catch-up step. The integration branch stays where `start`, or the last fast-forward to the publish remote by `start` or `finish`, left it; a port's journal is unchanged. Resolutions already made by hand in a stopped merge or copy are recorded first, so a retry reapplies them. A worktree that has `git-intake/update` checked out anywhere other than where `start` places the update worktree belongs to the user: `abort`, `start` and `doctor` name it and leave it for the user to remove or switch.
+`abort` removes the worktree, the update branch, the plan, the update's upstream references, its logs and the state at any step before `finish` moves the integration branch, including a catch-up step. The integration branch stays where `start`, or the last fast-forward to the publish remote by `start` or `finish`, left it; a port's journal is unchanged. Resolutions already made by hand in a stopped merge or copy are recorded first, so a retry reapplies them. A worktree that has `git-intake/update` checked out anywhere other than where `start` places the update worktree belongs to the user: `abort`, `start`, `sync` and `doctor` name it and leave it for the user to remove or switch.
 
-While the update waits for its merge request, `abort` first checks the publish remote's integration branch as `finish` does:
-
-- If the verified tree landed, `abort` refuses and names `finish`, which completes the update.
-- If a merge that did not land the verified tree is there, `abort` removes the update and says that the integration branch holds an unverified merge.
-- Otherwise it removes the update and names the merge request that is left to close on the forge.
-
-In each case where it proceeds, it deletes the merge request branch from the publish remote only while that branch still points at one of the commits the update pushed. A branch that is already gone counts as deleted; a branch that received other commits is left alone.
+`abort` never touches the forge. Closing a merge request that a CI job opened, perhaps while someone reviews it, is a different act, with its own spelling: `git intake abort --merge-request` removes the local update in progress, if any, then closes the update's open merge request through the API and deletes the update's branch on each push URL while it points at the commit read, open merge request or not; it says what remains, and that there is nothing to withdraw when there is neither. A branch someone moved meanwhile is kept and named. Run again after an interruption between closing and deleting, it deletes the branch the closed merge request left. Withdrawing declines the merge request's targets: `sync` proposes them again only once an upstream moves on, and `start` with `finish` publishes them by hand. Running `abort` twice never escalates from the local update to the forge. With no update in progress in merge-request mode, plain `abort` names `abort --merge-request` when the update's merge request is open, or says that it could not read the forge; on an update carried on from a merge request, it removes the local update, and the merge request stays open.
 
 ### The update state
 
-The update state lives in `<git-common-dir>/git-intake/state.json`, which every worktree shares and no commit can carry. Its format has a version, and the state records the release that started the update. This release reads a state of format 4 in place, including an update that waits for its merge request; the first command that changes such an update writes it in format 5 and says that releases before v0.3.6 can no longer carry it on, and the first of `continue`, `verify` and `finish` warns once that an earlier release started the update. A state in any other format, older or newer, is refused by every command that reads the update: it names both formats and the release that started the update when the state records it, and advises finishing or aborting the update with a release that keeps that format. For format 3 it names `migrate` first (see *Migrating an update of format 3*). The formats belong to these releases:
+The update state lives in `<git-common-dir>/git-intake/state.json`, which every worktree shares and no commit can carry. Its format has a version, and the state records the release that started the update, `start` or `sync`. This release reads a state of format 4 in place, and hands an update of format 4 or 5 that waits for its merge request over to it (see *Updates left waiting by an earlier release*); the first command that changes such an update writes it in format 5 and says that releases before v0.3.6 can no longer carry it on, and the first of `continue`, `verify` and `finish` warns once that an earlier release started the update. A state in any other format, older or newer, is refused by every command that reads the update: it names both formats and the release that started the update when the state records it, and advises finishing or aborting the update with a release that keeps that format. For format 3 it names `migrate` first (see *Migrating an update of format 3*). The formats belong to these releases:
 
 | Format | Releases |
 | --- | --- |
@@ -447,7 +566,7 @@ The update state lives in `<git-common-dir>/git-intake/state.json`, which every 
 | 4 | v0.3.2 to v0.3.5 (no catch-up; the merge request branch named after the verified commit) |
 | 5 | v0.3.6 and later |
 
-A newer format is refused with the advice to use the release that started the update, or a later one that reads its format. Another release with the same format carries the update on; the first of `continue`, `verify` and `finish` that it runs warns once that a different release started it. Before `finish`, the warning advises `abort` and a new `start` to use one release throughout; once `finish` has moved a branch or opened the merge request, it gives no such advice, because `abort` would withdraw what is already published.
+A newer format is refused with the advice to use the release that started the update, or a later one that reads its format. Another release with the same format carries the update on; the first of `continue`, `verify` and `finish` that it runs warns once that a different release started it. Before `finish`, the warning advises `abort` and a new `start` to use one release throughout; once `finish` has moved a branch or pushed the update, it gives no such advice, because `abort` would leave what is already published behind. An earlier release of format 5 can carry on an update started or carried on by this one, under its own rules: it ignores the merge request a carried-on update records.
 
 ### Migrating an update of format 3
 
@@ -479,6 +598,8 @@ git log -1 --format='%(trailers:key=Intake-Tag,valueonly)' --grep='^Intake-Upstr
 
 The output is empty when the newest merge took a commit that no tag names. `status --json` gives the same fact for the last synced commit as `last_synced_tag`, read along the integration line as described below.
 
+A sync record counts only on a merge commit whose second parent is its target, as every sync merge the tool makes is: the trailers a squash commit's message copies from the merges it replaced do not count.
+
 Every commit it copies in port mode keeps the upstream commit's message and adds `Intake-Upstream: <name>` and `Intake-Taken: <upstream commit>`; the journal commit of a port is titled `sync(<name>): record <n> port decisions` or `sync(<name>): start the port journal at <commit>`.
 
 The tool reads its own history along the **integration line**: the first-parent line of the integration branch, where each merge on it is followed by the commits its second parent brought in along that parent's own first-parent line, as `git rev-list --first-parent <merge>^1..<merge>^2` lists them. An update published by push, or a merge request merged by fast-forward, puts the tool's merges on the first-parent line itself; a merge request merged with a merge commit puts them right after that merge commit. A catch-up merge among those commits, marked by its `Intake-Catch-Up` trailer, is followed in turn by the first-parent line of its second parent, which holds the update it caught up, down to the first commit that the first parent of the merge on the first-parent line contains, at any depth; so an update that caught up twice, or caught up and was merged with a merge commit, counts as if it had been merged straight in. Any other merge counts only at that one level: a branch merged into another branch, by a merge without the trailer, before that one was merged brings in nothing of its own. The trailer is as trustworthy as the sync records beside it: both are trailers the tool writes, and the tool reads history it does not police. A sync merge brings in nothing either: what it merged is the upstream's history.
@@ -491,34 +612,144 @@ A follow upstream's **last synced commit** is the target of its newest sync reco
 | --- | --- |
 | `start [UPSTREAM[=REV]...]` | Starts an update, as described above. A follow upstream named as `UPSTREAM=REV` is taken at the commit REV names instead of its fetched tip (see *Choosing a target*), or without REV, with `tags`, at its newest release (see *Release tags*); a port upstream's plan is limited to the pending commits REV contains. |
 | `continue` | Carries out the edited plan of a port upstream, or concludes the merge, copy or catch-up merge stopped on conflicts, and takes in the rest. It also accepts a merge concluded by hand when the commit keeps the sync record, a copy committed by hand when it keeps both copy trailers, and a catch-up merge committed by hand with its trailer. |
-| `abort` | Removes the update worktree, branch, plan, upstream references, logs and state. While the update waits for its merge request, also deletes the merge request branch from the publish remote. |
+| `abort [--merge-request]` | Removes the update worktree, branch, plan, upstream references, logs and state, and never touches the forge. With `--merge-request`, then closes the update's open merge request through the forge's API and deletes the update's branch on each push URL while it points at the commit read (see *Abort*). |
 | `verify` | Runs `install` and the checks and records the verified commit. |
-| `finish [--no-publish]` | Catches the update up when the integration branch moved, verifying the catch-up merge, then fast-forwards and publishes the verified update by push, or opens its merge request and, run again, catches it up while it waits or completes the update once it is merged. With `--no-publish` it fetches nothing, makes only the local move, closes the update without pushing, and names the unpublished branch. |
+| `finish [--no-publish]` | Catches the update up when the integration branch moved. In push mode it verifies the catch-up merge, then fast-forwards and publishes the verified update. In merge-request mode it requires the forge's merge settings, pushes the update to `git-intake/update`, opens its merge request or rewrites the open one, and ends the local update. With `--no-publish` it fetches nothing, makes only the local move of a verified update, closes the update without pushing, and names the unpublished branch. On an update an earlier release left waiting for its merge request, it hands the update over to the merge request. |
+| `sync` | Takes the follow upstreams in without local state: catches the update's open merge request up, or starts an update of every follow upstream that is behind and publishes it, as merge request or by push after `verify` (see *Unattended synchronisation*). |
+| `env [COMMIT] [--dotenv \| --json] [-- COMMAND...]` | Prints the variables `verify` gives the checks for a commit, read from history, or runs a command with them (see *The update variables outside verify*). |
 | `migrate` | Carries an update in progress of state format 3 over to this release's state format, in place, moving its worktree out of the git directory (see *Migrating an update of format 3*). Stop the processes and editors that use the update worktree first. |
-| `status [--check] [--json]` | Fetches every upstream and shows the configuration, then for every upstream its path, mode, branch, fetched tip and one state. A follow upstream also shows its last synced commit and the number of commits the integration branch lacks, with the state `current`, `behind`, `not imported`, `no release`, `path removed`, `rewritten` or `unavailable`; with `tags`, the tip shown and the commits counted are those of the newest release, and `no release` means the branch has none. A port upstream shows its journal's base and its numbers of taken, decided and pending commits, with the state `current`, `pending`, `no base`, `rewritten` or `unavailable`; `no base` means it has no journal and nothing to start one from, and a rewritten one names the commits off its line. `unavailable` means the upstream could not be fetched, its branch is missing, the tags of an upstream with `tags` could not be listed, or, for a port upstream, its journal is invalid; any upstream that cannot be fetched makes `status` exit with status 1. `path removed` means a synced path upstream, from a record or from history, whose path no longer exists on the integration branch; `start` refuses it and `status --check` counts it as drift. When several states apply, `unavailable` comes first, then `rewritten`, then `path removed`. A path upstream is `not imported` until a sync record for it exists or, without one, while its path is absent or holds content that no merge of the upstream brought in; a root upstream is `not imported` while it shares no history with the integration branch. While an update is in progress it also shows the step reached, the base and the base the update started from when a catch-up moved it, the worktree, each queued upstream's target or plan and step, a catch-up merge in conflict or awaiting verification with the tip it catches up with, and the next command. |
+| `status [--check] [--json]` | Fetches every upstream and shows the configuration, then for every upstream its path, mode, branch, fetched tip and one state. A follow upstream also shows its last synced commit and the number of commits the integration branch lacks, with the state `current`, `behind`, `not imported`, `no release`, `path removed`, `rewritten` or `unavailable`; with `tags`, the tip shown and the commits counted are those of the newest release, and `no release` means the branch has none. A port upstream shows its journal's base and its numbers of taken, decided and pending commits, with the state `current`, `pending`, `no base`, `rewritten` or `unavailable`; `no base` means it has no journal and nothing to start one from, and a rewritten one names the commits off its line. `unavailable` means the upstream could not be fetched, its branch is missing, the tags of an upstream with `tags` could not be listed, or, for a port upstream, its journal is invalid; any upstream that cannot be fetched makes `status` exit with status 1. `path removed` means a synced path upstream, from a record or from history, whose path no longer exists on the integration branch; `start` refuses it and `status --check` counts it as drift. When several states apply, `unavailable` comes first, then `rewritten`, then `path removed`. A path upstream is `not imported` until a sync record for it exists or, without one, while its path is absent or holds content that no merge of the upstream brought in; a root upstream is `not imported` while it shares no history with the integration branch. In merge-request mode it shows the update's open merge request with its number, address and head and whether the head contains the integration tip, naming `sync` when it does not, and the newest merge request of the update merged without its history; when it cannot read the forge, it says why and keeps its exit status. While an update is in progress it also shows the step reached, the base and the base the update started from when a catch-up moved it, the worktree, each queued upstream's target or plan and step, a catch-up merge in conflict or awaiting verification with the tip it catches up with, and the next command. |
 | `report [--json]` | For the update in progress, or the one just finished, per upstream. For a follow upstream: the merged range and commit count, the upstream tag of the target, each conflicted file with its resolution source (by hand or by a recorded resolution), and the size of the repository's own changes against that upstream before and after the merge. For a port upstream: the taken commits in the order copied, each with its conflicted files, the git-intake paths its copy left out and, where there are any, the earlier pending commits that change the same files; the commits recorded as present because their copy changed nothing; the skip and have decisions with their notes; and the number of commits left pending. Ranges and sizes are measured from the base the update started from. Each catch-up merge follows with the integration tip it took in and its conflicted files with their resolution source. |
 | `log [UPSTREAM...] [--json]` | Fetches the selected upstreams and lists, for a follow upstream, the commits on its branch that the integration branch does not contain, up to the newest release with `tags`, and for a port upstream its pending commits, oldest first. |
 | `branches [UPSTREAM...] [--json]` | Fetches every branch of the selected upstreams for the command and lists every branch that holds commits the integration branch does not contain, with their number; for a port upstream, commits a copy names as taken do not count. |
-| `doctor [--json]` | Checks the repository and reports each check as pass, fail or warn. It changes nothing but the references of its own fetches, which it removes. Checks: the configuration is valid; the update in progress, if any, holds its references at the tips `start` fetched; no reference under `refs/git-intake/` is left without an update; every upstream's URL can be fetched and its branch exists; every imported path exists on the integration branch; every follow upstream's last synced commit is still contained in its branch; every port upstream's journal is valid and its base and its decided and taken commits that are not retired are still on its branch, naming each one that is not; no git remote names an upstream's repository, with a note when the remote is the one a partial clone fetches missing objects from; no journal belongs to an upstream that is missing or in follow mode; the main checkout is clean; no merge is in progress there; the update state, if any, matches its worktree and branch. It warns about upstreams that still have sync records but were dropped from the configuration. |
+| `doctor [--json]` | Checks the repository and reports each check as pass, fail or warn. It changes nothing but the references of its own fetches, which it removes. Checks: the configuration is valid; the update in progress, if any, holds its references at the tips `start` fetched; no reference under `refs/git-intake/` is left without an update; every upstream's URL can be fetched and its branch exists; every imported path exists on the integration branch; every follow upstream's last synced commit is still contained in its branch; every port upstream's journal is valid and its base and its decided and taken commits that are not retired are still on its branch, naming each one that is not; no git remote names an upstream's repository, with a note when the remote is the one a partial clone fetches missing objects from; no journal belongs to an upstream that is missing or in follow mode; in merge-request mode, the forge is recognised, a token is set and accepted, and the merge settings qualify, with a warning when squash or rebase merges stay selectable; the main checkout is clean; no merge is in progress there; the update state, if any, matches its worktree and branch. It warns about upstreams that still have sync records but were dropped from the configuration. |
 | `contribute UPSTREAM[=REV] BRANCH` | Creates the local branch BRANCH at the upstream's fetched tip, or at the commit REV names on its branch, for a contribution to the upstream (see *Contributing to an upstream*). Never pushes. |
 
 `status --check` additionally predicts, with `git merge-tree`, the files a merge of each behind follow upstream's tip, or newest release with `tags`, would conflict in. It creates no worktree, branch or state, and fails unless every upstream is current, so a port upstream with pending commits fails it too. It can run on a schedule and gate a cutover or a port review.
 
 ### JSON output
 
-`status`, `report`, `log`, `branches` and `doctor` accept `--json`. They then write one JSON document to standard output, with the same facts as the text form under stable snake_case field names, and exit with the same status. Notes and errors go to standard error. For example, `status --json` carries `publish` (the publish remote or null) and `publish_via` (`push`, `merge_request` or null); while an update waits for its merge request, its `update` carries `step` `waiting_for_merge_request` and `merge_request` with `remote`, `source_branch`, `target_branch`, `commit`, `requested` (whether the push that asked the remote to open the merge request transferred the branch; when false, the merge request is opened by hand) and `number` (the merge request's number from the remote's reply, or null).
+`status`, `report`, `log`, `branches`, `doctor` and `env` accept `--json`. They then write one JSON document to standard output, with the same facts as the text form under stable snake_case field names, and exit with the same status. A URL in the output, as in every message, carries no credentials: a password is never shown, nor the user of an `http` or `https` URL, where a token is usually written; the user of an SSH URL stays. Notes and errors go to standard error. For example, `status --json` carries `publish` (the publish remote or null) and `publish_via` (`push`, `merge_request` or null). In merge-request mode it carries `merge_request`, the update's open merge request with `number`, `url`, `head` and `current` (whether the head contains the integration tip), `merged_without_history`, the newest merge request of the update merged without its history with `number` and `url`, each or null, and `forge_error`, why the forge could not be read, or null. An update carried on from a merge request carries `carried_from` with `number`, `url` and `source_branch` in its `update`; an update an earlier release left waiting carries `step` `waiting_for_merge_request` and `merge_request` with `number`, `remote`, `source_branch`, `target_branch` and `commit`. `env --json` prints one object whose keys are the variable names, and `{}` for a commit that carries no update.
 
 Every entry of `status --json` `upstreams` carries `name`, `path`, `url`, `branch`, `mode` (`follow` or `port`), `tip`, `state` (`current`, `behind`, `pending`, `no_base`, `not_imported`, `no_release`, `path_removed`, `rewritten`, `unavailable`) and `detail`. A follow upstream fills `last_synced`, `last_synced_source` (`record`, `history` or null), `last_synced_tag` (the `Intake-Tag` of the newest sync record, or null), `tags` (the configured pattern or null) and `commits_behind`, with `tags` also `release`, `release_tag` and `commits_after_release`, and with `--check` `conflicts`; a port upstream fills `base`, `journal` (whether the journal exists), `taken`, `decided` and `pending`, and when rewritten `off_line`, with `base` (the base when it is off the line, or null) and `commits` (each with `commit` and `recorded_as`: `taken`, `skip` or `have`). Fields that do not apply are null.
 
-Each queued upstream under `update` in `status --json` carries `name`, `mode`, `fetched`, `rev`, `step` (`plan`, `pending`, `conflict`, `merged`) and `conflicts`; a follow upstream adds `target`, `tag` (the upstream tag that names the target, or null), `kind` and `merge_commit`, a port upstream `plan` (the plan file), `commits` (each with `commit`, `subject`, `verb`, `note`, `copy` — `none`, `conflict`, `commit_failed`, `copied` or `empty` — `copied`, `failure`, git's output when the commit of the copy failed, and `left_out`) and `journal_commit`. The update's `step` is `plan` while a plan waits to be edited, `commit_failed` while a copy whose commit failed waits for `continue`, `catch_up_conflict` while a catch-up merge waits for its conflicts to be resolved and `continue`, and `catch_up` while a catch-up merge awaits its verification; in both, `catch_up` gives the catch-up's `tip`, `head_before`, `merge_commit` and `conflicts`, and is null otherwise. `base` is the integration tip the update lands on and `start_base` the one it started from. `report --json` carries `base`, the integration tip the update started from, and `catch_ups`, each with `tip`, `merge_commit` and `conflicts`. Each entry of `report --json` `upstreams` carries `mode` and `rev`; a follow upstream fills `kind`, `range_start`, `target`, `tag`, `commits`, `merge_commit`, `conflicts` and the diff sizes, and a port upstream fills `port` with `taken` (each with `commit`, `subject`, `copy`, `copied`, `conflicts`, `left_out` and `earlier_pending`), `unchanged` (each with `commit`, `subject` and `left_out`), `decisions` (each with `commit`, `subject`, `verdict` and `note`), `left_pending` and `journal_commit`. Each entry of `log --json` and `branches --json` carries `mode`; a follow upstream's entry of `log --json` adds `release` and `release_tag`, null without `tags`.
+Each queued upstream under `update` in `status --json` carries `name`, `mode`, `fetched`, `rev`, `step` (`plan`, `pending`, `conflict`, `merged`) and `conflicts`; a follow upstream adds `target`, `tag` (the upstream tag that names the target, or null), `kind` and `merge_commit`, a port upstream `plan` (the plan file), `commits` (each with `commit`, `subject`, `verb`, `note`, `copy` — `none`, `conflict`, `commit_failed`, `copied` or `empty` — `copied`, `failure`, git's output when the commit of the copy failed, and `left_out`) and `journal_commit`. The update's `step` is `plan` while a plan waits to be edited, `commit_failed` while a copy whose commit failed waits for `continue`, `catch_up_conflict` while a catch-up merge waits for its conflicts to be resolved and `continue`, and `catch_up` while a catch-up merge awaits its verification; in both, `catch_up` gives the catch-up's `tip`, `head_before`, `merge_commit` and `conflicts`, and is null otherwise. `base` is the integration tip the update lands on and `start_base` the one it started from. `report --json` carries `base`, the integration tip the update started from or was carried on at, `carried_from`, the address of the merge request an update was carried on from, or null, and `catch_ups`, each with `tip`, `merge_commit` and `conflicts`. Each entry of `report --json` `upstreams` carries `mode` and `rev`; a follow upstream fills `kind`, `range_start`, `target`, `tag`, `commits`, `merge_commit`, `conflicts` and the diff sizes, and a port upstream fills `port` with `taken` (each with `commit`, `subject`, `copy`, `copied`, `conflicts`, `left_out` and `earlier_pending`), `unchanged` (each with `commit`, `subject` and `left_out`), `decisions` (each with `commit`, `subject`, `verdict` and `note`), `left_pending` and `journal_commit`. Each entry of `log --json` and `branches --json` carries `mode`; a follow upstream's entry of `log --json` adds `release` and `release_tag`, null without `tags`.
 
 ## Exit status
 
 | Status | Meaning |
 | --- | --- |
 | 0 | Success. |
-| 1 | A negative result: `status --check` found drift or pending port commits, an upstream could not be fetched by `status`, `log` or `branches`, a `doctor` check failed, `verify` failed, or `start`/`continue` stopped on conflicts or on the failed commit of a copy. `finish` stopped on the conflicts or the failed checks of a catch-up merge, or because the integration branch moved again while it verified one, or found that the head or branch of the merge request it waits for no longer points at the verified commit. A pending update is not a negative result: `finish` exits with status 0 when it opens a merge request and while the update waits for it, and `status --check` is what reports the upstreams as not current. |
-| 2 | An error: invalid configuration, a refused command (for example `start` with an upstream that cannot be fetched, `continue` with an invalid plan, `finish` on an unverified update, on a merge request merged by squash or without the verified tree, or `finish --no-publish` while the update waits for its merge request), a catch-up refused because the integration branch was rewritten or its new commits change what the update means, a git failure (including a push rejected by the publish remote, after which `finish` retries the push, catching up first when the remote moved, and `finish --no-publish` closes the update locally), or invalid usage. |
+| 1 | A negative result: `status --check` found drift or pending port commits, an upstream could not be fetched by `status`, `log` or `branches`, a `doctor` check failed, `verify` failed, or `start`/`continue` stopped on conflicts or on the failed commit of a copy. `finish` stopped on the conflicts or the failed checks of a catch-up merge, or because the integration branch moved again while it made or verified one. `sync` stopped on a conflict or on failed checks, or left out a follow upstream it could not take. An open merge request is not a negative result. |
+| 2 | An error: invalid configuration, a refused command (for example `start` with an upstream that cannot be fetched, `continue` with an invalid plan, `finish` on an unverified update in push mode, on a forge whose merge settings do not qualify or without a token, `sync` on a rewritten merge request or a declined branch, or any command in a shallow clone), a forge that rejected the token or a request, a push of the update's branch rejected because another run pushed it first, a catch-up refused because the integration branch was rewritten or its new commits change what the update means, a git failure (including a push rejected by the publish remote, after which `finish` retries the push, catching up first when the remote moved, and `finish --no-publish` closes the update locally), or invalid usage. |
+
+`env -- <command>` exits with the command's status, or with status 2 without running it when it cannot read the variables.
+
+## Running in CI
+
+A scheduled job runs `git intake sync`; the merge request's own pipeline runs the repository's checks on the update, with the variables `git intake env` gives them. Every command refuses a shallow clone, because a shallow history cuts the integration line off: an upstream's last sync record may lie below the cut, and the tool would plan from the wrong commit without noticing. CI systems clone shallow by default, so set the job to fetch the full history. Install the binary in the job first, as under *Installation*.
+
+The job's clone must push with a credential whose pushes start the forge's pipeline, and the token in the environment must be able to open merge requests (see *Tokens*). The tool commits merges, so the job also sets git's `user.name` and `user.email`.
+
+### GitLab
+
+```yaml
+variables:
+  GIT_DEPTH: "0"        # the full history; git intake refuses a shallow clone
+
+git-intake-sync:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - git config user.name "git intake"
+    - git config user.email "git-intake@example.com"
+    # Push with the access token in GITLAB_TOKEN instead of the job token,
+    # whose pushes start no pipeline.
+    - git remote set-url origin "$CI_SERVER_URL/$CI_PROJECT_PATH.git"
+    - git config credential.helper '!f() { echo username=oauth2; echo "password=$GITLAB_TOKEN"; }; f'
+    - git intake sync
+
+upstream-checks:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - git intake env -- ./scripts/check.sh
+```
+
+`GITLAB_TOKEN` is a project or group access token with the `api` scope and the Developer role, or Maintainer where the integration branch's protection requires it; a personal access token works as well. Store it as a **masked and protected** CI/CD variable: protected variables reach only pipelines of protected branches and tags, such as the scheduled pipeline on the default branch, and never the merge request pipeline that runs an update's code. `CI_JOB_TOKEN` cannot open merge requests, and pushes made with it start no pipeline. In a job of the instance that hosts the remote, the tool finds the forge and its API from `CI_SERVER_URL` and `CI_API_V4_URL`, including on an instance installed under a relative URL root.
+
+`upstream-checks` runs on every merge request pipeline and gets no variable outside an update, so a check can fall back to its usual baseline. A job that hands the variables to later jobs writes them as a dotenv report:
+
+```yaml
+intake-env:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - git intake env --dotenv > intake.env
+  artifacts:
+    reports:
+      dotenv: intake.env
+```
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/git-intake-sync.yml
+name: git intake sync
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.INTAKE_APP_ID }}
+          private-key: ${{ secrets.INTAKE_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0          # the full history; git intake refuses a shallow clone
+          token: ${{ steps.app.outputs.token }}
+      - run: |
+          git config user.name "git intake"
+          git config user.email "git-intake@users.noreply.github.com"
+      - run: git intake sync
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+```
+
+```yaml
+# .github/workflows/upstream-checks.yml
+name: upstream checks
+on:
+  pull_request:
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: git intake env -- ./scripts/check.sh
+```
+
+The scheduled job pushes and opens the pull request with a GitHub App installation token, or a fine-grained personal access token with *Contents: write*, *Pull requests: write* and *Metadata: read*, stored as a secret. Not the workflow's `GITHUB_TOKEN`: pushes made with it start no workflow, and pull requests it opens start their runs only after someone with write access approves them, so the pull request would wait untested until a person approves its runs. `actions/checkout` keeps the token it was given for the job's later pushes. A `pull_request` workflow checks out the merge of the pull request into its base by default; `env` then gives the base branch's tip as `GIT_INTAKE_BASE`, which is the base of the tree being tested. To hand the variables to later steps, append them to the environment file: `git intake env --dotenv >> "$GITHUB_ENV"`.
+
+### Code from upstreams in CI
+
+An update brings upstream code into the repository, and its checks run that code: locally in `verify`, in CI in `sync`'s push mode or in the merge request's pipeline. That was always so; what a scheduled `sync` changes is that it happens before a person has looked at the update. A pipeline of a merge request from a branch of the same repository gets the repository's non-protected CI/CD variables on GitLab and its secrets on GitHub, and an upstream that changes the CI definition changes the pipeline that tests it. In push mode, the job that runs the checks also holds the credential it pushes with, typically in the clone's git configuration.
+
+The tool does not pretend to fence this off: hiding its own token variables from the checks would not protect the push credential beside them, and would break checks that use those variables for their own purposes. It makes the exposure visible instead: when an update changes the forge's CI definition, or the install command or checks of `.git-intake.toml`, `finish` and `sync` name the change in their output and in the merge request's description, since the pipeline that is supposed to verify the update then runs what the update brings. Contain the rest by configuration:
+
+- Treat upstreams as code the repository chooses to run.
+- Keep deploy secrets in protected variables (GitLab) or in environments with protection rules (GitHub) that an update's branch cannot reach, and keep the token `sync` uses there too.
+- On GitHub, a token without the *Workflows* permission cannot push an update that changes `.github/workflows`: such an update stops, for a person to look at and publish by hand with `start` and `finish`.
+- In push mode, give the job only the credential it pushes with.
 
 ## Moving from upstream remotes and mirror branches
 
@@ -545,9 +776,10 @@ Earlier releases kept a git remote per upstream, its remote-tracking branches, a
 - It never pushes to an upstream. The publish remote may not be fetched from or pushed to an upstream's URL, and the tool keeps no remote for an upstream: a reference to an upstream exists only while a command or an update needs it.
 - No file of the main checkout is changed, beyond the fast-forward of a checkout of the integration branch. The update lives in its own worktree, `.worktrees/git-intake/update` in the main worktree (in the git directory of a bare repository), on `git-intake/update`, with its state and plan in `<git-common-dir>/git-intake/`, which every worktree shares and no commit can carry.
 - Each target is fixed when the update starts, and an update keeps the references that hold its targets and planned commits until it ends. What is merged or copied, verified and published is the same commit.
-- `finish` moves no ref unless the verified commit is the worktree head, the base is still the integration tip, and the move is a fast-forward. When the integration branch moved, the update first takes the new tip in by a catch-up merge, which is verified before anything moves to it. It validates the move before making it, and it can be resumed.
+- In push mode, `finish` moves no ref unless the verified commit is the worktree head, the base is still the integration tip, and the move is a fast-forward. When the integration branch moved, the update first takes the new tip in by a catch-up merge, which is verified before anything moves to it. It validates the move before making it, and it can be resumed.
 - Publication by push pushes exactly the planned commit. Nothing unverified is ever published by a retry, and `finish --no-publish` closes an update that cannot be published.
-- Publication through a merge request pushes only verified commits, without force, to the branch `git-intake/update`, which only moves forward. The local integration branch moves only after the publish remote's integration branch received one of them, by fast-forward or by a merge whose tree is that commit's tree. A merge by squash or rebase is refused, and so is a merge request whose head, as the remote keeps it or as the tool last saw its branch, is not the verified commit, or whose merge brought in another tree. Without the merge request's head, commits above a fast-forwarded verified commit cannot be attributed; `finish` lists them.
+- In push mode, only a commit `verify` passed reaches the integration branch. In merge-request mode, only a tree the forge's required pipeline tested can be merged, by anyone the forge's rules bind: the tool publishes only to a forge whose settings guarantee it, read before every push. The update's branch only moves forward, and a branch the tool did not leave is never deleted or overwritten; deletions go under a lease on the commit read.
+- The forge's token is read from the environment only, sent only to the API of the publish remote's own host, and never printed or stored; the publication setting is read from the integration tip, never from an update's head.
 - The tool never adds or changes a git remote, and never fetches an upstream through one.
 - A rewritten upstream is detected from the sync record or the port journal and copies, and is not taken.
 - The configuration and a port's journal are read from the committed integration tip, never from a working copy or from the tree being taken in.

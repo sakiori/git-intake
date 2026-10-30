@@ -13,9 +13,9 @@ use crate::port::Verb;
 /// The branch an update is built on.
 pub const UPDATE_BRANCH: &str = "git-intake/update";
 
-/// Version 5: an update catches up with a moved integration branch, keeps
-/// the base it started from, and keeps every commit it pushed to its merge
-/// request branch. Version 4: the update worktree lives in the main
+/// Version 5: an update catches up with a moved integration branch and
+/// keeps the base it started from; an update carried on from a merge
+/// request records it, which earlier releases of the format ignore. Version 4: the update worktree lives in the main
 /// worktree, at [`UPDATE_WORKTREE`], instead of in the git directory.
 /// Version 3 fetched upstreams by URL into references the update holds,
 /// dropped mirror branches, and took an upstream in `follow` or `port` mode.
@@ -384,43 +384,37 @@ pub struct Finishing {
     pub unpublished: Vec<String>,
 }
 
-/// The merge request an update waits for in merge-request mode.
+/// The merge request an update of an earlier release waits for. Releases
+/// before this one kept an update alive after `finish` opened its merge
+/// request; this release hands such an update over to its merge request at
+/// the next `finish`, or ends it with `abort`, and never makes one. What the
+/// earlier release recorded besides the fields read here is kept as it was,
+/// so that the state stays readable to that release.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MergeRequest {
+pub struct EarlierMergeRequest {
     /// The publish remote the branch was pushed to.
     pub remote: String,
-    /// The branch on the publish remote that holds the verified commit.
+    /// The branch on the publish remote: `git-intake/update`, or
+    /// `git-intake/update-<commit>` in format 4.
     pub branch: String,
-    /// The verified commit the branch points at.
+    /// The commit the earlier release last pushed to the branch.
     pub commit: String,
-    /// Whether the push that carried the options asking the remote to open
-    /// the merge request transferred the branch; when it did not, the user
-    /// opens the merge request.
-    pub requested: bool,
     /// The number of the merge request, when the remote's reply named it.
-    /// Its head as the remote keeps it decides what the merge landed.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub number: Option<u64>,
-    /// Where the merge request branch pointed when last seen on the remote.
-    #[serde(default)]
-    pub last_seen_head: Option<String>,
-    /// Every commit of the update pushed to the merge request branch, oldest
-    /// first: the verified commit of the first push, then each catch-up
-    /// merge, recorded before its push. Format 4 kept only `commit`.
-    #[serde(default)]
-    pub pushed: Vec<String>,
+    #[serde(flatten)]
+    pub recorded: serde_json::Map<String, serde_json::Value>,
 }
 
-impl MergeRequest {
-    /// Every commit of the update pushed to the merge request branch, oldest
-    /// first.
-    pub fn pushed(&self) -> Vec<String> {
-        if self.pushed.is_empty() {
-            vec![self.commit.clone()]
-        } else {
-            self.pushed.clone()
-        }
-    }
+/// The merge request whose update `sync` carried on locally, to catch it up
+/// with the integration branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarriedMergeRequest {
+    pub number: u64,
+    /// Its address on the forge.
+    pub url: String,
+    /// The branch it comes from, which the update is pushed to.
+    pub branch: String,
 }
 
 /// An update from `start` to `finish`.
@@ -455,9 +449,18 @@ pub struct UpdateState {
     /// Set once `finish` has planned its ref moves.
     #[serde(default)]
     pub finishing: Option<Finishing>,
-    /// Set once `finish` pushed the merge request branch in merge-request mode.
-    #[serde(default)]
-    pub merge_request: Option<MergeRequest>,
+    /// The merge request an update of an earlier release waits for; see
+    /// [`EarlierMergeRequest`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_request: Option<EarlierMergeRequest>,
+    /// The merge request whose update `sync` carried on, for an update it
+    /// carried on. Earlier releases of the same format ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_from: Option<CarriedMergeRequest>,
+    /// The update head `finish` pushed to the update's branch in
+    /// merge-request mode, before the merge request was opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_head: Option<String>,
     /// The catch-up merges of the update, oldest first; the last one may be
     /// in progress.
     #[serde(default)]
@@ -496,6 +499,8 @@ impl UpdateState {
             verification: None,
             finishing: None,
             merge_request: None,
+            carried_from: None,
+            published_head: None,
             catch_ups: Vec::new(),
             remote_tip: None,
             finished: false,
@@ -675,7 +680,11 @@ pub fn release_warning(state: &UpdateState) -> Option<String> {
     if started == RELEASE || state.release_warned.as_deref() == Some(RELEASE) {
         return None;
     }
-    let advice = if state.finishing.is_none() && state.merge_request.is_none() {
+    let advice = if state.finishing.is_none()
+        && state.merge_request.is_none()
+        && state.carried_from.is_none()
+        && state.published_head.is_none()
+    {
         " To use one release throughout, run `git intake abort` and start the update again."
     } else {
         ""
@@ -971,13 +980,21 @@ mod tests {
         assert!(read.catch_ups.is_empty());
         let mr = read.merge_request.clone().unwrap();
         assert_eq!(mr.branch, "git-intake/update-bbbbbbbbbbbb");
-        assert_eq!(mr.pushed(), vec!["c".repeat(40)]);
+        assert_eq!(mr.commit, "c".repeat(40));
+        // What the earlier release recorded is kept as it was.
+        assert_eq!(
+            mr.recorded.get("requested"),
+            Some(&serde_json::Value::Bool(true))
+        );
         // It is written in the current format.
         let (current, upgraded) = in_current_format(&read);
         assert!(upgraded);
         save(&path, &current).unwrap();
         let again = load(&path).unwrap().unwrap();
         assert_eq!(again.version, STATE_VERSION);
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["merge_request"]["requested"], true);
         assert!(!in_current_format(&again).1);
         assert!(format_note().contains("releases before v0.3.6 can no longer carry the update on"));
         // Another release of the same update says what it does to the state.

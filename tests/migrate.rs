@@ -625,8 +625,34 @@ fn update_waiting_for_its_merge_request_keeps_its_verification() {
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
-    f.tool(&["finish"]).success();
+    // An earlier release pushed the verified commit to its merge request
+    // branch and removed the update worktree; the update waits for the
+    // merge request.
+    let wt = env.update_worktree(&f.down);
+    let verified = env.rev(&wt, "HEAD");
+    env.git(
+        &f.down,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{verified}:refs/heads/git-intake/update"),
+        ],
+    );
+    env.git(
+        &f.down,
+        &["worktree", "remove", "--force", &wt.to_string_lossy()],
+    );
     let git_dir = f.down.join(".git");
+    let mut state = read_state(&git_dir);
+    state["merge_request"] = serde_json::json!({
+        "remote": "origin",
+        "branch": "git-intake/update",
+        "commit": verified,
+        "requested": true,
+        "pushed": [verified],
+    });
+    fs::write(state_path(&git_dir), state.to_string()).unwrap();
     let old = fs::canonicalize(&git_dir)
         .unwrap()
         .join("git-intake")

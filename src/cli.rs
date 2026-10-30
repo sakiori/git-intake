@@ -20,9 +20,9 @@ use clap::{Parser, Subcommand};
         describes itself in a .git-intake.toml committed on its integration branch.",
     after_long_help = "Exit status: 0 on success; 1 on a negative result (drift found by status --check, \
         a failed doctor check, a failed verify, an upstream that could not be fetched, a stop on \
-        conflicts, an integration branch that moved again while finish verified a catch-up merge, or a \
-        merge request that no longer holds the verified commit); 2 on an error (invalid configuration, \
-        a refused command, a git failure, or invalid usage)."
+        conflicts, an integration branch that moved again while finish verified a catch-up merge, or \
+        an upstream sync left out); 2 on an error (invalid configuration, a refused command, a git or \
+        forge failure, or invalid usage). env -- <command> exits with the command's status."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -61,10 +61,15 @@ pub enum Command {
     /// Remove the update worktree, branch, plan, references, logs and state
     ///
     /// Leaves the integration branch where `start`, or the last fast-forward to the publish remote,
-    /// left it, and is refused once `finish` has moved it. While the update waits for its merge
-    /// request, it deletes the merge request branch from the publish remote; the merge request
-    /// itself is closed on the forge.
-    Abort,
+    /// left it, and is refused once `finish` has moved it. Never closes a merge request: with no
+    /// update in progress in merge-request mode, it names the update's open merge request, which
+    /// `--merge-request` withdraws.
+    Abort {
+        /// Also withdraw the update's merge request through the forge: close it, and delete the
+        /// update's branch on each push URL while it points at the commit read
+        #[arg(long)]
+        merge_request: bool,
+    },
     /// Run the install command and checks on the update
     ///
     /// Each command runs through `sh -c` in the update worktree with variables that describe
@@ -73,32 +78,34 @@ pub enum Command {
     /// integration branch; `GIT_INTAKE_UPSTREAMS`, the names of the upstreams the update takes,
     /// separated by spaces. For each of them, `GIT_INTAKE_UPSTREAM_<NAME>_MODE` is `follow` or
     /// `port`, and `GIT_INTAKE_UPSTREAM_<NAME>_TARGET` is the target merged, or for a port the
-    /// newest commit of the plan; a follow upstream with a last synced commit before the update
-    /// also gets it as `GIT_INTAKE_UPSTREAM_<NAME>_PREVIOUS`. `<NAME>` is the upstream's name in
-    /// upper case with every character other than a letter or a digit replaced by `_`.
+    /// newest upstream commit the update takes or decides on; a follow upstream with a last synced
+    /// commit before the update also gets it as `GIT_INTAKE_UPSTREAM_<NAME>_PREVIOUS`. `<NAME>` is
+    /// the upstream's name in upper case with every character other than a letter or a digit
+    /// replaced by `_`. `env` gives a merge request pipeline the same variables.
     Verify,
-    /// Publish the verified update by push or merge request, and complete it
+    /// Publish the update by push or as a merge request, and complete it
     ///
     /// When the integration branch moved past the update's base, `finish` first catches up: it
     /// merges the update into the new tip with a merge commit that carries an `Intake-Catch-Up`
-    /// trailer, runs the install command and the checks on it, and publishes it once they pass.
-    /// It makes at most one catch-up merge per run; a conflict stops it for `continue`, and an
-    /// integration branch that moves again while it verifies stops it for another run.
+    /// trailer. It makes at most one catch-up merge per run; a conflict stops it for `continue`.
     ///
-    /// With `via = "push"`, fetches the publish remote, fast-forwards a local integration branch
-    /// strictly behind it, fast-forwards the integration branch to the verified commit, then pushes
-    /// it without force.
+    /// With `via = "push"`, `finish` requires a verified update and verifies a catch-up merge
+    /// itself. It fetches the publish remote, fast-forwards a local integration branch strictly
+    /// behind it, fast-forwards the integration branch to the verified commit, then pushes it
+    /// without force.
     ///
-    /// With `via = "merge-request"`, pushes the verified commit to the branch `git-intake/update` on
-    /// the publish remote, requests a merge request into the integration branch with squashing
-    /// off, and moves no local branch; the update then waits. When the remote's integration branch
-    /// moves before the merge, `finish` catches up with it and pushes the result to the same
-    /// branch without force, so that the open merge request carries it. Once the merge request is
-    /// merged with a merge commit or by fast-forward, `finish` fast-forwards the integration branch
-    /// to the remote one and deletes the merge request branch. While the merge request waits,
-    /// `finish` reports so and exits with status 0, or with status 1 when the merge request no
-    /// longer holds the verified commit; `status --check` fails until the update completes, and
-    /// `--no-publish` is refused until the merge.
+    /// With `via = "merge-request"`, `finish` requires no local verification: the merge request's
+    /// pipeline verifies the update. It reads the forge's merge settings and refuses a project
+    /// that does not merge only a tree its required pipeline tested, catches up with the publish
+    /// remote's integration branch without running the checks, pushes the update head without
+    /// force to the branch `git-intake/update`, opens the merge request through the forge's API,
+    /// or rewrites the title and description of the open one, and removes the local update: the
+    /// merge request carries it from then on. No local branch moves. The forge's token comes from
+    /// `GITLAB_TOKEN`, or `GH_TOKEN` or `GITHUB_TOKEN` (`GH_ENTERPRISE_TOKEN` or
+    /// `GITHUB_ENTERPRISE_TOKEN` for GitHub Enterprise Server).
+    ///
+    /// An update an earlier release left waiting for its merge request is handed over to the
+    /// merge request instead.
     Finish {
         /// Complete only the local moves and close the update without fetching or pushing; a
         /// catch-up takes in only the local integration branch, and after a rejected push the
@@ -106,6 +113,45 @@ pub enum Command {
         /// an unverified or conflicted one
         #[arg(long)]
         no_publish: bool,
+    },
+    /// Take the follow upstreams in without local state, as a scheduled CI job does
+    ///
+    /// Brings the local integration branch up to date with the publish remote's, creating it when
+    /// missing. In merge-request mode, with the update's merge request open, it catches the
+    /// merge request up with the integration branch when that moved, by a catch-up merge pushed
+    /// without force, and otherwise changes nothing. Without an open merge request it starts an
+    /// update of every follow upstream the integration branch lacks the target of and publishes
+    /// it as `finish` does, unless a person closed the last merge request of those very targets
+    /// without merging it. Merge-request mode runs no install command and no check. In push mode
+    /// it starts, verifies and publishes in one run. Upstreams it cannot take are left out and
+    /// named; port upstreams with pending commits are named, never taken. A conflict, or failed
+    /// checks in push mode, stop it with the update in progress, as `start` stops.
+    Sync,
+    /// Print or pass on the update variables of a commit, read from history
+    ///
+    /// Sets, for COMMIT (`HEAD` by default), the `GIT_INTAKE_*` variables `verify` gives the
+    /// checks, read from history alone, so that a merge request pipeline gives its checks what
+    /// `verify` gives them locally. The integration tip is the publish remote's, fetched for the
+    /// command, or the local integration branch without a publish remote. A commit the
+    /// integration branch contains, or that carries no update, gets no variable.
+    ///
+    /// Prints one `export` line per variable by default; `--dotenv` prints `NAME=value` lines
+    /// for a GitLab dotenv report or GitHub's environment file; `--json` one JSON object. With a
+    /// command after `--`, runs it with the variables and exits with its status, or with status 2
+    /// without running it when the variables cannot be read.
+    Env {
+        /// The commit to describe; `HEAD` when none is given
+        #[arg(value_name = "COMMIT")]
+        rev: Option<String>,
+        /// Print `NAME=value` lines, unquoted
+        #[arg(long, conflicts_with_all = ["json", "command"])]
+        dotenv: bool,
+        /// Write one JSON object to standard output
+        #[arg(long, conflicts_with = "command")]
+        json: bool,
+        /// The command to run with the variables
+        #[arg(last = true, value_name = "COMMAND")]
+        command: Vec<String>,
     },
     /// Carry an update in progress over from state format 3
     ///
@@ -120,7 +166,9 @@ pub enum Command {
     /// Fetch every upstream and show its drift, and the update in progress
     ///
     /// A follow upstream with `tags` is compared with its newest release tag instead of its
-    /// branch tip, and shows the state `no release` while its branch has none.
+    /// branch tip, and shows the state `no release` while its branch has none. In merge-request
+    /// mode it also shows the update's open merge request, and the newest one merged without the
+    /// update's history.
     Status {
         /// Predict conflicts, and fail unless every upstream is current
         #[arg(long)]
@@ -152,6 +200,9 @@ pub enum Command {
         json: bool,
     },
     /// Check the configuration, upstreams, history, journals and update state
+    ///
+    /// In merge-request mode it also checks that the forge is recognised, that a token is set
+    /// and accepted, and that the merge settings qualify.
     Doctor {
         /// Write one JSON document to standard output
         #[arg(long)]

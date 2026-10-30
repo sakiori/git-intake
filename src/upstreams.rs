@@ -5,8 +5,9 @@
 //! changed. Each command fetches into a namespace of its own,
 //! `refs/git-intake/read/<token>/`, through [`Fetches`], and removes it when
 //! it ends. An update holds `refs/git-intake/upstreams/<name>` for each of
-//! its queued upstreams: `start` writes them, from what it fetched, and only
-//! `finish` or `abort` removes them, so no other command ever moves them.
+//! its queued upstreams: `start` and `sync` write them, from what they
+//! fetched or from the update a merge request carries, and only `finish`,
+//! `abort` and `sync` remove them, so no other command ever moves them.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -37,7 +38,12 @@ pub fn upstream_ref(name: &str) -> String {
 /// the repository until the update ends.
 pub fn hold(git: &Git, state: &UpdateState) -> Result<()> {
     for (name, tip) in held_by(state) {
-        git.run(&["update-ref", "-m", "git-intake: start", &name, &tip])?;
+        // An update carried on from a merge request may name upstream
+        // commits the repository does not have, as the taken commits of a
+        // port: there is nothing to keep.
+        if git.object_exists(&tip)? {
+            git.run(&["update-ref", "-m", "git-intake: start", &name, &tip])?;
+        }
     }
     Ok(())
 }
@@ -131,7 +137,8 @@ impl<'r> Fetches<'r> {
             Some(tip) => Ok(tip),
             None => Err(format!(
                 "fetching branch '{}' from {} left no commit",
-                up.branch, up.url
+                up.branch,
+                crate::git::redacted(&up.url)
             )),
         })
     }
@@ -157,14 +164,38 @@ impl<'r> Fetches<'r> {
             .collect()))
     }
 
+    /// Fetches branch `branch` of the git remote `remote`, as the update's
+    /// branch on the publish remote is read. Returns its tip, or git's error.
+    pub fn remote_branch(
+        &mut self,
+        remote: &str,
+        branch: &str,
+    ) -> Result<std::result::Result<String, String>> {
+        let name = format!("{}remotes/{remote}/{branch}", self.namespace);
+        let refspec = format!("+refs/heads/{branch}:{name}");
+        if let Err(why) = self.fetch_from(remote, &refspec)? {
+            return Ok(Err(why));
+        }
+        Ok(match self.git.commit(&name)? {
+            Some(tip) => Ok(tip),
+            None => Err(format!(
+                "fetching branch '{branch}' from '{remote}' left no commit"
+            )),
+        })
+    }
+
     fn fetch(&self, up: &Upstream, refspec: &str) -> Result<std::result::Result<(), String>> {
+        self.fetch_from(&up.url, refspec)
+    }
+
+    fn fetch_from(&self, source: &str, refspec: &str) -> Result<std::result::Result<(), String>> {
         let out = self.git.raw(&[
             "fetch",
             "--quiet",
             "--no-tags",
             "--no-write-fetch-head",
             "--end-of-options",
-            &up.url,
+            source,
             refspec,
         ])?;
         Ok(if out.success() {

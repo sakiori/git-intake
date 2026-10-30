@@ -195,7 +195,7 @@ fn every_queued_upstream_gets_its_own_variables() {
 }
 
 #[test]
-fn port_upstream_names_the_newest_planned_commit() {
+fn port_upstream_names_the_newest_commit_it_takes_or_decides() {
     let f = Fork::port();
     let env = &f.env;
     f.reconfigure(
@@ -235,7 +235,9 @@ fn port_upstream_names_the_newest_planned_commit() {
             "GIT_INTAKE_INTEGRATION=main".to_string(),
             "GIT_INTAKE_UPSTREAMS=upstream".to_string(),
             "GIT_INTAKE_UPSTREAM_UPSTREAM_MODE=port".to_string(),
-            format!("GIT_INTAKE_UPSTREAM_UPSTREAM_TARGET={}", c[2]),
+            // The commit left `later` is not what the update moves the
+            // upstream to.
+            format!("GIT_INTAKE_UPSTREAM_UPSTREAM_TARGET={}", c[1]),
         ])
     );
 }

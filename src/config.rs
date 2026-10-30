@@ -43,6 +43,10 @@ struct RawPublish {
     remote: String,
     #[serde(default)]
     via: PublishVia,
+    /// Read as text so that an unknown forge is named with the values
+    /// accepted.
+    forge: Option<String>,
+    api: Option<String>,
 }
 
 /// How an upstream is taken.
@@ -88,11 +92,27 @@ impl PublishVia {
     }
 }
 
+/// The forge that hosts the publish remote, as the setting `forge` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForgeKind {
+    Gitlab,
+    Github,
+}
+
 /// Where and how `finish` publishes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Publish {
     pub remote: String,
     pub via: PublishVia,
+    /// Merge-request mode: the forge of the publish remote, when its URL
+    /// does not tell it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<ForgeKind>,
+    /// Merge-request mode: the base URL of the forge's REST API, an `https`
+    /// URL on the publish remote's host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
 }
 
 /// A validated configuration.
@@ -318,10 +338,53 @@ fn parse_publish(value: toml::Value) -> std::result::Result<Publish, String> {
     let raw: RawPublish = value
         .try_into()
         .map_err(|e: toml::de::Error| format!("publish: {}", e.message()))?;
+    let forge = match raw.forge.as_deref().map(str::trim) {
+        None => None,
+        Some("gitlab") => Some(ForgeKind::Gitlab),
+        Some("github") => Some(ForgeKind::Github),
+        Some(other) => {
+            return Err(format!(
+                "publish forge: '{other}' is not a forge the tool reaches; use `gitlab` or `github`"
+            ));
+        }
+    };
+    let api = match raw.api.as_deref().map(str::trim) {
+        None => None,
+        Some(api) => Some(check_api(api)?),
+    };
     Ok(Publish {
         remote: raw.remote,
         via: raw.via,
+        forge,
+        api,
     })
+}
+
+/// Validates the setting `api`: an `https` URL with a host, without
+/// credentials, query or fragment. Returns it without a trailing `/`.
+fn check_api(api: &str) -> std::result::Result<String, String> {
+    let refuse = |why: &str| {
+        format!(
+            "publish api: '{api}' {why}; give the base URL of the forge's REST API as an `https` URL, \
+             such as `https://gitlab.example.com/api/v4` or `https://github.example.com/api/v3`"
+        )
+    };
+    let url = url::Url::parse(api).map_err(|e| refuse(&format!("is not a URL ({e})")))?;
+    if url.scheme() != "https" {
+        return Err(refuse("is not an `https` URL"));
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(refuse("names no host"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(refuse(
+            "carries credentials, which belong in the environment",
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(refuse("has a query or a fragment"));
+    }
+    Ok(api.trim_end_matches('/').to_string())
 }
 
 /// Cross-entry rules: unique names and sources, distinct environment
@@ -357,7 +420,8 @@ fn check_layout(integration: &str, upstreams: &[Upstream], problems: &mut Vec<St
     }
     for (url, branch, n) in sources.into_iter().filter(|s| s.2 > 1) {
         problems.push(format!(
-            "{n} upstreams share the URL '{url}' and the branch '{branch}'"
+            "{n} upstreams share the URL '{}' and the branch '{branch}'",
+            crate::git::redacted(url)
         ));
     }
 
@@ -553,7 +617,9 @@ via = "merge-request"
             cfg.publish,
             Some(Publish {
                 remote: "origin".into(),
-                via: PublishVia::MergeRequest
+                via: PublishVia::MergeRequest,
+                forge: None,
+                api: None,
             })
         );
         assert_eq!(cfg.checks.len(), 2);
@@ -765,6 +831,48 @@ via = "merge-request"
             e.contains("publish remote: 'bad name' is not a valid remote name"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn forge_and_api_settings_are_validated() {
+        let cfg = parse(&format!(
+            "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\nvia = \"merge-request\"\n\
+             forge = \"gitlab\"\napi = \"https://gitlab.example.com/gitlab/api/v4/\"\n"
+        ))
+        .unwrap();
+        let publish = cfg.publish.unwrap();
+        assert_eq!(publish.forge, Some(ForgeKind::Gitlab));
+        assert_eq!(
+            publish.api.as_deref(),
+            Some("https://gitlab.example.com/gitlab/api/v4")
+        );
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\nforge = \"gitea\"\n"
+        ));
+        assert!(
+            e.contains(
+                "publish forge: 'gitea' is not a forge the tool reaches; use `gitlab` or `github`"
+            ),
+            "{e}"
+        );
+        for (api, why) in [
+            ("http://forge.example/api/v4", "is not an `https` URL"),
+            ("forge.example/api/v4", "is not a URL"),
+            (
+                "https://user:secret@forge.example/api/v4",
+                "carries credentials",
+            ),
+            (
+                "https://forge.example/api/v4?x=1",
+                "has a query or a fragment",
+            ),
+        ] {
+            let e = err(&format!(
+                "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\napi = \"{api}\"\n"
+            ));
+            assert!(e.contains(&format!("publish api: '{api}' {why}")), "{e}");
+            assert!(e.contains("as an `https` URL"), "{e}");
+        }
     }
 
     #[test]

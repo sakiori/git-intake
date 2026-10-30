@@ -19,14 +19,19 @@ use crate::state::{
 pub struct ReportDoc {
     pub in_progress: bool,
     pub integration: String,
-    /// The integration tip the update started from, which upstream ranges
-    /// and the repository's own changes are measured from.
+    /// The integration tip the update started from, or was carried on at,
+    /// which upstream ranges and the repository's own changes are measured
+    /// from.
     pub base: String,
     /// Branches `finish --no-publish` advanced locally without publishing.
     pub unpublished: Vec<String>,
     pub upstreams: Vec<UpstreamReport>,
     /// The catch-up merges with the integration branch, oldest first.
     pub catch_ups: Vec<CatchUpReport>,
+    /// For an update `sync` carried on from a merge request, its address:
+    /// what the history holds of the update is shown, but the conflicts of
+    /// the steps taken before it was carried on are not known.
+    pub carried_from: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -221,6 +226,7 @@ fn build(git: &Git, state: &UpdateState, in_progress: bool) -> Result<ReportDoc>
             .unwrap_or_default(),
         upstreams,
         catch_ups,
+        carried_from: state.carried_from.as_ref().map(|c| c.url.clone()),
     })
 }
 
@@ -414,6 +420,12 @@ impl Render for ReportDoc {
                 "finished"
             }
         );
+        if let Some(url) = &self.carried_from {
+            out.push_str(&format!(
+                "carried on from {url}: what its history holds is shown; the conflicts of the steps taken before \
+                 it was carried on are not known\n"
+            ));
+        }
         if !self.unpublished.is_empty() {
             out.push_str(&format!(
                 "not published (advanced locally only): {}\n",

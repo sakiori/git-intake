@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{Fork, Mono, mono_config, stderr, stdout};
+use common::{Fork, MERGE_REQUEST_BRANCH, Mono, mono_config, stderr, stdout};
 use predicates::str::contains;
 
 #[test]
@@ -792,20 +792,27 @@ fn another_release_of_the_same_format_continues_with_a_warning_once() {
 }
 
 #[test]
-fn another_release_waiting_for_the_merge_request_is_not_advised_to_abort() {
+fn another_release_after_the_push_is_not_advised_to_abort() {
     let f = Fork::merge_request();
     let env = &f.env;
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
-    f.tool(&["verify"]).success();
-    f.tool(&["finish"]).success();
+    // The forge refuses to open the merge request once the branch is
+    // pushed: the update stays, with its head published.
+    f.forge()
+        .fail("POST", "/merge_requests", 500, "500 Internal Server Error");
+    f.tool(&["finish"]).code(2);
+    assert_eq!(
+        env.rev(&f.publish, MERGE_REQUEST_BRANCH),
+        env.rev(&env.update_worktree(&f.down), "HEAD")
+    );
 
-    // `abort` would withdraw the published merge request branch, so the
-    // warning gives no such advice while the update waits.
+    // `abort` would leave the pushed branch behind, so the warning gives no
+    // such advice once the update was pushed.
     edit_state(&f, |s| s["release"] = "0.0.1".into());
+    f.forge().world().failures.clear();
     let first = stderr(&f.tool(&["finish"]).success());
     assert!(first.contains(OTHER_RELEASE), "{first}");
     assert!(!first.contains("abort"), "{first}");
-    let again = stderr(&f.tool(&["finish"]).success());
-    assert!(!again.contains("warning:"), "{again}");
+    env.assert_no_update(&f.down);
 }

@@ -94,10 +94,16 @@ fn without_upstream_history(commits: Vec<LineCommit>, records: Vec<Record>) -> L
                 .is_none_or(|m| !sync_merges.contains(m))
         })
         .collect();
-    let kept: HashSet<&str> = commits.iter().map(|c| c.commit.as_str()).collect();
+    // A sync record counts only on a merge whose second parent is its
+    // target, as every sync merge the tool makes is: the trailers a squash
+    // commit's message copies from the merges it replaces do not count.
+    let kept: HashMap<&str, &LineCommit> = commits.iter().map(|c| (c.commit.as_str(), c)).collect();
     let records = records
         .into_iter()
-        .filter(|r| kept.contains(r.commit.as_str()))
+        .filter(|r| {
+            kept.get(r.commit.as_str())
+                .is_some_and(|c| sync_record::is_sync_merge(&c.parents, &r.target))
+        })
         .collect();
     Line { commits, records }
 }
@@ -210,11 +216,29 @@ mod tests {
             target: target.into(),
             tag: None,
         };
-        let records = vec![record("g", "x"), record("s", "t"), record("t", "y")];
+        let records = vec![record("g", "u"), record("s", "t"), record("t", "y")];
         let line = without_upstream_history(line(listing, &HashSet::new()), records);
         assert_eq!(ids(&line.commits), ["m", "f", "g", "s", "b"]);
         let kept: Vec<&str> = line.records.iter().map(|r| r.commit.as_str()).collect();
         assert_eq!(kept, ["g", "s"]);
+    }
+
+    #[test]
+    fn trailers_off_a_sync_merge_do_not_count() {
+        // q is a squash commit whose message copied a sync merge's trailers;
+        // g merges u but names another target.
+        let listing = "q g\ng b u\nu\nb\n";
+        let record = |commit: &str, target: &str| Record {
+            commit: commit.into(),
+            upstream: "up".into(),
+            target: target.into(),
+            tag: None,
+        };
+        let line = without_upstream_history(
+            line(listing, &HashSet::new()),
+            vec![record("q", "u"), record("g", "x")],
+        );
+        assert!(line.records.is_empty(), "{:?}", line.records);
     }
 
     #[test]

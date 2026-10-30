@@ -4,7 +4,9 @@
 mod cli;
 mod commands;
 mod config;
+mod description;
 mod drift;
+mod forge;
 mod git;
 mod integration_line;
 mod output;
@@ -14,6 +16,7 @@ mod state;
 mod sync_record;
 mod tags;
 mod target;
+mod update_line;
 mod upstreams;
 
 use std::process::ExitCode;
@@ -30,6 +33,8 @@ pub enum Exit {
     /// Exit status 1: a negative result such as drift, a failed check or a
     /// stop on conflicts.
     Negative,
+    /// The exit status of a command `env` ran.
+    Code(u8),
 }
 
 /// Exit status for errors: invalid configuration, refused command, git failure.
@@ -37,12 +42,25 @@ const ERROR_STATUS: u8 = 2;
 
 fn run(command: Command) -> anyhow::Result<Exit> {
     let repo = repo::Repo::open()?;
+    // The integration line needs the full history: a shallow clone cuts it
+    // off, and an upstream's last sync record may lie below the cut. Only
+    // the commands that end or carry over an update work without it.
+    if !matches!(command, Command::Abort { .. } | Command::Migrate) {
+        repo.refuse_shallow()?;
+    }
     let result = match command {
         Command::Start { upstreams } => commands::update::start(&repo, &upstreams),
         Command::Continue => commands::update::resume(&repo),
-        Command::Abort => commands::update::abort(&repo),
+        Command::Abort { merge_request } => commands::update::abort(&repo, merge_request),
         Command::Verify => commands::verify::run(&repo),
         Command::Finish { no_publish } => commands::finish::run(&repo, no_publish),
+        Command::Sync => commands::sync::run(&repo),
+        Command::Env {
+            rev,
+            dotenv,
+            json,
+            command,
+        } => commands::env::run(&repo, rev.as_deref(), dotenv, json, &command),
         Command::Migrate => commands::migrate::run(&repo),
         Command::Status { check, json } => commands::status::run(&repo, check, json),
         Command::Report { json } => commands::report::run(&repo, json),
@@ -62,6 +80,7 @@ fn main() -> ExitCode {
     match run(cli.command) {
         Ok(Exit::Success) => ExitCode::SUCCESS,
         Ok(Exit::Negative) => ExitCode::from(1),
+        Ok(Exit::Code(code)) => ExitCode::from(code),
         Err(err) => {
             eprintln!("error: {err:#}");
             ExitCode::from(ERROR_STATUS)

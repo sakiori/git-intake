@@ -37,41 +37,69 @@ fn output_path(repo: &Repo) -> std::path::PathBuf {
     repo.paths.logs.join("catch-up.out")
 }
 
+/// What a refused catch-up names as the way on.
+#[derive(Debug, Clone, Copy)]
+pub enum Advice<'a> {
+    /// The update can be aborted.
+    Abort,
+    /// `finish` has moved the integration branch, so the update can only be
+    /// closed at the planned commit.
+    NoPublish,
+    /// `sync` carried on the update of the open merge request this names.
+    Sync(&'a str),
+}
+
+impl Advice<'_> {
+    fn text(self, state: &UpdateState, remote: &str) -> String {
+        let integration = &state.config.integration;
+        match self {
+            Advice::Abort => {
+                "Run `git intake abort`, then `git intake start` to plan the update from the new history".to_string()
+            }
+            Advice::NoPublish => {
+                "Run `git intake finish --no-publish` to close the update at the planned commit without publishing it"
+                    .to_string()
+            }
+            Advice::Sync(request) => format!(
+                "The {request} keeps its head. Withdraw it with `git intake abort --merge-request`, which declines its \
+                 targets: `git intake sync` proposes them again only once an upstream moves on, and \
+                 `git intake start` with `git intake finish` publishes them again by hand; or bring \
+                 '{remote}/{integration}' and the {request} together by hand"
+            ),
+        }
+    }
+}
+
 /// Refuses, naming what to do instead, when the update cannot take `tip` in
 /// by a catch-up merge: `tip` does not contain the base, or the commits it
-/// adds change what the update means. `moved` says that `finish` has moved
-/// the integration branch, so that the update can only be closed at the
-/// planned commit; `remote` that `tip` is the publish remote's.
+/// adds change what the update means. `remote` says that `tip` is the
+/// publish remote's.
 pub fn require_possible(
     repo: &Repo,
     state: &UpdateState,
     tip: &str,
-    moved: bool,
+    advice: Advice,
     remote: bool,
 ) -> Result<()> {
     let git = &repo.git;
     let integration = &state.config.integration;
-    let advice = if moved {
-        "Run `git intake finish --no-publish` to close the update at the planned commit without publishing it"
-    } else {
-        "Run `git intake abort`, then `git intake start` to plan the update from the new history"
-    };
+    let publish = state
+        .config
+        .publish
+        .as_ref()
+        .map(|p| p.remote.as_str())
+        .unwrap_or_default();
+    let way_on = advice.text(state, publish);
     if remote && let Some(unpublished) = unpublished(repo, state, tip)? {
-        let publish = state
-            .config
-            .publish
-            .as_ref()
-            .map(|p| p.remote.as_str())
-            .unwrap_or_default();
         bail!(
             "{}",
-            unpublished_refusal(state, publish, tip, &unpublished, moved)
+            unpublished_refusal(state, publish, tip, &unpublished, advice)
         );
     }
     if !git.is_ancestor(&state.base, tip)? {
         bail!(
             "'{integration}' was rewritten: its tip {} does not contain the update's base {}, so the update \
-             cannot catch up with it. Nothing was merged and no branch moved. {advice}",
+             cannot catch up with it. Nothing was merged and no branch moved. {way_on}",
             abbrev(tip),
             abbrev(&state.base)
         );
@@ -101,7 +129,7 @@ pub fn require_possible(
     if !problems.is_empty() {
         bail!(
             "cannot catch up with '{integration}' at {}: the commits it adds change what the update means:\n{}\n\
-             Nothing was merged and no branch moved. {advice}",
+             Nothing was merged and no branch moved. {way_on}",
             abbrev(tip),
             bullet(&problems)
         );
@@ -137,18 +165,18 @@ pub fn unpublished_refusal(
     remote: &str,
     tip: &str,
     unpublished: &[String],
-    moved: bool,
+    advice: Advice,
 ) -> String {
     let integration = &state.config.integration;
-    let advice = if moved {
-        "Run `git intake finish --no-publish` to close the update locally, publish or reconcile those commits \
+    let advice = match advice {
+        Advice::NoPublish => "Run `git intake finish --no-publish` to close the update locally, publish or reconcile those commits \
          with the remote's work, and publish the result through a new update"
-            .to_string()
-    } else {
-        format!(
+            .to_string(),
+        Advice::Abort => format!(
             "Run `git intake abort`, publish those commits or reconcile '{integration}' with '{remote}/{integration}', \
              then run `git intake start` again"
-        )
+        ),
+        Advice::Sync(_) => advice.text(state, remote),
     };
     format!(
         "'{remote}/{integration}' moved to {}, but the update's base {} holds commits of '{integration}' that were \

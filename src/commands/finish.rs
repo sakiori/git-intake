@@ -5,8 +5,9 @@
 //! again after an interruption or a rejected push completes the move (a
 //! branch already at its planned value counts as done), publishes exactly
 //! the planned commit, and cleans up. `--no-publish` closes the
-//! update locally without pushing. In merge-request mode publication goes
-//! through [`merge_request`](super::merge_request) instead.
+//! update locally without pushing. In merge-request mode the update is
+//! published as a merge request through
+//! [`merge_request`](super::merge_request) instead, without moving a branch.
 //!
 //! When the integration branch moved past the update's base, `finish` takes
 //! the new tip in by a catch-up merge (see [`catch_up`](super::catch_up)),
@@ -28,12 +29,14 @@ use crate::upstreams;
 
 pub fn run(repo: &Repo, no_publish: bool) -> Result<Exit> {
     let state = repo.require_state()?;
+    // An update an earlier release left waiting for its merge request is
+    // the merge request's from now on.
     if state.merge_request.is_some() {
-        return merge_request::complete(repo, state, no_publish);
+        return merge_request::hand_over(repo, state);
     }
     let via = state.config.publish.as_ref().map(|p| p.via);
     if via == Some(PublishVia::MergeRequest) && state.finishing.is_none() && !no_publish {
-        return merge_request::open(repo, state);
+        return merge_request::finish(repo, state);
     }
     finish_by_push(repo, state, no_publish)
 }
@@ -419,7 +422,12 @@ pub fn prepare(
         return Ok(Ready::Stop(Exit::Negative));
     }
     if moved_on {
-        catch_up::require_possible(repo, state, tip, run.moved, run.remote_tip)?;
+        let advice = if run.moved {
+            catch_up::Advice::NoPublish
+        } else {
+            catch_up::Advice::Abort
+        };
+        catch_up::require_possible(repo, state, tip, advice, run.remote_tip)?;
         if run.remote_tip {
             state.remote_tip = Some(tip.to_string());
         }

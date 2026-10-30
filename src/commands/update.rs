@@ -9,11 +9,11 @@ use anyhow::{Context, Result, bail};
 
 use crate::Exit;
 use crate::cli::UpstreamTarget;
-use crate::commands::merge_request::{self, Landing};
+use crate::commands::merge_request;
 use crate::commands::{catch_up, finish, port_plan};
-use crate::config::{Mode, Upstream};
+use crate::config::{Config, Mode, PublishVia, Upstream};
 use crate::drift::{self, DriftState};
-use crate::git::{Git, abbrev, branch_ref};
+use crate::git::{Git, abbrev, branch_ref, tracking_ref};
 use crate::port::{self, PlanLine};
 use crate::repo::{Repo, bullet};
 use crate::state::{
@@ -31,36 +31,10 @@ use crate::upstreams::{self, Fetches};
 /// pending commits, and the update stops for the plan to be edited.
 pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
     if let Some(state) = repo.state()? {
-        if let Some(mr) = state
-            .merge_request
-            .as_ref()
-            .filter(|_| state.finishing.is_none())
-        {
-            bail!(
-                "the previous update waits for its merge request from '{}' into '{}' on '{}'; \
-                 run `git intake finish` once it is merged, or `git intake abort` to withdraw it",
-                mr.branch,
-                state.config.integration,
-                mr.remote
-            );
-        }
-        if state.finishing.is_some() {
-            bail!(
-                "the previous update is finishing; run `git intake finish` to publish it, \
-                 or `git intake finish --no-publish` to close it locally"
-            );
-        }
-        bail!(
-            "an update is already in progress (worktree {}); run `git intake status` to see it, then `continue`, `verify`, `finish` or `abort`",
-            state.worktree.display()
-        );
+        refuse_in_progress(&state)?;
     }
     let worktree = repo.place_update_worktree()?;
-    if repo.update_worktree_registered()? || worktree.exists() || repo.update_branch_exists()? {
-        bail!(
-            "an interrupted update left its worktree or the branch '{UPDATE_BRANCH}' behind; run `git intake abort` to remove them"
-        );
-    }
+    refuse_leftovers(repo, &worktree)?;
     let names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
     let mut repeated: Vec<&str> = names
         .iter()
@@ -99,6 +73,12 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
             );
         }
         config = reread;
+    }
+    if let Some(publish) = config.publish.clone()
+        && publish.via == PublishVia::MergeRequest
+    {
+        require_published(repo, &publish.remote, &config.integration)?;
+        merge_request::require_startable(repo, &publish, &config.integration)?;
     }
     let selected = config.select(&names)?;
 
@@ -182,6 +162,74 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
         return Ok(Exit::Success);
     }
 
+    let mut state = begin(repo, config, &base, worktree, queue)?;
+    drop(fetches);
+    finish_advance(repo, &mut state)
+}
+
+/// Refuses a new update while one is in progress, naming its step and the
+/// next command.
+pub fn refuse_in_progress(state: &UpdateState) -> Result<()> {
+    merge_request::refuse_earlier(state)?;
+    if state.finishing.is_some() {
+        bail!(
+            "the previous update is finishing; run `git intake finish` to publish it, \
+             or `git intake finish --no-publish` to close it locally"
+        );
+    }
+    let wt = Git::worktree(&state.worktree);
+    bail!(
+        "an update is already in progress (worktree {}), at the step {}; next: {}",
+        state.worktree.display(),
+        step_name(state, &wt)?.replace('_', " "),
+        next_step(state, &wt)?
+    )
+}
+
+/// Refuses when an interrupted update left its worktree at `worktree` or
+/// its branch behind.
+pub fn refuse_leftovers(repo: &Repo, worktree: &std::path::Path) -> Result<()> {
+    if repo.update_worktree_registered()? || worktree.exists() || repo.update_branch_exists()? {
+        bail!(
+            "an interrupted update left its worktree or the branch '{UPDATE_BRANCH}' behind; run `git intake abort` to remove them"
+        );
+    }
+    Ok(())
+}
+
+/// Refuses, in merge-request mode, a local integration branch with commits
+/// the publish remote's lacks: they would ride along in the next merge
+/// request unannounced.
+pub fn require_published(repo: &Repo, remote: &str, integration: &str) -> Result<()> {
+    let git = &repo.git;
+    let Some(published) = git.commit(&tracking_ref(remote, integration))? else {
+        return Ok(());
+    };
+    let local = git
+        .commit(&branch_ref(integration))?
+        .with_context(|| format!("the integration branch '{integration}' does not exist"))?;
+    let extra = git.count(&published, &local)?;
+    if extra > 0 {
+        bail!(
+            "'{integration}' holds {extra} commit{} that '{remote}/{integration}' lacks; published through a merge \
+             request, the update would carry them unannounced. Nothing changed. Publish them first, or reset \
+             '{integration}' to '{remote}/{integration}'",
+            plural(extra)
+        );
+    }
+    Ok(())
+}
+
+/// Creates the update worktree and branch at `base` and the update's state,
+/// holds the update's upstream references, and says what it queued.
+pub fn begin(
+    repo: &Repo,
+    config: Config,
+    base: &str,
+    worktree: std::path::PathBuf,
+    queue: Vec<QueuedUpstream>,
+) -> Result<UpdateState> {
+    let git = &repo.git;
     repo.exclude_update_worktree()?;
     git.run(&["config", "rerere.enabled", "true"])?;
     fs::create_dir_all(&repo.paths.root)
@@ -193,15 +241,12 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
         "-b",
         UPDATE_BRANCH,
         &worktree.to_string_lossy(),
-        &base,
+        base,
     ])?;
-    let mut state = UpdateState::new(config, base.clone(), worktree, queue);
+    let mut state = UpdateState::new(config, base.to_string(), worktree, queue);
     state.main_worktree = repo.main_checkout()?;
     if let Some(publish) = &state.config.publish {
-        state.remote_tip = git.commit(&crate::git::tracking_ref(
-            &publish.remote,
-            &state.config.integration,
-        ))?;
+        state.remote_tip = git.commit(&tracking_ref(&publish.remote, &state.config.integration))?;
     }
     for q in &state.upstreams {
         if let Some(plan) = q.port() {
@@ -217,11 +262,10 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
     repo.save_state(&state)?;
     // The update holds its references from now on.
     upstreams::hold(git, &state)?;
-    drop(fetches);
     println!(
         "update started from {} at {} in {}",
         state.config.integration,
-        abbrev(&base),
+        abbrev(base),
         state.worktree.display()
     );
     for q in &state.upstreams {
@@ -247,19 +291,19 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
             }
         }
     }
-    advance(repo, &mut state)
+    Ok(state)
 }
 
 /// What `start` fetched of one selected upstream: its branch tip, and the
 /// tags of its repository when it needs them.
 #[derive(Clone, Copy)]
-struct Fetched<'a> {
-    tip: &'a str,
-    tags: &'a UpstreamTags,
+pub struct Fetched<'a> {
+    pub tip: &'a str,
+    pub tags: &'a UpstreamTags,
 }
 
 /// What `start` makes of one selected upstream.
-enum Queued {
+pub enum Queued {
     Work(Box<QueuedUpstream>),
     /// Nothing to do; the message says so.
     Current(String),
@@ -271,7 +315,7 @@ enum Queued {
 /// The target is the commit `rev` names, the newest release tag on the
 /// fetched branch when the upstream has a `tags` pattern, or the fetched
 /// tip. The upstream tag that names it goes into the sync record.
-fn queue_follow(
+pub fn queue_follow(
     repo: &Repo,
     base: &str,
     up: &Upstream,
@@ -384,7 +428,7 @@ pub fn no_release(up: &Upstream) -> String {
         "upstream '{}': no tag of {} matching '{}' is a release version on {} as fetched; \
          name the target with `git intake start {}=<rev>`",
         up.name,
-        up.url,
+        crate::git::redacted(&up.url),
         up.tags.as_deref().unwrap_or_default(),
         up.source(),
         up.name
@@ -543,9 +587,19 @@ pub fn blocking_prefix(git: &Git, rev: &str, path: &str) -> Result<Option<String
     Ok(None)
 }
 
+/// How [`advance`] left the update.
+pub enum Advanced {
+    /// Every queued upstream is merged or its plan carried out.
+    Merged,
+    /// A port upstream's plan waits to be edited.
+    Plan,
+    /// A merge or copy stopped, with this exit status.
+    Stopped(Exit),
+}
+
 /// Takes in every pending upstream in order, stopping at the first conflict
 /// or at a plan to edit.
-pub fn advance(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
+pub fn advance(repo: &Repo, state: &mut UpdateState) -> Result<Advanced> {
     for i in 0..state.upstreams.len() {
         let stopped = match (state.upstreams[i].step, &state.upstreams[i].work) {
             (UpstreamStep::Merged, _) => None,
@@ -558,17 +612,32 @@ pub fn advance(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
                 println!(
                     "mark each commit take, skip, have or later, then run `git intake continue`"
                 );
-                return Ok(Exit::Success);
+                return Ok(Advanced::Plan);
             }
             (_, Work::Follow(_)) => merge_follow(repo, state, i)?,
             (_, Work::Port(_)) => port_plan::carry_out(repo, state, i)?,
         };
         if let Some(exit) = stopped {
-            return Ok(exit);
+            return Ok(Advanced::Stopped(exit));
         }
     }
-    println!("every queued upstream is merged or its plan carried out; next: git intake verify");
-    Ok(Exit::Success)
+    Ok(Advanced::Merged)
+}
+
+/// [`advance`] as `start` and `continue` run it, naming the next command
+/// once every upstream is taken in.
+fn finish_advance(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
+    Ok(match advance(repo, state)? {
+        Advanced::Merged => {
+            println!(
+                "every queued upstream is merged or its plan carried out; next: {}",
+                next_step(state, &Git::worktree(&state.worktree))?
+            );
+            Exit::Success
+        }
+        Advanced::Plan => Exit::Success,
+        Advanced::Stopped(exit) => exit,
+    })
 }
 
 /// Merges one pending follow upstream. Returns the exit status when the
@@ -953,7 +1022,7 @@ pub fn resume(repo: &Repo) -> Result<Exit> {
         );
         return Ok(Exit::Success);
     }
-    advance(repo, &mut state)
+    finish_advance(repo, &mut state)
 }
 
 /// Concludes the merge of a follow upstream stopped on conflicts.
@@ -1050,8 +1119,9 @@ fn read_plan(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<()> {
 }
 
 /// `abort`: removes the update worktree, branch, plan, upstream references,
-/// logs and state, and withdraws a merge request the update waits for.
-pub fn abort(repo: &Repo) -> Result<Exit> {
+/// logs and state. With `--merge-request` it then withdraws the update's
+/// merge request through the forge: closes it and deletes its branch.
+pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
     let state = repo.state()?;
     if let Some(finishing) = state.as_ref().and_then(|s| s.finishing.as_ref()) {
         let mut moved = Vec::new();
@@ -1068,28 +1138,40 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
             );
         }
     }
-    let merge_request = state.as_ref().and_then(|s| s.merge_request.clone());
-    let mut unverified = None;
-    if let (Some(state), Some(mr)) = (&state, &merge_request) {
-        let landing = if state.finishing.is_some() {
-            // `finish` plans its moves only once the verified tree landed.
-            None
-        } else {
-            Some(merge_request::inspect(repo, &mut state.clone())?)
-        };
-        match landing {
-            None | Some(Landing::Landed { .. }) => bail!(
-                "the merge request from '{}' was merged with the verified commit; the update can no longer be aborted. \
-                 Run `git intake finish` to complete it",
-                mr.branch
+    // The forge is reached before anything is removed, so that a missing
+    // token or setting refuses with the update intact.
+    let withdrawal = if withdraw {
+        let (publish, integration) = match &state {
+            Some(s) => (
+                merge_request::publication(repo, s),
+                s.config.integration.clone(),
             ),
-            Some(Landing::Unverified {
-                tip, landing, head, ..
-            }) => unverified = Some((tip, landing, head)),
-            Some(_) => {}
+            None => {
+                let config = repo.load_config()?.config;
+                (config.publish, config.integration)
+            }
+        };
+        let publish = publish.context(
+            "no publication setting is configured, so the update has no merge request to withdraw",
+        )?;
+        if publish.via != PublishVia::MergeRequest {
+            bail!(
+                "'{}' is published by push, which opens no merge request; run `git intake abort` to remove the \
+                 local update",
+                publish.remote
+            );
         }
-        merge_request::delete_branch(&repo.git, mr)?;
-    }
+        merge_request::connect(repo, &publish)?;
+        Some((publish, integration))
+    } else {
+        None
+    };
+    let earlier_state = match &state {
+        Some(s) if s.merge_request.is_some() && !withdraw => {
+            Some(merge_request::earlier_state(repo, s))
+        }
+        _ => None,
+    };
     let mut removed = repo.remove_update_artifacts()?;
     removed.extend(repo.remove_plan()?);
     if let Some(state) = &state {
@@ -1101,53 +1183,60 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
     }
     removed.extend(repo.remove_logs()?);
     state::remove(&repo.paths.state)?;
-    if state.is_none() && removed.is_empty() {
-        println!("no update is in progress; nothing to abort");
-        return Ok(Exit::Success);
-    }
     for r in &removed {
         println!("removed {r}");
     }
-    match state {
-        Some(state) => {
+    match &state {
+        Some(state) => println!(
+            "update aborted; '{}' is unchanged",
+            state.config.integration
+        ),
+        None if !removed.is_empty() => println!("removed the remains of an interrupted update"),
+        None if withdrawal.is_none() => println!("no update is in progress; nothing to abort"),
+        None => {}
+    }
+    if let Some((publish, integration)) = withdrawal {
+        let earlier = state.as_ref().and_then(|s| s.merge_request.as_ref());
+        merge_request::withdraw(repo, &publish, &integration, earlier)?;
+        return Ok(Exit::Success);
+    }
+    if let Some(state) = &state {
+        if let Some(carried) = &state.carried_from {
             println!(
-                "update aborted; '{}' is unchanged",
-                state.config.integration
+                "the update was carried on from {}, which stays open; `git intake abort --merge-request` withdraws it",
+                carried.url
             );
-            if let (Some(mr), Some((tip, landing, head))) = (&merge_request, &unverified) {
-                let integration = &state.config.integration;
-                let how = match head {
-                    Some(head) => format!(
-                        "{}, and it landed instead of the verified commit",
-                        head.describe()
-                    ),
-                    None => format!(
-                        "{} brought in '{}' without the verified tree",
-                        abbrev(landing),
-                        mr.branch
-                    ),
-                };
-                println!(
-                    "'{}/{integration}' at {} holds an unverified merge: {how}; review it before building on it",
-                    mr.remote,
-                    abbrev(tip)
-                );
-            } else if let Some(mr) = merge_request {
-                let integration = &state.config.integration;
-                if mr.requested {
-                    println!(
-                        "close the merge request from '{}' into '{integration}' on '{}'",
-                        mr.branch, mr.remote
-                    );
-                } else {
-                    println!(
-                        "if a merge request from '{}' into '{integration}' was opened on '{}', close it",
-                        mr.branch, mr.remote
-                    );
-                }
+        }
+        if let (Some(mr), Some(found)) = (&state.merge_request, &earlier_state) {
+            println!(
+                "{found}; it is kept, with its branch '{}'; `git intake abort --merge-request` withdraws it",
+                mr.branch
+            );
+        }
+        return Ok(Exit::Success);
+    }
+    // With no update in progress, `abort` names the merge request it does
+    // not close.
+    if let Ok(loaded) = repo.load_config()
+        && let Some(publish) = &loaded.config.publish
+        && publish.via == PublishVia::MergeRequest
+    {
+        let integration = &loaded.config.integration;
+        let found = merge_request::connect(repo, publish).and_then(|forge| {
+            let reqs =
+                merge_request::requests(repo, forge.as_ref(), &publish.remote, integration, &[])?;
+            Ok((forge.kind(), reqs.open))
+        });
+        match found {
+            Ok((kind, Some(open))) => println!(
+                "the update's {} is open; `git intake abort --merge-request` withdraws it",
+                merge_request::named(kind, &open)
+            ),
+            Ok((_, None)) => {}
+            Err(err) => {
+                println!("could not read the forge for the update's merge request: {err:#}")
             }
         }
-        None => println!("removed the remains of an interrupted update"),
     }
     Ok(Exit::Success)
 }
@@ -1156,40 +1245,32 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
 /// unless it has caught up with the integration branch in its worktree
 /// since: `continue` and `verify` then work on the catch-up.
 pub fn require_merging(repo: &Repo, state: &UpdateState) -> Result<()> {
-    if (state.finishing.is_some() || state.merge_request.is_some())
-        && moved_on(state)?
-        && repo.update_worktree_registered()?
-    {
+    merge_request::refuse_earlier(state)?;
+    if state.finishing.is_some() && moved_on(state)? && repo.update_worktree_registered()? {
         return Ok(());
     }
     if state.finishing.is_some() {
         bail!("`finish` is in progress; run `git intake finish` to complete it");
     }
-    if let Some(mr) = &state.merge_request {
-        bail!(
-            "the update waits for its merge request from '{}' into '{}' on '{}'; run `git intake finish` once it is merged, \
-             or `git intake abort` to withdraw it",
-            mr.branch,
-            state.config.integration,
-            mr.remote
-        );
-    }
     Ok(())
 }
 
 /// Whether the update worktree holds work beyond the commit `finish`
-/// planned to publish or pushed to the merge request branch, as a catch-up
-/// merge made after either, and what was committed on top of it.
+/// planned to publish, as a catch-up merge made after a rejected push, and
+/// what was committed on top of it.
 pub fn moved_on(state: &UpdateState) -> Result<bool> {
-    let published = match (&state.finishing, &state.merge_request) {
-        (None, None) => return Ok(false),
-        (Some(f), _) => f.moves.first().map(|m| m.new.clone()),
-        (None, Some(mr)) => Some(mr.commit.clone()),
+    let Some(published) = state
+        .finishing
+        .as_ref()
+        .and_then(|f| f.moves.first())
+        .map(|m| m.new.clone())
+    else {
+        return Ok(false);
     };
     if state.catching_up().is_some() {
         return Ok(true);
     }
-    Ok(head(&Git::worktree(&state.worktree))?.is_some_and(|h| Some(h) != published))
+    Ok(head(&Git::worktree(&state.worktree))?.is_some_and(|h| h != published))
 }
 
 /// Refuses when the update worktree is missing.
@@ -1205,6 +1286,9 @@ pub fn require_worktree(repo: &Repo, state: &UpdateState) -> Result<()> {
 
 /// The step an update has reached, as a stable name.
 pub fn step_name(state: &UpdateState, wt: &Git) -> Result<&'static str> {
+    if state.merge_request.is_some() {
+        return Ok("waiting_for_merge_request");
+    }
     if let Some(c) = state.catching_up() {
         let merging = wt.dir().exists() && wt.merge_in_progress()?;
         return Ok(if c.step == CatchUpStep::Conflict || merging {
@@ -1218,9 +1302,6 @@ pub fn step_name(state: &UpdateState, wt: &Git) -> Result<&'static str> {
     }
     if state.finishing.is_some() {
         return Ok("finishing");
-    }
-    if state.merge_request.is_some() {
-        return Ok("waiting_for_merge_request");
     }
     if state
         .upstreams
@@ -1252,12 +1333,18 @@ pub fn step_name(state: &UpdateState, wt: &Git) -> Result<&'static str> {
 
 /// The command to run next.
 pub fn next_step(state: &UpdateState, wt: &Git) -> Result<String> {
+    let by_merge_request = state
+        .config
+        .publish
+        .as_ref()
+        .is_some_and(|p| p.via == PublishVia::MergeRequest);
     Ok(match step_name(state, wt)? {
         "catch_up_conflict" => format!(
             "resolve the conflicts of the catch-up merge in {}, stage them, then run `git intake continue`",
             state.worktree.display()
         ),
         "catch_up" if state.catching_up().is_some() => "git intake continue".to_string(),
+        "catch_up" if by_merge_request => "git intake finish".to_string(),
         "catch_up" if state.verification.as_ref().is_some_and(|v| !v.passed) => format!(
             "`git intake finish` to verify the catch-up merge again and publish it, or fix the failures on the \
              update branch in {}, commit, then run `git intake verify`",
@@ -1282,7 +1369,7 @@ pub fn next_step(state: &UpdateState, wt: &Git) -> Result<String> {
         "merging" => "git intake continue".to_string(),
         "verified" => "git intake finish".to_string(),
         "waiting_for_merge_request" => match &state.merge_request {
-            Some(mr) => merge_request::waiting_next(mr, &state.config.integration),
+            Some(mr) => merge_request::earlier_next(mr),
             None => "git intake finish".to_string(),
         },
         "finishing" => match state.finishing.as_ref().and_then(|f| f.push_error.as_ref()) {
@@ -1291,10 +1378,20 @@ pub fn next_step(state: &UpdateState, wt: &Git) -> Result<String> {
                 .to_string(),
             None => "git intake finish".to_string(),
         },
+        "verification_failed" if by_merge_request => format!(
+            "`git intake finish` to publish the update as a merge request, whose pipeline verifies it, or fix the \
+             failures on the update branch in {}, commit, then run `git intake verify`",
+            state.worktree.display()
+        ),
         "verification_failed" => format!(
             "fix the failures on the update branch in {}, commit, then run `git intake verify`",
             state.worktree.display()
         ),
+        _ if by_merge_request => {
+            "git intake finish, which publishes the update as a merge request; `git intake verify` runs the \
+             checks locally first"
+                .to_string()
+        }
         _ => "git intake verify".to_string(),
     })
 }

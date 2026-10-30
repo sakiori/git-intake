@@ -4,7 +4,7 @@
 use anyhow::Result;
 
 use crate::config::Upstream;
-use crate::git::{Git, abbrev};
+use crate::git::{Git, abbrev, redacted};
 use crate::tags::UpstreamTags;
 
 /// The commit a revision names, with the upstream tag it named, if any.
@@ -39,21 +39,23 @@ pub fn resolve(
     let (oid, named, upstream_tag) = match tags.get(tag) {
         Some(oid) => (
             oid.to_string(),
-            format!("tag '{tag}' of {}", up.url),
+            format!("tag '{tag}' of {}", redacted(&up.url)),
             Some(tag.to_string()),
         ),
         None => {
             let Some(commit) = here.commit(rev)? else {
                 return Ok(Err(format!(
                     "upstream '{}': '{rev}' names no commit and no tag of {}",
-                    up.name, up.url
+                    up.name,
+                    redacted(&up.url)
                 )));
             };
             if let Some(local) = own_tag(here, rev)? {
                 return Ok(Err(format!(
                     "upstream '{}': {} has no tag '{tag}', and '{rev}' resolves through \
                      the repository's own tag {local}; name a tag of the upstream's repository or a commit",
-                    up.name, up.url
+                    up.name,
+                    redacted(&up.url)
                 )));
             }
             (commit, format!("'{rev}'"), None)

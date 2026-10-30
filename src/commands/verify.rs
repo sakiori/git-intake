@@ -10,13 +10,14 @@ use crate::Exit;
 use crate::commands::update::{require_merging, require_worktree};
 use crate::config;
 use crate::git::{Git, abbrev};
+use crate::port::Verb;
 use crate::repo::{Repo, bullet};
 use crate::state::{CheckOutcome, CheckResult, UpdateState, Verification, Work};
 
 /// Prefix of the environment variables the install command and the checks
 /// receive. Variables with this prefix inherited from the caller are not
 /// passed on, so a command sees only those of the update it verifies.
-const ENV_PREFIX: &str = "GIT_INTAKE_";
+pub const ENV_PREFIX: &str = "GIT_INTAKE_";
 
 pub fn run(repo: &Repo) -> Result<Exit> {
     let mut state = repo.require_state()?;
@@ -185,6 +186,52 @@ fn merged_config_problem(
     })
 }
 
+/// One upstream as the variables describe it.
+pub struct Described {
+    pub name: String,
+    pub mode: config::Mode,
+    /// The follow target, or the newest upstream commit a port update takes
+    /// or decides on.
+    pub target: Option<String>,
+    /// A follow upstream's last synced commit before the update.
+    pub previous: Option<String>,
+}
+
+/// The variables that describe an update with the base `base`, at `head`,
+/// of the integration branch `integration`, taking `upstreams` in queue
+/// order, as full commit ids. `verify` and `env` give the same ones.
+pub fn variables(
+    base: &str,
+    head: &str,
+    integration: &str,
+    upstreams: &[Described],
+) -> Vec<(String, String)> {
+    let mut vars = vec![
+        (format!("{ENV_PREFIX}BASE"), base.to_string()),
+        (format!("{ENV_PREFIX}HEAD"), head.to_string()),
+        (format!("{ENV_PREFIX}INTEGRATION"), integration.to_string()),
+        (
+            format!("{ENV_PREFIX}UPSTREAMS"),
+            upstreams
+                .iter()
+                .map(|u| u.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    ];
+    for u in upstreams {
+        let prefix = format!("{ENV_PREFIX}UPSTREAM_{}_", config::env_name(&u.name));
+        vars.push((format!("{prefix}MODE"), u.mode.as_str().to_string()));
+        if let Some(target) = &u.target {
+            vars.push((format!("{prefix}TARGET"), target.clone()));
+        }
+        if let Some(previous) = &u.previous {
+            vars.push((format!("{prefix}PREVIOUS"), previous.clone()));
+        }
+    }
+    vars
+}
+
 /// The environment that describes the update to the install command and the
 /// checks, as full commit ids. The base is the integration tip the update
 /// lands on: the tip it started from, or the one it last caught up with; a
@@ -193,44 +240,43 @@ fn merged_config_problem(
 /// update branch, and each upstream's commits are in the history of the
 /// reference the update holds for it.
 fn check_environment(state: &UpdateState, head: &str) -> Vec<(String, String)> {
-    let mut vars = vec![
-        (format!("{ENV_PREFIX}BASE"), state.base.clone()),
-        (format!("{ENV_PREFIX}HEAD"), head.to_string()),
-        (
-            format!("{ENV_PREFIX}INTEGRATION"),
-            state.config.integration.clone(),
-        ),
-        (
-            format!("{ENV_PREFIX}UPSTREAMS"),
-            state
-                .upstreams
-                .iter()
-                .map(|q| q.name.as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
-    ];
-    for q in &state.upstreams {
-        let prefix = format!("{ENV_PREFIX}UPSTREAM_{}_", config::env_name(&q.name));
-        let (mode, target, previous) = match &q.work {
-            Work::Follow(f) => (config::Mode::Follow, Some(&f.target), f.previous.as_ref()),
-            // The newest commit of the plan: after the update, each upstream
-            // commit up to it is taken, decided, or left pending by the plan.
-            Work::Port(p) => (
-                config::Mode::Port,
-                p.commits.last().map(|c| &c.commit),
-                None,
-            ),
-        };
-        vars.push((format!("{prefix}MODE"), mode.as_str().to_string()));
-        if let Some(target) = target {
-            vars.push((format!("{prefix}TARGET"), target.clone()));
-        }
-        if let Some(previous) = previous {
-            vars.push((format!("{prefix}PREVIOUS"), previous.clone()));
+    let upstreams: Vec<Described> = state
+        .upstreams
+        .iter()
+        .map(|q| match &q.work {
+            Work::Follow(f) => Described {
+                name: q.name.clone(),
+                mode: config::Mode::Follow,
+                target: Some(f.target.clone()),
+                previous: f.previous.clone(),
+            },
+            // The newest commit the update takes or decides on, which is
+            // what it moves the upstream to in the journal; commits left
+            // `later` stay pending.
+            Work::Port(p) => Described {
+                name: q.name.clone(),
+                mode: config::Mode::Port,
+                target: p
+                    .commits
+                    .iter()
+                    .rev()
+                    .find(|c| matches!(c.verb, Some(Verb::Take | Verb::Skip | Verb::Have)))
+                    .map(|c| c.commit.clone()),
+                previous: None,
+            },
+        })
+        .collect();
+    variables(&state.base, head, &state.config.integration, &upstreams)
+}
+
+/// Keeps the `GIT_INTAKE_` variables the tool inherited from `cmd`, so that
+/// it sees only those of the update it is given.
+pub fn clear_inherited(cmd: &mut Command) {
+    for (var, _) in std::env::vars_os() {
+        if var.to_str().is_some_and(|v| v.starts_with(ENV_PREFIX)) {
+            cmd.env_remove(var);
         }
     }
-    vars
 }
 
 /// Runs a shell command in `dir` with the variables of `environment`,
@@ -259,11 +305,7 @@ fn run_logged(
     ] {
         cmd.env_remove(var);
     }
-    for (var, _) in std::env::vars_os() {
-        if var.to_str().is_some_and(|v| v.starts_with(ENV_PREFIX)) {
-            cmd.env_remove(var);
-        }
-    }
+    clear_inherited(&mut cmd);
     cmd.envs(environment.iter().map(|(k, v)| (k, v)));
     let status = cmd
         .status()

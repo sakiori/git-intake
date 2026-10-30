@@ -120,6 +120,37 @@ impl Repo {
         })
     }
 
+    /// Refuses in a shallow repository, whose cut-off history would make
+    /// the integration line end too early.
+    pub fn refuse_shallow(&self) -> Result<()> {
+        if self.git.line(&["rev-parse", "--is-shallow-repository"])? == "true" {
+            bail!(
+                "this repository is a shallow clone; the integration line, where the tool reads its sync records, \
+                 needs the full history. Run `git fetch --unshallow` to fetch it, and in CI clone with the full \
+                 history (GitLab: `GIT_DEPTH: 0`; GitHub Actions: `fetch-depth: 0`)"
+            );
+        }
+        Ok(())
+    }
+
+    /// The configuration committed at `rev`, validated, or `None` when
+    /// `rev` has none.
+    pub fn config_at(&self, rev: &str) -> Result<Option<Config>> {
+        match self.git.show_file(rev, config::FILE_NAME)? {
+            None => Ok(None),
+            Some(text) => {
+                let config = config::parse(&text)?;
+                self.refuse_publishing_to_an_upstream(&config)?;
+                Ok(Some(config))
+            }
+        }
+    }
+
+    /// The commit at `HEAD` of the worktree the tool was started in.
+    pub fn head(&self) -> Option<&str> {
+        self.head.as_deref()
+    }
+
     /// The update in progress, if any.
     pub fn state(&self) -> Result<Option<UpdateState>> {
         state::load(&self.paths.state)
@@ -531,9 +562,12 @@ impl Repo {
                 .find(|u| crate::upstreams::same_repository(u, &up.url, base))
             {
                 problems.push(format!(
-                    "publish remote '{}' has the URL {url}, which names the repository of upstream '{}' ({}); \
+                    "publish remote '{}' has the URL {}, which names the repository of upstream '{}' ({}); \
                      the tool never pushes to an upstream",
-                    publish.remote, up.name, up.url
+                    publish.remote,
+                    crate::git::redacted(url),
+                    up.name,
+                    crate::git::redacted(&up.url)
                 ));
             }
         }

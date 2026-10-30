@@ -110,7 +110,9 @@ pub fn catch_ups<'a>(
 
 /// The commits of `rev` that `base` lacks, without those of the configured
 /// upstreams' fetched branches, that carry a sync record or a copy's
-/// trailers, each with the upstreams they name, newest first.
+/// trailers, each with the upstreams they name, newest first. A sync record
+/// counts only on a merge whose second parent is its target, and a copy only
+/// with the commit it took.
 pub fn naming_upstreams(
     git: &Git,
     rev: &str,
@@ -120,7 +122,9 @@ pub fn naming_upstreams(
     let mut args = log_args(
         upstream_tips,
         &[format!(
-            "--format=%H%x1f%(trailers:key={UPSTREAM_TRAILER},valueonly,separator=%x2C)%x1e"
+            "--format=%H%x1f%P%x1f%(trailers:key={UPSTREAM_TRAILER},valueonly,separator=%x2C)\
+             %x1f%(trailers:key={TARGET_TRAILER},valueonly,separator=%x2C)\
+             %x1f%(trailers:key={TAKEN_TRAILER},valueonly,separator=%x2C)%x1e"
         )],
         UPSTREAM_TRAILER,
         rev,
@@ -138,13 +142,22 @@ pub fn naming_upstreams(
         .filter_map(|entry| {
             let mut fields = entry.trim_matches(['\n', '\r']).split(FIELD);
             let commit = fields.next()?.trim().to_string();
+            let parents: Vec<String> = fields
+                .next()?
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
             let names: Vec<String> = fields
                 .next()?
                 .split(',')
                 .map(|n| n.trim().to_string())
                 .filter(|n| !n.is_empty())
                 .collect();
-            (!commit.is_empty() && !names.is_empty()).then_some((commit, names))
+            let target = first_value(fields.next().unwrap_or_default()).to_string();
+            let taken = first_value(fields.next().unwrap_or_default()).to_string();
+            let counts =
+                (!target.is_empty() && is_sync_merge(&parents, &target)) || !taken.is_empty();
+            (!commit.is_empty() && !names.is_empty() && counts).then_some((commit, names))
         })
         .collect())
 }
@@ -261,10 +274,31 @@ fn log_args(upstream_tips: &[String], options: &[String], trailer: &str, rev: &s
     args
 }
 
-/// The sync record carried by one commit, as git parses its trailers.
+/// Whether a commit with `parents` carries a sync record for `target`: a
+/// sync record counts only on a merge whose second parent is its target.
+pub fn is_sync_merge(parents: &[String], target: &str) -> bool {
+    parents.len() >= 2 && parents[1].eq_ignore_ascii_case(target)
+}
+
+/// The sync record one commit carries, as git parses its trailers, when it
+/// is a merge whose second parent is the record's target.
 pub fn record_of(git: &Git, commit: &str) -> Result<Option<Record>> {
     let out = git.run(&["log", "-1", &log_format(), commit, "--"])?;
-    Ok(parse_log(&out).into_iter().next())
+    let Some(record) = parse_log(&out).into_iter().next() else {
+        return Ok(None);
+    };
+    let parents = parents_of(git, commit)?;
+    Ok(is_sync_merge(&parents, &record.target).then_some(record))
+}
+
+/// The parents of a commit.
+pub fn parents_of(git: &Git, commit: &str) -> Result<Vec<String>> {
+    let line = git.line(&["rev-list", "--parents", "-n", "1", commit, "--"])?;
+    Ok(line
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_string)
+        .collect())
 }
 
 /// The upstream commit `commit` names as taken from upstream `name`, if it

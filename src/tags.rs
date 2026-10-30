@@ -112,8 +112,8 @@ impl UpstreamTags {
             return Ok(Err(format!(
                 "upstream '{}': cannot list the tags of {}: {}",
                 up.name,
-                up.url,
-                out.stderr.trim()
+                crate::git::redacted(&up.url),
+                crate::git::redacted(out.stderr.trim())
             )));
         }
         Ok(Ok(Self::parse(&out.stdout)))

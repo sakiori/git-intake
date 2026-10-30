@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{MERGE_REQUEST_BRANCH, Mono, merge_on_forge, mono_config, stdout};
+use common::{How, Mono, merge_on_fake, mono_config, open_number, stdout};
 use predicates::str::contains;
 
 #[test]
@@ -385,11 +385,15 @@ fn paths_imported_through_a_merge_request_merged_with_a_merge_commit_stay_import
     let a_tip = env.rev(&m.a.bare, "main");
     let b_tip = env.rev(&m.b.bare, "main");
     m.tool(&["start"]).success();
-    m.tool(&["verify"]).success();
     let commit = env.rev(&env.update_worktree(&m.down), "HEAD");
     m.tool(&["finish"]).success();
-    merge_on_forge(env, &publish, MERGE_REQUEST_BRANCH);
-    m.tool(&["finish"]).success();
+    let fake = m.forge.as_ref().unwrap();
+    merge_on_fake(env, fake, open_number(fake), How::MergeCommit);
+    // The next `start` brings the local integration branch up to date.
+    m.tool(&["start"])
+        .success()
+        .stdout(contains("every selected upstream is current"));
+    assert_eq!(env.rev(&m.down, "main"), env.rev(&publish, "main"));
     assert_eq!(env.rev(&m.down, "main^2"), commit);
 
     let status = env.tool_json(&m.down, &["status", "--json"], 0);
