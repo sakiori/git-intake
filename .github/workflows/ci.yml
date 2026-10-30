@@ -162,6 +162,11 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-deny@0.20.2
+      # cargo-deny tells a yanked version only from cargo's cached index
+      # entries, which a fresh runner lacks and a resolution from Cargo.lock
+      # never fetches; a dry-run update fetches the current entry of every
+      # locked crate without changing Cargo.lock.
+      - run: cargo update --dry-run
       - run: cargo deny --locked check
 
   # Builds and packs the release archive of every release target exactly as

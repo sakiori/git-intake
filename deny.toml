@@ -19,7 +19,9 @@ all-features = true
 # vulnerability, and an unmaintained or unsound crate whether the workspace
 # depends on it directly or through another crate (cargo-deny's default for
 # unsound crates covers only the workspace's direct dependencies). A yanked
-# version in the lockfile fails it too.
+# version in the lockfile fails it too, as far as cargo's cached index
+# entries tell: run `cargo update --dry-run` first, as CI does, so that they
+# are current.
 unmaintained = "all"
 unsound = "all"
 yanked = "deny"
