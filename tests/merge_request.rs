@@ -25,28 +25,12 @@ fn verified(f: &Fork) -> (String, String) {
 }
 
 fn mr_branch(commit: &str) -> String {
-    format!("git-intake/update-{}", &commit[..12])
+    common::merge_request_branch(commit)
 }
 
 /// A clone of the publish remote that plays the forge merging the request.
 fn forge(f: &Fork) -> PathBuf {
-    let env = &f.env;
-    let dir = env.path("forge");
-    if !dir.exists() {
-        env.git(
-            &env.path(""),
-            &[
-                "clone",
-                "-q",
-                &f.publish.to_string_lossy(),
-                &dir.to_string_lossy(),
-            ],
-        );
-    } else {
-        env.git(&dir, &["fetch", "-q", "origin"]);
-        env.git(&dir, &["reset", "-q", "--hard", "origin/main"]);
-    }
-    dir
+    common::forge(&f.env, &f.publish)
 }
 
 fn push_forge_main(f: &Fork, forge: &Path) {
@@ -454,22 +438,7 @@ fn merge_request_closed_without_merging_is_refused() {
 
 /// The forge merges the merge request branch with a merge commit.
 fn merge_on_forge(f: &Fork, branch: &str) -> String {
-    let env = &f.env;
-    let forge = forge(f);
-    env.git(&forge, &["fetch", "-q", "origin"]);
-    env.git(
-        &forge,
-        &[
-            "merge",
-            "-q",
-            "--no-ff",
-            "-m",
-            "Merge branch into main",
-            &format!("origin/{branch}"),
-        ],
-    );
-    push_forge_main(f, &forge);
-    env.rev(&f.publish, "main")
+    common::merge_on_forge(&f.env, &f.publish, branch)
 }
 
 #[test]
@@ -1094,4 +1063,97 @@ fn a_reply_without_the_pushed_branch_names_no_merge_request() {
         status["update"]["merge_request"]["number"],
         serde_json::Value::Null
     );
+}
+
+#[test]
+fn a_sync_record_merged_with_a_merge_commit_is_the_last_synced_commit() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, target) = verified(&f);
+    f.tool(&["finish"]).success();
+    // The forge merges with a merge commit while the integration branch is
+    // where the update started, as the semi-linear method requires: the
+    // update's commits, its sync record among them, are off the first-parent
+    // line.
+    merge_on_forge(&f, &mr_branch(&commit));
+    f.tool(&["finish"]).success();
+    assert_eq!(env.rev(&f.down, "main^2"), commit);
+
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    let up = &status["upstreams"][0];
+    assert_eq!(up["state"], "current");
+    assert_eq!(up["last_synced"], target.as_str());
+    assert_eq!(up["last_synced_source"], "record");
+    let doctor = stdout(&f.tool(&["doctor"]).success());
+    assert!(
+        doctor.contains(&format!(
+            "last synced commit {} is contained in upstream/main",
+            &target[..12]
+        )),
+        "{doctor}"
+    );
+
+    // A feature merged later with a merge commit carries no record and
+    // hides none.
+    let forge = forge(&f);
+    env.git(&forge, &["checkout", "-q", "-b", "feature"]);
+    env.commit(&forge, &[("feature.txt", "f\n")], "fork: a feature");
+    env.git(&forge, &["checkout", "-q", "main"]);
+    env.git(
+        &forge,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge branch 'feature'",
+            "feature",
+        ],
+    );
+    push_forge_main(&f, &forge);
+    env.git(&f.down, &["pull", "-q", "--ff-only", "origin", "main"]);
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    let up = &status["upstreams"][0];
+    assert_eq!(up["last_synced"], target.as_str());
+    assert_eq!(up["last_synced_source"], "record");
+
+    // The next update starts from that record, and its merge request lands
+    // the same way.
+    let next = env.push_upstream(&f.up, &[("m.txt", "m\n")], "upstream: m");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    let second = env.rev(&env.update_worktree(&f.down), "HEAD");
+    f.tool(&["finish"]).success();
+    let description = recorded_push_options(&f.publish)
+        .into_iter()
+        .find(|o| o.starts_with("merge_request.description="))
+        .expect("description");
+    assert!(
+        description.contains(&format!("{}..{} (1 commit)", &target[..12], &next[..12])),
+        "{description}"
+    );
+    merge_on_forge(&f, &mr_branch(&second));
+    f.tool(&["finish"]).success();
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    let up = &status["upstreams"][0];
+    assert_eq!(up["state"], "current");
+    assert_eq!(up["last_synced"], next.as_str());
+    assert_eq!(up["last_synced_source"], "record");
+}
+
+#[test]
+fn a_sync_record_landed_by_fast_forward_is_the_last_synced_commit() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, target) = verified(&f);
+    f.tool(&["finish"]).success();
+    env.git(&f.publish, &["update-ref", "refs/heads/main", &commit]);
+    f.tool(&["finish"]).success();
+    assert_eq!(env.rev(&f.down, "main"), commit);
+
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    let up = &status["upstreams"][0];
+    assert_eq!(up["state"], "current");
+    assert_eq!(up["last_synced"], target.as_str());
+    assert_eq!(up["last_synced_source"], "record");
 }

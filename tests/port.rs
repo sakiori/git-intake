@@ -1581,3 +1581,53 @@ fn a_copy_whose_added_file_was_unstaged_is_not_recorded_as_present() {
     // The copy, then the journal that the first plan starts.
     assert_eq!(taken_by(&f, &env.rev(&wt, "HEAD~1")), added);
 }
+
+/// Verifies the update in progress, opens its merge request, has the forge
+/// merge it with a merge commit, and finishes the update.
+fn land_with_a_merge_commit(f: &Fork) {
+    let env = &f.env;
+    f.tool(&["verify"]).success();
+    let commit = env.rev(&env.update_worktree(&f.down), "HEAD");
+    f.tool(&["finish"]).success();
+    common::merge_on_forge(env, &f.publish, &common::merge_request_branch(&commit));
+    f.tool(&["finish"]).success();
+    assert_eq!(env.rev(&f.down, "main^2"), commit);
+}
+
+#[test]
+fn a_port_starts_at_a_record_merged_with_a_merge_commit() {
+    let f = Fork::merge_request();
+    let c = upstream_commits(&f, 3);
+    f.tool(&["start", &format!("upstream={}", c[0])]).success();
+    land_with_a_merge_commit(&f);
+    // c1 merged by hand, without a record: the history would say c1, the
+    // record says c0.
+    let env = &f.env;
+    env.git(&f.down, &["fetch", "-q", &f.up.url(), &c[1]]);
+    env.git(
+        &f.down,
+        &["merge", "-q", "--no-ff", "-m", "Merge c1 by hand", &c[1]],
+    );
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
+    f.reconfigure("mode = \"follow\"", "mode = \"port\"");
+
+    let up = port_status(&f, 0);
+    assert_eq!(up["base"], c[0].as_str());
+    assert_eq!(up["journal"], false);
+    assert_eq!(up["pending"], 2);
+
+    // The port update lands the same way; its journal starts at the record,
+    // and its copy counts as taken.
+    f.tool(&["start"]).success();
+    write_plan(&f, &[("have", &c[1], ""), ("take", &c[2], "")]);
+    f.tool(&["continue"]).success();
+    land_with_a_merge_commit(&f);
+    assert!(journal_at(&f, "main").contains(&format!("base = \"{}\"", c[0])));
+    let up = port_status(&f, 0);
+    assert_eq!(up["state"], "current");
+    assert_eq!(up["journal"], true);
+    assert_eq!(up["base"], c[0].as_str());
+    assert_eq!(up["decided"], 1);
+    assert_eq!(up["taken"], 1);
+    assert_eq!(up["pending"], 0);
+}

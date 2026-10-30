@@ -112,7 +112,7 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
     }
 
     let fetched_tips: Vec<String> = tips.values().cloned().collect();
-    let latest = sync_record::latest(&sync_record::records(git, &base, &fetched_tips)?);
+    let latest = sync_record::latest(git, &sync_record::records(git, &base, &fetched_tips)?)?;
     let mut refusals = Vec::new();
     let mut queue = Vec::new();
     let mut current = Vec::new();

@@ -197,7 +197,7 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     }
     let fetch_failed = fetched.iter().any(|f| f.is_err());
     let tips: Vec<String> = fetched.iter().filter_map(|f| f.clone().ok()).collect();
-    let latest = sync_record::latest(&sync_record::records(git, &tip, &tips)?);
+    let latest = sync_record::latest(git, &sync_record::records(git, &tip, &tips)?)?;
     let mut upstreams = Vec::new();
     for (up, fetched) in config.upstreams.iter().zip(&fetched) {
         let fetched = fetched.as_deref().map_err(String::as_str);

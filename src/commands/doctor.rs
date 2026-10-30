@@ -224,7 +224,7 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
     }
     let tips: Vec<String> = fetched.iter().filter_map(|f| f.clone().ok()).collect();
     let records = sync_record::records(git, &integration, &tips)?;
-    let latest = sync_record::latest(&records);
+    let latest = sync_record::latest(git, &records)?;
     for (up, fetched) in config.upstreams.iter().zip(&fetched) {
         let name = Some(up.name.as_str());
         checks.pass_or_fail(
@@ -280,13 +280,18 @@ fn follow_checks(
     checks: &mut Checks,
 ) -> Result<()> {
     let name = Some(up.name.as_str());
+    // Without a record, the last synced commit the history shows.
+    let adopted = match (record, tip) {
+        (None, Some(t)) => adopted_base(git, integration, up, t)?,
+        _ => None,
+    };
     if let Some(path) = &up.path {
         let exists = git.object_type(integration, path)?.is_some();
         // Synced: a record, or a merge in the history that brought the
         // upstream into its path; unknown when the branch is not fetched.
         let synced = match (record.is_some(), tip) {
             (true, _) => Some(true),
-            (false, Some(t)) => Some(adopted_base(git, integration, up, t)?.is_some()),
+            (false, Some(_)) => Some(adopted.is_some()),
             (false, None) => None,
         };
         let (status, detail) = match (synced, exists) {
@@ -324,11 +329,11 @@ fn follow_checks(
     }
 
     match (record, tip) {
-        (None, Some(t)) => {
-            let detail = match adopted_base(git, integration, up, t)? {
+        (None, Some(_)) => {
+            let detail = match &adopted {
                 Some(base) => format!(
                     "no sync record yet; last synced from history is {}, contained in {}",
-                    abbrev(&base),
+                    abbrev(base),
                     up.source()
                 ),
                 None => "no sync record yet".to_string(),
