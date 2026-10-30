@@ -464,23 +464,72 @@ fn check_copyright_lines(crates: &[(String, String, PathBuf)], text: &str) -> Re
     Ok(())
 }
 
-/// Whether a line states a copyright: `Copyright` followed by a year, `(c)`
-/// or `©`, in any letter case, as in `// Copyright 2016 Brian Smith.`.
+/// Whether a line states a copyright notice. These forms count:
+///
+/// - `SPDX-FileCopyrightText`, anywhere in the line;
+/// - the word `copyright`, in any letter case, followed by a year, `©`, `ⓒ`
+///   or `(c)` in either case, as in `Copyright ⓒ 2015-2016 Kevin B. Knapp`;
+/// - a line that starts, past its comment markers and an optional
+///   `Portions`, with `Copyright` or `COPYRIGHT`, an optional `:`, and a
+///   holder, a word that starts with a capital letter, as in
+///   `Copyright The Rust Project Developers`, unless that word is one of
+///   license prose, such as `COPYRIGHT HOLDERS` or `Copyright Notice`;
+/// - a line that starts with `©` or `ⓒ`.
 fn is_copyright_line(line: &str) -> bool {
+    const PROSE: &[&str] = &[
+        "notice",
+        "notices",
+        "holder",
+        "holders",
+        "owner",
+        "owners",
+        "license",
+        "licenses",
+        "law",
+        "laws",
+        "act",
+        "statement",
+        "and",
+        "or",
+    ];
+    if line.contains("SPDX-FileCopyrightText") {
+        return true;
+    }
     let lower = line.to_lowercase();
-    lower.match_indices("copyright").any(|(at, word)| {
-        let after_word = lower[at..].chars().nth(word.len());
-        let before = lower[..at].chars().next_back();
-        if before.is_some_and(char::is_alphanumeric)
-            || after_word.is_some_and(char::is_alphanumeric)
-        {
-            return false;
-        }
-        let rest = lower[at + word.len()..].trim_start();
+    let symbol_or_year = |rest: &str| {
+        let rest = rest.trim_start();
         rest.starts_with(|c: char| c.is_ascii_digit())
             || rest.starts_with("(c)")
             || rest.starts_with('©')
-    })
+            || rest.starts_with('ⓒ')
+    };
+    let noticed = lower.match_indices("copyright").any(|(at, word)| {
+        let before = lower[..at].chars().next_back();
+        let after = lower[at + word.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric)
+            && !after.is_some_and(char::is_alphanumeric)
+            && symbol_or_year(&lower[at + word.len()..])
+    });
+    if noticed {
+        return true;
+    }
+    let text = normalized(line);
+    let text = text.strip_prefix("Portions ").unwrap_or(&text);
+    if text.starts_with('©') || text.starts_with('ⓒ') {
+        return true;
+    }
+    let Some(rest) = text
+        .strip_prefix("Copyright")
+        .or_else(|| text.strip_prefix("COPYRIGHT"))
+    else {
+        return false;
+    };
+    if !rest.starts_with([' ', ':']) {
+        return false;
+    }
+    let holder = rest.trim_start_matches([' ', ':']);
+    let word: String = holder.chars().take_while(|c| c.is_alphanumeric()).collect();
+    word.starts_with(char::is_uppercase) && !PROSE.contains(&word.to_lowercase().as_str())
 }
 
 /// A line without the comment markers before it, with its whitespace
@@ -700,4 +749,79 @@ fn check_archive(archive: &Path, epoch: u64) -> Result<()> {
         archive.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copyright_lines_are_recognised_in_every_common_form() {
+        for line in [
+            // clap 4.6.7 and clap_builder 4.6.7, src/lib.rs, line 1.
+            "// Copyright ⓒ 2015-2016 Kevin B. Knapp and [`clap-rs` contributors](https://github.com/clap-rs/clap/graphs/contributors).",
+            "// Copyright 2016 Brian Smith.",
+            "/* Copyright (c) 2014, Intel Corporation.",
+            "# Copyright (C) 2019 Example Authors",
+            "Copyright © 2005-2020 Rich Felker, et al.",
+            "© 2014 Unicode, Inc.",
+            "// Copyright The Rust Project Developers",
+            "Copyright: Example Project contributors",
+            "// Portions Copyright (c) 2016, Google Inc.",
+            "// SPDX-FileCopyrightText: 2023 Example Authors",
+            "COPYRIGHT 2001 EXAMPLE CORP.",
+        ] {
+            assert!(is_copyright_line(line), "{line}");
+        }
+        for line in [
+            "// The above copyright notice and this permission notice shall be included in",
+            "// IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,",
+            "COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER",
+            "// copyright, or license notices",
+            "Copyright and related rights waived via CC0",
+            "// characters such as '#' and '©'.",
+            "let copyright = read();",
+        ] {
+            assert!(!is_copyright_line(line), "{line}");
+        }
+    }
+
+    /// The locked clap's header, which writes `Copyright ⓒ`, is among the
+    /// copyright lines of its sources.
+    #[test]
+    fn the_locked_clap_header_is_a_copyright_line() {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let out = Process::new(cargo)
+            .current_dir(root)
+            .args(["metadata", "--locked", "--format-version", "1"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        for name in ["clap", "clap_builder"] {
+            let manifest = metadata["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == name)
+                .and_then(|p| p["manifest_path"].as_str())
+                .unwrap();
+            let source = Path::new(manifest).parent().unwrap();
+            let header = fs::read_to_string(source.join("src/lib.rs")).unwrap();
+            let header = header.lines().next().unwrap();
+            assert!(is_copyright_line(header), "{name}: {header}");
+            let lines = copyright_lines(source).unwrap();
+            assert!(
+                lines
+                    .get(&normalized(header))
+                    .is_some_and(|files| files.iter().any(|f| f == "src/lib.rs")),
+                "{name}: {lines:?}"
+            );
+        }
+    }
 }
