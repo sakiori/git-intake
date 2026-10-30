@@ -5,7 +5,7 @@ mod common;
 
 use std::fs;
 
-use common::{FORK_FILE, Fork, recorded_push_options, stderr, stdout};
+use common::{FORK_FILE, Fork, How, merge_on_fake, open_number, stderr, stdout};
 use predicates::str::contains;
 
 const UPSTREAM_AUTHOR: &str = "Upstream Dev <dev@upstream.example>";
@@ -889,16 +889,11 @@ fn merge_request_describes_the_port() {
         ],
     );
     f.tool(&["continue"]).success();
-    f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    let options = recorded_push_options(&f.publish);
-    let description = options
-        .iter()
-        .find(|o| o.starts_with("merge_request.description="))
-        .expect("description");
+    let description = f.forge().mr(1).description;
     assert!(
         description.contains(&format!(
-            "upstream from upstream/main, ported: took {}; skipped {}; already present {}",
+            "`upstream` from upstream/main, ported: took {}; skipped {}; already present {}",
             &c[0][..12],
             &c[1][..12],
             &c[2][..12]
@@ -1582,15 +1577,15 @@ fn a_copy_whose_added_file_was_unstaged_is_not_recorded_as_present() {
     assert_eq!(taken_by(&f, &env.rev(&wt, "HEAD~1")), added);
 }
 
-/// Verifies the update in progress, opens its merge request, has the forge
-/// merge it with a merge commit, and finishes the update.
+/// Opens the merge request of the update in progress, has the forge merge
+/// it with a merge commit, and brings the local integration branch up to
+/// date.
 fn land_with_a_merge_commit(f: &Fork) {
     let env = &f.env;
-    f.tool(&["verify"]).success();
     let commit = env.rev(&env.update_worktree(&f.down), "HEAD");
     f.tool(&["finish"]).success();
-    common::merge_on_forge(env, &f.publish, common::MERGE_REQUEST_BRANCH);
-    f.tool(&["finish"]).success();
+    merge_on_fake(env, f.forge(), open_number(f.forge()), How::MergeCommit);
+    env.git(&f.down, &["pull", "-q", "--ff-only", "origin", "main"]);
     assert_eq!(env.rev(&f.down, "main^2"), commit);
 }
 
@@ -1640,21 +1635,21 @@ fn a_caught_up_port_merged_with_a_merge_commit_counts_its_takes() {
     f.tool(&["start"]).success();
     write_plan(&f, &[("take", &c[0], ""), ("skip", &c[1], "")]);
     f.tool(&["continue"]).success();
-    f.tool(&["verify"]).success();
     let commit = env.rev(&env.update_worktree(&f.down), "HEAD");
     f.tool(&["finish"]).success();
-    // Other work lands first; `finish` catches up and pushes the result.
+    // Other work lands first; `sync` catches the merge request up and
+    // pushes the result.
     let forge = common::forge(env, &f.publish);
     env.commit(&forge, &[("other.txt", "o\n")], "other: lands first");
     env.git(&forge, &["push", "-q", "origin", "HEAD:main"]);
-    f.tool(&["finish"]).success();
+    f.tool(&["sync"]).success();
     let branch = format!("refs/heads/{}", common::MERGE_REQUEST_BRANCH);
     let caught = env.rev(&f.publish, &branch);
     assert_ne!(caught, commit);
     assert_eq!(env.rev(&f.publish, &format!("{caught}^2")), commit);
 
-    common::merge_on_forge(env, &f.publish, common::MERGE_REQUEST_BRANCH);
-    f.tool(&["finish"]).success();
+    merge_on_fake(env, f.forge(), open_number(f.forge()), How::MergeCommit);
+    env.git(&f.down, &["pull", "-q", "--ff-only", "origin", "main"]);
     assert_eq!(env.rev(&f.down, "main^2"), caught);
     let up = port_status(&f, 0);
     assert_eq!(up["state"], "current");

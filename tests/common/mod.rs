@@ -3,6 +3,9 @@
 
 #![allow(dead_code)]
 
+pub mod forge;
+
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -21,8 +24,34 @@ const ISOLATION_CLEARED: &[&str] = &[
     "GIT_NAMESPACE",
 ];
 
+/// Variables of the environment the tool would otherwise read from the
+/// machine the tests run on: CI jobs, forge tokens, proxies.
+const TOOL_CLEARED: &[&str] = &[
+    "GITLAB_CI",
+    "CI_SERVER_URL",
+    "CI_API_V4_URL",
+    "GITHUB_ACTIONS",
+    "GITHUB_SERVER_URL",
+    "GITHUB_API_URL",
+    "GITLAB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "ALL_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+];
+
 pub struct Env {
     dir: TempDir,
+    /// Variables every run of the tool gets, as a CI job gives them.
+    vars: RefCell<Vec<(String, String)>>,
 }
 
 /// An upstream: a bare repository and a working clone that pushes to it.
@@ -42,7 +71,40 @@ impl Env {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(dir.path().join("gitconfig"), "").unwrap();
         fs::create_dir_all(dir.path().join("home")).unwrap();
-        Self { dir }
+        Self {
+            dir,
+            vars: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Gives every later run of the tool the variable `name`.
+    pub fn set_var(&self, name: &str, value: &str) {
+        let mut vars = self.vars.borrow_mut();
+        vars.retain(|(n, _)| n != name);
+        vars.push((name.to_string(), value.to_string()));
+    }
+
+    /// Stops giving the tool the variable `name`.
+    pub fn unset_var(&self, name: &str) {
+        self.vars.borrow_mut().retain(|(n, _)| n != name);
+    }
+
+    fn tool_command(&self, cwd: &Path, args: &[&str]) -> Command {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("git-intake"));
+        cmd.current_dir(cwd).args(args);
+        self.apply_env(&mut cmd);
+        for var in TOOL_CLEARED {
+            cmd.env_remove(var);
+        }
+        for (var, _) in std::env::vars() {
+            if var.starts_with("GIT_INTAKE_") {
+                cmd.env_remove(var);
+            }
+        }
+        for (k, v) in self.vars.borrow().iter() {
+            cmd.env(k, v);
+        }
+        cmd
     }
 
     pub fn path(&self, name: &str) -> PathBuf {
@@ -165,20 +227,27 @@ impl Env {
 
     /// Runs the tool in `cwd`.
     pub fn tool(&self, cwd: &Path, args: &[&str]) -> Assert {
-        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("git-intake"));
-        cmd.current_dir(cwd).args(args);
-        self.apply_env(&mut cmd);
-        let output = cmd.output().expect("run git-intake");
+        let output = self
+            .tool_command(cwd, args)
+            .output()
+            .expect("run git-intake");
         Assert::new(output)
     }
 
     /// Runs the tool in `cwd` with extra environment variables.
     pub fn tool_env(&self, cwd: &Path, args: &[&str], vars: &[(&str, &str)]) -> Assert {
-        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("git-intake"));
-        cmd.current_dir(cwd).args(args);
-        self.apply_env(&mut cmd);
+        let mut cmd = self.tool_command(cwd, args);
         for (k, v) in vars {
             cmd.env(k, v);
+        }
+        Assert::new(cmd.output().expect("run git-intake"))
+    }
+
+    /// Runs the tool in `cwd` without the variables `names`.
+    pub fn tool_without(&self, cwd: &Path, args: &[&str], names: &[&str]) -> Assert {
+        let mut cmd = self.tool_command(cwd, args);
+        for name in names {
+            cmd.env_remove(name);
         }
         Assert::new(cmd.output().expect("run git-intake"))
     }
@@ -278,6 +347,8 @@ pub struct Fork {
     pub up: Upstream,
     pub publish: PathBuf,
     pub down: PathBuf,
+    /// The forge of the publish remote, in merge-request mode.
+    pub forge: Option<forge::FakeForge>,
 }
 
 pub const FORK_FILE: &str = "app.txt";
@@ -289,32 +360,48 @@ impl Fork {
     }
 
     pub fn with_checks(checks: &[&str]) -> Self {
-        Self::build(checks, "push", "follow")
+        Self::build(checks, "push", "follow", None)
     }
 
     /// A fork that takes its upstream in port mode, publishing by push.
     pub fn port() -> Self {
-        Self::build(&["test -f app.txt"], "push", "port")
+        Self::build(&["test -f app.txt"], "push", "port", None)
     }
 
     /// A fork that takes its upstream in port mode and publishes through
     /// merge requests, like [`Fork::merge_request`].
     pub fn port_merge_request() -> Self {
-        let f = Self::build(&["test -f app.txt"], "merge-request", "port");
-        accept_push_options(&f.env, &f.publish);
-        f
+        Self::build(
+            &["test -f app.txt"],
+            "merge-request",
+            "port",
+            Some(forge::Kind::GitLab),
+        )
     }
 
-    /// A fork that publishes through merge requests. Its publish remote
-    /// accepts push options and records them, as a forge that opens the
-    /// merge request would.
+    /// A fork that publishes through merge requests on a GitLab whose
+    /// settings qualify, reached as from one of its CI jobs.
     pub fn merge_request() -> Self {
-        let f = Self::build(&["test -f app.txt"], "merge-request", "follow");
-        accept_push_options(&f.env, &f.publish);
-        f
+        Self::build(
+            &["test -f app.txt"],
+            "merge-request",
+            "follow",
+            Some(forge::Kind::GitLab),
+        )
     }
 
-    fn build(checks: &[&str], via: &str, mode: &str) -> Self {
+    /// A fork that publishes through pull requests on a GitHub whose
+    /// settings qualify, reached as from one of its Actions jobs.
+    pub fn github() -> Self {
+        Self::build(
+            &["test -f app.txt"],
+            "merge-request",
+            "follow",
+            Some(forge::Kind::GitHub),
+        )
+    }
+
+    fn build(checks: &[&str], via: &str, mode: &str, kind: Option<forge::Kind>) -> Self {
         let env = Env::new();
         let up = env.upstream("upstream", &[(FORK_FILE, FORK_CONTENT)]);
         let publish = env.bare("publish");
@@ -331,10 +418,34 @@ impl Fork {
             ],
         );
         env.git(&down, &["remote", "remove", "upstream"]);
-        env.git(
-            &down,
-            &["remote", "add", "origin", &publish.to_string_lossy()],
-        );
+        let fake = kind.map(|kind| match kind {
+            forge::Kind::GitLab => forge::FakeForge::gitlab(&publish),
+            forge::Kind::GitHub => forge::FakeForge::github(&publish),
+        });
+        match &fake {
+            Some(fake) => {
+                // The remote is on the forge's host; git reaches it through
+                // the bare repository.
+                env.git(&down, &["remote", "add", "origin", &fake.remote_url()]);
+                env.git(
+                    &down,
+                    &[
+                        "config",
+                        &format!("url.{}.insteadOf", publish.display()),
+                        &fake.remote_url(),
+                    ],
+                );
+                for (k, v) in fake.job_vars() {
+                    env.set_var(&k, &v);
+                }
+            }
+            None => {
+                env.git(
+                    &down,
+                    &["remote", "add", "origin", &publish.to_string_lossy()],
+                );
+            }
+        }
         let checks = checks
             .iter()
             .map(|c| format!("{c:?}"))
@@ -357,11 +468,17 @@ impl Fork {
             up,
             publish,
             down,
+            forge: fake,
         }
     }
 
     pub fn tool(&self, args: &[&str]) -> Assert {
         self.env.tool(&self.down, args)
+    }
+
+    /// The fake forge of a fork in merge-request mode.
+    pub fn forge(&self) -> &forge::FakeForge {
+        self.forge.as_ref().expect("a fork in merge-request mode")
     }
 
     /// The committed configuration with `from` replaced by `to`, committed
@@ -380,54 +497,7 @@ impl Fork {
     }
 }
 
-/// File in a bare repository where [`accept_push_options`] records the push
-/// options of the last push.
-pub const PUSH_OPTIONS_FILE: &str = "push-options";
-
-/// The number of the merge request the remote of [`accept_push_options`]
-/// names in its reply.
-pub const MERGE_REQUEST_NUMBER: u64 = 7;
-
-/// Makes a bare repository accept push options and record those of each
-/// push in [`PUSH_OPTIONS_FILE`], one per line.
-pub fn accept_push_options(env: &Env, bare: &Path) {
-    env.git(bare, &["config", "receive.advertisePushOptions", "true"]);
-    let hook = bare.join("hooks").join("pre-receive");
-    fs::create_dir_all(hook.parent().unwrap()).unwrap();
-    // The hook runs in the bare repository and rejects nothing. Like GitLab,
-    // it answers a push that asks for a merge request with its address.
-    let script = format!(
-        r#"#!/bin/sh
-: > push-options
-create=
-i=0
-while [ "$i" -lt "${{GIT_PUSH_OPTION_COUNT:-0}}" ]; do
-    eval "option=\"\$GIT_PUSH_OPTION_$i\""
-    printf '%s\n' "$option" >> push-options
-    [ "$option" = merge_request.create ] && create=1
-    i=$((i + 1))
-done
-if [ -n "$create" ]; then
-    while read -r old new ref; do
-        echo "View merge request for ${{ref#refs/heads/}}:" >&2
-        echo "  https://example.com/team/fork/-/merge_requests/{MERGE_REQUEST_NUMBER}" >&2
-    done
-fi
-"#
-    );
-    fs::write(&hook, script).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-/// The push options recorded by [`accept_push_options`] for the last push.
-pub fn recorded_push_options(bare: &Path) -> Vec<String> {
-    fs::read_to_string(bare.join(PUSH_OPTIONS_FILE))
-        .map(|t| t.lines().map(str::to_string).collect())
-        .unwrap_or_default()
-}
-
-/// The branch `finish` pushes the verified commit to in merge-request mode.
+/// The branch the update's merge request comes from.
 pub const MERGE_REQUEST_BRANCH: &str = "git-intake/update";
 
 /// A clone of the publish remote `publish` that plays the forge merging
@@ -471,6 +541,76 @@ pub fn merge_on_forge(env: &Env, publish: &Path, branch: &str) -> String {
     env.rev(publish, "main")
 }
 
+/// How the forge merges a merge request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum How {
+    /// A merge commit, as GitLab's merge commit methods and GitHub's
+    /// `Create a merge commit` make it.
+    MergeCommit,
+    /// The integration branch moves to the merge request's head.
+    FastForward,
+    /// One commit with the merge request's changes, whose message joins the
+    /// messages of its commits, as GitHub's squash merge writes it.
+    Squash,
+}
+
+/// The fake forge merges merge request `number` the way `how` says, marks
+/// it merged and deletes its branch, as a forge set to remove the source
+/// branch does. Returns the new tip of the integration branch.
+pub fn merge_on_fake(env: &Env, fake: &forge::FakeForge, number: u64, how: How) -> String {
+    let mr = fake.mr(number);
+    let dir = forge(env, &fake.publish);
+    let source = format!("origin/{}", mr.source);
+    match how {
+        How::MergeCommit => {
+            env.git(
+                &dir,
+                &[
+                    "merge",
+                    "-q",
+                    "--no-ff",
+                    "-m",
+                    &format!("Merge branch '{}' into '{}'", mr.source, mr.target),
+                    &source,
+                ],
+            );
+        }
+        How::FastForward => {
+            env.git(&dir, &["merge", "-q", "--ff-only", &source]);
+        }
+        How::Squash => {
+            let messages = env.git(&dir, &["log", "--format=%B", &format!("HEAD..{source}")]);
+            env.git(&dir, &["merge", "-q", "--squash", &source]);
+            env.git(
+                &dir,
+                &[
+                    "commit",
+                    "-q",
+                    "-m",
+                    &format!("{} (#{number})\n\n{messages}", mr.title),
+                ],
+            );
+        }
+    }
+    env.git(
+        &dir,
+        &["push", "-q", "origin", &format!("HEAD:{}", mr.target)],
+    );
+    fake.end(number, "merged");
+    env.git(
+        &fake.publish,
+        &["update-ref", "-d", &format!("refs/heads/{}", mr.source)],
+    );
+    env.rev(&fake.publish, &mr.target)
+}
+
+/// The number of the only open merge request on the fake forge.
+pub fn open_number(fake: &forge::FakeForge) -> u64 {
+    let open = fake.open_mrs();
+    assert_eq!(open.len(), 1, "open merge requests: {open:?}");
+    open[0].number
+}
+
 /// A monorepo with path upstreams `app-a` at `apps/a` and `app-b` at
 /// `apps/b`, not yet imported, and no publish remote unless built by
 /// [`Mono::merge_request`].
@@ -480,6 +620,7 @@ pub struct Mono {
     pub b: Upstream,
     pub down: PathBuf,
     pub publish: Option<PathBuf>,
+    pub forge: Option<forge::FakeForge>,
 }
 
 impl Mono {
@@ -488,17 +629,27 @@ impl Mono {
     }
 
     /// A monorepo that publishes through merge requests to the remote
-    /// `origin`, which accepts push options as in [`Fork::merge_request`].
+    /// `origin`, on a GitLab as in [`Fork::merge_request`].
     pub fn merge_request() -> Self {
         let mut m = Self::build("\n[publish]\nremote = \"origin\"\nvia = \"merge-request\"\n");
         let publish = m.env.bare("publish");
-        accept_push_options(&m.env, &publish);
+        let fake = forge::FakeForge::gitlab(&publish);
+        m.env
+            .git(&m.down, &["remote", "add", "origin", &fake.remote_url()]);
         m.env.git(
             &m.down,
-            &["remote", "add", "origin", &publish.to_string_lossy()],
+            &[
+                "config",
+                &format!("url.{}.insteadOf", publish.display()),
+                &fake.remote_url(),
+            ],
         );
+        for (k, v) in fake.job_vars() {
+            m.env.set_var(&k, &v);
+        }
         m.env.git(&m.down, &["push", "-q", "origin", "main"]);
         m.publish = Some(publish);
+        m.forge = Some(fake);
         m
     }
 
@@ -519,6 +670,7 @@ impl Mono {
             b,
             down,
             publish: None,
+            forge: None,
         }
     }
 

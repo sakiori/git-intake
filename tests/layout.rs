@@ -106,23 +106,24 @@ fn push_and_no_publish_finish_run_from_the_update_worktree_complete() {
 }
 
 #[test]
-fn merge_request_opened_from_the_update_worktree_waits() {
+fn merge_request_opened_from_the_update_worktree_ends_the_update() {
     let f = Fork::merge_request();
     let env = &f.env;
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
-    f.tool(&["verify"]).success();
     let wt = env.update_worktree(&f.down);
-    let verified = env.rev(&wt, "HEAD");
+    let head = env.rev(&wt, "HEAD");
     env.tool(&wt, &["finish"])
         .success()
-        .stdout(contains("the update waits for the merge request"))
+        .stdout(contains("opened merge request !1"))
         .stderr(contains(LEFT_REMOVED_DIRECTORY));
     assert!(!wt.exists(), "the update worktree remains");
     let branch = common::MERGE_REQUEST_BRANCH;
-    assert_eq!(env.rev(&f.publish, branch), verified);
+    assert_eq!(env.rev(&f.publish, branch), head);
+    env.assert_no_update(&f.down);
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
-    assert_eq!(status["update"]["step"], "waiting_for_merge_request");
+    assert_eq!(status["update"], serde_json::Value::Null);
+    assert_eq!(status["merge_request"]["number"], 1);
 }
 
 #[test]
