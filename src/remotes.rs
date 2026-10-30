@@ -59,7 +59,10 @@ pub fn ensure_all(git: &Git, ups: &[&Upstream]) -> Result<Vec<String>> {
         }
     }
     if !refusals.is_empty() {
-        bail!("cannot fetch the upstreams:\n{}", bullet(&refusals));
+        bail!(
+            "cannot use the remotes of the selected upstreams:\n{}",
+            bullet(&refusals)
+        );
     }
     let mut added = Vec::new();
     for up in ups {

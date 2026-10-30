@@ -133,8 +133,12 @@ fn remote_with_a_different_url_is_refused() {
             "https://example.com/elsewhere.git",
         ],
     );
-    let fetch = m.tool(&["fetch"]).code(2);
-    let err = stderr(&fetch);
+    // Only the mismatched upstream is refused; the others are fetched.
+    let fetch = m.tool(&["fetch"]).code(1);
+    let err = stdout(&fetch);
+    assert!(err.contains("app-a: refused: "), "{err}");
+    assert!(err.contains("app-b: fetched app-b/main"), "{err}");
+    assert!(env.has_rev(&m.down, "refs/remotes/app-b/main"));
     assert!(
         err.contains(
             "upstream 'app-a': remote 'app-a' points to https://example.com/elsewhere.git"
@@ -168,9 +172,16 @@ fn missing_remote_without_url_is_refused() {
         "path = \"apps/b\"",
     );
     env.commit(&m.down, &[(".fork-sync.toml", &cfg)], "mono: no url for b");
-    m.tool(&["fetch"]).code(2).stderr(contains(
+    m.tool(&["fetch"])
+        .code(1)
+        .stdout(contains("app-a: fetched app-a/main"))
+        .stdout(contains(
+            "app-b: refused: upstream 'app-b': remote 'app-b' does not exist and no url is configured",
+        ));
+    m.tool(&["start"]).code(2).stderr(contains(
         "remote 'app-b' does not exist and no url is configured",
     ));
+    m.env.assert_no_update(&m.down);
 }
 
 #[test]

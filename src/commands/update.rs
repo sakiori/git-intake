@@ -178,6 +178,11 @@ fn require_not_behind_published(
 }
 
 /// Decides how a queued upstream is merged, or why it cannot be.
+///
+/// A root upstream needs shared history. A path upstream is imported when it
+/// has no sync record and its path is absent, and merged with the subtree
+/// strategy once it has a record; shared ancestry alone (for example
+/// repositories created from one template) does not count as imported.
 fn merge_kind(
     git: &Git,
     base: &str,
@@ -185,8 +190,8 @@ fn merge_kind(
     target: &str,
     has_record: bool,
 ) -> Result<std::result::Result<MergeKind, String>> {
-    let shared = has_record || git.merge_base(base, target)?.is_some();
     let Some(path) = &up.path else {
+        let shared = has_record || git.merge_base(base, target)?.is_some();
         return Ok(if shared {
             Ok(MergeKind::Root)
         } else {
@@ -198,21 +203,42 @@ fn merge_kind(
             ))
         });
     };
-    let exists = git.path_exists(base, path)?;
-    Ok(match (exists, shared) {
-        (false, false) => Ok(MergeKind::Import),
+    let exists = git.object_type(base, path)?.is_some();
+    Ok(match (has_record, exists) {
+        (false, false) => match blocking_prefix(git, base, path)? {
+            None => Ok(MergeKind::Import),
+            Some(prefix) => Err(format!(
+                "upstream '{}': '{prefix}' is a file on the integration branch; importing under '{path}' would replace it",
+                up.name
+            )),
+        },
         (true, true) => Ok(MergeKind::Subtree),
-        (true, false) => Err(format!(
-            "upstream '{}': path '{path}' already holds content that does not come from the upstream's history; \
+        (false, true) => Err(format!(
+            "upstream '{}': path '{path}' already holds content that this tool did not import from the upstream; \
              move that content away or choose another path",
             up.name
         )),
-        (false, true) => Err(format!(
-            "upstream '{}': its history is part of the integration branch but path '{path}' does not exist; \
+        (true, false) => Err(format!(
+            "upstream '{}' was imported before, but path '{path}' was removed on the integration branch; \
              restore the path or correct the configuration",
             up.name
         )),
     })
+}
+
+/// The first leading component of `path` that exists in `rev` as something
+/// other than a directory.
+pub fn blocking_prefix(git: &Git, rev: &str, path: &str) -> Result<Option<String>> {
+    let parts: Vec<&str> = path.split('/').collect();
+    for n in 1..parts.len() {
+        let prefix = parts[..n].join("/");
+        match git.object_type(rev, &prefix)?.as_deref() {
+            None => return Ok(None),
+            Some("tree") => {}
+            Some(_) => return Ok(Some(prefix)),
+        }
+    }
+    Ok(None)
 }
 
 /// Merges every pending upstream in order, stopping at the first conflict.
@@ -224,8 +250,28 @@ fn merge_pending(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
         }
         let up = upstream_of(state, i)?;
         let target = state.upstreams[i].target.clone();
+        let kind = state.upstreams[i].kind;
+
+        // A merge that completed before the state could be saved.
+        if carries_record(&wt, &up, &target)? {
+            let commit = confirm_merged(&wt, &up, &target)?;
+            mark_merged(repo, state, i, commit)?;
+            continue;
+        }
+        if wt.merge_in_progress()? {
+            let ours = wt.commit("MERGE_HEAD")?.as_deref() == Some(target.as_str());
+            if ours && kind != MergeKind::Import {
+                // A merge of this upstream that stopped before the state was saved.
+                let head_before = wt.line(&["rev-parse", "HEAD"])?;
+                state.upstreams[i].head_before = Some(head_before.clone());
+                return stop_on_conflict(repo, state, i, &head_before, "");
+            }
+            wt.run(&["merge", "--abort"])?;
+        }
+
         let msg = merge_message(&repo.git, &up, &target)?;
-        state.upstreams[i].head_before = Some(wt.line(&["rev-parse", "HEAD"])?);
+        let head_before = wt.line(&["rev-parse", "HEAD"])?;
+        state.upstreams[i].head_before = Some(head_before.clone());
         repo.save_state(state)?;
         println!(
             "{}: merging {} at {}",
@@ -234,55 +280,39 @@ fn merge_pending(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
             abbrev(&target)
         );
 
-        let failure = match state.upstreams[i].kind {
-            MergeKind::Root => {
-                failed(wt.raw(&["merge", "--no-ff", "--no-edit", "-m", &msg, &target])?)
+        let failure = match kind {
+            MergeKind::Root | MergeKind::Subtree => {
+                let mut args: Vec<String> = ["merge", "--no-ff", "--no-log", "--no-edit"]
+                    .map(String::from)
+                    .to_vec();
+                if kind == MergeKind::Subtree {
+                    args.push("-X".into());
+                    args.push(format!(
+                        "subtree={}",
+                        up.path.as_deref().unwrap_or_default()
+                    ));
+                }
+                args.extend(["-m".to_string(), msg, target.clone()]);
+                let out = wt.raw(&args)?;
+                (!out.success()).then_some(out)
             }
-            MergeKind::Subtree => failed(wt.raw(&[
-                "merge",
-                "--no-ff",
-                "--no-edit",
-                "-X",
-                &format!("subtree={}", up.path.as_deref().unwrap_or_default()),
-                "-m",
-                &msg,
-                &target,
-            ])?),
-            MergeKind::Import => import(&wt, &up, &target, &msg)?,
+            MergeKind::Import => {
+                import(&wt, &up, &target, &msg)?;
+                None
+            }
         };
 
         match failure {
             None => {
-                let commit = wt.line(&["rev-parse", "HEAD"])?;
-                println!("{}: merged as {}", up.name, abbrev(&commit));
-                let q = &mut state.upstreams[i];
-                q.merge_commit = Some(commit);
-                q.step = UpstreamStep::Merged;
-                repo.save_state(state)?;
+                let commit = confirm_merged(&wt, &up, &target)?;
+                mark_merged(repo, state, i, commit)?;
             }
             Some(out) => {
-                let unmerged = wt.unmerged_files()?;
-                if unmerged.is_empty() && !wt.merge_in_progress()? {
+                if !wt.merge_in_progress()? {
                     return Err(anyhow::Error::new(out.into_error()))
                         .with_context(|| format!("merging upstream '{}' failed", up.name));
                 }
-                let remaining = wt.rerere_remaining()?;
-                let q = &mut state.upstreams[i];
-                q.conflicts = unmerged
-                    .iter()
-                    .map(|p| ConflictFile {
-                        path: p.clone(),
-                        resolution: if remaining.contains(p) {
-                            Resolution::Unresolved
-                        } else {
-                            Resolution::Recorded
-                        },
-                    })
-                    .collect();
-                q.step = UpstreamStep::Conflict;
-                repo.save_state(state)?;
-                print_conflict(state, i, &out.stderr);
-                return Ok(Exit::Negative);
+                return stop_on_conflict(repo, state, i, &head_before, &out.stderr);
             }
         }
     }
@@ -290,28 +320,148 @@ fn merge_pending(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
     Ok(Exit::Success)
 }
 
-fn failed(out: crate::git::Output) -> Option<crate::git::Output> {
-    (!out.success()).then_some(out)
+fn mark_merged(repo: &Repo, state: &mut UpdateState, i: usize, commit: String) -> Result<()> {
+    println!("{}: merged as {}", state.upstreams[i].name, abbrev(&commit));
+    let q = &mut state.upstreams[i];
+    for c in &mut q.conflicts {
+        if c.resolution == Resolution::Unresolved {
+            c.resolution = Resolution::Manual;
+        }
+    }
+    q.merge_commit = Some(commit);
+    q.step = UpstreamStep::Merged;
+    state.verification = None;
+    repo.save_state(state)
+}
+
+/// Records the conflicts of the merge stopped in the worktree and reports them.
+fn stop_on_conflict(
+    repo: &Repo,
+    state: &mut UpdateState,
+    i: usize,
+    head_before: &str,
+    stderr: &str,
+) -> Result<Exit> {
+    let wt = Git::worktree(&state.worktree);
+    let up = upstream_of(state, i)?;
+    let q = &state.upstreams[i];
+    let subtree = (q.kind == MergeKind::Subtree)
+        .then_some(up.path.as_deref())
+        .flatten();
+    let conflicts = conflict_files(&wt, head_before, &q.target, subtree)?;
+    let q = &mut state.upstreams[i];
+    q.conflicts = conflicts;
+    q.step = UpstreamStep::Conflict;
+    repo.save_state(state)?;
+    print_conflict(state, i, stderr);
+    Ok(Exit::Negative)
+}
+
+/// Files the stopped merge conflicted in, and where each resolution came from.
+///
+/// Unmerged index entries alone miss files that `rerere.autoupdate` already
+/// staged, so the conflicts are also derived from the merge itself with
+/// `git merge-tree`, which is independent of rerere and of the index.
+fn conflict_files(
+    wt: &Git,
+    head_before: &str,
+    target: &str,
+    subtree: Option<&str>,
+) -> Result<Vec<ConflictFile>> {
+    let mut paths = wt.unmerged_files()?;
+    for p in drift::predict_conflicts(wt, head_before, target, subtree)? {
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    let remaining = wt.rerere_remaining()?;
+    Ok(paths
+        .into_iter()
+        .map(|path| ConflictFile {
+            resolution: if remaining.contains(&path) {
+                Resolution::Unresolved
+            } else {
+                Resolution::Recorded
+            },
+            path,
+        })
+        .collect())
 }
 
 /// First import of a path upstream: keep its history with an `ours` merge and
-/// read its tree under the path.
-fn import(wt: &Git, up: &Upstream, target: &str, msg: &str) -> Result<Option<crate::git::Output>> {
+/// read its tree under the path. All or nothing: on any failure the merge is
+/// aborted and the upstream stays pending.
+fn import(wt: &Git, up: &Upstream, target: &str, msg: &str) -> Result<()> {
     let path = up.path.as_deref().unwrap_or_default();
-    let out = wt.raw(&[
-        "merge",
-        "--no-ff",
-        "-s",
-        "ours",
-        "--no-commit",
-        "--allow-unrelated-histories",
-        target,
-    ])?;
-    if !out.success() {
-        return Ok(Some(out));
+    let steps = || -> Result<()> {
+        wt.run(&[
+            "merge",
+            "--no-ff",
+            "--no-log",
+            "-s",
+            "ours",
+            "--no-commit",
+            "--allow-unrelated-histories",
+            target,
+        ])?;
+        wt.run(&["read-tree", &format!("--prefix={path}/"), "-u", target])?;
+        wt.run(&["commit", "--no-edit", "-m", msg])?;
+        Ok(())
+    };
+    if let Err(err) = steps() {
+        if wt.merge_in_progress().unwrap_or(false) {
+            wt.run(&["merge", "--abort"])
+                .context("aborting the failed import")?;
+        }
+        return Err(err.context(format!(
+            "importing upstream '{}' under '{path}' failed; the import was undone and the upstream is still pending. \
+             Fix the cause, then run `git fork-sync continue`, or run `git fork-sync abort`",
+            up.name
+        )));
     }
-    wt.run(&["read-tree", &format!("--prefix={path}/"), "-u", target])?;
-    Ok(failed(wt.raw(&["commit", "--no-edit", "-m", msg])?))
+    Ok(())
+}
+
+/// Whether HEAD is a merge carrying this upstream's sync record for `target`.
+fn carries_record(wt: &Git, up: &Upstream, target: &str) -> Result<bool> {
+    Ok(sync_record::record_of(wt, "HEAD")?
+        .is_some_and(|r| r.upstream == up.name && r.target == target))
+}
+
+/// Checks that HEAD is a complete merge of the upstream before it is counted
+/// as merged: the sync record names the upstream and target, the target is
+/// merged, and a path upstream's path exists. Returns HEAD.
+fn confirm_merged(wt: &Git, up: &Upstream, target: &str) -> Result<String> {
+    let head = wt.line(&["rev-parse", "HEAD"])?;
+    let mut problems = Vec::new();
+    if !carries_record(wt, up, target)? {
+        problems.push(format!(
+            "the commit message does not end with the sync record trailers for upstream '{}' and target {}",
+            up.name,
+            abbrev(target)
+        ));
+    }
+    if !wt.is_ancestor(target, &head)? {
+        problems.push(format!("the target {} is not merged", abbrev(target)));
+    }
+    if let Some(path) = &up.path
+        && wt.object_type(&head, path)?.as_deref() != Some("tree")
+    {
+        problems.push(format!("path '{path}' does not exist in the merge"));
+    }
+    if !problems.is_empty() {
+        bail!(
+            "the merge of upstream '{}' at {} in {} is not a complete sync merge:\n{}\n\
+             a hook or configuration may have changed the merge; correct the commit (expected message below) \
+             and run `git fork-sync continue`, or run `git fork-sync abort`:\n\n{}",
+            up.name,
+            abbrev(&head),
+            wt.dir().display(),
+            bullet(&problems),
+            sync_record::message(&up.name, &up.source(), abbrev(target), target)
+        );
+    }
+    Ok(head)
 }
 
 fn upstream_of(state: &UpdateState, i: usize) -> Result<Upstream> {
@@ -378,6 +528,9 @@ fn print_conflict(state: &UpdateState, i: usize, stderr: &str) {
 /// `continue`: concludes the merge stopped on conflicts and merges the rest.
 pub fn resume(repo: &Repo) -> Result<Exit> {
     let mut state = repo.require_state()?;
+    if state.finishing.is_some() {
+        bail!("`finish` is in progress; run `git fork-sync finish` to complete it");
+    }
     require_worktree(repo, &state)?;
     let wt = Git::worktree(&state.worktree);
     if let Some(i) = state
@@ -417,28 +570,9 @@ pub fn resume(repo: &Repo) -> Result<Exit> {
                     state.worktree.display()
                 );
             }
-            let record = sync_record::record_of(&wt, "HEAD")?;
-            if !record.is_some_and(|r| r.upstream == up.name && r.target == target) {
-                bail!(
-                    "the merge commit of upstream '{}' lacks the sync record; amend it in {} with this message, then run `git fork-sync continue`:\n\n{}",
-                    up.name,
-                    state.worktree.display(),
-                    merge_message(&repo.git, &up, &target)?
-                );
-            }
         }
-        let commit = wt.line(&["rev-parse", "HEAD"])?;
-        let q = &mut state.upstreams[i];
-        for c in &mut q.conflicts {
-            if c.resolution == Resolution::Unresolved {
-                c.resolution = Resolution::Manual;
-            }
-        }
-        q.merge_commit = Some(commit.clone());
-        q.step = UpstreamStep::Merged;
-        state.verification = None;
-        repo.save_state(&state)?;
-        println!("{}: merged as {}", up.name, abbrev(&commit));
+        let commit = confirm_merged(&wt, &up, &target)?;
+        mark_merged(repo, &mut state, i, commit)?;
     } else if state.all_merged() {
         println!(
             "every queued upstream is already merged; next: {}",
@@ -452,6 +586,20 @@ pub fn resume(repo: &Repo) -> Result<Exit> {
 /// `abort`: removes the update worktree, branch and state.
 pub fn abort(repo: &Repo) -> Result<Exit> {
     let state = repo.state()?;
+    if let Some(finishing) = state.as_ref().and_then(|s| s.finishing.as_ref()) {
+        let mut moved = Vec::new();
+        for m in &finishing.moves {
+            if repo.git.commit(&branch_ref(&m.branch))? != m.old {
+                moved.push(m.branch.as_str());
+            }
+        }
+        if !moved.is_empty() {
+            bail!(
+                "`finish` has already moved {}; the update can no longer be aborted. Run `git fork-sync finish` to complete it",
+                moved.join(", ")
+            );
+        }
+    }
     let removed = repo.remove_update_artifacts()?;
     state::remove(&repo.paths.state)?;
     if state.is_none() && removed.is_empty() {
@@ -485,6 +633,9 @@ pub fn require_worktree(repo: &Repo, state: &UpdateState) -> Result<()> {
 
 /// The step an update has reached, as a stable name.
 pub fn step_name(state: &UpdateState, wt: &Git) -> Result<&'static str> {
+    if state.finishing.is_some() {
+        return Ok("finishing");
+    }
     if state
         .upstreams
         .iter()
@@ -511,6 +662,16 @@ pub fn next_step(state: &UpdateState, wt: &Git) -> Result<String> {
         ),
         "merging" => "git fork-sync continue".to_string(),
         "verified" => "git fork-sync finish".to_string(),
+        "finishing" => match state.finishing.as_ref().and_then(|f| f.push_error.as_ref()) {
+            Some(_) => match &state.config.publish {
+                Some(p) => format!(
+                    "reconcile '{0}' with '{p}/{0}' without force (`git fetch {p}`, merge, run the checks), then run `git fork-sync finish` to publish",
+                    state.config.integration
+                ),
+                None => "git fork-sync finish".to_string(),
+            },
+            None => "git fork-sync finish".to_string(),
+        },
         "verification_failed" => format!(
             "fix the failures on the update branch in {}, commit, then run `git fork-sync verify`",
             state.worktree.display()

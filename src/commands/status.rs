@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::Exit;
-use crate::commands::update::{next_step, step_name};
+use crate::commands::update::{blocking_prefix, next_step, step_name};
 use crate::drift::{self, Drift, DriftState};
 use crate::git::{Git, abbrev, branch_ref};
 use crate::output::{Render, emit, table};
@@ -55,6 +55,8 @@ pub struct UpdateView {
     pub worktree: PathBuf,
     pub upstreams: Vec<QueuedView>,
     pub verified_commit: Option<String>,
+    /// The error of the last rejected push while finishing, if any.
+    pub publish_error: Option<String>,
     pub next: String,
 }
 
@@ -158,13 +160,17 @@ fn predicted(
     match d.state {
         DriftState::Behind => drift::predict_conflicts(git, tip, &upstream_tip, up.path.as_deref()),
         DriftState::NotImported => {
-            if let Some(path) = &up.path
-                && git.path_exists(tip, path)?
-            {
-                d.detail = Some(format!(
-                    "path '{path}' already holds content that does not come from the upstream's history"
-                ));
-            } else if up.path.is_none() {
+            if let Some(path) = &up.path {
+                if git.path_exists(tip, path)? {
+                    d.detail = Some(format!(
+                        "path '{path}' already holds content that this tool did not import from the upstream"
+                    ));
+                } else if let Some(prefix) = blocking_prefix(git, tip, path)? {
+                    d.detail = Some(format!(
+                        "'{prefix}' is a file on the integration branch; importing under '{path}' would replace it"
+                    ));
+                }
+            } else {
                 d.detail = Some("shares no history with the integration branch".to_string());
             }
             Ok(Vec::new())
@@ -197,6 +203,7 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
             .as_ref()
             .filter(|v| v.passed)
             .map(|v| v.commit.clone()),
+        publish_error: state.finishing.as_ref().and_then(|f| f.push_error.clone()),
         next: next_step(state, &wt)?,
     })
 }
@@ -333,6 +340,9 @@ pub fn render_update(u: &UpdateView) -> String {
     }
     if let Some(v) = &u.verified_commit {
         out.push_str(&format!("  verified: {}\n", abbrev(v)));
+    }
+    if let Some(e) = &u.publish_error {
+        out.push_str(&format!("  publish rejected: {e}\n"));
     }
     out.push_str(&format!("  next: {}\n", u.next));
     out

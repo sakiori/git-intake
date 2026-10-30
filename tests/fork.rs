@@ -276,6 +276,29 @@ fn remote_moved_rejects_push_without_force() {
         theirs,
         "the remote branch is not overwritten"
     );
+    // The update stays in the finishing step until it is published.
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["step"], "finishing");
+    assert!(status["update"]["publish_error"].is_string());
+    assert!(
+        status["update"]["next"]
+            .as_str()
+            .unwrap()
+            .contains("reconcile")
+    );
+    f.tool(&["abort"]).code(2).stderr(contains(
+        "can no longer be aborted. Run `git fork-sync finish`",
+    ));
+
+    // Reconcile without force, then finish publishes.
+    env.git(&f.down, &["fetch", "-q", "origin"]);
+    env.git(&f.down, &["merge", "-q", "--no-edit", "origin/main"]);
+    f.tool(&["finish"])
+        .success()
+        .stdout(contains("pushed main, upstream-main to 'origin'"));
+    assert_eq!(env.rev(&f.publish, "main"), env.rev(&f.down, "main"));
+    assert!(env.is_ancestor(&f.down, &theirs, "main"));
+    assert!(env.is_ancestor(&f.down, &verified, "main"));
     env.assert_no_update(&f.down);
 }
 
@@ -590,7 +613,8 @@ fn atomic_push_publishes_nothing_when_one_ref_is_rejected() {
         "the accepted ref did not move either"
     );
     assert_eq!(env.rev(&f.publish, "upstream-main"), theirs);
-    env.assert_no_update(&f.down);
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["step"], "finishing");
 }
 
 #[test]

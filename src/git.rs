@@ -202,6 +202,13 @@ impl Git {
         Ok(out.success())
     }
 
+    /// The object type at `rev:path` (`blob`, `tree`, `commit`), or `None`
+    /// when nothing is there.
+    pub fn object_type(&self, rev: &str, path: &str) -> Result<Option<String>> {
+        let out = self.raw(&["cat-file", "-t", &format!("{rev}:{path}")])?;
+        Ok(out.success().then(|| out.stdout.trim().to_string()))
+    }
+
     /// Whether an object exists in the repository.
     pub fn object_exists(&self, oid: &str) -> Result<bool> {
         Ok(self.raw(&["cat-file", "-e", oid])?.success())

@@ -151,12 +151,8 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
 
         let record = latest.get(&up.name);
         if let Some(path) = &up.path {
-            let imported = record.is_some()
-                || match &tip {
-                    Some(t) => git.merge_base(&integration, t)?.is_some(),
-                    None => false,
-                };
-            if imported {
+            // Only a sync record makes a path upstream imported.
+            if record.is_some() {
                 let exists = git.path_exists(&integration, path)?;
                 checks.pass_or_fail(
                     "path",

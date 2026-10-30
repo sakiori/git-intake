@@ -73,12 +73,20 @@ Every merge commit the tool creates SHALL name the upstream and its target commi
 - **THEN** only the upstreams with new commits are queued and the others are reported as current
 
 #### Scenario: First import of an upstream
-- **WHEN** a queued upstream has a path that does not exist at the base and its history is not yet part of the integration branch
+- **WHEN** a queued upstream has a path that does not exist at the base and the integration branch carries no sync record of that upstream
 - **THEN** the tool imports the target's tree under that path with a merge commit that keeps the upstream's full history
 
 #### Scenario: Path already holds unrelated content
-- **WHEN** a queued upstream's path exists at the base but none of the upstream's history is part of the integration branch
+- **WHEN** a queued upstream's path exists at the base but the integration branch carries no sync record of that upstream
 - **THEN** `start` refuses and names the upstream and the path
+
+#### Scenario: Imported path removed downstream
+- **WHEN** the integration branch carries a sync record of a path upstream but its path no longer exists at the base
+- **THEN** `start` refuses and explains that the path was removed downstream
+
+#### Scenario: File on the import path
+- **WHEN** a leading component of a queued upstream's path is a file at the base
+- **THEN** `start` refuses instead of replacing the file
 
 ### Requirement: Recorded resolutions
 The tool SHALL enable git's recorded conflict resolution for the repository before merging, so a resolution made in one update or attempt is reapplied when the same conflict recurs.
@@ -88,7 +96,7 @@ The tool SHALL enable git's recorded conflict resolution for the repository befo
 - **THEN** git reapplies the recorded resolution and the tool reports the file as resolved by a recorded resolution
 
 ### Requirement: Resumable state
-The tool SHALL keep the state of an update in the repository's common git directory, visible from every worktree, and every command SHALL act on that state: `continue` concludes a resolved merge and merges the remaining queued upstreams, `status` shows the step reached, each queued upstream as merged, in conflict or pending, and what comes next, and `abort` removes the worktree, the update branch and the state without touching the integration or any mirror branch.
+The tool SHALL keep the state of an update in the repository's common git directory, visible from every worktree, and every command SHALL act on that state: `continue` concludes a resolved merge and merges the remaining queued upstreams, `status` shows the step reached, each queued upstream as merged, in conflict or pending, and what comes next, and `abort` removes the worktree, the update branch and the state without touching the integration or any mirror branch. An upstream SHALL count as merged only when the update branch head carries its sync record for its target. Once `finish` has begun moving branches, `abort` SHALL refuse and name `finish` as the way to complete the update.
 
 #### Scenario: Resume after interruption
 - **WHEN** the user returns to an update in a new shell
@@ -99,11 +107,11 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **THEN** the tool concludes the merge and merges the pending upstreams in order, stopping again at the next conflict
 
 #### Scenario: Abort
-- **WHEN** the user aborts an update at any step before `finish`
+- **WHEN** the user aborts an update before `finish` has moved any branch
 - **THEN** the integration and mirror branches are as before `start` and no worktree or update branch remains
 
 ### Requirement: Verification of the published tree
-`verify` SHALL run the configured install command and every check in the update worktree once every queued upstream is merged, write each command's output to a log, report pass or fail per command, and record the worktree commit it verified. A failed or skipped check SHALL leave the update unverified.
+`verify` SHALL require the configuration at the update worktree head to be valid and to name the same integration branch, then run the configured install command and every check in the update worktree once every queued upstream is merged, write each command's output to a log, report pass or fail per command, and record the worktree commit it verified. A failed or skipped check SHALL leave the update unverified.
 
 #### Scenario: Checks pass
 - **WHEN** every check succeeds
@@ -118,7 +126,7 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **THEN** the tool refuses and names the upstreams that still need `continue`
 
 ### Requirement: Guarded publication
-`finish` SHALL require a verified update whose worktree commit is the verified one and whose base is still the integration tip. It SHALL fast-forward the integration branch to the verified commit and each merged upstream's mirror branch, where one is configured, to that upstream's target, push them without force when a publish remote is configured, then remove the worktree, the update branch and the state. It SHALL never rewrite or force-push a branch, and SHALL never push to an upstream remote.
+`finish` SHALL require a verified update whose worktree commit is the verified one and whose base is still the integration tip. Before moving any branch it SHALL confirm that every move is a fast-forward, that the verified commit contains the base and every merged target, and that no checkout of a moved branch would lose changes. It SHALL record the planned moves, fast-forward the integration branch to the verified commit and each merged upstream's mirror branch, where one is configured, to that upstream's target, push them without force in one atomic push when a publish remote is configured, and only after publication succeeds remove the worktree, the update branch and the state. An interrupted or failed `finish` SHALL complete the remaining moves and the push when run again. It SHALL never rewrite or force-push a branch, and SHALL never push to an upstream remote.
 
 #### Scenario: Integration branch moved
 - **WHEN** a commit lands on the integration branch after `start`
@@ -126,7 +134,11 @@ The tool SHALL keep the state of an update in the repository's common git direct
 
 #### Scenario: Remote moved
 - **WHEN** the publish remote's branch is ahead of the local one
-- **THEN** the push is rejected, the local branches stay advanced, and the tool reports how to reconcile without force
+- **THEN** the push is rejected, no remote branch moves, the local branches stay advanced, the update stays in its finishing step, and the tool reports how to reconcile without force and run `finish` again
+
+#### Scenario: Interrupted finish
+- **WHEN** `finish` stops after moving some branches
+- **THEN** `status` shows the finishing step, `abort` refuses, and running `finish` again completes the remaining moves and the push
 
 #### Scenario: No publish remote
 - **WHEN** no publish remote is configured

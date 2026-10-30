@@ -317,6 +317,9 @@ pub fn normalise_path(path: &str) -> std::result::Result<String, &'static str> {
         match segment {
             "" => return Err("the path has an empty segment"),
             "." | ".." => return Err("the path may not contain '.' or '..' segments"),
+            s if s.eq_ignore_ascii_case(".git") => {
+                return Err("the path may not contain a '.git' segment");
+            }
             s if s.chars().any(char::is_control) => {
                 return Err("the path contains a control character");
             }
@@ -508,6 +511,9 @@ mirror = "upstream-app-a"
         assert!(normalise_path("a/../b").is_err());
         assert!(normalise_path("./a").is_err());
         assert!(normalise_path("a//b").is_err());
+        assert!(normalise_path("vendor/.git").is_err());
+        assert!(normalise_path(".GIT/x").is_err());
+        assert!(normalise_path("a/.gitlab").is_ok());
     }
 
     #[test]

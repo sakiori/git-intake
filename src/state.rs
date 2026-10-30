@@ -129,6 +129,27 @@ pub struct Verification {
     pub commit: String,
     pub passed: bool,
     pub results: Vec<CheckResult>,
+    /// Reasons the verification failed other than a failed command.
+    #[serde(default)]
+    pub problems: Vec<String>,
+}
+
+/// One branch move planned by `finish`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedMove {
+    pub branch: String,
+    /// Value before `finish`; `None` when the branch is created.
+    pub old: Option<String>,
+    pub new: String,
+}
+
+/// Progress of `finish`, persisted before any ref moves so that an
+/// interrupted or rejected `finish` can be run again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finishing {
+    pub moves: Vec<PlannedMove>,
+    /// The error of the last rejected or failed push, if any.
+    pub push_error: Option<String>,
 }
 
 /// An update from `start` to `finish`.
@@ -143,7 +164,10 @@ pub struct UpdateState {
     pub worktree: PathBuf,
     pub upstreams: Vec<QueuedUpstream>,
     pub verification: Option<Verification>,
-    /// Set once `finish` advanced the integration branch.
+    /// Set once `finish` has planned its ref moves.
+    #[serde(default)]
+    pub finishing: Option<Finishing>,
+    /// Set once `finish` completed.
     pub finished: bool,
 }
 
@@ -162,6 +186,7 @@ impl UpdateState {
             worktree,
             upstreams,
             verification: None,
+            finishing: None,
             finished: false,
         }
     }

@@ -93,10 +93,16 @@ pub fn evaluate(
         });
     }
     let behind = git.count(integration_tip, &tip)?;
-    let state = if behind == 0 {
-        DriftState::Current
-    } else if last_synced.is_none() && git.merge_base(integration_tip, &tip)?.is_none() {
+    // A path upstream counts as imported only once a sync record exists:
+    // shared ancestry (for example repositories created from one template)
+    // does not put its content under the path. A root upstream is imported
+    // when it shares history with the integration branch.
+    let imported = last_synced.is_some()
+        || (up.path.is_none() && git.merge_base(integration_tip, &tip)?.is_some());
+    let state = if !imported {
         DriftState::NotImported
+    } else if behind == 0 {
+        DriftState::Current
     } else {
         DriftState::Behind
     };

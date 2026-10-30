@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::Exit;
 use crate::commands::update::require_worktree;
+use crate::config;
 use crate::git::{Git, abbrev};
 use crate::repo::{Repo, bullet};
 use crate::state::{CheckOutcome, CheckResult, UpstreamStep, Verification};
@@ -32,6 +33,9 @@ pub fn run(repo: &Repo) -> Result<Exit> {
             "cannot verify before every queued upstream is merged; these still need `git fork-sync continue`:\n{}",
             bullet(&open)
         );
+    }
+    if state.finishing.is_some() {
+        bail!("`finish` is in progress; run `git fork-sync finish` to complete it");
     }
     let wt = Git::worktree(&state.worktree);
     if wt.merge_in_progress()? {
@@ -70,7 +74,13 @@ pub fn run(repo: &Repo) -> Result<Exit> {
         state.worktree.display()
     );
     let mut results = Vec::new();
-    let mut install_failed = false;
+    let mut problems = Vec::new();
+    if let Err(why) = merged_config_problem(&wt, &head, &state.config.integration)? {
+        println!("FAILED   {why}");
+        problems.push(why);
+    }
+    // A broken merged configuration fails verification; the commands are skipped.
+    let mut install_failed = !problems.is_empty();
     for (i, (kind, command)) in commands.iter().enumerate() {
         let log = logs.join(format!("{:02}-{kind}.log", i + 1));
         if install_failed {
@@ -107,25 +117,28 @@ pub fn run(repo: &Repo) -> Result<Exit> {
         });
     }
 
-    let mut passed = results.iter().all(|r| r.outcome == CheckOutcome::Passed);
     let head_after = wt.line(&["rev-parse", "HEAD"])?;
     if head_after != head {
-        passed = false;
-        println!("the update branch moved during verification; verify again");
+        let why = "the update branch moved during verification; verify again".to_string();
+        println!("{why}");
+        problems.push(why);
     }
     let changed = wt.tracked_changes()?;
     if !changed.is_empty() {
-        passed = false;
-        println!(
+        let why = format!(
             "the commands changed tracked files, so the verified tree would differ from the commit:\n{}",
             bullet(&changed)
         );
+        println!("{why}");
+        problems.push(why);
     }
+    let passed = problems.is_empty() && results.iter().all(|r| r.outcome == CheckOutcome::Passed);
 
     state.verification = Some(Verification {
         commit: head.clone(),
         passed,
         results,
+        problems,
     });
     repo.save_state(&state)?;
     if passed {
@@ -138,6 +151,30 @@ pub fn run(repo: &Repo) -> Result<Exit> {
         );
         Ok(Exit::Negative)
     }
+}
+
+/// Checks the configuration as it will be committed on the integration branch
+/// after `finish`: it must exist, be valid, and name the same integration branch.
+fn merged_config_problem(
+    wt: &Git,
+    head: &str,
+    integration: &str,
+) -> Result<std::result::Result<(), String>> {
+    let Some(text) = wt.show_file(head, config::FILE_NAME)? else {
+        return Ok(Err(format!("the merged tree has no {}", config::FILE_NAME)));
+    };
+    Ok(match config::parse(&text) {
+        Err(err) => Err(format!(
+            "the merged {} is invalid: {err:#}",
+            config::FILE_NAME
+        )),
+        Ok(cfg) if cfg.integration != integration => Err(format!(
+            "the merged {} names '{}' as the integration branch instead of '{integration}'",
+            config::FILE_NAME,
+            cfg.integration
+        )),
+        Ok(_) => Ok(()),
+    })
 }
 
 /// Runs a shell command in `dir`, writing its output to `log`.
