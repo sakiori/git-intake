@@ -884,6 +884,169 @@ fn another_release_after_the_push_is_not_advised_to_abort() {
     env.assert_no_update(&f.down);
 }
 
+/// A way the publish remote can push to the upstream's repository under a
+/// URL that differs from the upstream's.
+#[derive(Debug, Clone, Copy)]
+enum Alias {
+    /// An `https` URL with credentials, which git serves from the same
+    /// repository as the upstream's URL.
+    Credentials,
+    /// A push URL that `url.<base>.insteadOf` rewrites to the upstream's.
+    InsteadOf,
+    /// The publish remote's own URL, which `url.<base>.pushInsteadOf`
+    /// rewrites to the upstream's for pushes.
+    PushInsteadOf,
+    /// A `file://localhost/` push URL of the upstream's repository.
+    FileLocalhost,
+}
+
+const ALIASES: [Alias; 4] = [
+    Alias::Credentials,
+    Alias::InsteadOf,
+    Alias::PushInsteadOf,
+    Alias::FileLocalhost,
+];
+
+impl Alias {
+    /// What the configuration needs before an update starts: for
+    /// [`Alias::Credentials`], the upstream reached by an `https` URL that
+    /// the test's git configuration serves from its local repository.
+    fn prepare(self, f: &Fork) {
+        if let Alias::Credentials = self {
+            let config = f.env.path("gitconfig");
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(&format!(
+                "[url {:?}]\n\tinsteadOf = https://example.com/\n\tinsteadOf = https://user:s3cret@example.com/\n",
+                format!("{}/", f.env.path("").display())
+            ));
+            std::fs::write(&config, text).unwrap();
+            f.reconfigure(
+                &format!("url = {:?}", f.up.url()),
+                "url = \"https://example.com/upstream.git\"",
+            );
+        }
+    }
+
+    /// Makes the publish remote push to the upstream's repository.
+    fn apply(self, f: &Fork) {
+        let env = &f.env;
+        let up = f.up.url();
+        match self {
+            Alias::Credentials => env.git(
+                &f.down,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    "https://user:s3cret@example.com/upstream.git",
+                ],
+            ),
+            Alias::InsteadOf => {
+                env.git(
+                    &f.down,
+                    &["config", &format!("url.{up}.insteadOf"), "upstream-alias:"],
+                );
+                env.git(
+                    &f.down,
+                    &["remote", "set-url", "--push", "origin", "upstream-alias:"],
+                )
+            }
+            Alias::PushInsteadOf => env.git(
+                &f.down,
+                &[
+                    "config",
+                    &format!("url.{up}.pushInsteadOf"),
+                    &f.publish.to_string_lossy(),
+                ],
+            ),
+            Alias::FileLocalhost => env.git(
+                &f.down,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    &format!("file://localhost{up}"),
+                ],
+            ),
+        };
+    }
+}
+
+/// Asserts that nothing of the downstream reached the upstream's
+/// repository, whose `main` is still at `tip`.
+fn assert_upstream_untouched(f: &Fork, tip: &str, alias: Alias) {
+    assert_eq!(f.env.rev(&f.up.bare, "main"), tip, "{alias:?}");
+    assert!(
+        !f.env
+            .git_output(&f.up.bare, &["cat-file", "-e", "main:.git-intake.toml"])
+            .status
+            .success(),
+        "{alias:?}"
+    );
+}
+
+#[test]
+fn sync_never_pushes_to_an_upstream_under_another_url() {
+    for alias in ALIASES {
+        let f = Fork::new();
+        alias.prepare(&f);
+        alias.apply(&f);
+        let tip = f
+            .env
+            .push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+        let err = stderr(&f.tool(&["sync"]).code(2));
+        assert!(
+            err.contains("names the repository of upstream 'upstream'"),
+            "{alias:?}: {err}"
+        );
+        assert!(
+            err.contains("the tool never pushes to an upstream"),
+            "{alias:?}: {err}"
+        );
+        assert!(!err.contains("s3cret"), "{alias:?}: {err}");
+        assert_upstream_untouched(&f, &tip, alias);
+        f.env.assert_no_update(&f.down);
+        let doctor = stdout(&f.tool(&["doctor"]).code(1));
+        assert!(
+            doctor.contains("names the repository of upstream 'upstream'")
+                && doctor.contains("the tool never pushes to an upstream"),
+            "{alias:?}: {doctor}"
+        );
+        assert!(!doctor.contains("s3cret"), "{alias:?}: {doctor}");
+    }
+}
+
+#[test]
+fn finish_never_pushes_to_an_upstream_under_another_url() {
+    for alias in ALIASES {
+        let f = Fork::new();
+        alias.prepare(&f);
+        let tip = f
+            .env
+            .push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+        f.tool(&["start"]).success();
+        f.tool(&["verify"]).success();
+        let main = f.env.rev(&f.down, "main");
+        // The remote changes once the update is under way, after the
+        // configuration was read.
+        alias.apply(&f);
+        let err = stderr(&f.tool(&["finish"]).code(2));
+        assert!(
+            err.contains("names the repository of upstream 'upstream'"),
+            "{alias:?}: {err}"
+        );
+        assert!(
+            err.contains("the tool never pushes to an upstream"),
+            "{alias:?}: {err}"
+        );
+        assert!(!err.contains("s3cret"), "{alias:?}: {err}");
+        assert_eq!(f.env.rev(&f.down, "main"), main, "{alias:?}");
+        assert_upstream_untouched(&f, &tip, alias);
+    }
+}
+
 /// Asserts that no run of `args` shows `secret`, in text or JSON.
 fn assert_never_shown(f: &Fork, secret: &str, runs: &[&[&str]]) {
     for args in runs {

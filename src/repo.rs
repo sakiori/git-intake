@@ -475,6 +475,39 @@ impl Repo {
         }
     }
 
+    /// The name and URL of each upstream of the configuration committed on
+    /// `integration`, read without validating the rest, as for an update of
+    /// an earlier release whose configuration this release may refuse.
+    pub fn committed_upstream_urls(&self, integration: &str) -> Result<Vec<(String, String)>> {
+        let text = self
+            .git
+            .show_file(&branch_ref(integration), config::FILE_NAME)?
+            .with_context(|| {
+                format!(
+                    "no {} is committed on '{integration}', so the upstreams' URLs are unknown",
+                    config::FILE_NAME
+                )
+            })?;
+        let table: toml::Table = toml::from_str(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid {} on '{integration}', so the upstreams' URLs are unknown: {}",
+                config::FILE_NAME,
+                e.message()
+            )
+        })?;
+        Ok(table
+            .get("upstream")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|up| {
+                let name = up.get("name")?.as_str()?.to_string();
+                let url = up.get("url")?.as_str()?.to_string();
+                Some((name, url))
+            })
+            .collect())
+    }
+
     /// Reads and validates the configuration committed on the integration
     /// branch tip. A working copy that differs is reported on stderr.
     pub fn load_config(&self) -> Result<Loaded> {
@@ -512,28 +545,23 @@ impl Repo {
     }
 
     /// The tool never pushes to an upstream: a publish remote fetched from
-    /// or pushed to a URL that names an upstream's repository is refused.
+    /// or pushed to a URL that names an upstream's repository, as git
+    /// resolves both, is refused.
     fn refuse_publishing_to_an_upstream(&self, config: &Config) -> Result<()> {
         let Some(publish) = &config.publish else {
             return Ok(());
         };
-        let urls = crate::upstreams::remote_urls(&self.git, &publish.remote)?;
-        let base = self.git.dir();
+        let upstreams = crate::identity::Upstreams::new(&self.git, &config.upstreams)?;
         let mut problems = Vec::new();
-        for up in &config.upstreams {
-            if let Some(url) = urls
-                .iter()
-                .find(|u| crate::upstreams::same_repository(u, &up.url, base))
-            {
-                problems.push(format!(
-                    "publish remote '{}' has the URL {}, which names the repository of upstream '{}' ({}); \
-                     the tool never pushes to an upstream",
-                    publish.remote,
-                    crate::redact::redacted(url),
-                    up.name,
-                    crate::redact::redacted(&up.url)
-                ));
-            }
+        for (place, up) in upstreams.named_by_remote(&self.git, &publish.remote)? {
+            problems.push(format!(
+                "publish remote '{}' has the URL {}, which names the repository of upstream '{}' ({}); \
+                 the tool never pushes to an upstream",
+                publish.remote,
+                place.shown(),
+                up.name,
+                crate::redact::redacted(&up.url)
+            ));
         }
         if !problems.is_empty() {
             bail!(

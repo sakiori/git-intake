@@ -20,6 +20,7 @@ use crate::config::{self, Config, Publish};
 use crate::description::{self, Content, Targets};
 use crate::forge::{self, Forge, Kind, MergeRequest, State};
 use crate::git::{Git, abbrev, branch_ref, split_z, tracking_ref};
+use crate::identity;
 use crate::port::Verb;
 use crate::redact::redacted;
 use crate::repo::{Repo, bullet};
@@ -311,7 +312,8 @@ pub fn publish(
     }
     state.published_head = Some(head.to_string());
     repo.save_state(state)?;
-    let pushed = push_branch(repo, p.remote, p.branch, head, term)?;
+    let upstreams = identity::Upstreams::new(&repo.git, &state.config.upstreams)?;
+    let pushed = push_branch(repo, p.remote, p.branch, head, term, &upstreams)?;
     if pushed {
         println!(
             "pushed the update head {} to '{}' as branch '{}'",
@@ -372,6 +374,7 @@ pub fn guard<'a>(
     open: &'a MergeRequest,
     head: &'a str,
     tip: &'a str,
+    upstreams: &'a identity::Upstreams,
 ) -> impl FnMut(Stage) -> Result<Option<Stopped>> + 'a {
     let kind = forge.kind();
     move |stage| {
@@ -416,11 +419,12 @@ pub fn guard<'a>(
                 }
                 // The push recreated a branch the merge removed; it is
                 // deleted while it is still at the pushed commit.
-                let recreated = if delete_branch(&repo.git, remote, &open.source, pushed)? {
-                    Recreated::Kept
-                } else {
-                    Recreated::Deleted
-                };
+                let recreated =
+                    if delete_branch(&repo.git, remote, &open.source, pushed, upstreams)? {
+                        Recreated::Kept
+                    } else {
+                        Recreated::Deleted
+                    };
                 Ok(Some(Stopped {
                     exit: Exit::Success,
                     message: format!(
@@ -620,7 +624,15 @@ fn upstream_lines(git: &Git, state: &UpdateState) -> Result<Vec<String>> {
 /// Pushes `head` without force to `branch` on each place pushes to `remote`
 /// go where the branch is not at `head`. Returns whether anything was
 /// pushed.
-fn push_branch(repo: &Repo, remote: &str, branch: &str, head: &str, term: &str) -> Result<bool> {
+fn push_branch(
+    repo: &Repo,
+    remote: &str,
+    branch: &str,
+    head: &str,
+    term: &str,
+    upstreams: &identity::Upstreams,
+) -> Result<bool> {
+    upstreams.refuse_push(&repo.git, remote)?;
     let places = match pushed_branch(&repo.git, remote, branch) {
         Ok(places) => places,
         Err(err) => bail!(
@@ -628,6 +640,9 @@ fn push_branch(repo: &Repo, remote: &str, branch: &str, head: &str, term: &str) 
         ),
     };
     let targets = push_targets(remote, &places, |at| at != Some(head));
+    for target in &targets {
+        upstreams.refuse_push(&repo.git, target)?;
+    }
     let mut received: Vec<&str> = Vec::new();
     for target in &targets {
         let out = repo.git.raw(&[
@@ -744,12 +759,23 @@ pub fn unknown_branch(git: &Git, kind: Kind, remote: &str, at: &str) -> Result<S
 
 /// Deletes `branch` on each push URL of `remote` while it is at `lease`, and
 /// says what happened on each. Returns whether it remains anywhere.
-pub fn delete_branch(git: &Git, remote: &str, branch: &str, lease: &str) -> Result<bool> {
+pub fn delete_branch(
+    git: &Git,
+    remote: &str,
+    branch: &str,
+    lease: &str,
+    upstreams: &identity::Upstreams,
+) -> Result<bool> {
+    upstreams.refuse_push(git, remote)?;
     let places = pushed_branch(git, remote, branch)?;
     let full = branch_ref(branch);
     let mut failed = None;
     let mut tried = false;
-    for target in push_targets(remote, &places, |at| at == Some(lease)) {
+    let targets = push_targets(remote, &places, |at| at == Some(lease));
+    for target in &targets {
+        upstreams.refuse_push(git, target)?;
+    }
+    for target in targets {
         // The lease makes the deletion conditional on the commit read; it
         // never overwrites anything.
         let out = git.raw(&[
@@ -819,6 +845,7 @@ pub fn withdraw(
     publish: &Publish,
     integration: &str,
     earlier: Option<&EarlierMergeRequest>,
+    upstreams: &identity::Upstreams,
 ) -> Result<()> {
     let forge = connect(repo, publish)?;
     let kind = forge.kind();
@@ -833,7 +860,7 @@ pub fn withdraw(
         forge.close(open.number)?;
         println!("closed {}", named(kind, open));
         done = true;
-        delete_branch(&repo.git, remote, &open.source, &open.head)?;
+        delete_branch(&repo.git, remote, &open.source, &open.head, upstreams)?;
         branches.retain(|b| *b != open.source);
     }
     for branch in branches {
@@ -841,7 +868,7 @@ pub fn withdraw(
         let listed = remote_refs(&repo.git, remote, std::slice::from_ref(&full))?;
         if let Some(at) = listed.get(&full) {
             done = true;
-            delete_branch(&repo.git, remote, &branch, at)?;
+            delete_branch(&repo.git, remote, &branch, at, upstreams)?;
         }
     }
     if !done {
@@ -1086,7 +1113,13 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
                     "the branch '{branch}' on '{remote}' holds nothing but what landed or a closed {term} held; \
                      deleting it"
                 );
-                if delete_branch(&repo.git, &remote, &branch, &at)? {
+                if delete_branch(
+                    &repo.git,
+                    &remote,
+                    &branch,
+                    &at,
+                    &identity::Upstreams::new(&repo.git, &state.config.upstreams)?,
+                )? {
                     bail!(
                         "the branch '{branch}' remains on '{remote}'; nothing was pushed. Run `git intake finish` again"
                     );
@@ -1123,7 +1156,16 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     };
     let published = match &open {
         Some(open) => {
-            let mut guard = guard(repo, forge.as_ref(), &remote, open, &read_head, &tip);
+            let upstreams = identity::Upstreams::new(&repo.git, &state.config.upstreams)?;
+            let mut guard = guard(
+                repo,
+                forge.as_ref(),
+                &remote,
+                open,
+                &read_head,
+                &tip,
+                &upstreams,
+            );
             publish(repo, &mut state, &head, publication, Some(&mut guard))?
         }
         None => publish(repo, &mut state, &head, publication, None)?,

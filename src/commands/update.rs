@@ -1155,18 +1155,27 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
     // The forge is reached before anything is removed, so that a missing
     // token or setting refuses with the update intact.
     let withdrawal = if withdraw {
-        let (publish, integration) = match (&state, &waiting) {
+        // The branches it deletes are never deleted from an upstream.
+        let (publish, integration, upstreams) = match (&state, &waiting) {
             (Some(s), _) => (
                 merge_request::publication(repo, s.config.publish.as_ref()),
                 s.config.integration.clone(),
+                crate::identity::Upstreams::new(&repo.git, &s.config.upstreams)?,
             ),
+            // An earlier release recorded no upstream's URL, and the
+            // configuration may be in a form this release refuses.
             (_, Some(w)) => (
                 merge_request::publication(repo, w.publish.as_ref()),
                 w.integration.clone(),
+                crate::identity::Upstreams::named(
+                    &repo.git,
+                    repo.committed_upstream_urls(&w.integration)?,
+                )?,
             ),
             (None, None) => {
                 let config = repo.load_config()?.config;
-                (config.publish, config.integration)
+                let upstreams = crate::identity::Upstreams::new(&repo.git, &config.upstreams)?;
+                (config.publish, config.integration, upstreams)
             }
         };
         let publish = publish.context(
@@ -1180,7 +1189,7 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
             );
         }
         merge_request::connect(repo, &publish)?;
-        Some((publish, integration))
+        Some((publish, integration, upstreams))
     } else {
         None
     };
@@ -1208,9 +1217,9 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
         None if withdrawal.is_none() => println!("no update is in progress; nothing to abort"),
         None => {}
     }
-    if let Some((publish, integration)) = withdrawal {
+    if let Some((publish, integration, upstreams)) = withdrawal {
         let earlier = waiting.map(|w| &w.merge_request);
-        merge_request::withdraw(repo, &publish, &integration, earlier)?;
+        merge_request::withdraw(repo, &publish, &integration, earlier, &upstreams)?;
         return Ok(Exit::Success);
     }
     if let Some(carried) = state.and_then(|s| s.carried_from.as_ref()) {

@@ -8,6 +8,7 @@ mod description;
 mod drift;
 mod forge;
 mod git;
+mod identity;
 mod integration_line;
 mod output;
 mod port;

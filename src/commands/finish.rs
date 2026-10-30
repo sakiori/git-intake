@@ -21,8 +21,9 @@ use anyhow::{Context, Result, bail};
 use crate::Exit;
 use crate::commands::update::require_worktree;
 use crate::commands::{catch_up, merge_request, verify};
-use crate::config::PublishVia;
+use crate::config::{PublishVia, Upstream};
 use crate::git::{Git, abbrev, branch_ref, tracking_ref};
+use crate::identity;
 use crate::repo::{MainWorktree, Repo, bullet};
 use crate::state::{self, Finishing, PlannedMove, Stored, UpdateState, Work};
 use crate::upstreams;
@@ -51,6 +52,12 @@ fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Resu
         .as_ref()
         .filter(|p| p.via == PublishVia::Push && !no_publish)
         .map(|p| p.remote.clone());
+    // Refused before any branch moves, as the configuration was read
+    // before the remote may have changed.
+    if let Some(remote) = &remote {
+        identity::Upstreams::new(&repo.git, &state.config.upstreams)?
+            .refuse_push(&repo.git, remote)?;
+    }
     let finishing = match state.finishing.clone() {
         Some(f) => {
             println!("resuming finish");
@@ -134,7 +141,8 @@ fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Resu
                     "'{publish}' already holds {}; nothing was pushed",
                     branches.join(", ")
                 );
-            } else if let Err(err) = push_exact(repo, &publish, &unpushed)? {
+            } else if let Err(err) = push_exact(repo, &publish, &unpushed, &state.config.upstreams)?
+            {
                 if let Some(f) = state.finishing.as_mut() {
                     f.push_error = Some(err.clone());
                 }
@@ -595,7 +603,9 @@ pub fn push_exact(
     repo: &Repo,
     remote: &str,
     moves: &[PlannedMove],
+    upstreams: &[Upstream],
 ) -> Result<std::result::Result<(), String>> {
+    identity::Upstreams::new(&repo.git, upstreams)?.refuse_push(&repo.git, remote)?;
     let mut args = vec![
         "push".to_string(),
         "--quiet".to_string(),

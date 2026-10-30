@@ -347,7 +347,13 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
                     "the branch '{UPDATE_BRANCH}' on '{remote}' holds nothing but what landed or what a closed or \
                      merged {term} held; deleting it"
                 );
-                if delete_branch(git, &remote, UPDATE_BRANCH, &at)? {
+                if delete_branch(
+                    git,
+                    &remote,
+                    UPDATE_BRANCH,
+                    &at,
+                    &crate::identity::Upstreams::new(git, &config.upstreams)?,
+                )? {
                     bail!(
                         "the branch '{UPDATE_BRANCH}' remains on '{remote}'; nothing was pushed. Run `git intake sync` again"
                     );
@@ -608,7 +614,10 @@ fn carry_and_publish(
         };
         let outcome = match open {
             Some(open) => {
-                let mut guard = merge_request::guard(repo, forge, remote, open, head, tip);
+                let upstreams =
+                    crate::identity::Upstreams::new(&repo.git, &state.config.upstreams)?;
+                let mut guard =
+                    merge_request::guard(repo, forge, remote, open, head, tip, &upstreams);
                 publish(
                     repo,
                     &mut state,

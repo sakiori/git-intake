@@ -11,6 +11,7 @@ use crate::commands::update::unrelated_content;
 use crate::config::{Config, Mode, PublishVia, Upstream};
 use crate::drift::adopted_base;
 use crate::git::{Git, abbrev, branch_ref, lines};
+use crate::identity;
 use crate::output::{Render, emit};
 use crate::port::{self, Standing};
 use crate::redact::redacted;
@@ -527,13 +528,9 @@ fn remote_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<()
         .trim()
         .to_string();
     let mut found = false;
-    for remote in upstreams::remotes(git)? {
-        let urls = upstreams::remote_urls(git, &remote)?;
-        let at_upstream = |up: &&Upstream| {
-            urls.iter()
-                .any(|u| upstreams::same_repository(u, &up.url, git.dir()))
-        };
-        for up in config.upstreams.iter().filter(at_upstream) {
+    let known = identity::Upstreams::new(git, &config.upstreams)?;
+    for remote in identity::remotes(git)? {
+        for (_, up) in known.named_by_remote(git, &remote)? {
             found = true;
             let partial = remote == promisor
                 || git
