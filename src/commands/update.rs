@@ -132,7 +132,7 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
             .and_then(|t| t.rev.clone());
         let target = match &rev {
             None => tip,
-            Some(rev) => match target::resolve(git, up, rev, &tip)? {
+            Some(rev) => match target::resolve(git, &repo.here, up, rev, &tip)? {
                 Ok(commit) => commit,
                 Err(why) => {
                     refusals.push(why);
@@ -228,6 +228,7 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
         &base,
     ])?;
     let mut state = UpdateState::new(config, base.clone(), repo.paths.worktree.clone(), queue);
+    state.main_worktree = repo.main_checkout()?;
     repo.save_state(&state)?;
     println!(
         "update started from {} at {} in {}",
@@ -256,6 +257,9 @@ fn require_not_behind_published(
     if git.remote_url(publish)?.is_none() {
         bail!("the publish remote '{publish}' does not exist");
     }
+    // Read where the remote is fetched from, as every other comparison with
+    // its tracking refs is. This is only a precondition: if the push side is
+    // ahead, the push at `finish`, never forced, is rejected instead.
     let out = git.raw(&["fetch", "--quiet", "--no-tags", publish])?;
     if !out.success() {
         bail!(

@@ -84,8 +84,8 @@ pub struct Git {
 }
 
 impl Git {
-    /// A handle for the repository the tool was started in. The caller's git
-    /// environment is honoured.
+    /// A handle for the directory the tool was started in, which finds the
+    /// repository. The caller's git environment is honoured.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),

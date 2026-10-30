@@ -10,7 +10,7 @@ use crate::drift::adopted_base;
 use crate::git::{Git, abbrev, branch_ref, tracking_ref};
 use crate::output::{Render, emit};
 use crate::remotes::{self, RemoteCheck};
-use crate::repo::Repo;
+use crate::repo::{MainWorktree, Repo};
 use crate::state::{UPDATE_BRANCH, UpstreamStep};
 use crate::sync_record;
 
@@ -264,8 +264,20 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
 }
 
 fn checkout_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
-    let Some(main) = repo.main_checkout()? else {
-        return Ok(());
+    let main = match repo.main_worktree() {
+        MainWorktree::Bare => return Ok(()),
+        MainWorktree::At(main) => main.clone(),
+        // Nothing is wrong with the repository; the checks need to run in
+        // the main worktree.
+        MainWorktree::Unknown => {
+            checks.add(
+                "main_checkout_clean",
+                None,
+                CheckStatus::Warn,
+                format!("not checked: {}", repo.unknown_main_worktree()),
+            );
+            return Ok(());
+        }
     };
     let git = Git::worktree(&main);
     let changes = git.tracked_changes()?;

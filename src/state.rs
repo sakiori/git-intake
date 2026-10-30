@@ -206,6 +206,11 @@ pub struct UpdateState {
     pub merge_request: Option<MergeRequest>,
     /// Set once `finish` completed.
     pub finished: bool,
+    /// The main worktree as `start` found it. Git cannot locate a main
+    /// worktree whose git directory lies elsewhere from any other worktree,
+    /// and the later commands of the update may run in one.
+    #[serde(default)]
+    pub main_worktree: Option<PathBuf>,
 }
 
 impl UpdateState {
@@ -226,6 +231,7 @@ impl UpdateState {
             finishing: None,
             merge_request: None,
             finished: false,
+            main_worktree: None,
         }
     }
 

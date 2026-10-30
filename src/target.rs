@@ -6,7 +6,10 @@ use crate::config::Upstream;
 use crate::git::{Git, abbrev};
 
 /// Resolves `rev` to a commit of the fetched upstream branch at `tip`, or
-/// returns why it cannot be the upstream's target.
+/// returns why it cannot be the upstream's target. `git` asks the remote and
+/// checks the ancestry; `here`, bound to the directory the tool was started
+/// in, resolves the revision as the user typed it there, so that `HEAD~1`,
+/// `@{-1}` or `ORIG_HEAD` mean that worktree's.
 ///
 /// A tag of the upstream's remote takes precedence; the remote is asked for
 /// it. Any other revision is resolved in the repository, except one that
@@ -16,6 +19,7 @@ use crate::git::{Git, abbrev};
 /// branch.
 pub fn resolve(
     git: &Git,
+    here: &Git,
     up: &Upstream,
     rev: &str,
     tip: &str,
@@ -28,13 +32,13 @@ pub fn resolve(
     let (oid, named) = match remote {
         Some(oid) => (oid, format!("tag '{tag}' of remote '{}'", up.remote)),
         None => {
-            let Some(commit) = git.commit(rev)? else {
+            let Some(commit) = here.commit(rev)? else {
                 return Ok(Err(format!(
                     "upstream '{}': '{rev}' names no commit and no tag of remote '{}'",
                     up.name, up.remote
                 )));
             };
-            if let Some(local) = own_tag(git, rev)? {
+            if let Some(local) = own_tag(here, rev)? {
                 return Ok(Err(format!(
                     "upstream '{}': remote '{}' has no tag '{tag}', and '{rev}' resolves through \
                      the repository's own tag {local}; name a tag of the upstream's remote or a commit",

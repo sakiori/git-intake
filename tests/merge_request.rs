@@ -9,7 +9,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use common::{Fork, MERGE_REQUEST_NUMBER, recorded_push_options, stderr, stdout};
+use common::{
+    Fork, MERGE_REQUEST_NUMBER, accept_push_options, recorded_push_options, stderr, stdout,
+};
 use predicates::str::contains;
 
 /// A fork in merge-request mode with one verified update. Returns the
@@ -650,17 +652,236 @@ fn interrupted_opening_does_not_claim_a_merge_request() {
             &format!("{commit}:refs/heads/{branch}"),
         ],
     );
+    // Pushes go to a repository that holds the branch as well and cannot
+    // receive any push: the branch is found in place there, and nothing is
+    // pushed.
+    let push_side = push_side(&f);
+    env.git(
+        &f.down,
+        &[
+            "push",
+            "-q",
+            &push_side.to_string_lossy(),
+            &format!("{commit}:refs/heads/{branch}"),
+        ],
+    );
+    env.git(&f.down, &["config", "remote.origin.receivepack", "false"]);
 
-    f.tool(&["finish"]).success().stdout(contains(format!(
-        "'{branch}' was already on 'origin', so this push asked for no merge request; \
-         if none is open, open one from '{branch}' into 'main'"
-    )));
+    let finish = f.tool(&["finish"]).success();
+    let out = stdout(&finish);
+    assert!(
+        out.contains(&format!(
+            "'{branch}' was already on 'origin', so nothing was pushed and no merge request was asked for; \
+             if none is open, open one from '{branch}' into 'main'"
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("pushed the verified commit"), "{out}");
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["update"]["step"], "waiting_for_merge_request");
     assert_eq!(status["update"]["merge_request"]["requested"], false);
     f.tool(&["finish"])
         .code(1)
         .stdout(contains("open the merge request if it is not open yet"));
+}
+
+/// A repository the publish remote pushes to while it is still fetched from
+/// its own URL.
+fn push_side(f: &Fork) -> PathBuf {
+    let env = &f.env;
+    let dir = env.bare("push-side");
+    accept_push_options(env, &dir);
+    env.git(
+        &f.down,
+        &["config", "remote.origin.pushurl", &dir.to_string_lossy()],
+    );
+    dir
+}
+
+#[test]
+fn branch_only_on_the_fetch_side_is_pushed_where_pushes_go() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    env.git(
+        &f.down,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{commit}:refs/heads/{branch}"),
+        ],
+    );
+    let push_side = push_side(&f);
+
+    f.tool(&["finish"]).success().stdout(contains(format!(
+        "asked 'origin' to open a merge request from '{branch}' into 'main'"
+    )));
+    assert_eq!(env.rev(&push_side, &format!("refs/heads/{branch}")), commit);
+    assert!(recorded_push_options(&push_side).contains(&"merge_request.create".to_string()));
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["merge_request"]["requested"], true);
+}
+
+/// A URL that reads `bare` but refuses every push, through git's `ext`
+/// transport, which the fork's repository is allowed to use.
+fn read_only_url(f: &Fork, bare: &Path) -> String {
+    f.env
+        .git(&f.down, &["config", "protocol.ext.allow", "always"]);
+    format!(
+        "ext::sh -c test% %s% =% upload-pack% &&% exec% git% %s% {}",
+        bare.display()
+    )
+}
+
+/// Makes the publish remote push to exactly `urls`.
+fn set_push_urls(f: &Fork, urls: &[&str]) {
+    let env = &f.env;
+    env.git_output(&f.down, &["config", "--unset-all", "remote.origin.pushurl"]);
+    for url in urls {
+        env.git(&f.down, &["config", "--add", "remote.origin.pushurl", url]);
+    }
+}
+
+#[test]
+fn only_push_urls_without_the_branch_receive_the_push() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    let holding = env.bare("holding");
+    env.git(
+        &f.down,
+        &[
+            "push",
+            "-q",
+            &holding.to_string_lossy(),
+            &format!("{commit}:refs/heads/{branch}"),
+        ],
+    );
+    let lacking = env.bare("lacking");
+    accept_push_options(env, &lacking);
+    // A push to the URL that already holds the branch would fail.
+    let read_only = read_only_url(&f, &holding);
+    set_push_urls(&f, &[&read_only, &lacking.to_string_lossy()]);
+
+    f.tool(&["finish"]).success().stdout(contains(format!(
+        "asked 'origin' to open a merge request from '{branch}' into 'main'"
+    )));
+    assert_eq!(env.rev(&lacking, &format!("refs/heads/{branch}")), commit);
+    assert!(recorded_push_options(&lacking).contains(&"merge_request.create".to_string()));
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["merge_request"]["requested"], true);
+}
+
+#[test]
+fn a_failed_push_names_the_push_urls_that_received_the_branch() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    let holding = env.bare("holding");
+    env.git(
+        &f.down,
+        &[
+            "push",
+            "-q",
+            &holding.to_string_lossy(),
+            &format!("{commit}:refs/heads/{branch}"),
+        ],
+    );
+    let receiving = env.bare("receiving").to_string_lossy().into_owned();
+    let refusing = env.bare("refusing");
+    let holding = read_only_url(&f, &holding);
+    let refusing = read_only_url(&f, &refusing);
+    set_push_urls(&f, &[&holding, &receiving, &refusing]);
+
+    let finish = f.tool(&["finish"]).code(2);
+    let err = stderr(&finish);
+    assert!(
+        err.contains(&format!(
+            "The branch is already on {receiving}; no other ref moved, and the update stays verified; \
+             fix the cause and run `git intake finish` again, which pushes only where the branch is missing"
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("Nothing moved"), "{err}");
+    assert!(!stdout(&finish).contains("pushed the verified commit"));
+}
+
+#[test]
+fn a_failed_push_through_several_push_urls_says_some_may_hold_the_branch() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    verified(&f);
+    let receiving = env.bare("receiving").to_string_lossy().into_owned();
+    let refusing = read_only_url(&f, &env.bare("refusing"));
+    set_push_urls(&f, &[&receiving, &refusing]);
+
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(
+        err.contains(
+            "The branch may already be on some of the push URLs of 'origin'; no other ref moved, \
+             and the update stays verified"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("Nothing moved"), "{err}");
+}
+
+#[test]
+fn a_failed_push_to_the_only_push_url_moved_nothing() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    verified(&f);
+    let refusing = read_only_url(&f, &env.bare("refusing"));
+    set_push_urls(&f, &[&refusing]);
+
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(
+        err.contains(
+            "Nothing moved, and the update stays verified; fix the cause and run `git intake finish` again"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_copy_left_on_one_push_url_is_not_reported_gone() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, _) = verified(&f);
+    let branch = mr_branch(&commit);
+    let second = env.bare("second");
+    let publish = f.publish.to_string_lossy().into_owned();
+    set_push_urls(&f, &[&publish, &second.to_string_lossy()]);
+    f.tool(&["finish"]).success();
+    assert_eq!(env.rev(&second, &format!("refs/heads/{branch}")), commit);
+
+    // The second URL now refuses pushes, so only the first copy is deleted.
+    let read_only = read_only_url(&f, &second);
+    set_push_urls(&f, &[&publish, &read_only]);
+    let abort = f.tool(&["abort"]).code(2);
+    let out = stdout(&abort);
+    assert!(
+        out.contains(&format!(
+            "deleted the merge request branch '{branch}' from 'origin' at {publish}"
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("already gone"), "{out}");
+    assert!(
+        stderr(&abort).contains(&format!(
+            "cannot delete the merge request branch '{branch}' from 'origin'"
+        )),
+        "{}",
+        stderr(&abort)
+    );
+    assert!(!env.has_rev(&f.publish, &format!("refs/heads/{branch}")));
+    assert_eq!(env.rev(&second, &format!("refs/heads/{branch}")), commit);
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["step"], "waiting_for_merge_request");
 }
 
 /// Where the remote keeps the merge request's head, as GitLab does.
