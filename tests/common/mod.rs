@@ -427,11 +427,8 @@ pub fn recorded_push_options(bare: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The branch `finish` pushes the verified commit `commit` to in
-/// merge-request mode.
-pub fn merge_request_branch(commit: &str) -> String {
-    format!("git-intake/update-{}", &commit[..12])
-}
+/// The branch `finish` pushes the verified commit to in merge-request mode.
+pub const MERGE_REQUEST_BRANCH: &str = "git-intake/update";
 
 /// A clone of the publish remote `publish` that plays the forge merging
 /// requests, at the remote's integration branch.

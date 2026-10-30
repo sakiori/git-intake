@@ -1,6 +1,6 @@
-//! `migrate`: an update in progress started by the release before the
-//! current state format is carried over in place, with its worktree, branch,
-//! merge, index and files.
+//! `migrate`: an update in progress started by a release of state format 3
+//! is carried over in place, with its worktree, branch, merge, index and
+//! files.
 
 mod common;
 
@@ -12,7 +12,7 @@ use predicates::str::contains;
 
 /// The advice every command but `migrate` gives on a state in format 3.
 const MIGRATE_ADVICE: &str = "the update in progress was started by a release that keeps its state in format 3; \
-     this release (git-intake 0.0.0) understands format 4. Run `git intake migrate` to carry the update over \
+     this release (git-intake 0.0.0) understands format 5. Run `git intake migrate` to carry the update over \
      to this release, or finish or abort it with a release that keeps format 3 (git-intake v0.3.0 to v0.3.1)";
 
 /// What `migrate` says once the directory has moved.
@@ -191,7 +191,7 @@ fn merged_update_moves_with_its_uncommitted_and_untracked_files() {
     );
     assert!(out.contains(STOP_PROCESSES), "{out}");
     assert!(
-        out.contains("migrated the update in progress to state format 4"),
+        out.contains("migrated the update in progress to state format 5"),
         "{out}"
     );
     assert!(!old.exists(), "the old worktree remains");
@@ -199,7 +199,7 @@ fn merged_update_moves_with_its_uncommitted_and_untracked_files() {
     assert_eq!(env.rev(&f.down, "refs/heads/git-intake/update"), branch);
     assert_eq!(env.intake_refs(&f.down), refs);
     let state = read_state(&f.down.join(".git"));
-    assert_eq!(state["version"], 4);
+    assert_eq!(state["version"], 5);
     assert_eq!(state["worktree"], new.to_string_lossy().as_ref());
     assert!(
         fs::read_to_string(env.info_exclude(&f.down))
@@ -374,7 +374,7 @@ fn interrupted_migrate_finishes_the_state_once_the_worktree_moved() {
         "{out}"
     );
     let state = read_state(&f.down.join(".git"));
-    assert_eq!(state["version"], 4);
+    assert_eq!(state["version"], 5);
     assert_eq!(state["worktree"], new.to_string_lossy().as_ref());
     assert_eq!(changes(env, &new), before);
     assert!(
@@ -449,7 +449,7 @@ fn worktree_moved_by_hand_is_repaired_and_kept() {
     assert!(!list.contains("prunable"), "{list}");
     assert_eq!(changes(env, &new), before);
     let state = read_state(&f.down.join(".git"));
-    assert_eq!(state["version"], 4);
+    assert_eq!(state["version"], 5);
     assert_eq!(state["worktree"], new.to_string_lossy().as_ref());
     fs::remove_file(new.join("untracked.txt")).unwrap();
     f.tool(&["verify"]).success();
@@ -591,7 +591,7 @@ fn current_state_and_no_update_are_refused() {
     f.tool(&["start"]).success();
     let state = fs::read_to_string(state_path(&f.down.join(".git"))).unwrap();
     f.tool(&["migrate"]).code(2).stderr(contains(
-        "the update in progress already keeps its state in format 4; there is nothing to migrate",
+        "the update in progress already keeps its state in format 5; there is nothing to migrate",
     ));
     assert_eq!(
         fs::read_to_string(state_path(&f.down.join(".git"))).unwrap(),
@@ -610,7 +610,7 @@ fn state_older_than_the_previous_release_keeps_its_advice() {
     let err = stderr(&f.tool(&["migrate"]).code(2));
     assert!(
         err.contains(
-            "keeps its state in format 2; this release (git-intake 0.0.0) understands format 4. \
+            "keeps its state in format 2; this release (git-intake 0.0.0) understands format 5. \
              Finish or abort the update with a release that keeps format 2 (git-intake v0.2.0 to v0.2.2)"
         ),
         "{err}"

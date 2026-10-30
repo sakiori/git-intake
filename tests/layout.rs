@@ -119,8 +119,8 @@ fn merge_request_opened_from_the_update_worktree_waits() {
         .stdout(contains("the update waits for the merge request"))
         .stderr(contains(LEFT_REMOVED_DIRECTORY));
     assert!(!wt.exists(), "the update worktree remains");
-    let branch = format!("git-intake/update-{}", &verified[..12]);
-    assert_eq!(env.rev(&f.publish, &branch), verified);
+    let branch = common::MERGE_REQUEST_BRANCH;
+    assert_eq!(env.rev(&f.publish, branch), verified);
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["update"]["step"], "waiting_for_merge_request");
 }

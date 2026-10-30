@@ -1,5 +1,6 @@
-//! `migrate`: carry an update in progress over from the previous state
-//! format to the current one, in place.
+//! `migrate`: carry an update in progress over from state format 3 to the
+//! current one, in place. An update of format 4 needs no migration: this
+//! release reads its state in place.
 //!
 //! Format 3 kept the update worktree in the git directory, where compilers,
 //! bundlers and watchers ignore every path, so checks run there may not see
@@ -23,6 +24,12 @@ use crate::state::{self, Stored, UPDATE_BRANCH};
 pub fn run(repo: &Repo) -> Result<Exit> {
     let state = match state::load_stored(&repo.paths.state)? {
         None => bail!("no update is in progress; there is nothing to migrate"),
+        Some(Stored::Current(state)) if state.earlier_format() => bail!(
+            "the update in progress keeps its state in format {}, which this release carries on without migration; \
+             there is nothing to migrate. The first command that changes the update writes its state in format {}",
+            state.version,
+            state::current_format()
+        ),
         Some(Stored::Current(_)) => bail!(
             "the update in progress already keeps its state in format {}; there is nothing to migrate",
             state::current_format()

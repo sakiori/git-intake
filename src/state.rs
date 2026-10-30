@@ -13,18 +13,28 @@ use crate::port::Verb;
 /// The branch an update is built on.
 pub const UPDATE_BRANCH: &str = "git-intake/update";
 
-/// Version 4: the update worktree lives in the main worktree, at
-/// [`UPDATE_WORKTREE`], instead of in the git directory. Version 3 fetched
-/// upstreams by URL into references the update holds, dropped mirror
-/// branches, and took an upstream in `follow` or `port` mode. Version 2 made
-/// the publication setting a table and let an update wait for its merge
-/// request.
-const STATE_VERSION: u32 = 4;
+/// Version 5: an update catches up with a moved integration branch, keeps
+/// the base it started from, and keeps every commit it pushed to its merge
+/// request branch. Version 4: the update worktree lives in the main
+/// worktree, at [`UPDATE_WORKTREE`], instead of in the git directory.
+/// Version 3 fetched upstreams by URL into references the update holds,
+/// dropped mirror branches, and took an upstream in `follow` or `port` mode.
+/// Version 2 made the publication setting a table and let an update wait
+/// for its merge request.
+const STATE_VERSION: u32 = 5;
+
+/// The format this release reads in place. Format 4 lacks only what format
+/// 5 added, which reads as absent, so it reads into the same shape; the
+/// first save writes it in [`STATE_VERSION`].
+const EARLIER_STATE_VERSION: u32 = 4;
 
 /// The format `migrate` carries over to [`STATE_VERSION`]. Format 3 differs
 /// from format 4 only in the recorded worktree, which lay in the git
 /// directory, so it reads into the same shape.
 const PREVIOUS_STATE_VERSION: u32 = 3;
+
+/// The first release that keeps the state in [`STATE_VERSION`].
+pub const FIRST_RELEASE_OF_FORMAT: &str = "v0.3.6";
 
 /// The release of this binary, as recorded in the states it starts. A build
 /// from source reports `0.0.0`.
@@ -36,7 +46,8 @@ const FORMAT_RELEASES: &[(u64, &str)] = &[
     (1, "v0.1.0"),
     (2, "v0.2.0 to v0.2.2"),
     (3, "v0.3.0 to v0.3.1"),
-    (4, "v0.3.2 and later"),
+    (4, "v0.3.2 to v0.3.5"),
+    (5, "from v0.3.6"),
 ];
 
 /// The update worktree, relative to the main worktree. It lives under
@@ -53,9 +64,6 @@ pub const BARE_UPDATE_WORKTREE: &str = "git-intake/worktree";
 /// The line `start` adds to the repository's `info/exclude` when the update
 /// worktree is not ignored yet, so that the main checkout does not show it.
 pub const WORKTREES_EXCLUDE: &str = "/.worktrees/";
-
-/// Prefix of the branch a merge request is opened from.
-pub const MERGE_REQUEST_BRANCH_PREFIX: &str = "git-intake/update-";
 
 /// Locations under `<git-common-dir>/git-intake/`. The update worktree is not
 /// among them; see [`UPDATE_WORKTREE`].
@@ -330,6 +338,31 @@ pub struct Verification {
     pub problems: Vec<String>,
 }
 
+/// Progress of a catch-up merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatchUpStep {
+    /// Recorded before the merge began: the merge may be in progress, or
+    /// committed without the update branch moved to it yet.
+    Merging,
+    Conflict,
+    /// The update branch is at the catch-up merge.
+    Merged,
+}
+
+/// One catch-up merge: the integration tip it takes into the update, as
+/// first parent, with the update branch head as second parent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatchUp {
+    /// The integration tip caught up with, recorded before the merge.
+    pub tip: String,
+    /// The update branch head the catch-up started from.
+    pub head_before: String,
+    pub step: CatchUpStep,
+    pub merge_commit: Option<String>,
+    pub conflicts: Vec<ConflictFile>,
+}
+
 /// One branch move planned by `finish`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedMove {
@@ -371,6 +404,23 @@ pub struct MergeRequest {
     /// Where the merge request branch pointed when last seen on the remote.
     #[serde(default)]
     pub last_seen_head: Option<String>,
+    /// Every commit of the update pushed to the merge request branch, oldest
+    /// first: the verified commit of the first push, then each catch-up
+    /// merge, recorded before its push. Format 4 kept only `commit`.
+    #[serde(default)]
+    pub pushed: Vec<String>,
+}
+
+impl MergeRequest {
+    /// Every commit of the update pushed to the merge request branch, oldest
+    /// first.
+    pub fn pushed(&self) -> Vec<String> {
+        if self.pushed.is_empty() {
+            vec![self.commit.clone()]
+        } else {
+            self.pushed.clone()
+        }
+    }
 }
 
 /// An update from `start` to `finish`.
@@ -387,10 +437,17 @@ pub struct UpdateState {
     /// update, so that it warns once rather than at every command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_warned: Option<String>,
-    /// The configuration read from the integration tip at `start`.
+    /// The configuration read from the integration tip at `start`, with the
+    /// install command and the checks read again at each catch-up merge.
     pub config: Config,
-    /// Integration tip at `start`.
+    /// The integration tip the update lands on: the tip at `start`, or the
+    /// tip of the last catch-up merge.
     pub base: String,
+    /// The integration tip at `start`, which upstream ranges and the
+    /// repository's own changes are measured from. Format 4 did not record
+    /// it; its base, which never moved, stands in.
+    #[serde(default)]
+    pub start_base: Option<String>,
     pub branch: String,
     pub worktree: PathBuf,
     pub upstreams: Vec<QueuedUpstream>,
@@ -401,6 +458,10 @@ pub struct UpdateState {
     /// Set once `finish` pushed the merge request branch in merge-request mode.
     #[serde(default)]
     pub merge_request: Option<MergeRequest>,
+    /// The catch-up merges of the update, oldest first; the last one may be
+    /// in progress.
+    #[serde(default)]
+    pub catch_ups: Vec<CatchUp>,
     /// Set once `finish` completed.
     pub finished: bool,
     /// The main worktree as `start` found it. Git cannot locate a main
@@ -422,6 +483,7 @@ impl UpdateState {
             release: Some(RELEASE.to_string()),
             release_warned: None,
             config,
+            start_base: Some(base.clone()),
             base,
             branch: UPDATE_BRANCH.to_string(),
             worktree,
@@ -429,9 +491,29 @@ impl UpdateState {
             verification: None,
             finishing: None,
             merge_request: None,
+            catch_ups: Vec::new(),
             finished: false,
             main_worktree: None,
         }
+    }
+
+    /// The integration tip at `start`.
+    pub fn start_base(&self) -> &str {
+        self.start_base.as_deref().unwrap_or(&self.base)
+    }
+
+    /// The catch-up merge in progress: recorded, but the update branch not
+    /// yet moved to it.
+    pub fn catching_up(&self) -> Option<&CatchUp> {
+        self.catch_ups
+            .last()
+            .filter(|c| c.step != CatchUpStep::Merged)
+    }
+
+    /// Whether the state was read in the format this release reads in place
+    /// and has not been saved by it yet.
+    pub fn earlier_format(&self) -> bool {
+        self.version == EARLIER_STATE_VERSION
     }
 
     /// The state in the current format with its update worktree at
@@ -441,6 +523,7 @@ impl UpdateState {
     pub fn into_current(mut self, worktree: PathBuf) -> Self {
         self.version = STATE_VERSION;
         self.worktree = worktree;
+        self.start_base.get_or_insert_with(|| self.base.clone());
         self
     }
 
@@ -458,9 +541,12 @@ impl UpdateState {
 }
 
 /// Reads the state of the update in progress, or `None` when there is none.
-/// A state in any other format, older or newer, is refused: its update has
-/// to be finished or aborted with a release that understands that format,
-/// or, in the previous format, carried over by `migrate`.
+/// A state of format 4 is read in place; [`Repo::save_state`] writes it in
+/// the current format. A state in any other format, older or newer, is
+/// refused: its update has to be finished or aborted with a release that
+/// understands that format, or, in format 3, carried over by `migrate`.
+///
+/// [`Repo::save_state`]: crate::repo::Repo::save_state
 pub fn load(path: &Path) -> Result<Option<UpdateState>> {
     match load_stored(path)? {
         None => Ok(None),
@@ -476,16 +562,16 @@ pub fn load(path: &Path) -> Result<Option<UpdateState>> {
     }
 }
 
-/// The state of the update in progress as `migrate` reads it: in the
-/// current format or the previous one.
+/// The state of the update in progress as `migrate` reads it: in a format
+/// this release reads, or in the format `migrate` carries over.
 pub enum Stored {
     Current(Box<UpdateState>),
     Previous(Box<UpdateState>),
 }
 
-/// Reads the state of the update in progress in the current or the previous
-/// format, or `None` when there is none. Any other format is refused as by
-/// [`load`].
+/// Reads the state of the update in progress in a format this release reads
+/// or in the previous format, or `None` when there is none. Any other format
+/// is refused as by [`load`].
 pub fn load_stored(path: &Path) -> Result<Option<Stored>> {
     match read(path)? {
         None => Ok(None),
@@ -508,6 +594,25 @@ pub fn recorded_main_worktree(path: &Path) -> Option<PathBuf> {
 /// The state format this release writes.
 pub fn current_format() -> u32 {
     STATE_VERSION
+}
+
+/// `state` as this release writes it: a state read in format 4 is written in
+/// the current format. Returns whether the format changed.
+pub fn in_current_format(state: &UpdateState) -> (std::borrow::Cow<'_, UpdateState>, bool) {
+    if state.version == STATE_VERSION {
+        return (std::borrow::Cow::Borrowed(state), false);
+    }
+    let mut current = state.clone();
+    current.version = STATE_VERSION;
+    (std::borrow::Cow::Owned(current), true)
+}
+
+/// What the first command that writes a state read in format 4 says.
+pub fn format_note() -> String {
+    format!(
+        "the update's state is now kept in format {STATE_VERSION}; releases before \
+         {FIRST_RELEASE_OF_FORMAT} can no longer carry the update on"
+    )
 }
 
 /// Why a state of another format is refused, and what to do about it.
@@ -569,9 +674,17 @@ pub fn release_warning(state: &UpdateState) -> Option<String> {
     } else {
         ""
     };
+    let understand = if state.earlier_format() {
+        format!(
+            "this release reads its state of format {EARLIER_STATE_VERSION} and keeps it in format {STATE_VERSION}, \
+             and the two may differ in what they do"
+        )
+    } else {
+        "both understand its state, but they may differ in what they do".to_string()
+    };
     Some(format!(
         "the update was started by git-intake {started} and is carried on by git-intake {RELEASE}; \
-         both understand its state, but they may differ in what they do.{advice}"
+         {understand}.{advice}"
     ))
 }
 
@@ -615,7 +728,8 @@ fn read(path: &Path) -> Result<Option<Versioned>> {
     // The version is checked before the shape, so that a state written by
     // another release is named as such rather than as unreadable.
     let version = value.get("version").and_then(serde_json::Value::as_u64);
-    let current = version == Some(u64::from(STATE_VERSION));
+    let current = version == Some(u64::from(STATE_VERSION))
+        || version == Some(u64::from(EARLIER_STATE_VERSION));
     if !current && version != Some(u64::from(PREVIOUS_STATE_VERSION)) {
         let release = value
             .get("release")
@@ -623,8 +737,10 @@ fn read(path: &Path) -> Result<Option<Versioned>> {
             .map(str::to_string);
         return Ok(Some(Versioned::Other { version, release }));
     }
-    // The previous format has the shape of the current one.
-    let state = Box::new(serde_json::from_value::<UpdateState>(value).with_context(unreadable)?);
+    // Formats 3 and 4 have the shape of the current one.
+    let mut state =
+        Box::new(serde_json::from_value::<UpdateState>(value).with_context(unreadable)?);
+    state.start_base.get_or_insert_with(|| state.base.clone());
     Ok(Some(if current {
         Versioned::Current(state)
     } else {
@@ -782,7 +898,7 @@ mod tests {
         let err = format!("{:#}", load(&path).unwrap_err());
         assert!(
             err.contains(&format!(
-                "keeps its state in format 3; this release (git-intake {RELEASE}) understands format 4. \
+                "keeps its state in format 3; this release (git-intake {RELEASE}) understands format 5. \
                  Run `git intake migrate` to carry the update over to this release, or finish or abort it \
                  with a release that keeps format 3 (git-intake v0.3.0 to v0.3.1)"
             )),
@@ -813,7 +929,7 @@ mod tests {
         let err = format!("{:#}", load(&path).unwrap_err());
         assert!(
             err.contains(&format!(
-                "keeps its state in format 2; this release (git-intake {RELEASE}) understands format 4"
+                "keeps its state in format 2; this release (git-intake {RELEASE}) understands format 5"
             )),
             "{err}"
         );
@@ -822,6 +938,50 @@ mod tests {
             "{err}"
         );
         assert!(load_finished(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_state_of_format_4_is_read_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state = UpdateState::new(config(), "b".repeat(40), dir.path().join("wt"), vec![]);
+        // Format 4 knew neither the starting base nor catch-ups, nor the
+        // commits pushed to a merge request branch.
+        let mut value = serde_json::to_value(&state).unwrap();
+        value["version"] = 4.into();
+        let object = value.as_object_mut().unwrap();
+        object.remove("start_base");
+        object.remove("catch_ups");
+        value["merge_request"] = serde_json::json!({
+            "remote": "origin",
+            "branch": "git-intake/update-bbbbbbbbbbbb",
+            "commit": "c".repeat(40),
+            "requested": true,
+        });
+        fs::write(&path, value.to_string()).unwrap();
+        let read = load(&path).unwrap().unwrap();
+        assert!(read.earlier_format());
+        assert_eq!(read.start_base(), "b".repeat(40));
+        assert!(read.catch_ups.is_empty());
+        let mr = read.merge_request.clone().unwrap();
+        assert_eq!(mr.branch, "git-intake/update-bbbbbbbbbbbb");
+        assert_eq!(mr.pushed(), vec!["c".repeat(40)]);
+        // It is written in the current format.
+        let (current, upgraded) = in_current_format(&read);
+        assert!(upgraded);
+        save(&path, &current).unwrap();
+        let again = load(&path).unwrap().unwrap();
+        assert_eq!(again.version, STATE_VERSION);
+        assert!(!in_current_format(&again).1);
+        assert!(format_note().contains("releases before v0.3.6 can no longer carry the update on"));
+        // Another release of the same update says what it does to the state.
+        let mut other = read;
+        other.release = Some("0.3.5".to_string());
+        let warning = release_warning(&other).unwrap();
+        assert!(
+            warning.contains("reads its state of format 4 and keeps it in format 5"),
+            "{warning}"
+        );
     }
 
     #[test]
@@ -838,16 +998,16 @@ mod tests {
     fn a_state_of_a_newer_format_names_its_release() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        fs::write(&path, r#"{"version": 5, "release": "0.4.0"}"#).unwrap();
+        fs::write(&path, r#"{"version": 6, "release": "0.4.0"}"#).unwrap();
         let err = format!("{:#}", load(&path).unwrap_err());
         assert!(
             err.contains(
-                "started by a release (git-intake 0.4.0) that keeps its state in format 5"
+                "started by a release (git-intake 0.4.0) that keeps its state in format 6"
             ),
             "{err}"
         );
         assert!(
-            err.contains("with that release or a later one that understands format 5"),
+            err.contains("with that release or a later one that understands format 6"),
             "{err}"
         );
     }

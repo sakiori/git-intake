@@ -1589,7 +1589,7 @@ fn land_with_a_merge_commit(f: &Fork) {
     f.tool(&["verify"]).success();
     let commit = env.rev(&env.update_worktree(&f.down), "HEAD");
     f.tool(&["finish"]).success();
-    common::merge_on_forge(env, &f.publish, &common::merge_request_branch(&commit));
+    common::merge_on_forge(env, &f.publish, common::MERGE_REQUEST_BRANCH);
     f.tool(&["finish"]).success();
     assert_eq!(env.rev(&f.down, "main^2"), commit);
 }
@@ -1630,4 +1630,61 @@ fn a_port_starts_at_a_record_merged_with_a_merge_commit() {
     assert_eq!(up["decided"], 1);
     assert_eq!(up["taken"], 1);
     assert_eq!(up["pending"], 0);
+}
+
+#[test]
+fn a_caught_up_port_merged_with_a_merge_commit_counts_its_takes() {
+    let f = Fork::port_merge_request();
+    let env = &f.env;
+    let c = upstream_commits(&f, 2);
+    f.tool(&["start"]).success();
+    write_plan(&f, &[("take", &c[0], ""), ("skip", &c[1], "")]);
+    f.tool(&["continue"]).success();
+    f.tool(&["verify"]).success();
+    let commit = env.rev(&env.update_worktree(&f.down), "HEAD");
+    f.tool(&["finish"]).success();
+    // Other work lands first; `finish` catches up and pushes the result.
+    let forge = common::forge(env, &f.publish);
+    env.commit(&forge, &[("other.txt", "o\n")], "other: lands first");
+    env.git(&forge, &["push", "-q", "origin", "HEAD:main"]);
+    f.tool(&["finish"]).success();
+    let branch = format!("refs/heads/{}", common::MERGE_REQUEST_BRANCH);
+    let caught = env.rev(&f.publish, &branch);
+    assert_ne!(caught, commit);
+    assert_eq!(env.rev(&f.publish, &format!("{caught}^2")), commit);
+
+    common::merge_on_forge(env, &f.publish, common::MERGE_REQUEST_BRANCH);
+    f.tool(&["finish"]).success();
+    assert_eq!(env.rev(&f.down, "main^2"), caught);
+    let up = port_status(&f, 0);
+    assert_eq!(up["state"], "current");
+    assert_eq!(up["journal"], true);
+    assert_eq!(up["taken"], 1);
+    assert_eq!(up["decided"], 1);
+    assert_eq!(up["pending"], 0);
+}
+
+#[test]
+fn a_catch_up_refuses_a_changed_journal() {
+    let f = Fork::port();
+    let env = &f.env;
+    let c = upstream_commits(&f, 2);
+    f.tool(&["start"]).success();
+    write_plan(&f, &[("take", &c[0], ""), ("skip", &c[1], "")]);
+    f.tool(&["continue"]).success();
+    f.tool(&["verify"]).success();
+    let verified = env.rev(&env.update_worktree(&f.down), "HEAD");
+    env.commit(
+        &f.down,
+        &[(JOURNAL, "# written by hand\n")],
+        "fork: edit the journal",
+    );
+
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(
+        err.contains("the journal .git-intake/upstream.toml of port upstream 'upstream' changed"),
+        "{err}"
+    );
+    assert!(err.contains("Run `git intake abort`"), "{err}");
+    assert_eq!(env.rev(&env.update_worktree(&f.down), "HEAD"), verified);
 }

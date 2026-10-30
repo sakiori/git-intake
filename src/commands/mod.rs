@@ -1,6 +1,7 @@
 //! One module per command or command group.
 
 pub mod branches;
+pub mod catch_up;
 pub mod contribute;
 pub mod doctor;
 pub mod finish;

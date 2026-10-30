@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{Mono, merge_on_forge, merge_request_branch, mono_config, stdout};
+use common::{MERGE_REQUEST_BRANCH, Mono, merge_on_forge, mono_config, stdout};
 use predicates::str::contains;
 
 #[test]
@@ -388,7 +388,7 @@ fn paths_imported_through_a_merge_request_merged_with_a_merge_commit_stay_import
     m.tool(&["verify"]).success();
     let commit = env.rev(&env.update_worktree(&m.down), "HEAD");
     m.tool(&["finish"]).success();
-    merge_on_forge(env, &publish, &merge_request_branch(&commit));
+    merge_on_forge(env, &publish, MERGE_REQUEST_BRANCH);
     m.tool(&["finish"]).success();
     assert_eq!(env.rev(&m.down, "main^2"), commit);
 

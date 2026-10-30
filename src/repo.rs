@@ -38,6 +38,9 @@ pub struct Repo {
     head: Option<String>,
     /// Whether this command removed the update worktree it was started in.
     left_removed_directory: Cell<bool>,
+    /// Whether this command said that it wrote a state of format 4 in the
+    /// current format.
+    noted_format: Cell<bool>,
 }
 
 /// Where the repository's main worktree is.
@@ -113,6 +116,7 @@ impl Repo {
             toplevel,
             head,
             left_removed_directory: Cell::new(false),
+            noted_format: Cell::new(false),
         })
     }
 
@@ -149,8 +153,16 @@ impl Repo {
         Ok(())
     }
 
+    /// Writes the state of the update in progress, always in the current
+    /// format; the first time a state read in format 4 is written, says that
+    /// earlier releases can no longer carry the update on.
     pub fn save_state(&self, state: &UpdateState) -> Result<()> {
-        state::save(&self.paths.state, state)
+        let (current, upgraded) = state::in_current_format(state);
+        state::save(&self.paths.state, &current)?;
+        if upgraded && !self.noted_format.replace(true) {
+            eprintln!("note: {}", state::format_note());
+        }
+        Ok(())
     }
 
     /// Every worktree of the repository, the main one first. Git lists the
