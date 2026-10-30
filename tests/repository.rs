@@ -902,15 +902,19 @@ enum Alias {
     SshForHttps,
     /// The path of a linked worktree of the upstream's repository.
     LinkedWorktree,
+    /// An `ssh` push URL on a host alias of the SSH client's configuration
+    /// for the upstream's host.
+    SshHostNickname,
 }
 
-const ALIASES: [Alias; 6] = [
+const ALIASES: [Alias; 7] = [
     Alias::Credentials,
     Alias::InsteadOf,
     Alias::PushInsteadOf,
     Alias::FileLocalhost,
     Alias::SshForHttps,
     Alias::LinkedWorktree,
+    Alias::SshHostNickname,
 ];
 
 impl Alias {
@@ -932,6 +936,33 @@ impl Alias {
                     &f.env.path("upstream-linked").to_string_lossy(),
                     "main",
                 ],
+            );
+        }
+        if let Alias::SshHostNickname = self {
+            // An `ssh` that answers `-G` as a client whose configuration
+            // makes `upstream-alias` stand for `example.com`; git itself
+            // reaches the repositories through the test's SSH shim.
+            let bin = f.env.path("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let ssh = bin.join("ssh");
+            std::fs::write(
+                &ssh,
+                "#!/bin/sh\n[ \"$1\" = -G ] || exit 255\nshift\n[ \"$1\" = -- ] && shift\n\
+                 case \"$1\" in upstream-alias) host=example.com ;; *) host=$1 ;; esac\n\
+                 printf 'user git\\nhostname %s\\nport 22\\n' \"$host\"\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            f.env.set_var(
+                "PATH",
+                &format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            );
+            std::fs::create_dir_all(f.env.path("served")).unwrap();
+            std::os::unix::fs::symlink(&f.up.bare, f.env.path("served/upstream.git")).unwrap();
+            f.reconfigure(
+                &format!("url = {:?}", f.up.url()),
+                "url = \"ssh://git@example.com/upstream.git\"",
             );
         }
         if let Alias::SshForHttps = self {
@@ -1004,6 +1035,16 @@ impl Alias {
                     "--push",
                     "origin",
                     "ssh://git@example.com/upstream.git",
+                ],
+            ),
+            Alias::SshHostNickname => env.git(
+                &f.down,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    "ssh://upstream-alias/upstream.git",
                 ],
             ),
             Alias::LinkedWorktree => env.git(

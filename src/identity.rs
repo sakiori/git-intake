@@ -9,11 +9,13 @@
 //! `git ls-remote --get-url` resolves it for a fetch. The URLs as configured
 //! are compared as well. Each URL is then made comparable: a local path or
 //! `file://` URL names the repository git finds there, made canonical; any
-//! other URL, the scp-like `[user@]host:path` read as `ssh`, is compared
-//! without its credentials, by scheme, host in lower case, port unless it is
-//! the scheme's default, and path without its trailing `/` and `.git`.
+//! other URL, the scp-like `[user@]host:path` read as `ssh`, is compared by
+//! host and path whatever its scheme and credentials (see [`comparable`]),
+//! and an `ssh` URL also by the host and port the SSH client resolves.
 
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 
 use anyhow::{Result, bail};
 use percent_encoding::percent_decode_str;
@@ -86,7 +88,7 @@ impl Upstreams {
                 urls.push(out.stdout.trim().to_string());
             }
             urls.dedup();
-            let ids = urls.iter().map(|u| normalise(u, &base)).collect();
+            let ids = urls.iter().flat_map(|u| normalise(u, &base)).collect();
             known.push(Known { name, url, ids });
         }
         Ok(Self { base, known })
@@ -94,9 +96,9 @@ impl Upstreams {
 
     /// The upstream whose repository `place` names, if any.
     pub fn named_by(&self, place: &Place) -> Option<&Known> {
-        let mut ids = vec![normalise(&place.configured, &self.base)];
+        let mut ids = normalise(&place.configured, &self.base);
         if place.resolved != place.configured {
-            ids.push(normalise(&place.resolved, &self.base));
+            ids.extend(normalise(&place.resolved, &self.base));
         }
         self.known
             .iter()
@@ -284,11 +286,16 @@ fn rewritten_for_push(git: &Git, url: &str) -> Result<String> {
 /// against `base`.
 #[cfg(test)]
 fn same_repository(a: &str, b: &str, base: &Path) -> bool {
-    normalise(a, base) == normalise(b, base)
+    let b = normalise(b, base);
+    normalise(a, base).iter().any(|id| b.contains(id))
 }
 
-/// The comparable form of a URL; see the module's documentation.
-fn normalise(url: &str, base: &Path) -> String {
+/// The comparable forms of a URL; see the module's documentation. Two URLs
+/// name the same repository when they share one. An `ssh` URL has two: by
+/// its host as written, and by the host and port the SSH client's
+/// configuration makes of it, when `ssh -G` tells; without an `ssh` that
+/// answers, the first alone.
+fn normalise(url: &str, base: &Path) -> Vec<String> {
     let url = address(url.trim());
     if let Some(path) = local_path(url) {
         let path = Path::new(&path);
@@ -297,21 +304,67 @@ fn normalise(url: &str, base: &Path) -> String {
         } else {
             base.join(path)
         };
-        return format!("file:{}", local_repository(&full).display());
+        return vec![format!("file:{}", local_repository(&full).display())];
     }
     let written = if url.contains("://") {
         url.to_string()
     } else {
         scp_as_ssh(url)
     };
-    match Url::parse(&written) {
-        Ok(parsed) => comparable(&parsed),
-        Err(_) => format!("unparsed:{url}"),
+    let Ok(parsed) = Url::parse(&written) else {
+        return vec![format!("unparsed:{url}")];
+    };
+    let mut ids = vec![comparable(&parsed, None)];
+    if matches!(parsed.scheme(), "ssh" | "git+ssh" | "ssh+git")
+        && let Some(host) = parsed.host_str()
+        && let Some(destination) = ssh_destination(host)
+    {
+        let resolved = comparable(&parsed, Some(destination));
+        if !ids.contains(&resolved) {
+            ids.push(resolved);
+        }
     }
+    ids
 }
 
-/// Hosts whose repository paths ignore case.
-const CASELESS_HOSTS: &[&str] = &["github.com", "gitlab.com"];
+/// The host and port the SSH client connects to for `host`, as `ssh -G`
+/// resolves its configuration; `None` without an `ssh` that answers. Each
+/// host is asked once per run.
+pub fn ssh_destination(host: &str) -> Option<(String, u16)> {
+    type Asked = Vec<(String, Option<(String, u16)>)>;
+    static ASKED: Mutex<Asked> = Mutex::new(Vec::new());
+    // Unit tests never read the configuration of the machine they run on;
+    // the integration tests give the tool an `ssh` of their own.
+    if host.starts_with('-') || cfg!(test) {
+        return None;
+    }
+    let mut asked = ASKED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, known)) = asked.iter().find(|(h, _)| h == host) {
+        return known.clone();
+    }
+    let found = (|| {
+        let out = Command::new("ssh")
+            .args(["-G", host])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let value = |key: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(key))
+                .map(|v| v.trim().to_string())
+        };
+        let hostname = value("hostname ")?;
+        let port = value("port ").and_then(|p| p.parse().ok()).unwrap_or(22);
+        Some((hostname, port))
+    })();
+    asked.push((host.to_string(), found.clone()));
+    found
+}
 
 /// The address of git's `<transport>::<address>` form, which a remote
 /// helper reaches; any other URL itself.
@@ -332,10 +385,14 @@ fn address(url: &str) -> &str {
 /// A parsed URL by host, port and path: one repository is served over
 /// several schemes, so the scheme does not tell repositories apart, nor do
 /// credentials or the scheme's default port. The path loses doubled and
-/// trailing `/`, a `.git` suffix in any case, and a leading `~/`, by which an
-/// `ssh` URL names the home directory that an scp-like path starts from; on
-/// hosts that ignore the case of paths, its case.
-fn comparable(url: &Url) -> String {
+/// trailing `/`, a `.git` suffix in any case, a leading `~/`, by which an
+/// `ssh` URL names the home directory that an scp-like path starts from, and
+/// its case, which GitHub and GitLab ignore; a false match only refuses a
+/// push.
+///
+/// `destination` stands for the URL's host, and for its port when the URL
+/// names none, as the SSH client resolves them.
+fn comparable(url: &Url, destination: Option<(String, u16)>) -> String {
     let default_port = match url.scheme() {
         "ssh" | "git+ssh" | "ssh+git" => Some(22),
         "https" => Some(443),
@@ -343,12 +400,12 @@ fn comparable(url: &Url) -> String {
         "git" => Some(9418),
         _ => None,
     };
-    let host = url
-        .host_str()
-        .unwrap_or_default()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    let port = match url.port() {
+    let (host, port) = match destination {
+        Some((host, port)) => (host, url.port().or(Some(port))),
+        None => (url.host_str().unwrap_or_default().to_string(), url.port()),
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let port = match port {
         Some(port) if Some(port) != default_port => format!(":{port}"),
         _ => String::new(),
     };
@@ -364,12 +421,7 @@ fn comparable(url: &Url) -> String {
     if path.len() >= 4 && path[path.len() - 4..].eq_ignore_ascii_case(".git") {
         path.truncate(path.len() - 4);
     }
-    let path = path.trim_end_matches('/');
-    let path = if CASELESS_HOSTS.contains(&host.as_str()) {
-        path.to_lowercase()
-    } else {
-        path.to_string()
-    };
+    let path = path.trim_end_matches('/').to_lowercase();
     format!("{host}{port}/{path}")
 }
 
@@ -496,7 +548,9 @@ mod tests {
             "git@example.com:team/up",
             "ssh://git@example.com:2222/team/up"
         ));
-        assert!(!same(
+        // Hosts ignore the case of paths, as self-managed GitLab and GitHub
+        // Enterprise do; a false match only refuses a push.
+        assert!(same(
             "https://example.com/Team/up",
             "https://example.com/team/up"
         ));
@@ -603,7 +657,9 @@ mod tests {
             "https://gitlab.com/Team/Up",
             "https://gitlab.com/team/up"
         ));
-        assert!(!same(
+        // Hosts ignore the case of paths, as self-managed GitLab and GitHub
+        // Enterprise do; a false match only refuses a push.
+        assert!(same(
             "https://example.com/Team/up",
             "https://example.com/team/up"
         ));
