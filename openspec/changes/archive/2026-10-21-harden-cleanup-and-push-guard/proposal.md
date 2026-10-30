@@ -1,10 +1,8 @@
 ## Why
 
-Three guarantees of the tool could be broken by what an upstream brings or by how git is configured.
+An upstream could bring a `.worktrees` link, or a file at `.worktrees/git-intake/update`, into the tree `finish` checks out in the main worktree, and a later cleanup removed a directory outside the repository reached through the link.
 
-An upstream can bring a `.worktrees` symbolic link, or a file or directory at `.worktrees/git-intake/update`, into the tree. `finish` checked that tree out into the main checkout, replacing the directory that held the update worktree, and a later cleanup removed a directory reached through the link, outside the repository, as if it were the update worktree.
-
-The rule that the tool never pushes to an upstream compared the URLs as configured. A push URL with credentials, a `url.<base>.insteadOf` or `url.<base>.pushInsteadOf` alias, or a `file://localhost/` URL named the upstream's repository under another spelling, and `sync` pushed into it. The rule was also checked only when the configuration was read, not before the push.
+The rule that the tool never pushes to an upstream compared URLs as written, and only when the configuration was read: a push URL with credentials, an `insteadOf` or `pushInsteadOf` alias, or a `file://localhost/` URL let `sync` push into an upstream's repository.
 
 Messages could show credentials: the refusal of an API URL that carries them, a forge's message that quotes the token, and a git command line that could not be started.
 
