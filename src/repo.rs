@@ -282,23 +282,26 @@ impl Repo {
     }
 
     /// The tool never pushes to an upstream: a publish remote fetched from
-    /// or pushed to an upstream's URL is refused.
+    /// or pushed to a URL that names an upstream's repository is refused.
     fn refuse_publishing_to_an_upstream(&self, config: &Config) -> Result<()> {
         let Some(publish) = &config.publish else {
             return Ok(());
         };
         let urls = crate::upstreams::remote_urls(&self.git, &publish.remote)?;
-        let problems: Vec<String> = config
-            .upstreams
-            .iter()
-            .filter(|up| urls.contains(&up.url))
-            .map(|up| {
-                format!(
-                    "publish remote '{}' has the URL {} of upstream '{}'; the tool never pushes to an upstream",
-                    publish.remote, up.url, up.name
-                )
-            })
-            .collect();
+        let base = self.git.dir();
+        let mut problems = Vec::new();
+        for up in &config.upstreams {
+            if let Some(url) = urls
+                .iter()
+                .find(|u| crate::upstreams::same_repository(u, &up.url, base))
+            {
+                problems.push(format!(
+                    "publish remote '{}' has the URL {url}, which names the repository of upstream '{}' ({}); \
+                     the tool never pushes to an upstream",
+                    publish.remote, up.name, up.url
+                ));
+            }
+        }
         if !problems.is_empty() {
             bail!(
                 "invalid {} on '{}':\n{}",

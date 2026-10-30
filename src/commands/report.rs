@@ -62,7 +62,7 @@ pub struct PortReport {
     /// The taken commits in the order they were copied, or are to be.
     pub taken: Vec<TakenReport>,
     /// Commits marked `take` whose copy changed nothing, recorded as `have`.
-    pub unchanged: Vec<CommitRef>,
+    pub unchanged: Vec<UnchangedReport>,
     /// The `skip` and `have` decisions of the plan.
     pub decisions: Vec<DecisionReport>,
     /// Commits left pending: those marked `later`, and those a revision
@@ -80,9 +80,19 @@ pub struct TakenReport {
     pub copy: CopyStep,
     pub copied: Option<String>,
     pub conflicts: Vec<ConflictFile>,
+    /// Paths the copy left out: `.git-intake.toml` and `.git-intake/`.
+    pub left_out: Vec<String>,
     /// Earlier upstream commits still pending that changed some of the same
     /// files.
     pub earlier_pending: Vec<CommitRef>,
+}
+
+#[derive(Serialize)]
+pub struct UnchangedReport {
+    pub commit: String,
+    pub subject: String,
+    /// Paths the copy left out: `.git-intake.toml` and `.git-intake/`.
+    pub left_out: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -269,6 +279,7 @@ fn port_report(
                     step == UpstreamStep::Conflict && c.copy == CopyStep::Conflict,
                     live_unmerged,
                 ),
+                left_out: c.left_out.clone(),
                 earlier_pending: c
                     .overlaps
                     .iter()
@@ -278,9 +289,15 @@ fn port_report(
             }
         })
         .collect();
-    let unchanged = (0..p.commits.len())
-        .filter(|i| p.commits[*i].copy == CopyStep::Empty)
-        .map(reference)
+    let unchanged = p
+        .commits
+        .iter()
+        .filter(|c| c.copy == CopyStep::Empty)
+        .map(|c| UnchangedReport {
+            commit: c.commit.clone(),
+            subject: c.subject.clone(),
+            left_out: c.left_out.clone(),
+        })
         .collect();
     let decisions = p
         .commits
@@ -424,6 +441,7 @@ fn render_port(u: &UpstreamReport, p: &PortReport, out: &mut String) {
         let outcome = match (&t.copy, &t.copied) {
             (CopyStep::Copied, Some(c)) => format!("copied as {}", abbrev(c)),
             (CopyStep::Conflict, _) => "in conflict".to_string(),
+            (CopyStep::CommitFailed, _) => "its commit failed".to_string(),
             _ => "not copied yet".to_string(),
         };
         out.push_str(&format!(
@@ -432,6 +450,9 @@ fn render_port(u: &UpstreamReport, p: &PortReport, out: &mut String) {
             t.subject
         ));
         render_conflicts(&t.conflicts, "      ", out);
+        if !t.left_out.is_empty() {
+            out.push_str(&format!("      left out: {}\n", t.left_out.join(", ")));
+        }
         if !t.earlier_pending.is_empty() {
             out.push_str("      earlier pending commits that change the same files:\n");
             for e in &t.earlier_pending {
@@ -443,6 +464,9 @@ fn render_port(u: &UpstreamReport, p: &PortReport, out: &mut String) {
         out.push_str("  recorded as present because the copy changed nothing:\n");
         for c in &p.unchanged {
             out.push_str(&format!("    {} {}\n", abbrev(&c.commit), c.subject));
+            if !c.left_out.is_empty() {
+                out.push_str(&format!("      left out: {}\n", c.left_out.join(", ")));
+            }
         }
     }
     if p.decisions.is_empty() {

@@ -15,14 +15,23 @@ use crate::commands::update::{
 use crate::git::{Git, abbrev, split_z};
 use crate::port::{self, Decision, Journal, Verb, Verdict};
 use crate::repo::{Repo, bullet};
-use crate::state::{CopyStep, PlannedCommit, PortPlan, UpdateState, UpstreamStep, Work};
+use crate::state::{CopyStep, PortPlan, UpdateState, UpstreamStep, Work};
 use crate::sync_record;
 
 /// The note of a `have` decision recorded because a copy changed nothing.
 const EMPTY_COPY_NOTE: &str = "taken, but its copy changed nothing";
 
+/// The note of a `have` decision recorded because a copy changed only the
+/// paths a copy never changes.
+const OWN_FILES_COPY_NOTE: &str =
+    "taken, but its copy changed nothing outside .git-intake.toml and .git-intake/";
+
+/// The paths a copy never changes: the repository's own git-intake files.
+const OWN_PATHS: [&str; 2] = [crate::config::FILE_NAME, port::JOURNAL_DIR];
+
 /// Copies the remaining takes of upstream `i`, then commits the journal.
-/// Returns the exit status when a copy stopped on conflicts.
+/// Returns the exit status when a copy stopped on conflicts or its commit
+/// failed.
 pub fn carry_out(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Option<Exit>> {
     let wt = Git::worktree(&state.worktree);
     let name = state.upstreams[i].name.clone();
@@ -31,14 +40,15 @@ pub fn carry_out(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Optio
         let entry = plan_of(state, i)?.commits[index].clone();
         match entry.copy {
             CopyStep::Copied | CopyStep::Empty => continue,
-            CopyStep::Conflict => bail!(
-                "the copy of {} is in conflict; resolve it and run `git intake continue`",
+            CopyStep::Conflict | CopyStep::CommitFailed => bail!(
+                "the copy of {} has stopped; complete it and run `git intake continue`",
                 abbrev(&entry.commit)
             ),
             CopyStep::None => {}
         }
         if let Some(head_before) = &entry.head_before {
-            // A copy that began before an interruption.
+            // A copy that began before an interruption. Nothing in the
+            // worktree is thrown away: a copy already applied is committed.
             let head = wt.line(&["rev-parse", "HEAD"])?;
             if head != *head_before
                 && sync_record::copy_of(&wt, &head, &name)?.as_deref() == Some(&entry.commit)
@@ -59,7 +69,12 @@ pub fn carry_out(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Optio
                 let output = fs::read_to_string(merge_output_path(repo, &name)).unwrap_or_default();
                 return stop_on_conflict(repo, state, i, index, &output).map(Some);
             }
-            wt.run(&["reset", "--quiet", "--hard", head_before])?;
+            if !wt.tracked_changes()?.is_empty() {
+                if let Some(exit) = finish_copy(repo, state, i, index)? {
+                    return Ok(Some(exit));
+                }
+                continue;
+            }
         }
 
         let head_before = wt.line(&["rev-parse", "HEAD"])?;
@@ -88,11 +103,15 @@ pub fn carry_out(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Optio
                     )
                 });
             }
-            let output = format!("{}{}", out.stdout, out.stderr);
-            return stop_on_conflict(repo, state, i, index, &output).map(Some);
+            leave_out_own_paths(repo, state, i, index)?;
+            if !wt.unmerged_files()?.is_empty() {
+                let output = format!("{}{}", out.stdout, out.stderr);
+                return stop_on_conflict(repo, state, i, index, &output).map(Some);
+            }
         }
-        let copied = commit_copy(&wt, &name, &entry)?;
-        record_copy(repo, state, i, index, copied)?;
+        if let Some(exit) = finish_copy(repo, state, i, index)? {
+            return Ok(Some(exit));
+        }
     }
     find_overlaps(repo, state, i)?;
     commit_journal(repo, state, i)?;
@@ -135,62 +154,112 @@ pub fn carry_out(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Optio
     Ok(None)
 }
 
-/// Concludes the copy that stopped on conflicts once they are resolved.
-pub fn conclude_copy(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<()> {
+/// Concludes the copy that stopped on conflicts, or whose commit failed,
+/// with what the worktree now holds. Returns the exit status when its
+/// commit fails again.
+pub fn conclude_copy(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Option<Exit>> {
     let wt = Git::worktree(&state.worktree);
     let name = state.upstreams[i].name.clone();
     let Some(index) = plan_of(state, i)?
         .commits
         .iter()
-        .position(|c| c.copy == CopyStep::Conflict)
+        .position(|c| matches!(c.copy, CopyStep::Conflict | CopyStep::CommitFailed))
     else {
-        bail!("upstream '{name}' has no copy in conflict");
+        bail!("upstream '{name}' has no copy that stopped");
     };
     let entry = plan_of(state, i)?.commits[index].clone();
     let head = wt.line(&["rev-parse", "HEAD"])?;
-    let copied = if Some(&head) != entry.head_before.as_ref()
+    if Some(&head) != entry.head_before.as_ref()
         && sync_record::copy_of(&wt, &head, &name)?.as_deref() == Some(&entry.commit)
     {
         // Committed by hand with its trailers.
-        Some(head)
-    } else {
-        if Some(&head) != entry.head_before.as_ref() {
-            bail!(
-                "the update branch moved to {} while the copy of {} was in conflict; commit the copy with the \
-                 trailers of upstream '{name}', or run `git intake abort` and start again",
-                abbrev(&head),
-                abbrev(&entry.commit)
-            );
-        }
-        let unmerged = wt.unmerged_files()?;
-        if !unmerged.is_empty() {
-            bail!(
-                "the copy of {} from upstream '{name}' still has unresolved conflicts in {}:\n{}\n\
-                 resolve them, stage them with `git add`, then run `git intake continue`",
-                abbrev(&entry.commit),
-                state.worktree.display(),
-                bullet(&unmerged)
-            );
-        }
-        commit_copy(&wt, &name, &entry)?
-    };
-    state.upstreams[i].step = UpstreamStep::Pending;
-    record_copy(repo, state, i, index, copied)
-}
-
-/// Commits the copy staged in the worktree with the commit's author and
-/// message and the copy trailers. Returns the copy, or `None` when it
-/// changes nothing; then nothing is committed.
-fn commit_copy(wt: &Git, name: &str, entry: &PlannedCommit) -> Result<Option<String>> {
-    if wt.test(&["diff", "--cached", "--quiet"])? {
-        // Record a resolution made for this copy before the index is reset,
-        // so that a retry reapplies it.
-        let _ = wt.raw(&["rerere"]);
-        wt.run(&["reset", "--quiet", "--hard", "HEAD"])?;
+        state.upstreams[i].step = UpstreamStep::Pending;
+        record_copy(repo, state, i, index, Some(head))?;
         return Ok(None);
     }
-    let [upstream, taken] = sync_record::copy_trailers(name, &entry.commit);
-    wt.run(&[
+    if Some(&head) != entry.head_before.as_ref() {
+        bail!(
+            "the update branch moved to {} while the copy of {} was stopped; commit the copy with the \
+             trailers of upstream '{name}', or run `git intake abort` and start again",
+            abbrev(&head),
+            abbrev(&entry.commit)
+        );
+    }
+    leave_out_own_paths(repo, state, i, index)?;
+    let unmerged = wt.unmerged_files()?;
+    if !unmerged.is_empty() {
+        bail!(
+            "the copy of {} from upstream '{name}' still has unresolved conflicts in {}:\n{}\n\
+             resolve them, stage them with `git add`, then run `git intake continue`",
+            abbrev(&entry.commit),
+            state.worktree.display(),
+            bullet(&unmerged)
+        );
+    }
+    finish_copy(repo, state, i, index)
+}
+
+/// Removes from the copy staged in the worktree its changes to the paths a
+/// copy never changes, and records which ones it left out.
+fn leave_out_own_paths(repo: &Repo, state: &mut UpdateState, i: usize, index: usize) -> Result<()> {
+    let wt = Git::worktree(&state.worktree);
+    let mut args = vec!["diff", "--cached", "--name-only", "-z", "HEAD", "--"];
+    args.extend(OWN_PATHS);
+    let mut paths = split_z(&wt.run(&args)?);
+    for p in wt.unmerged_files()? {
+        let own = OWN_PATHS
+            .iter()
+            .any(|o| p == *o || p.starts_with(&format!("{o}/")));
+        if own && !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut restore: Vec<&str> = vec!["restore", "--source=HEAD", "--staged", "--worktree", "--"];
+    restore.extend(paths.iter().map(String::as_str));
+    wt.run(&restore)?;
+    let name = state.upstreams[i].name.clone();
+    let entry = &mut plan_mut(state, i)?.commits[index];
+    println!(
+        "{name}: left out of the copy of {}: {}; a copy never changes .git-intake.toml or .git-intake/",
+        abbrev(&entry.commit),
+        paths.join(", ")
+    );
+    for p in paths {
+        if !entry.left_out.contains(&p) {
+            entry.left_out.push(p);
+        }
+    }
+    repo.save_state(state)
+}
+
+/// Commits the copy staged in the worktree, without the paths a copy never
+/// changes, and records its outcome. A copy that changes nothing is not
+/// committed. A commit that fails stops the update: the staged copy stays,
+/// and `continue` commits it once the cause is fixed. Returns the exit
+/// status then.
+fn finish_copy(
+    repo: &Repo,
+    state: &mut UpdateState,
+    i: usize,
+    index: usize,
+) -> Result<Option<Exit>> {
+    leave_out_own_paths(repo, state, i, index)?;
+    let wt = Git::worktree(&state.worktree);
+    let name = state.upstreams[i].name.clone();
+    let entry = plan_of(state, i)?.commits[index].clone();
+    if wt.test(&["diff", "--cached", "--quiet"])? {
+        // Record a resolution made for this copy, so that a retry
+        // reapplies it.
+        let _ = wt.raw(&["rerere"]);
+        state.upstreams[i].step = UpstreamStep::Pending;
+        record_copy(repo, state, i, index, None)?;
+        return Ok(None);
+    }
+    let [upstream, taken] = sync_record::copy_trailers(&name, &entry.commit);
+    let out = wt.raw(&[
         "commit",
         "--quiet",
         "-C",
@@ -200,8 +269,28 @@ fn commit_copy(wt: &Git, name: &str, entry: &PlannedCommit) -> Result<Option<Str
         "--trailer",
         &taken,
     ])?;
+    if !out.success() {
+        let why = format!("{}{}", out.stdout, out.stderr).trim().to_string();
+        let plan_entry = &mut plan_mut(state, i)?.commits[index];
+        plan_entry.copy = CopyStep::CommitFailed;
+        plan_entry.failure = Some(why.clone());
+        state.upstreams[i].step = UpstreamStep::Conflict;
+        repo.save_state(state)?;
+        println!(
+            "{name}: the commit of the copy of {} {} failed in {}:\n{}",
+            abbrev(&entry.commit),
+            entry.subject,
+            state.worktree.display(),
+            why
+        );
+        println!(
+            "the copy stays staged; fix the cause there, stage the result with `git add`, then run \
+             `git intake continue`, which commits it as the copy with its author, message and trailers"
+        );
+        return Ok(Some(Exit::Negative));
+    }
     let head = wt.line(&["rev-parse", "HEAD"])?;
-    if sync_record::copy_of(wt, &head, name)?.as_deref() != Some(&entry.commit) {
+    if sync_record::copy_of(&wt, &head, &name)?.as_deref() != Some(&entry.commit) {
         bail!(
             "the copy of {} at {} in {} does not end with the trailers of upstream '{name}'; a hook or configuration \
              may have changed its message. Correct the commit so that its message ends with\n\n{upstream}\n{taken}\n\n\
@@ -211,7 +300,9 @@ fn commit_copy(wt: &Git, name: &str, entry: &PlannedCommit) -> Result<Option<Str
             wt.dir().display()
         );
     }
-    Ok(Some(head))
+    state.upstreams[i].step = UpstreamStep::Pending;
+    record_copy(repo, state, i, index, Some(head))?;
+    Ok(None)
 }
 
 /// Records the outcome of one copy.
@@ -237,6 +328,7 @@ fn record_copy(
         CopyStep::Empty
     };
     entry.copied = copied;
+    entry.failure = None;
     settle(&mut entry.conflicts);
     state.verification = None;
     repo.save_state(state)
@@ -352,7 +444,10 @@ fn commit_journal(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<()> 
     let mut decisions = Vec::new();
     for c in &plan.commits {
         let (verdict, note) = match (c.verb, c.copy) {
-            (_, CopyStep::Empty) => (Verdict::Have, Some(EMPTY_COPY_NOTE.to_string())),
+            (_, CopyStep::Empty) if c.left_out.is_empty() => {
+                (Verdict::Have, Some(EMPTY_COPY_NOTE.to_string()))
+            }
+            (_, CopyStep::Empty) => (Verdict::Have, Some(OWN_FILES_COPY_NOTE.to_string())),
             (Some(Verb::Skip), _) => (Verdict::Skip, c.note.clone()),
             (Some(Verb::Have), _) => (Verdict::Have, c.note.clone()),
             _ => continue,
@@ -371,6 +466,7 @@ fn commit_journal(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<()> 
     let created = existing.is_none();
     let mut journal = existing.unwrap_or(Journal {
         base: plan.base.clone(),
+        retired: Vec::new(),
         decisions: Vec::new(),
     });
     let mut added = Vec::new();

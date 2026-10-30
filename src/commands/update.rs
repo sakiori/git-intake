@@ -11,7 +11,7 @@ use crate::Exit;
 use crate::cli::UpstreamTarget;
 use crate::commands::merge_request::{self, Landing};
 use crate::commands::port_plan;
-use crate::config::{Config, Mode, Upstream};
+use crate::config::{Mode, Upstream};
 use crate::drift::{self, DriftState};
 use crate::git::{Git, abbrev, branch_ref, tracking_ref};
 use crate::port::{self, PlanLine};
@@ -111,7 +111,8 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
         require_not_behind_published(git, &publish.remote, &config.integration, &base)?;
     }
 
-    let latest = sync_record::latest(&sync_record::records(git, &base, &config)?);
+    let fetched_tips: Vec<String> = tips.values().cloned().collect();
+    let latest = sync_record::latest(&sync_record::records(git, &base, &fetched_tips)?);
     let mut refusals = Vec::new();
     let mut queue = Vec::new();
     let mut current = Vec::new();
@@ -123,7 +124,15 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
             .and_then(|t| t.rev.clone());
         let queued = match up.mode {
             Mode::Follow => queue_follow(repo, &base, up, latest.get(&up.name), tip, rev)?,
-            Mode::Port => queue_port(repo, &config, &base, up, latest.get(&up.name), tip, rev)?,
+            Mode::Port => queue_port(
+                repo,
+                &base,
+                up,
+                latest.get(&up.name),
+                tip,
+                &fetched_tips,
+                rev,
+            )?,
         };
         match queued {
             Queued::Work(q) => queue.push(*q),
@@ -169,12 +178,8 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
     }
     repo.save_state(&state)?;
     // The update holds its references from now on.
-    let kept: Vec<(String, String)> = state
-        .upstreams
-        .iter()
-        .map(|q| (q.name.clone(), q.fetched.clone()))
-        .collect();
-    fetches.keep(&kept);
+    upstreams::hold(git, &state)?;
+    drop(fetches);
     println!(
         "update started from {} at {} in {}",
         state.config.integration,
@@ -298,15 +303,15 @@ fn queue_follow(
 /// revision contains.
 fn queue_port(
     repo: &Repo,
-    config: &Config,
     base: &str,
     up: &Upstream,
     last: Option<&Record>,
     tip: &str,
+    upstream_tips: &[String],
     rev: Option<String>,
 ) -> Result<Queued> {
     let git = &repo.git;
-    let accounting = match port::standing(git, config, base, up, last, tip)
+    let accounting = match port::standing(git, base, up, last, tip, upstream_tips)
         .and_then(|standing| port::require_plannable(&up.name, standing))
     {
         Ok(a) => a,
@@ -337,6 +342,8 @@ fn queue_port(
             head_before: None,
             copied: None,
             conflicts: Vec::new(),
+            failure: None,
+            left_out: Vec::new(),
             overlaps: Vec::new(),
         });
     }
@@ -852,7 +859,11 @@ pub fn resume(repo: &Repo) -> Result<Exit> {
     {
         match &state.upstreams[i].work {
             Work::Follow(_) => conclude_merge(repo, &mut state, i)?,
-            Work::Port(_) => port_plan::conclude_copy(repo, &mut state, i)?,
+            Work::Port(_) => {
+                if let Some(exit) = port_plan::conclude_copy(repo, &mut state, i)? {
+                    return Ok(exit);
+                }
+            }
         }
     } else if let Some(i) = state
         .upstreams
@@ -1104,6 +1115,14 @@ pub fn step_name(state: &UpdateState, wt: &Git) -> Result<&'static str> {
     if state
         .upstreams
         .iter()
+        .filter_map(|u| u.port())
+        .any(|p| p.commits.iter().any(|c| c.copy == CopyStep::CommitFailed))
+    {
+        return Ok("commit_failed");
+    }
+    if state
+        .upstreams
+        .iter()
         .any(|u| u.step == UpstreamStep::Conflict)
     {
         return Ok("conflict");
@@ -1126,6 +1145,10 @@ pub fn next_step(state: &UpdateState, wt: &Git) -> Result<String> {
     Ok(match step_name(state, wt)? {
         "conflict" => format!(
             "resolve the conflicts in {}, stage them, then run `git intake continue`",
+            state.worktree.display()
+        ),
+        "commit_failed" => format!(
+            "fix what made the commit of the copy fail in {}, stage the result, then run `git intake continue`",
             state.worktree.display()
         ),
         "plan" => match state.upstreams.iter().find_map(|u| u.port()) {

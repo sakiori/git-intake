@@ -660,13 +660,17 @@ fn a_port_without_shared_history_needs_a_journal_written_by_hand() {
     );
     env.assert_no_update(&down);
     let status = env.tool_json(&down, &["status", "--json"], 0);
-    assert_eq!(status["upstreams"][0]["state"], "pending");
+    assert_eq!(status["upstreams"][0]["state"], "no_base");
+    assert_eq!(status["upstreams"][0]["base"], serde_json::Value::Null);
     assert!(
         status["upstreams"][0]["detail"]
             .as_str()
             .unwrap()
-            .contains("by hand")
+            .contains("write the journal .git-intake/upstream.toml by hand")
     );
+    let text = stdout(&env.tool(&down, &["status"]).success());
+    assert!(text.contains("no base"), "{text}");
+    env.tool(&down, &["status", "--check"]).code(1);
     env.tool(&down, &["doctor"])
         .code(1)
         .stdout(contains("write the journal"));
@@ -755,20 +759,27 @@ fn a_rewritten_port_upstream_is_reported_and_not_planned() {
 
     let up = port_status(&f, 0);
     assert_eq!(up["state"], "rewritten");
+    assert_eq!(up["off_line"]["base"], serde_json::Value::Null);
+    assert_eq!(
+        up["off_line"]["commits"],
+        serde_json::json!([{"commit": c[1], "recorded_as": "skip"}])
+    );
+    let detail = up["detail"].as_str().unwrap();
+    assert!(detail.contains(&format!("{} (skip)", c[1])), "{detail}");
     assert!(
-        up["detail"]
-            .as_str()
-            .unwrap()
-            .contains(&format!("the journal decides commit {}", &c[1][..12])),
-        "{up}"
+        detail
+            .contains("list the commits under `retired` in the journal .git-intake/upstream.toml"),
+        "{detail}"
     );
     f.tool(&["start"])
         .code(2)
-        .stderr(contains("upstream 'upstream' was rewritten"));
+        .stderr(contains("upstream 'upstream' was rewritten"))
+        .stderr(contains(c[1].as_str()));
     env.assert_no_update(&f.down);
     f.tool(&["doctor"])
         .code(1)
-        .stdout(contains("the upstream was rewritten"));
+        .stdout(contains("the upstream was rewritten"))
+        .stdout(contains(format!("{} (skip)", c[1])));
 }
 
 #[test]
@@ -804,6 +815,31 @@ fn an_invalid_journal_is_refused_by_name() {
     f.tool(&["doctor"])
         .code(1)
         .stdout(contains("invalid journal"));
+
+    // A commit decided twice.
+    env.commit(
+        &f.down,
+        &[(
+            JOURNAL,
+            &format!(
+                "base = \"{base}\"\n[[decision]]\ncommit = \"{c0}\"\nverdict = \"skip\"\n\
+                 [[decision]]\ncommit = \"{c0}\"\nverdict = \"have\"\n",
+                c0 = c[0]
+            ),
+        )],
+        "fork: a commit decided twice",
+    );
+    f.tool(&["start"])
+        .code(2)
+        .stderr(contains(format!(
+            "invalid journal {JOURNAL} of upstream 'upstream'"
+        )))
+        .stderr(contains(format!(
+            "decision[1]: commit {} is decided more than once",
+            c[0]
+        )));
+    env.assert_no_update(&f.down);
+    assert_eq!(port_status(&f, 0)["state"], "unavailable");
 }
 
 #[test]
@@ -888,9 +924,26 @@ fn doctor_reports_stray_references_and_journals_of_no_upstream() {
         )),
         "{doctor}"
     );
-    // The next command that fetches the upstream replaces it, and removes it.
+    // Reading commands never touch it; removing it by hand clears the check.
     f.tool(&["status"]).success();
-    assert!(env.intake_refs(&f.down).is_empty());
+    assert_eq!(
+        env.intake_refs(&f.down),
+        vec!["refs/git-intake/upstreams/upstream".to_string()]
+    );
+    env.git(
+        &f.down,
+        &["update-ref", "-d", "refs/git-intake/upstreams/upstream"],
+    );
+    // A namespace an interrupted command left behind is reported too.
+    let left = "refs/git-intake/read/1-a/upstreams/upstream";
+    env.git(&f.down, &["update-ref", left, &tip]);
+    let doctor = stdout(&f.tool(&["doctor"]).code(1));
+    assert!(
+        doctor.contains(&format!("left without an update: {left} at")),
+        "{doctor}"
+    );
+    env.git(&f.down, &["update-ref", "-d", left]);
+    f.tool(&["doctor"]).success();
 
     env.commit(
         &f.down,
@@ -967,4 +1020,410 @@ fn contribute_creates_a_branch_of_upstream_history_only() {
         .code(2)
         .stderr(contains("unknown upstream 'nope'"));
     assert!(env.intake_refs(&f.down).is_empty());
+}
+
+/// Rewrites the upstream's whole history: a new root with the same files as
+/// its first commit, and the given changes on top, force-pushed. Returns the
+/// new commits, the root first.
+fn rewrite_upstream(f: &Fork, changes: &[(&str, &str, &str)]) -> Vec<String> {
+    let env = &f.env;
+    env.git(&f.up.work, &["checkout", "-q", "--orphan", "rewritten"]);
+    env.git(&f.up.work, &["rm", "-q", "-r", "-f", "--cached", "."]);
+    for entry in fs::read_dir(&f.up.work).unwrap() {
+        let path = entry.unwrap().path();
+        if path.file_name().unwrap() != ".git" {
+            if path.is_dir() {
+                fs::remove_dir_all(path).unwrap();
+            } else {
+                fs::remove_file(path).unwrap();
+            }
+        }
+    }
+    let mut commits = vec![env.commit(
+        &f.up.work,
+        &[(FORK_FILE, common::FORK_CONTENT)],
+        "upstream: initial, rewritten",
+    )];
+    for (file, content, message) in changes {
+        commits.push(env.commit(&f.up.work, &[(file, content)], message));
+    }
+    env.git(
+        &f.up.work,
+        &["push", "-q", "--force", "origin", "HEAD:main"],
+    );
+    commits
+}
+
+#[test]
+fn retiring_commits_recovers_a_rewritten_port_upstream() {
+    let f = Fork::port();
+    let env = &f.env;
+    let c = upstream_commits(&f, 3);
+    f.tool(&["start"]).success();
+    write_plan(&f, &[("take", &c[0], ""), ("take", &c[1], "")]);
+    f.tool(&["continue"]).success();
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+    let base = env.rev(&f.up.bare, &format!("{}~1", c[0]));
+
+    // The upstream rewrites the commits after the base: the taken commits
+    // are no longer on its line, and once garbage-collected no longer in
+    // the repository either.
+    env.git(&f.up.work, &["reset", "-q", "--hard", &base]);
+    let mut again = Vec::new();
+    for i in 1..=3 {
+        again.push(env.commit(
+            &f.up.work,
+            &[(&format!("p{i}.txt") as &str, &format!("{i}\n") as &str)],
+            &format!("upstream: change {i}, rewritten"),
+        ));
+    }
+    env.git(
+        &f.up.work,
+        &["push", "-q", "--force", "origin", "HEAD:main"],
+    );
+    env.git(&f.down, &["gc", "-q", "--prune=now"]);
+    assert!(
+        !env.has_rev(&f.down, &format!("{}^{{commit}}", c[0])),
+        "pruned"
+    );
+
+    let up = port_status(&f, 0);
+    assert_eq!(up["state"], "rewritten");
+    assert_eq!(
+        up["off_line"]["commits"],
+        serde_json::json!([
+            {"commit": c[0], "recorded_as": "taken"},
+            {"commit": c[1], "recorded_as": "taken"}
+        ])
+    );
+    let text = stdout(&f.tool(&["status"]).success());
+    assert!(text.contains(&format!("{} (taken)", c[1])), "{text}");
+    assert!(text.contains("list the commits under `retired`"), "{text}");
+    f.tool(&["start"]).code(2).stderr(contains("was rewritten"));
+    f.tool(&["doctor"])
+        .code(1)
+        .stdout(contains(format!("{} (taken)", c[0])));
+
+    // The owner acknowledges them, in upper case as some tools print ids.
+    let journal = journal_at(&f, "main");
+    assert!(journal.contains(&format!("base = \"{base}\"")), "{journal}");
+    let journal = journal.replace(
+        &format!("base = \"{base}\""),
+        &format!(
+            "base = \"{base}\"\nretired = [\"{}\", \"{}\"]",
+            c[0].to_uppercase(),
+            c[1].to_uppercase()
+        ),
+    );
+    env.commit(
+        &f.down,
+        &[(JOURNAL, &journal)],
+        "fork: retire the rewritten commits",
+    );
+    let up = port_status(&f, 0);
+    assert_eq!(up["state"], "pending");
+    assert_eq!(up["taken"], 0);
+    assert_eq!(up["pending"], 3);
+    f.tool(&["doctor"]).success();
+
+    // The rewritten versions are pending and can be marked present.
+    f.tool(&["start"]).success();
+    write_plan(
+        &f,
+        &[
+            ("have", &again[0], "taken before the rewrite"),
+            ("have", &again[1], ""),
+            ("take", &again[2], ""),
+        ],
+    );
+    f.tool(&["continue"]).success();
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+    let up = port_status(&f, 0);
+    assert_eq!(up["state"], "current");
+    let journal = journal_at(&f, "main");
+    assert!(
+        journal.contains(&format!(
+            "retired = [\n    \"{}\",\n    \"{}\",\n]",
+            c[0], c[1]
+        )),
+        "{journal}"
+    );
+
+    // A rewrite that drops the base as well: the base has to move.
+    let root = rewrite_upstream(&f, &[("q.txt", "q\n", "upstream: q")]);
+    env.git(&f.down, &["gc", "-q", "--prune=now"]);
+    let up = port_status(&f, 0);
+    assert_eq!(up["state"], "rewritten");
+    assert_eq!(up["off_line"]["base"], base.as_str());
+    let off: Vec<&str> = up["off_line"]["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["commit"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        off,
+        vec![again[0].as_str(), again[1].as_str(), again[2].as_str()]
+    );
+    let detail = up["detail"].as_str().unwrap();
+    assert!(detail.contains("move the base in the journal"), "{detail}");
+    // Retiring alone is not enough while the base is off the line.
+    let retired = format!(
+        "retired = [\"{}\", \"{}\", \"{}\", \"{}\", \"{}\"]\n",
+        c[0], c[1], again[0], again[1], again[2]
+    );
+    let journal = journal_at(&f, "main");
+    let start = journal.find("retired = [").unwrap();
+    let end = start + journal[start..].find("]\n").unwrap() + 2;
+    let retired_only = format!("{}{retired}{}", &journal[..start], &journal[end..]);
+    env.commit(&f.down, &[(JOURNAL, &retired_only)], "fork: retire again");
+    assert_eq!(port_status(&f, 0)["state"], "rewritten");
+    let moved = retired_only.replace(
+        &format!("base = \"{base}\""),
+        &format!("base = \"{}\"", root[0]),
+    );
+    env.commit(&f.down, &[(JOURNAL, &moved)], "fork: move the base");
+    let up = port_status(&f, 0);
+    assert_eq!(up["state"], "pending");
+    assert_eq!(up["base"], root[0].as_str());
+    assert_eq!(up["pending"], 1);
+    f.tool(&["start"]).success();
+    f.tool(&["abort"]).success();
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn a_failed_copy_commit_stops_and_continue_commits_the_fix() {
+    let f = Fork::port();
+    let env = &f.env;
+    let bad = upstream_change(&f, "bad.txt", "FORBIDDEN\n", "upstream: add bad.txt");
+    let ok = upstream_change(&f, "ok.txt", "ok\n", "upstream: add ok.txt");
+    // A hook of this repository rejects some content.
+    let hook = f.down.join(".git").join("hooks").join("pre-commit");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        "#!/bin/sh\nif git diff --cached | grep -q FORBIDDEN; then echo 'forbidden content' >&2; exit 1; fi\nexit 0\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    f.tool(&["start"]).success();
+    write_plan(&f, &[("take", &bad, ""), ("take", &ok, "")]);
+    let out = stdout(&f.tool(&["continue"]).code(1));
+    assert!(
+        out.contains(&format!(
+            "upstream: the commit of the copy of {} upstream: add bad.txt failed",
+            &bad[..12]
+        )),
+        "{out}"
+    );
+    assert!(out.contains("forbidden content"), "{out}");
+    assert!(out.contains("the copy stays staged"), "{out}");
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["step"], "commit_failed");
+    let planned = &status["update"]["upstreams"][0]["commits"][0];
+    assert_eq!(planned["copy"], "commit_failed");
+    assert!(
+        planned["failure"]
+            .as_str()
+            .unwrap()
+            .contains("forbidden content")
+    );
+    assert!(
+        status["update"]["next"]
+            .as_str()
+            .unwrap()
+            .contains("stage the result")
+    );
+
+    // Continue without a fix fails again and keeps the staged copy.
+    let wt = env.update_worktree(&f.down);
+    f.tool(&["continue"]).code(1);
+    assert_eq!(
+        fs::read_to_string(wt.join("bad.txt")).unwrap(),
+        "FORBIDDEN\n"
+    );
+
+    // The fix is staged, and an unrelated edit is left unstaged.
+    fs::write(wt.join("bad.txt"), "fine\n").unwrap();
+    env.git(&wt, &["add", "bad.txt"]);
+    fs::write(wt.join(FORK_FILE), "edited\n").unwrap();
+    let out = stdout(&f.tool(&["continue"]).success());
+    assert!(
+        out.contains(&format!("upstream: copied {} as", &bad[..12])),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("upstream: copied {} as", &ok[..12])),
+        "{out}"
+    );
+    assert_eq!(taken_by(&f, &env.rev(&wt, "HEAD~2")), bad);
+    assert_eq!(
+        env.git(&wt, &["show", "HEAD~2:bad.txt"]),
+        "fine",
+        "the staged fix is the copy"
+    );
+    assert_eq!(
+        env.git(&wt, &["log", "-1", "--format=%an <%ae>", "HEAD~2"]),
+        UPSTREAM_AUTHOR
+    );
+    assert_eq!(
+        fs::read_to_string(wt.join(FORK_FILE)).unwrap(),
+        "edited\n",
+        "unstaged work is kept"
+    );
+}
+
+#[test]
+fn a_copy_never_changes_the_git_intake_files() {
+    let f = Fork::port();
+    let env = &f.env;
+    let config_before = fs::read_to_string(f.down.join(".git-intake.toml")).unwrap();
+    // The upstream carries git-intake files of its own.
+    env.git(&f.up.work, &["add", "-A"]);
+    fs::create_dir_all(f.up.work.join(".git-intake")).unwrap();
+    fs::write(
+        f.up.work.join(".git-intake.toml"),
+        "integration = \"theirs\"\n",
+    )
+    .unwrap();
+    fs::write(
+        f.up.work.join(".git-intake").join("x.toml"),
+        "base = \"x\"\n",
+    )
+    .unwrap();
+    fs::write(f.up.work.join("real.txt"), "real\n").unwrap();
+    env.git(&f.up.work, &["add", "-A"]);
+    env.git(
+        &f.up.work,
+        &["commit", "-q", "-m", "upstream: real change and own files"],
+    );
+    env.git(&f.up.work, &["push", "-q", "origin", "HEAD:main"]);
+    let mixed = env.rev(&f.up.work, "HEAD");
+    let only_own = upstream_change(
+        &f,
+        ".git-intake/y.toml",
+        "base = \"y\"\n",
+        "upstream: own files only",
+    );
+
+    f.tool(&["start"]).success();
+    write_plan(&f, &[("take", &mixed, ""), ("take", &only_own, "")]);
+    let out = stdout(&f.tool(&["continue"]).success());
+    assert!(
+        out.contains(&format!(
+            "upstream: left out of the copy of {}: .git-intake.toml, .git-intake/x.toml",
+            &mixed[..12]
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "upstream: the copy of {} changes nothing",
+            &only_own[..12]
+        )),
+        "{out}"
+    );
+    let wt = env.update_worktree(&f.down);
+    assert_eq!(
+        fs::read_to_string(wt.join(".git-intake.toml")).unwrap(),
+        config_before
+    );
+    assert!(wt.join("real.txt").exists());
+    assert!(!wt.join(".git-intake").join("x.toml").exists());
+    assert!(!wt.join(".git-intake").join("y.toml").exists());
+    let journal = fs::read_to_string(wt.join(JOURNAL)).unwrap();
+    assert!(
+        journal.contains("note = \"taken, but its copy changed nothing outside .git-intake.toml and .git-intake/\""),
+        "{journal}"
+    );
+    let report = env.tool_json(&f.down, &["report", "--json"], 0);
+    let port = &report["upstreams"][0]["port"];
+    assert_eq!(
+        port["taken"][0]["left_out"],
+        serde_json::json!([".git-intake.toml", ".git-intake/x.toml"])
+    );
+    assert_eq!(
+        port["unchanged"][0]["left_out"],
+        serde_json::json!([".git-intake/y.toml"])
+    );
+    f.tool(&["report"])
+        .success()
+        .stdout(contains("left out: .git-intake.toml, .git-intake/x.toml"));
+    f.tool(&["verify"]).success();
+}
+
+#[test]
+fn a_merge_commit_is_taken_as_its_change_against_its_first_parent() {
+    let f = Fork::port();
+    let env = &f.env;
+    env.git(&f.up.work, &["checkout", "-q", "-b", "feature"]);
+    env.commit(&f.up.work, &[("f1.txt", "1\n")], "feature: one");
+    env.commit(&f.up.work, &[("f2.txt", "2\n")], "feature: two");
+    env.git(&f.up.work, &["checkout", "-q", "main"]);
+    env.git(
+        &f.up.work,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge pull request: feature",
+            "feature",
+        ],
+    );
+    env.git(&f.up.work, &["push", "-q", "origin", "main"]);
+    let merge = env.rev(&f.up.work, "HEAD");
+
+    f.tool(&["start"]).success();
+    let plan = fs::read_to_string(plan_path(&f)).unwrap();
+    let listed: Vec<&str> = plan.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(
+        listed,
+        vec![format!(
+            "later {} Merge pull request: feature",
+            &merge[..12]
+        )]
+    );
+    write_plan(&f, &[("take", &merge, "")]);
+    f.tool(&["continue"]).success();
+    let wt = env.update_worktree(&f.down);
+    let copy = env.rev(&wt, "HEAD~1");
+    assert_eq!(taken_by(&f, &copy), merge);
+    assert_eq!(
+        env.git(&wt, &["rev-list", "--parents", "-n", "1", &copy])
+            .split(' ')
+            .count(),
+        2,
+        "one parent"
+    );
+    assert!(wt.join("f1.txt").exists() && wt.join("f2.txt").exists());
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+    assert_eq!(port_status(&f, 0)["state"], "current");
+}
+
+#[test]
+fn reading_commands_never_move_the_update_references() {
+    let f = Fork::port();
+    let env = &f.env;
+    upstream_commits(&f, 1);
+    f.tool(&["start"]).success();
+    let held = env.rev(&f.down, "refs/git-intake/upstreams/upstream");
+    let moved = upstream_change(&f, "later.txt", "l\n", "upstream: later");
+    let up = port_status(&f, 0);
+    assert_eq!(up["tip"], moved.as_str());
+    env.tool(&f.down, &["log"]).success();
+    env.tool(&f.down, &["branches"]).success();
+    env.tool(&f.down, &["doctor"]).success();
+    assert_eq!(env.rev(&f.down, "refs/git-intake/upstreams/upstream"), held);
+    assert_eq!(
+        env.intake_refs(&f.down),
+        vec!["refs/git-intake/upstreams/upstream".to_string()],
+        "nothing else is left"
+    );
 }

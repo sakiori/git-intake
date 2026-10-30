@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, Upstream};
+use crate::config::Upstream;
 use crate::drift;
 use crate::git::{Git, abbrev};
 use crate::sync_record::{self, Record};
@@ -58,6 +58,10 @@ pub struct Decision {
 pub struct Journal {
     /// The upstream commit the port started from; it never moves.
     pub base: String,
+    /// Upstream commits that were taken or decided but are no longer on the
+    /// upstream's first-parent line, acknowledged by the owner after the
+    /// upstream was rewritten. They count as neither taken nor decided.
+    pub retired: Vec<String>,
     pub decisions: Vec<Decision>,
 }
 
@@ -65,6 +69,8 @@ pub struct Journal {
 #[serde(deny_unknown_fields)]
 struct RawJournal {
     base: String,
+    #[serde(default)]
+    retired: Vec<String>,
     #[serde(default, rename = "decision")]
     decisions: Vec<RawDecision>,
 }
@@ -96,17 +102,31 @@ pub fn read_journal(git: &Git, rev: &str, name: &str) -> Result<Option<Journal>>
     }
 }
 
-/// Parses journal text. All problems are reported at once.
+/// Parses journal text. All problems are reported at once. Commit ids are
+/// read in lower case, as git writes them.
 pub fn parse_journal(text: &str) -> std::result::Result<Journal, Vec<String>> {
     let raw: RawJournal = toml::from_str(text).map_err(|e| vec![e.message().to_string()])?;
     let mut problems = Vec::new();
-    let base = raw.base.trim().to_string();
+    let base = commit_id(&raw.base);
     if !is_full_id(&base) {
         problems.push(format!("base: '{base}' is not a full commit id"));
     }
+    let mut retired: Vec<String> = Vec::new();
+    for (i, r) in raw.retired.iter().enumerate() {
+        let commit = commit_id(r);
+        if !is_full_id(&commit) {
+            problems.push(format!("retired[{i}]: '{commit}' is not a full commit id"));
+        } else if retired.contains(&commit) {
+            problems.push(format!(
+                "retired[{i}]: commit {commit} is retired more than once"
+            ));
+        } else {
+            retired.push(commit);
+        }
+    }
     let mut decisions: Vec<Decision> = Vec::new();
     for (i, d) in raw.decisions.into_iter().enumerate() {
-        let commit = d.commit.trim().to_string();
+        let commit = commit_id(&d.commit);
         if !is_full_id(&commit) {
             problems.push(format!("decision[{i}]: '{commit}' is not a full commit id"));
         }
@@ -137,10 +157,20 @@ pub fn parse_journal(text: &str) -> std::result::Result<Journal, Vec<String>> {
         });
     }
     if problems.is_empty() {
-        Ok(Journal { base, decisions })
+        Ok(Journal {
+            base,
+            retired,
+            decisions,
+        })
     } else {
         Err(problems)
     }
+}
+
+/// A commit id as the journal and the trailers compare it: trimmed and in
+/// lower case.
+pub fn commit_id(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
 }
 
 /// The journal in the form the tool writes it.
@@ -153,6 +183,16 @@ pub fn render_journal(journal: &Journal) -> String {
          base = {}\n",
         quote(&journal.base)
     );
+    if !journal.retired.is_empty() {
+        out.push_str(
+            "# Taken or decided commits the upstream no longer has, acknowledged after a rewrite.\n\
+             retired = [\n",
+        );
+        for r in &journal.retired {
+            out.push_str(&format!("    {},\n", quote(r)));
+        }
+        out.push_str("]\n");
+    }
     for d in &journal.decisions {
         out.push_str(&format!(
             "\n[[decision]]\ncommit = {}\nverdict = {}\n",
@@ -185,11 +225,83 @@ pub struct LineCommit {
 pub enum Standing {
     /// Every commit after the base is accounted for, or some are pending.
     Known(Accounting),
-    /// The base, a decided commit or a taken commit is no longer on the
-    /// first-parent line of the fetched branch.
-    Rewritten(String),
+    /// The base, or a taken or decided commit that is not retired, is no
+    /// longer on the first-parent line of the fetched branch.
+    Rewritten(Rewrite),
     /// No journal, and no last synced commit to start one from.
     NoBase,
+}
+
+/// What a rewrite of a port upstream left off its first-parent line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rewrite {
+    /// The journal's base, or the last synced commit a new journal would
+    /// start from, when it is no longer on the line.
+    pub base: Option<String>,
+    /// Whether that base comes from the journal.
+    pub journal: bool,
+    /// Taken or decided commits off the line that the journal does not
+    /// retire.
+    pub commits: Vec<OffLine>,
+}
+
+/// A taken or decided commit that is no longer on the upstream's line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OffLine {
+    pub commit: String,
+    /// `taken`, `skip` or `have`.
+    pub recorded_as: &'static str,
+}
+
+impl Rewrite {
+    /// What was rewritten and the way out, naming every commit.
+    pub fn describe(&self, name: &str) -> String {
+        let mut parts = Vec::new();
+        if let Some(base) = &self.base {
+            parts.push(format!(
+                "{} {} is no longer on the first-parent line of the upstream branch",
+                if self.journal {
+                    "the journal's base"
+                } else {
+                    "the last synced commit"
+                },
+                abbrev(base)
+            ));
+        }
+        if !self.commits.is_empty() {
+            let listed: Vec<String> = self
+                .commits
+                .iter()
+                .map(|c| format!("{} ({})", c.commit, c.recorded_as))
+                .collect();
+            parts.push(format!(
+                "taken or decided commits are no longer on it: {}",
+                listed.join(", ")
+            ));
+        }
+        let journal = journal_path(name);
+        let mut steps = Vec::new();
+        match (&self.base, self.journal) {
+            (Some(_), true) => steps.push(format!(
+                "move the base in the journal {journal} to a commit of the upstream's first-parent line"
+            )),
+            (Some(_), false) => steps.push(format!(
+                "write the journal {journal} by hand, with a commit of the upstream's first-parent line as its `base`"
+            )),
+            (None, true) => {}
+            (None, false) => steps.push(format!(
+                "write the journal {journal} with the last synced commit as its `base`"
+            )),
+        }
+        if !self.commits.is_empty() {
+            steps.push(format!(
+                "list the commits under `retired` in the journal {journal}; their rewritten versions then show as \
+                 pending and can be marked `have`"
+            ));
+        }
+        let way_out = steps.join(", and ");
+        format!("{}; {way_out}", parts.join("; "))
+    }
 }
 
 /// The commits after a port upstream's base, accounted for.
@@ -220,15 +332,16 @@ impl Accounting {
 /// Where a port upstream stands against the integration branch at
 /// `integration_tip`: its journal there, or without one its last synced
 /// commit from the sync record `last` or the history, and the commits the
-/// integration branch's copies name as taken. An invalid journal is an
-/// error.
+/// integration branch's copies name as taken. `upstream_tips` are the
+/// fetched tips of the configured upstreams, whose own history holds no
+/// copies of this repository. An invalid journal is an error.
 pub fn standing(
     git: &Git,
-    config: &Config,
     integration_tip: &str,
     up: &Upstream,
     last: Option<&Record>,
     tip: &str,
+    upstream_tips: &[String],
 ) -> Result<Standing> {
     let journal = read_journal(git, integration_tip, &up.name)?;
     let last_synced = match (&journal, last) {
@@ -236,7 +349,7 @@ pub fn standing(
         (None, Some(record)) => Some(record.target.clone()),
         (None, None) => drift::adopted_base(git, integration_tip, up, tip)?,
     };
-    let taken = sync_record::taken(git, integration_tip, config, &up.name)?;
+    let taken = sync_record::taken(git, integration_tip, upstream_tips, &up.name)?;
     account(git, tip, journal.as_ref(), last_synced.as_deref(), &taken)
 }
 
@@ -244,6 +357,7 @@ pub fn standing(
 /// after its base. `journal` is the journal on the integration branch;
 /// without one, `last_synced` is the base a new journal would start from.
 /// `taken` are the upstream commits the integration branch's copies name.
+/// Commits the journal retires count as neither taken nor decided.
 pub fn account(
     git: &Git,
     tip: &str,
@@ -256,54 +370,75 @@ pub fn account(
         (None, Some(last)) => (last.to_string(), false),
         (None, None) => return Ok(Standing::NoBase),
     };
-    let what = if from_journal {
-        "the journal's base"
-    } else {
-        "the last synced commit"
-    };
-    let Some(line) = line_after(git, &base, tip)? else {
-        return Ok(Standing::Rewritten(format!(
-            "{what} {} is no longer on the first-parent line of the upstream branch",
-            abbrev(&base)
-        )));
-    };
-    let on_line: HashSet<&str> = line.iter().map(|c| c.commit.as_str()).collect();
-    // A commit at or before the base is on the line too; it only does not
-    // count, since the port starts after the base.
-    let before_base =
-        |c: &str| -> Result<bool> { Ok(git.object_exists(c)? && git.is_ancestor(c, &base)?) };
-
-    let mut decided = HashMap::new();
-    for d in journal.map(|j| j.decisions.as_slice()).unwrap_or_default() {
-        if on_line.contains(d.commit.as_str()) {
-            decided.insert(d.commit.clone(), d.verdict);
-        } else if !before_base(&d.commit)? {
-            return Ok(Standing::Rewritten(format!(
-                "the journal decides commit {}, which is no longer on the first-parent line of the upstream branch",
-                abbrev(&d.commit)
-            )));
+    let retired: HashSet<&str> = journal
+        .map(|j| j.retired.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let decisions = journal.map(|j| j.decisions.as_slice()).unwrap_or_default();
+    // The commits to place on the line, as recorded.
+    let mut recorded: Vec<(String, &'static str, Option<Verdict>)> = Vec::new();
+    for d in decisions {
+        if !retired.contains(d.commit.as_str()) {
+            recorded.push((d.commit.clone(), d.verdict.as_str(), Some(d.verdict)));
         }
     }
-    let mut taken_on_line = HashSet::new();
     for named in taken {
-        let commit = if is_full_id(named) {
-            Some(named.clone())
-        } else {
-            git.commit(named)?
+        let commit = match commit_id(named) {
+            c if is_full_id(&c) => c,
+            c => git.commit(&c)?.unwrap_or(c),
         };
-        match commit {
-            Some(c) if on_line.contains(c.as_str()) => {
-                taken_on_line.insert(c);
-            }
-            Some(c) if before_base(&c)? => {}
-            _ => {
-                return Ok(Standing::Rewritten(format!(
-                    "a copy on the integration branch names commit {} as taken, which is no longer on the \
-                     first-parent line of the upstream branch",
-                    abbrev(named)
-                )));
-            }
+        if !retired.contains(commit.as_str()) && !recorded.iter().any(|r| r.0 == commit) {
+            recorded.push((commit, "taken", None));
         }
+    }
+
+    let Some(line) = line_after(git, &base, tip)? else {
+        // Without the base, the commits are judged against the whole line.
+        let whole: HashSet<String> =
+            crate::git::lines(&git.run(&["rev-list", "--first-parent", tip, "--"])?)
+                .into_iter()
+                .collect();
+        return Ok(Standing::Rewritten(Rewrite {
+            base: Some(base),
+            journal: from_journal,
+            commits: recorded
+                .iter()
+                .filter(|(c, _, _)| !whole.contains(c))
+                .map(|(c, as_, _)| OffLine {
+                    commit: c.clone(),
+                    recorded_as: as_,
+                })
+                .collect(),
+        }));
+    };
+    let on_line: HashSet<&str> = line.iter().map(|c| c.commit.as_str()).collect();
+    let mut decided = HashMap::new();
+    let mut taken_on_line = HashSet::new();
+    let mut off_line = Vec::new();
+    for (commit, as_, verdict) in recorded {
+        if on_line.contains(commit.as_str()) {
+            match verdict {
+                Some(v) => {
+                    decided.insert(commit, v);
+                }
+                None => {
+                    taken_on_line.insert(commit);
+                }
+            }
+        } else if !(git.object_exists(&commit)? && git.is_ancestor(&commit, &base)?) {
+            // A commit at or before the base is on the line too; it only
+            // does not count, since the port starts after the base.
+            off_line.push(OffLine {
+                commit,
+                recorded_as: as_,
+            });
+        }
+    }
+    if !off_line.is_empty() {
+        return Ok(Standing::Rewritten(Rewrite {
+            base: None,
+            journal: from_journal,
+            commits: off_line,
+        }));
     }
     Ok(Standing::Known(Accounting {
         base,
@@ -509,17 +644,25 @@ fn note_of(rest: &str, subject: &str) -> Option<String> {
     (!note.is_empty()).then(|| note.to_string())
 }
 
+/// Why a port upstream has no base, and the way out.
+pub fn no_base_advice(name: &str) -> String {
+    format!(
+        "the upstream is in port mode but has no journal, and the integration branch has no sync record of it and \
+         shares no history with it; write the journal {} by hand, with the upstream commit the port starts from \
+         as its `base`",
+        journal_path(name)
+    )
+}
+
 /// Refuses an upstream whose standing cannot be planned.
 pub fn require_plannable(name: &str, standing: Standing) -> Result<Accounting> {
     match standing {
         Standing::Known(a) => Ok(a),
-        Standing::Rewritten(why) => bail!("upstream '{name}' was rewritten: {why}"),
-        Standing::NoBase => bail!(
-            "upstream '{name}' is in port mode but has no journal, and the integration branch has no sync record \
-             of it and shares no history with it; write the journal {} by hand, with the upstream commit the port \
-             starts from as its `base`",
-            journal_path(name)
+        Standing::Rewritten(rewrite) => bail!(
+            "upstream '{name}' was rewritten: {}",
+            rewrite.describe(name)
         ),
+        Standing::NoBase => bail!("upstream '{name}': {}", no_base_advice(name)),
     }
 }
 
@@ -543,6 +686,7 @@ mod tests {
     fn journal_round_trips() {
         let journal = Journal {
             base: A.into(),
+            retired: vec![C.into()],
             decisions: vec![
                 Decision {
                     commit: B.into(),
@@ -557,6 +701,33 @@ mod tests {
             ],
         };
         assert_eq!(parse_journal(&render_journal(&journal)).unwrap(), journal);
+    }
+
+    #[test]
+    fn commit_ids_are_read_in_lower_case() {
+        let text = format!(
+            "base = \"{}\"\nretired = [\"{}\"]\n[[decision]]\ncommit = \" {} \"\nverdict = \"skip\"\n",
+            A.to_uppercase(),
+            B.to_uppercase(),
+            C.to_uppercase()
+        );
+        let journal = parse_journal(&text).unwrap();
+        assert_eq!(journal.base, A);
+        assert_eq!(journal.retired, vec![B.to_string()]);
+        assert_eq!(journal.decisions[0].commit, C);
+        let lines = parse_plan("take AAAAAAAA\n", &commits()).unwrap();
+        assert_eq!(lines[0].index, 0);
+    }
+
+    #[test]
+    fn invalid_retired_commits_are_refused() {
+        let text = format!("base = \"{A}\"\nretired = [\"{B}\", \"{B}\", \"abc\"]\n");
+        let problems = parse_journal(&text).unwrap_err().join("\n");
+        assert!(problems.contains("is retired more than once"), "{problems}");
+        assert!(
+            problems.contains("retired[2]: 'abc' is not a full commit id"),
+            "{problems}"
+        );
     }
 
     #[test]

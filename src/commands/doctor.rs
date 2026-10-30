@@ -122,8 +122,8 @@ fn reference_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
             format!("no reference under {REFS_PREFIX} is left without an update")
         } else {
             format!(
-                "references under {REFS_PREFIX} are left without an update: {}; the next command that fetches \
-                 the upstream replaces its reference, or remove them with `git update-ref -d <reference>`",
+                "references under {REFS_PREFIX} are left without an update: {}; an interrupted command or update \
+                 left them, and nothing uses them: remove them with `git update-ref -d <reference>`",
                 stray.join(", ")
             )
         },
@@ -150,7 +150,8 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
     for up in &config.upstreams {
         fetched.push(fetches.upstream(up)?);
     }
-    let records = sync_record::records(git, &integration, config)?;
+    let tips: Vec<String> = fetched.iter().filter_map(|f| f.clone().ok()).collect();
+    let records = sync_record::records(git, &integration, &tips)?;
     let latest = sync_record::latest(&records);
     for (up, fetched) in config.upstreams.iter().zip(&fetched) {
         let name = Some(up.name.as_str());
@@ -172,7 +173,7 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
         let record = latest.get(&up.name);
         match up.mode {
             Mode::Follow => follow_checks(git, config, &integration, up, record, tip, checks)?,
-            Mode::Port => port_checks(git, config, &integration, up, record, tip, checks),
+            Mode::Port => port_checks(git, &integration, up, record, tip, &tips, checks),
         }
     }
     drop(fetches);
@@ -307,11 +308,11 @@ fn follow_checks(
 /// branch.
 fn port_checks(
     git: &Git,
-    config: &Config,
     integration: &str,
     up: &Upstream,
     record: Option<&Record>,
     tip: Option<&String>,
+    tips: &[String],
     checks: &mut Checks,
 ) {
     let name = Some(up.name.as_str());
@@ -327,18 +328,12 @@ fn port_checks(
         checks.add("journal", name, CheckStatus::Fail, detail);
         return;
     };
-    let (status, detail) = match port::standing(git, config, integration, up, record, tip) {
+    let (status, detail) = match port::standing(git, integration, up, record, tip, tips) {
         Err(err) => (CheckStatus::Fail, format!("{err:#}")),
-        Ok(Standing::NoBase) => (
+        Ok(Standing::NoBase) => (CheckStatus::Fail, port::no_base_advice(&up.name)),
+        Ok(Standing::Rewritten(rewrite)) => (
             CheckStatus::Fail,
-            format!(
-                "no journal, and no sync record of the upstream or history shared with it to start one from; \
-                 write the journal {journal} by hand"
-            ),
-        ),
-        Ok(Standing::Rewritten(why)) => (
-            CheckStatus::Fail,
-            format!("{why}; the upstream was rewritten"),
+            format!("the upstream was rewritten: {}", rewrite.describe(&up.name)),
         ),
         Ok(Standing::Known(a)) if !a.journal => (
             CheckStatus::Pass,
@@ -374,7 +369,11 @@ fn remote_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<()
     let mut found = false;
     for remote in upstreams::remotes(git)? {
         let urls = upstreams::remote_urls(git, &remote)?;
-        for up in config.upstreams.iter().filter(|u| urls.contains(&u.url)) {
+        let at_upstream = |up: &&Upstream| {
+            urls.iter()
+                .any(|u| upstreams::same_repository(u, &up.url, git.dir()))
+        };
+        for up in config.upstreams.iter().filter(at_upstream) {
             found = true;
             let partial = remote == promisor
                 || git
@@ -388,10 +387,10 @@ fn remote_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<()
                     .trim()
                     == "true";
             let mut detail = format!(
-                "git remote '{remote}' has the URL {} of upstream '{}'; the tool fetches upstreams by their URL \
+                "git remote '{remote}' names the repository of upstream '{}' ({}); the tool fetches upstreams by their URL \
                  and needs no remote for them, and other tools take the remote for a place of the repository's own: \
                  remove it with `git remote remove {remote}`",
-                up.url, up.name
+                up.name, up.url
             );
             if partial {
                 detail.push_str(&format!(

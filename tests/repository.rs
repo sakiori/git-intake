@@ -224,6 +224,16 @@ fn removed_and_invalid_upstream_settings_are_refused() {
     m.tool(&["log"]).code(2).stderr(contains(
         "upstream 'app-b': an upstream in `port` mode is taken at the repository root and cannot have a path",
     ));
+
+    let bad_name = mono_config(&m.a, &m.b, "").replace("name = \"app-b\"", "name = \"app.lock\"");
+    env.commit(
+        &m.down,
+        &[(".git-intake.toml", &bad_name)],
+        "bad: a name git cannot use",
+    );
+    m.tool(&["status"]).code(2).stderr(contains(
+        "upstream 'app.lock': 'app.lock' cannot name a git reference",
+    ));
     env.assert_no_update(&m.down);
 }
 
@@ -235,12 +245,22 @@ fn publish_remote_at_an_upstream_url_is_refused() {
     let err = stderr(&f.tool(&["status"]).code(2));
     assert!(
         err.contains(&format!(
-            "publish remote 'origin' has the URL {} of upstream 'upstream'; the tool never pushes to an upstream",
+            "publish remote 'origin' has the URL {}, which names the repository of upstream 'upstream' ({}); \
+             the tool never pushes to an upstream",
+            f.up.url(),
             f.up.url()
         )),
         "{err}"
     );
-    // Pushing to the upstream's URL counts as well.
+    // A relative path to the same repository, from the main worktree.
+    env.git(
+        &f.down,
+        &["remote", "set-url", "origin", "../upstream.git/"],
+    );
+    f.tool(&["status"]).code(2).stderr(contains(
+        "has the URL ../upstream.git/, which names the repository of upstream 'upstream'",
+    ));
+    // Pushing to the upstream's repository counts as well.
     env.git(
         &f.down,
         &["remote", "set-url", "origin", &f.publish.to_string_lossy()],
@@ -261,6 +281,54 @@ fn publish_remote_at_an_upstream_url_is_refused() {
         .code(2)
         .stderr(contains("publish remote 'origin' has the URL"));
     env.assert_no_update(&f.down);
+}
+
+#[test]
+fn hosted_urls_naming_the_same_repository_count_as_one() {
+    let f = Fork::new();
+    let env = &f.env;
+    f.reconfigure(
+        &format!("url = {:?}", f.up.url()),
+        "url = \"https://Example.com/team/upstream.git\"",
+    );
+    env.git(
+        &f.down,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.com/team/upstream/",
+        ],
+    );
+    f.tool(&["status"]).code(2).stderr(contains(
+        "which names the repository of upstream 'upstream'",
+    ));
+    env.git(
+        &f.down,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.com/team/other.git",
+        ],
+    );
+    env.git(
+        &f.down,
+        &[
+            "remote",
+            "add",
+            "mirror",
+            "https://EXAMPLE.com/team/upstream",
+        ],
+    );
+    let doctor = stdout(&f.tool(&["doctor"]).code(1));
+    assert!(
+        doctor.contains(
+            "[FAIL] upstream: git remote 'mirror' names the repository of upstream 'upstream' \
+             (https://Example.com/team/upstream.git)"
+        ),
+        "{doctor}"
+    );
 }
 
 #[test]
@@ -291,7 +359,7 @@ fn remote_at_an_upstream_url_is_neither_used_nor_changed_and_doctor_names_it() {
     let doctor = stdout(&m.tool(&["doctor"]).code(1));
     assert!(
         doctor.contains(&format!(
-            "[FAIL] app-a: git remote 'app-a' has the URL {} of upstream 'app-a'",
+            "[FAIL] app-a: git remote 'app-a' names the repository of upstream 'app-a' ({})",
             m.a.url()
         )),
         "{doctor}"

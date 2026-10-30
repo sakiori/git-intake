@@ -14,6 +14,9 @@ pub enum DriftState {
     Behind,
     /// A port upstream with commits nobody has decided on yet.
     Pending,
+    /// A port upstream without a journal or a last synced commit to start
+    /// one from.
+    NoBase,
     NotImported,
     /// A synced path upstream whose path no longer exists on the integration branch.
     PathRemoved,
@@ -27,6 +30,7 @@ impl DriftState {
             DriftState::Current => "current",
             DriftState::Behind => "behind",
             DriftState::Pending => "pending",
+            DriftState::NoBase => "no base",
             DriftState::NotImported => "not imported",
             DriftState::PathRemoved => "path removed",
             DriftState::Rewritten => "rewritten",

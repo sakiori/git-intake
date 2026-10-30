@@ -79,9 +79,12 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
         };
         let taken: HashSet<String> = match up.mode {
             Mode::Follow => HashSet::new(),
-            Mode::Port => sync_record::taken(git, &integration, &config, &up.name)?
-                .into_iter()
-                .collect(),
+            Mode::Port => {
+                let fetched: Vec<String> = refs.iter().map(|(_, r)| r.clone()).collect();
+                sync_record::taken(git, &integration, &fetched, &up.name)?
+                    .into_iter()
+                    .collect()
+            }
         };
         for (branch, r) in refs {
             let n = if taken.is_empty() {

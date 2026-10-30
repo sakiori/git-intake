@@ -228,6 +228,11 @@ pub struct PlannedCommit {
     /// The copy on the update branch.
     pub copied: Option<String>,
     pub conflicts: Vec<ConflictFile>,
+    /// What git said when the commit of the copy failed.
+    pub failure: Option<String>,
+    /// Paths the copy would have changed but a copy never changes:
+    /// `.git-intake.toml` and `.git-intake/`.
+    pub left_out: Vec<String>,
     /// Earlier planned commits still pending that changed some of the same
     /// files; set for a taken commit once the plan is carried out.
     pub overlaps: Vec<String>,
@@ -240,6 +245,9 @@ pub enum CopyStep {
     /// Not copied: not taken, or not reached yet.
     None,
     Conflict,
+    /// The copy is staged, but committing it failed, as when a hook
+    /// rejects it.
+    CommitFailed,
     Copied,
     /// The copy changed nothing; the commit is recorded as `have`.
     Empty,
@@ -506,6 +514,8 @@ mod tests {
                     head_before: None,
                     copied: None,
                     conflicts: Vec::new(),
+                    failure: None,
+                    left_out: Vec::new(),
                     overlaps: Vec::new(),
                 }],
                 takes: vec![0],

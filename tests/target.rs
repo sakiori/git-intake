@@ -399,13 +399,14 @@ fn own_tag_does_not_stand_in_for_a_missing_upstream_tag() {
 fn revision_expression_on_the_fetched_branch_is_resolved() {
     let f = Fork::new();
     let env = &f.env;
-    let [_, c2, _] = three_upstream_commits(&f);
-    // `start` fetches first, so an expression on the reference that holds
-    // the fetched branch sees the new tip.
-    f.tool(&["start", "upstream=refs/git-intake/upstreams/upstream~1"])
+    let [_, c2, c3] = three_upstream_commits(&f);
+    // `start` fetches first, so an expression on a commit of the fetched
+    // branch resolves, though the repository had no such commit before.
+    let rev = format!("{}~1", &c3[..12]);
+    f.tool(&["start", &format!("upstream={rev}")])
         .success()
         .stdout(contains(format!(
-            "upstream: queued at {} (refs/git-intake/upstreams/upstream~1)",
+            "upstream: queued at {} ({rev})",
             &c2[..12]
         )));
     f.tool(&["verify"]).success();

@@ -723,3 +723,42 @@ fn abort_removes_logs_and_the_update_references() {
     assert!(!logs.exists(), "the update's logs remain");
     env.assert_no_update(&f.down);
 }
+
+#[test]
+fn a_stopped_follow_update_keeps_its_target_through_garbage_collection() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.commit(
+        &f.down,
+        &[(FORK_FILE, "one\nTWO-fork\nthree\n")],
+        "fork: change two",
+    );
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
+    let target = env.push_upstream(
+        &f.up,
+        &[(FORK_FILE, "one\nTWO-upstream\nthree\n")],
+        "upstream: change two",
+    );
+    f.tool(&["start"]).code(1);
+    assert_eq!(
+        env.rev(&f.down, "refs/git-intake/upstreams/upstream"),
+        target
+    );
+
+    // The upstream disappears and the repository is garbage-collected: the target stays, and continue,
+    // verify and finish never fetch.
+    let wt = env.update_worktree(&f.down);
+    let away = env.path("upstream-away.git");
+    std::fs::rename(&f.up.bare, &away).unwrap();
+    env.git(&f.down, &["gc", "-q", "--prune=now"]);
+    assert!(env.has_rev(&f.down, &format!("{target}^{{commit}}")));
+    std::fs::write(wt.join(FORK_FILE), "one\nTWO-both\nthree\n").unwrap();
+    env.git(&wt, &["add", FORK_FILE]);
+    f.tool(&["continue"])
+        .success()
+        .stdout(contains("upstream: merged as"));
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+    assert_eq!(env.rev(&f.down, "main^2"), target);
+    env.assert_no_update(&f.down);
+}

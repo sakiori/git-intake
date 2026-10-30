@@ -61,7 +61,8 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
         fetched.push(fetches.upstream(up)?);
     }
     let fetch_failed = fetched.iter().any(|f| f.is_err());
-    let latest = sync_record::latest(&sync_record::records(git, &integration, &config)?);
+    let tips: Vec<String> = fetched.iter().filter_map(|f| f.clone().ok()).collect();
+    let latest = sync_record::latest(&sync_record::records(git, &integration, &tips)?);
     let mut upstreams = Vec::new();
     for (up, fetched) in selected.iter().zip(fetched) {
         let mut entry = UpstreamLog {
@@ -102,17 +103,12 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
                 entry.available = true;
             }
             Mode::Port => {
-                match port::standing(git, &config, &integration, up, latest.get(&up.name), &tip) {
+                match port::standing(git, &integration, up, latest.get(&up.name), &tip, &tips) {
                     Err(err) => entry.detail = Some(format!("{err:#}")),
-                    Ok(Standing::Rewritten(why)) => {
-                        entry.detail = Some(format!("rewritten: {why}"))
+                    Ok(Standing::Rewritten(rewrite)) => {
+                        entry.detail = Some(format!("rewritten: {}", rewrite.describe(&up.name)))
                     }
-                    Ok(Standing::NoBase) => {
-                        entry.detail = Some(format!(
-                            "no journal and no last synced commit to start one from; write the journal {} by hand",
-                            port::journal_path(&up.name)
-                        ))
-                    }
+                    Ok(Standing::NoBase) => entry.detail = Some(port::no_base_advice(&up.name)),
                     Ok(Standing::Known(a)) => {
                         entry.commits = a
                             .pending()

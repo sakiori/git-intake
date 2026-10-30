@@ -6,9 +6,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use crate::config::Config;
 use crate::git::Git;
-use crate::upstreams::upstream_ref;
 
 pub const UPSTREAM_TRAILER: &str = "Intake-Upstream";
 pub const TARGET_TRAILER: &str = "Intake-Target";
@@ -61,31 +59,31 @@ fn trailer_format(second: &str) -> String {
 /// configured upstream's fetched branch are excluded as well: such records
 /// were inherited from that upstream (for example a stacked branch that starts
 /// from another fork's integration line), while a merge this repository
-/// creates is never part of its upstream.
-pub fn records(git: &Git, rev: &str, config: &Config) -> Result<Vec<Record>> {
+/// creates is never part of its upstream. `upstream_tips` are the fetched
+/// tips of the configured upstreams.
+pub fn records(git: &Git, rev: &str, upstream_tips: &[String]) -> Result<Vec<Record>> {
     let args = log_args(
-        git,
-        config,
+        upstream_tips,
         &["--first-parent".into(), log_format()],
         UPSTREAM_TRAILER,
         rev,
-    )?;
+    );
     Ok(parse_log(&git.run(&args)?))
 }
 
-/// The upstream commits that copies on the history ending at `rev` name as
-/// taken from upstream `name`, as written in their trailers. The whole
+/// The upstream commits, oldest copy first, that copies on the history
+/// ending at `rev` name as taken from upstream `name`, as written in their
+/// trailers. The whole
 /// history counts, so that a copy made by hand on a merged branch counts as
 /// well; commits contained in a configured upstream's fetched branch are
 /// excluded, as for [`records`].
-pub fn taken(git: &Git, rev: &str, config: &Config, name: &str) -> Result<Vec<String>> {
+pub fn taken(git: &Git, rev: &str, upstream_tips: &[String], name: &str) -> Result<Vec<String>> {
     let args = log_args(
-        git,
-        config,
-        &[trailer_format(TAKEN_TRAILER)],
+        upstream_tips,
+        &["--reverse".into(), trailer_format(TAKEN_TRAILER)],
         TAKEN_TRAILER,
         rev,
-    )?;
+    );
     let out = git.run(&args)?;
     let mut found = Vec::new();
     for entry in out.split(RECORD) {
@@ -98,9 +96,13 @@ pub fn taken(git: &Git, rev: &str, config: &Config, name: &str) -> Result<Vec<St
         if !upstreams.split(',').any(|u| u.trim() == name) {
             continue;
         }
-        for c in commits.split(',').map(str::trim).filter(|c| !c.is_empty()) {
-            if !found.iter().any(|f| f == c) {
-                found.push(c.to_string());
+        for c in commits
+            .split(',')
+            .map(|c| c.trim().to_ascii_lowercase())
+            .filter(|c| !c.is_empty())
+        {
+            if !found.contains(&c) {
+                found.push(c);
             }
         }
     }
@@ -109,30 +111,17 @@ pub fn taken(git: &Git, rev: &str, config: &Config, name: &str) -> Result<Vec<St
 
 /// `git log` arguments that list the commits of `rev` whose message holds
 /// `trailer`, without those of the configured upstreams' fetched branches.
-fn log_args(
-    git: &Git,
-    config: &Config,
-    options: &[String],
-    trailer: &str,
-    rev: &str,
-) -> Result<Vec<String>> {
+fn log_args(upstream_tips: &[String], options: &[String], trailer: &str, rev: &str) -> Vec<String> {
     let mut args: Vec<String> = vec!["log".into(), "--fixed-strings".into()];
     args.push(format!("--grep={trailer}: "));
     args.extend(options.iter().cloned());
     args.push(rev.into());
-    let mut excluded = Vec::new();
-    for up in &config.upstreams {
-        let r = upstream_ref(&up.name);
-        if git.commit(&r)?.is_some() {
-            excluded.push(r);
-        }
-    }
-    if !excluded.is_empty() {
+    if !upstream_tips.is_empty() {
         args.push("--not".into());
-        args.extend(excluded);
+        args.extend(upstream_tips.iter().cloned());
     }
     args.push("--".into());
-    Ok(args)
+    args
 }
 
 /// The sync record carried by one commit, as git parses its trailers.
@@ -157,7 +146,7 @@ pub fn copy_of(git: &Git, commit: &str, name: &str) -> Result<Option<String>> {
         .split(',')
         .map(str::trim)
         .find(|t| !t.is_empty())
-        .map(str::to_string))
+        .map(str::to_ascii_lowercase))
 }
 
 /// Parses the output of the `git log` format used by [`records`].

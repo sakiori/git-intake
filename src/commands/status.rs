@@ -9,11 +9,11 @@ use crate::Exit;
 use crate::commands::update::{
     blocking_prefix, described, next_step, plural, step_name, unrelated_content,
 };
-use crate::config::{Config, Mode, Upstream};
+use crate::config::{Mode, Upstream};
 use crate::drift::{self, Drift, DriftState, SyncSource};
 use crate::git::{Git, abbrev, branch_ref};
 use crate::output::{Render, emit, table};
-use crate::port::{self, Standing, Verb};
+use crate::port::{self, OffLine, Standing, Verb};
 use crate::repo::Repo;
 use crate::state::{ConflictFile, CopyStep, MergeKind, UpdateState, UpstreamStep, Work};
 use crate::sync_record::{self, Record};
@@ -65,6 +65,9 @@ pub struct UpstreamStatus {
     pub decided: Option<u64>,
     /// Port mode: commits after the base nobody has decided on yet.
     pub pending: Option<u64>,
+    /// Port mode, when rewritten: what is no longer on the upstream's
+    /// first-parent line.
+    pub off_line: Option<OffLineView>,
     /// Files a merge of the tip would conflict in; only with `--check`, for
     /// a follow upstream.
     pub conflicts: Option<Vec<String>>,
@@ -89,9 +92,18 @@ impl UpstreamStatus {
             taken: None,
             decided: None,
             pending: None,
+            off_line: None,
             conflicts: None,
         }
     }
+}
+
+#[derive(Serialize)]
+pub struct OffLineView {
+    /// The base, when it is no longer on the line.
+    pub base: Option<String>,
+    /// Taken or decided commits no longer on the line and not retired.
+    pub commits: Vec<OffLine>,
 }
 
 #[derive(Serialize)]
@@ -156,9 +168,13 @@ pub struct PlannedView {
     /// `take`, `skip`, `have` or `later`; `null` until the plan is read.
     pub verb: Option<Verb>,
     pub note: Option<String>,
-    /// `none`, `conflict`, `copied` or `empty`.
+    /// `none`, `conflict`, `commit_failed`, `copied` or `empty`.
     pub copy: CopyStep,
     pub copied: Option<String>,
+    /// What git said when the commit of the copy failed.
+    pub failure: Option<String>,
+    /// Paths the copy left out: `.git-intake.toml` and `.git-intake/`.
+    pub left_out: Vec<String>,
 }
 
 pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
@@ -180,14 +196,15 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
         fetched.push(fetches.upstream(up)?);
     }
     let fetch_failed = fetched.iter().any(|f| f.is_err());
-    let latest = sync_record::latest(&sync_record::records(git, &tip, config)?);
+    let tips: Vec<String> = fetched.iter().filter_map(|f| f.clone().ok()).collect();
+    let latest = sync_record::latest(&sync_record::records(git, &tip, &tips)?);
     let mut upstreams = Vec::new();
     for (up, fetched) in config.upstreams.iter().zip(&fetched) {
         let fetched = fetched.as_deref().map_err(String::as_str);
         let last = latest.get(&up.name);
         upstreams.push(match up.mode {
             Mode::Follow => follow_status(git, &tip, up, last, fetched, check)?,
-            Mode::Port => port_status(git, config, &tip, up, last, fetched),
+            Mode::Port => port_status(git, &tip, up, last, fetched, &tips),
         });
     }
     drop(fetches);
@@ -249,11 +266,11 @@ fn follow_status(
 
 fn port_status(
     git: &Git,
-    config: &Config,
     tip: &str,
     up: &Upstream,
     last: Option<&Record>,
     fetched: std::result::Result<&str, &str>,
+    tips: &[String],
 ) -> UpstreamStatus {
     let upstream_tip = match fetched {
         Ok(t) => t,
@@ -264,22 +281,23 @@ fn port_status(
         }
     };
     let mut s = UpstreamStatus::new(up, Some(upstream_tip.to_string()), DriftState::Pending);
-    match port::standing(git, config, tip, up, last, upstream_tip) {
+    match port::standing(git, tip, up, last, upstream_tip, tips) {
         Err(err) => {
             s.state = DriftState::Unavailable;
             s.detail = Some(format!("{err:#}"));
         }
         Ok(Standing::NoBase) => {
+            s.state = DriftState::NoBase;
             s.journal = Some(false);
-            s.detail = Some(format!(
-                "no journal, and no sync record of the upstream or history shared with it to start one from; \
-                 write the journal {} by hand",
-                port::journal_path(&up.name)
-            ));
+            s.detail = Some(port::no_base_advice(&up.name));
         }
-        Ok(Standing::Rewritten(why)) => {
+        Ok(Standing::Rewritten(rewrite)) => {
             s.state = DriftState::Rewritten;
-            s.detail = Some(why);
+            s.detail = Some(rewrite.describe(&up.name));
+            s.off_line = Some(OffLineView {
+                base: rewrite.base.clone(),
+                commits: rewrite.commits,
+            });
         }
         Ok(Standing::Known(a)) => {
             let pending = a.pending().len() as u64;
@@ -373,6 +391,8 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
                                     note: c.note.clone(),
                                     copy: c.copy,
                                     copied: c.copied.clone(),
+                                    failure: c.failure.clone(),
+                                    left_out: c.left_out.clone(),
                                 })
                                 .collect(),
                         );
@@ -577,6 +597,7 @@ pub fn render_update(u: &UpdateView) -> String {
                                 ", changed nothing: recorded as present".to_string()
                             }
                             (CopyStep::Conflict, _) => ", in conflict".to_string(),
+                            (CopyStep::CommitFailed, _) => ", its commit failed".to_string(),
                             _ => String::new(),
                         };
                         out.push_str(&format!(
@@ -584,6 +605,14 @@ pub fn render_update(u: &UpdateView) -> String {
                             abbrev(&c.commit),
                             c.subject
                         ));
+                        if !c.left_out.is_empty() {
+                            out.push_str(&format!("      left out: {}\n", c.left_out.join(", ")));
+                        }
+                        if let Some(failure) = &c.failure {
+                            for line in failure.lines() {
+                                out.push_str(&format!("      {line}\n"));
+                            }
+                        }
                     }
                 }
             }

@@ -424,6 +424,12 @@ fn check_name(label: &str, name: &str, problems: &mut Vec<String>) {
         problems.push(format!(
             "{label}: the name may contain only letters, digits, '-', '_' and '.', and may not start with '-' or '.'"
         ));
+    } else if name.contains("..") || name.ends_with('.') || name.ends_with(".lock") {
+        // The name is a component of the references that hold the upstream,
+        // `refs/git-intake/upstreams/<name>`, which git refuses with these.
+        problems.push(format!(
+            "{label}: '{name}' cannot name a git reference: it may not contain '..' or end with '.' or '.lock'"
+        ));
     }
 }
 
@@ -705,6 +711,25 @@ via = "merge-request"
         );
         assert!(e.contains("the name may contain only"), "{e}");
         assert!(e.contains("'x..y' is not a valid branch name"), "{e}");
+    }
+
+    #[test]
+    fn names_that_cannot_name_a_reference_are_refused() {
+        for name in ["a..b", "x.lock", "a."] {
+            let e = err(&format!(
+                "integration = \"main\"\n[[upstream]]\nname = \"{name}\"\nurl = \"u\"\nbranch = \"main\"\n"
+            ));
+            assert!(
+                e.contains(&format!(
+                    "upstream '{name}': '{name}' cannot name a git reference"
+                )),
+                "{e}"
+            );
+        }
+        assert!(
+            parse("integration = \"main\"\n[[upstream]]\nname = \"a.b_c-1\"\nurl = \"u\"\nbranch = \"main\"\n")
+                .is_ok()
+        );
     }
 
     #[test]
