@@ -428,7 +428,7 @@ pub fn no_release(up: &Upstream) -> String {
         "upstream '{}': no tag of {} matching '{}' is a release version on {} as fetched; \
          name the target with `git intake start {}=<rev>`",
         up.name,
-        up.url,
+        crate::git::redacted(&up.url),
         up.tags.as_deref().unwrap_or_default(),
         up.source(),
         up.name

@@ -420,7 +420,8 @@ fn check_layout(integration: &str, upstreams: &[Upstream], problems: &mut Vec<St
     }
     for (url, branch, n) in sources.into_iter().filter(|s| s.2 > 1) {
         problems.push(format!(
-            "{n} upstreams share the URL '{url}' and the branch '{branch}'"
+            "{n} upstreams share the URL '{}' and the branch '{branch}'",
+            crate::git::redacted(url)
         ));
     }
 

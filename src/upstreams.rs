@@ -137,7 +137,8 @@ impl<'r> Fetches<'r> {
             Some(tip) => Ok(tip),
             None => Err(format!(
                 "fetching branch '{}' from {} left no commit",
-                up.branch, up.url
+                up.branch,
+                crate::git::redacted(&up.url)
             )),
         })
     }

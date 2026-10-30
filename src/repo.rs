@@ -562,9 +562,12 @@ impl Repo {
                 .find(|u| crate::upstreams::same_repository(u, &up.url, base))
             {
                 problems.push(format!(
-                    "publish remote '{}' has the URL {url}, which names the repository of upstream '{}' ({}); \
+                    "publish remote '{}' has the URL {}, which names the repository of upstream '{}' ({}); \
                      the tool never pushes to an upstream",
-                    publish.remote, up.name, up.url
+                    publish.remote,
+                    crate::git::redacted(url),
+                    up.name,
+                    crate::git::redacted(&up.url)
                 ));
             }
         }

@@ -61,7 +61,7 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
     for up in selected {
         let mut entry = UpstreamBranches {
             name: up.name.clone(),
-            url: up.url.clone(),
+            url: crate::git::redacted(&up.url),
             path: up.path.clone(),
             mode: up.mode,
             available: true,

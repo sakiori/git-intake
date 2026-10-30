@@ -10,7 +10,7 @@ use crate::commands::merge_request;
 use crate::commands::update::unrelated_content;
 use crate::config::{Config, Mode, PublishVia, Upstream};
 use crate::drift::adopted_base;
-use crate::git::{Git, abbrev, branch_ref, lines};
+use crate::git::{Git, abbrev, branch_ref, lines, redacted};
 use crate::output::{Render, emit};
 use crate::port::{self, Standing};
 use crate::repo::{MainWorktree, Repo};
@@ -237,10 +237,14 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
                 Ok(t) => format!(
                     "branch '{}' of {} was fetched at {}",
                     up.branch,
-                    up.url,
+                    redacted(&up.url),
                     abbrev(t)
                 ),
-                Err(why) => format!("cannot fetch branch '{}' of {}: {why}", up.branch, up.url),
+                Err(why) => format!(
+                    "cannot fetch branch '{}' of {}: {why}",
+                    up.branch,
+                    redacted(&up.url)
+                ),
             },
         );
         let tip = fetched.as_ref().ok();
@@ -541,7 +545,8 @@ fn remote_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<()
                 "git remote '{remote}' names the repository of upstream '{}' ({}); the tool fetches upstreams by their URL \
                  and needs no remote for them, and other tools take the remote for a place of the repository's own: \
                  remove it with `git remote remove {remote}`",
-                up.name, up.url
+                up.name,
+                redacted(&up.url)
             );
             if partial {
                 detail.push_str(&format!(

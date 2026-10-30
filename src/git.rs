@@ -32,13 +32,43 @@ impl fmt::Display for GitError {
             Some(code) => format!("exit status {code}"),
             None => "terminated by a signal".to_string(),
         };
-        write!(f, "`git {}` failed ({code})", self.args.join(" "))?;
+        // The arguments and git's message may name a URL with credentials.
+        write!(
+            f,
+            "`git {}` failed ({code})",
+            redacted(&self.args.join(" "))
+        )?;
         let stderr = self.stderr.trim();
         if !stderr.is_empty() {
-            write!(f, ": {stderr}")?;
+            write!(f, ": {}", redacted(stderr))?;
         }
         Ok(())
     }
+}
+
+/// `text` with the user information removed from every URL in it,
+/// `scheme://user:secret@host/path` becoming `scheme://host/path`, so that
+/// a credential written into a remote's or an upstream's URL never reaches
+/// a message.
+pub fn redacted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| c == '/' || c.is_whitespace() || "'\"`<>()[]".contains(c))
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        out.push_str(
+            authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host),
+        );
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 impl std::error::Error for GitError {}
@@ -363,6 +393,23 @@ mod tests {
             parse_porcelain_z(" M caf\u{e9}.txt\0R  new name\0old name\0M  q\"uote.txt\0"),
             vec!["caf\u{e9}.txt", "new name", "q\"uote.txt"]
         );
+    }
+
+    #[test]
+    fn credentials_in_urls_are_removed() {
+        assert_eq!(
+            redacted("push to https://user:s3cret@gitlab.example.com/g/app.git failed"),
+            "push to https://gitlab.example.com/g/app.git failed"
+        );
+        assert_eq!(
+            redacted("'ssh://git@host:22/x' and http://a:b@c"),
+            "'ssh://host:22/x' and http://c"
+        );
+        assert_eq!(
+            redacted("git@example.com:team/app.git"),
+            "git@example.com:team/app.git"
+        );
+        assert_eq!(redacted("no url here"), "no url here");
     }
 
     #[test]

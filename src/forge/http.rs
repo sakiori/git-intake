@@ -320,10 +320,13 @@ fn read(mut response: ureq::http::Response<ureq::Body>) -> Result<Reply> {
     Ok(Reply { status, json, text })
 }
 
-/// A URL as messages show it: without its query, which may be long.
+/// A URL as messages show it: without credentials, and without its query,
+/// which may be long.
 fn shown(url: &Url) -> String {
     let mut url = url.clone();
     url.set_query(None);
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
     url.to_string()
 }
 

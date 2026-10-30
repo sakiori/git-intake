@@ -124,7 +124,7 @@ impl UpstreamStatus {
         Self {
             name: up.name.clone(),
             path: up.path.clone(),
-            url: up.url.clone(),
+            url: crate::git::redacted(&up.url),
             branch: up.branch.clone(),
             mode: up.mode,
             tip,

@@ -75,7 +75,7 @@ pub fn run(repo: &Repo, upstream: &UpstreamTarget, branch: &str) -> Result<Exit>
     println!(
         "it holds only upstream history and has no tracking branch; copy the change onto it, then push it to where \
          pull requests to {} come from, such as your fork on the upstream's host. The tool does not push it",
-        up.url
+        crate::git::redacted(&up.url)
     );
     Ok(Exit::Success)
 }

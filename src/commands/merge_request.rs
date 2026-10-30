@@ -19,7 +19,7 @@ use crate::commands::{catch_up, finish};
 use crate::config::{self, Config, Publish};
 use crate::description::{self, Content, Targets};
 use crate::forge::{self, Forge, Kind, MergeRequest, State};
-use crate::git::{Git, abbrev, branch_ref, split_z, tracking_ref};
+use crate::git::{Git, abbrev, branch_ref, redacted, split_z, tracking_ref};
 use crate::port::Verb;
 use crate::repo::{Repo, bullet};
 use crate::state::{
@@ -475,16 +475,20 @@ fn push_branch(repo: &Repo, remote: &str, branch: &str, head: &str, term: &str) 
         ])?;
         if !out.success() {
             let moved = if !received.is_empty() {
-                format!("The branch is already on {}", received.join(", "))
+                format!(
+                    "The branch is already on {}",
+                    redacted(&received.join(", "))
+                )
             } else if *target == remote && places.len() > 1 {
                 format!("The branch may already be on some of the push URLs of '{remote}'")
             } else {
                 "Nothing was pushed".to_string()
             };
             bail!(
-                "pushing the update to the branch '{branch}' on '{target}' was rejected: {}\n{moved}, and no {term} \
+                "pushing the update to the branch '{branch}' on '{}' was rejected: {}\n{moved}, and no {term} \
                  was opened or changed. The branch is never forced: when another run pushed it meanwhile, run the \
                  command again, which pushes only where the branch is not at the update head",
+                redacted(target),
                 out.into_error()
             );
         }
@@ -565,7 +569,7 @@ pub fn classify(
 /// Why `finish` or `sync` will not take the update's branch at `at`, which
 /// holds commits that carry no update.
 pub fn unknown_branch(git: &Git, kind: Kind, remote: &str, at: &str) -> Result<String> {
-    let url = forge::fetch_url(git, remote)?.unwrap_or_default();
+    let url = redacted(&forge::fetch_url(git, remote)?.unwrap_or_default());
     Ok(format!(
         "the branch '{UPDATE_BRANCH}' on '{remote}' ({url}) is at {}, which holds commits that carry no update, and \
          no {} of the update points at it; it may be someone's work. Nothing was pushed. Fetch what should be kept, \
@@ -612,7 +616,7 @@ pub fn delete_branch(git: &Git, remote: &str, branch: &str, lease: &str) -> Resu
     let mut remains = false;
     for (before, now) in places.iter().zip(&after) {
         let on = if several {
-            format!("'{remote}' at {}", before.url)
+            format!("'{remote}' at {}", redacted(&before.url))
         } else {
             format!("'{remote}'")
         };
@@ -1103,7 +1107,8 @@ pub fn remote_refs(
     let out = git.raw(&args)?;
     if !out.success() {
         bail!(
-            "cannot list the refs of the publish remote '{remote}': {}",
+            "cannot list the refs of the publish remote '{}': {}",
+            redacted(remote),
             out.into_error()
         );
     }
