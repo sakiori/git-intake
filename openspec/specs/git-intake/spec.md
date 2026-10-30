@@ -7,82 +7,111 @@ Keep a repository current with one or more upstreams, each fetched by its URL on
 ## Requirements
 
 ### Requirement: Fork configuration
-The tool SHALL read a repository's settings from a `.git-intake.toml` file committed on the integration branch: the integration branch, an optional publication setting with the publish remote, the mode `push` or `merge-request`, and, for merge-request mode, an optional forge `gitlab` or `github` and an optional API base URL, an install command, an ordered list of named checks as "Named checks" describes them, and an ordered list of upstreams. Each upstream SHALL have a unique name, a URL, a branch, a mode `follow` or `port` with `follow` as the default, optionally a path inside the repository, and, in `follow` mode, optionally a `tags` pattern: a glob over the upstream's tag names that selects its release tags. No two upstreams SHALL have the same URL and branch. An upstream without a path is taken at the repository root. The tool SHALL read the committed file from the integration branch tip, not from a working tree, and SHALL refuse to run when the file is missing or invalid, naming the problem, except where "Resumable state" lets `finish` and `abort` act on an update waiting from an earlier release. It SHALL refuse the settings `remote` and `mirror`, naming what replaces them, an upstream in `port` mode with a path or a `tags` pattern, a `tags` pattern that is not a valid glob or that starts with `refs/` or `tags/`, a forge other than `gitlab` or `github`, an API base that is not an `https` URL, and a publish remote whose fetch or push URL names a configured upstream's repository.
+The tool SHALL read a repository's settings from a `.git-intake.toml` file committed on the integration branch: the integration branch, an optional publication setting with the publish remote, the mode `push` or `merge-request`, and, for merge-request mode, an optional forge `gitlab` or `github` and an optional API base URL, an install command, an ordered list of named checks as "Named checks" describes them, and an ordered list of upstreams.
 
 #### Scenario: Valid configuration
 - **WHEN** the integration branch carries a valid configuration
 - **THEN** every command uses its values and `status` shows them
+#### Scenario: Publication setting
+- **WHEN** the configuration names a publish remote without a mode
+- **THEN** the tool publishes by `push`
+
+### Requirement: Upstream settings
+Each upstream SHALL have a unique name, a URL, a branch, a mode `follow` or `port` with `follow` as the default, optionally a path inside the repository, and, in `follow` mode, optionally a `tags` pattern: a glob over the upstream's tag names that selects its release tags. No two upstreams SHALL have the same URL and branch. An upstream without a path is taken at the repository root.
+
+#### Scenario: Stacked downstream branch
+- **WHEN** a repository's configuration names another repository's integration branch as its upstream
+- **THEN** updates take that branch into the local integration branch the same way as an upstream project
+#### Scenario: Several upstreams at their paths
+- **WHEN** the configuration lists several upstreams, each with its own path
+- **THEN** every command treats each upstream as a separate source merged under its path
+#### Scenario: Ambiguous layout
+- **WHEN** two upstreams share a name or the same URL and branch, one upstream's path lies inside another's, or an upstream without a path is listed together with other upstreams
+- **THEN** the tool refuses to run and names the conflicting entries
+
+### Requirement: Committed configuration
+The tool SHALL read the committed `.git-intake.toml` from the integration branch tip, not from a working tree, and SHALL refuse to run when the file is missing or invalid, naming the problem, except where "Update state of format 4 or 5" lets `finish` and `abort` act on an update waiting from an earlier release.
 
 #### Scenario: Uncommitted edits are ignored
 - **WHEN** the working tree holds an edited but uncommitted configuration
 - **THEN** the tool uses the committed version and says that the working copy differs
 
-#### Scenario: Stacked downstream branch
-- **WHEN** a repository's configuration names another repository's integration branch as its upstream
-- **THEN** updates take that branch into the local integration branch the same way as an upstream project
-
-#### Scenario: Several upstreams at their paths
-- **WHEN** the configuration lists several upstreams, each with its own path
-- **THEN** every command treats each upstream as a separate source merged under its path
-
-#### Scenario: Ambiguous layout
-- **WHEN** two upstreams share a name or the same URL and branch, one upstream's path lies inside another's, or an upstream without a path is listed together with other upstreams
-- **THEN** the tool refuses to run and names the conflicting entries
-
-#### Scenario: Publication setting
-- **WHEN** the configuration names a publish remote without a mode
-- **THEN** the tool publishes by `push`
+### Requirement: Refused settings
+The tool SHALL refuse the settings `remote` and `mirror`, naming what replaces them, an upstream in `port` mode with a path or a `tags` pattern, a `tags` pattern that is not a valid glob or that starts with `refs/` or `tags/`, a forge other than `gitlab` or `github`, an API base that is not an `https` URL, and a publish remote whose fetch or push URL names a configured upstream's repository.
 
 #### Scenario: Forge setting
 - **WHEN** the publication setting names the forge `gitea`, or an API base `http://forge.example/api/v4`
 - **THEN** the tool refuses to run and names the setting and the values it accepts
-
 #### Scenario: Removed setting
 - **WHEN** an upstream has a `remote` or a `mirror` setting
 - **THEN** the tool refuses to run, names the upstream and the setting, and says that upstreams are fetched by their URL and that mirror branches are no longer kept
-
 #### Scenario: Port upstream under a path
 - **WHEN** an upstream in `port` mode has a path
 - **THEN** the tool refuses to run and names the upstream
-
 #### Scenario: Invalid release tag pattern
 - **WHEN** an upstream's `tags` pattern is not a valid glob, starts with `refs/tags/`, or belongs to an upstream in `port` mode
 - **THEN** the tool refuses to run and names the upstream and the pattern
-
 #### Scenario: Publish remote at an upstream's URL
 - **WHEN** the publish remote's fetch or push URL names a configured upstream's repository
 - **THEN** the tool refuses to run and names the remote and the upstream
 
 ### Requirement: Sync record in history
-Every merge commit the tool creates SHALL name the upstream and its target commit in commit trailers, and, when a tag of the upstream's repository points at the target, that tag in the trailer `Intake-Tag`: the tag a revision named, the release a `tags` pattern selected, or otherwise, of the tags at the target, the one with the highest version among those matching the upstream's `tags` pattern whose name is a version after the pattern's literal prefix, or, without such a tag, among those whose name is a semantic version with an optional `v` or `V`; a tag whose name is no version SHALL NOT be recorded this way, even when it matches the pattern. A tag whose name contains a comma SHALL NOT be recorded. The tag SHALL be fixed when `start` fixes the target. Every commit the tool copies from an upstream in `port` mode SHALL name the upstream and the upstream commit it took in the trailers `Intake-Upstream` and `Intake-Taken`. A sync record SHALL count only on a merge commit whose second parent is the record's target. For an upstream in `follow` mode, the tool SHALL derive the last synced commit from its sync records on the integration line, as the target of the newest record whose target no other of its records' targets contains, and SHALL NOT store it in the configuration or outside the history. For such an upstream that carries no sync record, the last synced commit SHALL come from the history, and the tool SHALL show that it does: for a root upstream it is the newest upstream commit the integration branch contains; for a path upstream it is the second parent of the newest merge on the integration line whose second parent belongs to the upstream's branch and which changes the upstream's path, as an import by `git subtree add` or `git subtree pull` leaves. This decision SHALL depend only on the integration branch and the upstream's own branch, never on other upstreams. When a `follow` upstream's last synced commit is no longer contained in its branch, the tool SHALL report that upstream's history as rewritten and SHALL refuse to update it.
-
-#### Scenario: Last synced commit
-- **WHEN** the integration line contains a merge of a `follow` upstream
-- **THEN** `status` shows that upstream's target from the most recent such merge as its last synced commit
-
-#### Scenario: Older record merged later
-- **WHEN** a branch that carries a sync record of an older target is merged into the integration branch after a newer target's record landed
-- **THEN** `status` still shows the newer target as the last synced commit, and nothing between the two targets counts as pending
-
-#### Scenario: Upstream force-pushed
-- **WHEN** a `follow` upstream's branch no longer contains the last synced commit
-- **THEN** `status` reports the upstream as rewritten and `start` refuses to update it
-
-#### Scenario: Target named by a tag
-- **WHEN** an update merges a target that a tag of the upstream's repository points at, chosen by a release pattern, by naming the tag, or by naming the commit
-- **THEN** the merge commit carries `Intake-Tag` with that tag, `report` names it, and `status` shows it as the tag of the last synced commit
-
-#### Scenario: Target without a tag
-- **WHEN** an update merges a target that no tag of the upstream's repository points at
-- **THEN** the merge commit carries no `Intake-Tag` trailer
+Every merge commit the tool creates SHALL name the upstream and its target commit in commit trailers. Every commit the tool copies from an upstream in `port` mode SHALL name the upstream and the upstream commit it took in the trailers `Intake-Upstream` and `Intake-Taken`. A sync record SHALL count only on a merge commit whose second parent is the record's target.
 
 #### Scenario: Copied commit
 - **WHEN** a port update copies an upstream commit
 - **THEN** the copy carries the upstream's name and the upstream commit's id in its trailers
-
 #### Scenario: Squash message with trailers
 - **WHEN** a squash commit's message ends with `Intake-Upstream` and `Intake-Target` trailers copied from an update's sync merge
 - **THEN** the trailers do not count as a sync record
+
+### Requirement: Tag in the sync record
+When a tag of the upstream's repository points at the target, every merge commit the tool creates SHALL name that tag in the trailer `Intake-Tag`: the tag a revision named, the release a `tags` pattern selected, or otherwise, of the tags at the target, the one with the highest version among those matching the upstream's `tags` pattern whose name is a version after the pattern's literal prefix, or, without such a tag, among those whose name is a semantic version with an optional `v` or `V`.
+
+#### Scenario: Target named by a tag
+- **WHEN** an update merges a target that a tag of the upstream's repository points at, chosen by a release pattern, by naming the tag, or by naming the commit
+- **THEN** the merge commit carries `Intake-Tag` with that tag, `report` names it, and `status` shows it as the tag of the last synced commit
+#### Scenario: Target without a tag
+- **WHEN** an update merges a target that no tag of the upstream's repository points at
+- **THEN** the merge commit carries no `Intake-Tag` trailer
+
+### Requirement: Recording of the upstream tag
+A tag whose name is no version SHALL NOT be recorded in `Intake-Tag` as the one with the highest version, even when it matches the upstream's `tags` pattern. A tag whose name contains a comma SHALL NOT be recorded. The tag recorded in `Intake-Tag` SHALL be fixed when `start` fixes the target.
+
+#### Scenario: Tag that is no version
+- **WHEN** an update merges a target, named by its commit, at which the only tag is one that matches the upstream's `tags` pattern and whose name is no version
+- **THEN** the merge commit carries no `Intake-Tag` trailer
+
+### Requirement: Last synced commit
+For an upstream in `follow` mode, the tool SHALL derive the last synced commit from its sync records on the integration line, as the target of the newest record whose target no other of its records' targets contains, and SHALL NOT store it in the configuration or outside the history.
+
+#### Scenario: Last synced commit
+- **WHEN** the integration line contains a merge of a `follow` upstream
+- **THEN** `status` shows that upstream's target from the most recent such merge as its last synced commit
+#### Scenario: Older record merged later
+- **WHEN** a branch that carries a sync record of an older target is merged into the integration branch after a newer target's record landed
+- **THEN** `status` still shows the newer target as the last synced commit, and nothing between the two targets counts as pending
+
+### Requirement: Last synced commit without a sync record
+For an upstream in `follow` mode that carries no sync record, the last synced commit SHALL come from the history, and the tool SHALL show that it does. The last synced commit taken from the history SHALL depend only on the integration branch and the upstream's own branch, never on other upstreams.
+
+#### Scenario: Root upstream without a sync record
+- **WHEN** the integration branch contains commits of a root `follow` upstream and carries no sync record of it
+- **THEN** `status` shows the newest upstream commit the integration branch contains as the last synced commit, and shows that it comes from the history
+
+### Requirement: Last synced commit from the history
+For a `follow` upstream that carries no sync record, the last synced commit SHALL be, for a root upstream, the newest upstream commit the integration branch contains, and, for a path upstream, the second parent of the newest merge on the integration line whose second parent belongs to the upstream's branch and which changes the upstream's path, as an import by `git subtree add` or `git subtree pull` leaves.
+
+#### Scenario: Path upstream imported by subtree
+- **WHEN** the integration line holds a merge made by `git subtree add` of a path `follow` upstream's branch into its path, and the integration branch carries no sync record of that upstream
+- **THEN** `status` shows that merge's second parent as the upstream's last synced commit
+
+### Requirement: Rewritten follow upstream
+When a `follow` upstream's last synced commit is no longer contained in its branch, the tool SHALL report that upstream's history as rewritten and SHALL refuse to update it.
+
+#### Scenario: Upstream force-pushed
+- **WHEN** a `follow` upstream's branch no longer contains the last synced commit
+- **THEN** `status` reports the upstream as rewritten and `start` refuses to update it
 
 ### Requirement: Recorded resolutions
 The tool SHALL enable git's recorded conflict resolution for the repository before merging or copying commits, so a resolution made in one update or attempt is reapplied when the same conflict recurs.
@@ -92,226 +121,331 @@ The tool SHALL enable git's recorded conflict resolution for the repository befo
 - **THEN** git reapplies the recorded resolution and the tool reports the file as resolved by a recorded resolution
 
 ### Requirement: Resumable state
-The tool SHALL keep the state of an update in the repository's common git directory, visible from every worktree, and the update worktree at `.worktrees/git-intake/update` in the main worktree, never inside the git directory. Unless that path is ignored already, `start` and `sync` SHALL add the line `/.worktrees/` to the repository's `info/exclude` once, without changing a committed ignore file, so that the main checkout does not show the update worktree. Every command SHALL act on that state: `continue` carries out a plan, concludes a resolved merge, copy or catch-up merge, and goes on with the remaining queued upstreams or planned commits; `status` shows the step reached, each queued upstream as merged, at its plan, in conflict or pending, a catch-up merge in conflict or, where verification is required, awaiting it, and what comes next; and `abort` removes the worktree, the update branch, the plan, the update's upstream references, its logs and the state without touching the integration branch. A `follow` upstream SHALL count as merged only when the history of the update branch head carries its sync record for its target, and a `port` upstream as carried out only when its plan has been carried out to the journal commit. Once `finish` has begun moving branches, `abort` SHALL refuse and name `finish` as the way to complete the update. The tool SHALL read an update state of format 4 or 5 only when the update waits for its merge request, as "Update waiting from an earlier release" hands it over: it SHALL read only what the hand-over and `abort` need, ignoring the checks and the verification the state records, SHALL hand it over and abort it while the committed configuration is invalid, using the publication setting the update recorded, and SHALL never write it. It SHALL refuse any other update state of format 4 or 5, and an update state in any other format than its own, older or newer, or without a format: name both formats and, where the state records it, the release that started the update, and advise finishing or aborting the update with a release that keeps that format, naming the releases of each format (1: v0.1.0; 2: v0.2.0 to v0.2.2; 3: v0.3.0 to v0.3.1; 4: v0.3.2 to v0.3.5, also carried on by v0.3.6; 5: v0.3.6; 6: from v0.3.7), or for a newer format with the release that started it or a later one that reads it. For format 3, the refusal SHALL also say that v0.3.6 carries the update over with `migrate` and can then finish it. Only `start` and `sync` SHALL record the release that started the update in the state. The first of `continue`, `verify` and `finish` run by another release of the same format SHALL warn once, without refusing, and record that it warned; it SHALL advise aborting and starting again only before `finish` has moved a branch or pushed the update.
+The tool SHALL keep the state of an update in the repository's common git directory, visible from every worktree, and the update worktree at `.worktrees/git-intake/update` in the main worktree, never inside the git directory.
 
 #### Scenario: Update worktree in the main worktree
 - **WHEN** `start` creates the update worktree
 - **THEN** it is `.worktrees/git-intake/update` in the main worktree, outside the git directory, and the main checkout shows no untracked file for it and counts as clean
-
 #### Scenario: Directory of the update worktree that is a link
 - **WHEN** `.worktrees` or `.worktrees/git-intake` in the main worktree is a symbolic link or not a directory
 - **THEN** `start` refuses before it changes anything
+#### Scenario: User's worktree on the update branch
+- **WHEN** no update is in progress and a worktree other than the tool's update worktree has `git-intake/update` checked out
+- **THEN** `abort`, `start` and `sync` refuse and `doctor` fails, each naming that worktree and saying to remove or switch it, and the worktree and its uncommitted changes are kept
+
+### Requirement: Update worktree hidden from the main checkout
+Unless the update worktree's path is ignored already, `start` and `sync` SHALL add the line `/.worktrees/` to the repository's `info/exclude` once, without changing a committed ignore file, so that the main checkout does not show the update worktree.
 
 #### Scenario: Update worktree already ignored
 - **WHEN** the main worktree already ignores `.worktrees/git-intake/update`, or `info/exclude` already holds `/.worktrees/`
 - **THEN** `start` leaves `info/exclude` unchanged
 
-#### Scenario: Resume after interruption
-- **WHEN** the user returns to an update in a new shell
-- **THEN** `status` names each upstream's target or plan, the base, the worktree, the state of every queued upstream and the next command
+### Requirement: Commands on the update state
+Every command SHALL act on the update's state. `continue` SHALL carry out a plan, conclude a resolved merge, copy or catch-up merge, and go on with the remaining queued upstreams or planned commits.
 
 #### Scenario: Continue after a conflict
 - **WHEN** the user resolves a conflict and runs `continue` while other upstreams or planned commits are pending
 - **THEN** the tool concludes the merge or copy and goes on with the pending ones in order, stopping again at the next conflict
 
+### Requirement: Update state in status
+`status` SHALL show the step the update reached, each queued upstream as merged, at its plan, in conflict or pending, a catch-up merge in conflict or, where verification is required, awaiting it, and what comes next.
+
+#### Scenario: Resume after interruption
+- **WHEN** the user returns to an update in a new shell
+- **THEN** `status` names each upstream's target or plan, the base, the worktree, the state of every queued upstream and the next command
+
+### Requirement: Aborting an update
+`abort` SHALL remove the worktree, the update branch, the plan, the update's upstream references, its logs and the state without touching the integration branch.
+
 #### Scenario: Abort
 - **WHEN** the user aborts an update before `finish` has moved any branch
 - **THEN** the integration branch is where `start` or the last fast-forward to the publish remote left it, and no worktree, update branch, plan, upstream reference or log of the update remains
 
-#### Scenario: User's worktree on the update branch
-- **WHEN** no update is in progress and a worktree other than the tool's update worktree has `git-intake/update` checked out
-- **THEN** `abort`, `start` and `sync` refuse and `doctor` fails, each naming that worktree and saying to remove or switch it, and the worktree and its uncommitted changes are kept
+### Requirement: Progress of the queued upstreams
+A `follow` upstream SHALL count as merged only when the history of the update branch head carries its sync record for its target, and a `port` upstream as carried out only when its plan has been carried out to the journal commit.
 
-#### Scenario: State of the previous release
-- **WHEN** an update started by a release with state format 5 is in progress and does not wait for its merge request
-- **THEN** every command that reads the update refuses, changes nothing, and says to finish or abort it with v0.3.6
+#### Scenario: Merge without the sync record
+- **WHEN** the update branch head's history carries no sync record of a queued `follow` upstream for its target
+- **THEN** `status` does not show that upstream as merged
+
+### Requirement: Abort during finish
+Once `finish` has begun moving branches, `abort` SHALL refuse and name `finish` as the way to complete the update.
+
+#### Scenario: Abort once finish has moved a branch
+- **WHEN** `abort` runs after `finish` has begun moving branches
+- **THEN** it refuses and names `finish` as the way to complete the update
+
+### Requirement: Update state of format 4 or 5
+The tool SHALL read an update state of format 4 or 5 only when the update waits for its merge request, as "Update waiting from an earlier release" hands it over: it SHALL read only what the hand-over and `abort` need, ignoring the checks and the verification the state records, SHALL hand it over and abort it while the committed configuration is invalid, using the publication setting the update recorded, and SHALL never write it.
 
 #### Scenario: Hand-over with the old configuration
 - **WHEN** an update of format 5 waits for its open merge request, the integration tip still lists its checks as plain commands, and `finish` runs
 - **THEN** `finish` hands the update over, and the state file is unchanged until it is removed
-
 #### Scenario: Withdrawal with the old configuration
 - **WHEN** an update of format 5 waits for its open merge request, the integration tip still lists its checks as plain commands, and `abort --merge-request` runs
 - **THEN** it withdraws the merge request, and the state file is unchanged until it is removed
 
-#### Scenario: State of format 4
-- **WHEN** an update started by a release with state format 4 is in progress and does not wait for its merge request
-- **THEN** every command that reads the update refuses, changes nothing, and names v0.3.2 to v0.3.6 as the releases to finish or abort it with
-
-#### Scenario: State that needs migration
-- **WHEN** an update started by a release with state format 3, which kept the update worktree in the git directory, is in progress
-- **THEN** every command that reads the update refuses, changes nothing, and names finishing or aborting it with a release that keeps format 3, or carrying it over with `migrate` of v0.3.6 and finishing it with that release
-
-#### Scenario: State of an older release
-- **WHEN** an update started by a release with a state format older than 3 is in progress
-- **THEN** every command that reads the update refuses and says to finish or abort it with a release that keeps that format
+### Requirement: Update state of another format
+The tool SHALL refuse an update state of format 4 or 5 whose update does not wait for its merge request, and an update state in any other format than its own, older or newer, or without a format, naming both formats and, where the state records it, the release that started the update.
 
 #### Scenario: State of a newer release
 - **WHEN** an update started by a release with a newer state format is in progress
 - **THEN** every command that reads the update refuses, names that release when the state records it, says that this release is older, and changes nothing
+
+### Requirement: Releases named for a state of another format
+The refusal of an update state of another format SHALL advise finishing or aborting the update with a release that keeps that format, naming the releases of each format (1: v0.1.0; 2: v0.2.0 to v0.2.2; 3: v0.3.0 to v0.3.1; 4: v0.3.2 to v0.3.5, also carried on by v0.3.6; 5: v0.3.6; 6: from v0.3.7), or for a newer format with the release that started it or a later one that reads it. For format 3, the refusal SHALL also say that v0.3.6 carries the update over with `migrate` and can then finish it.
+
+#### Scenario: State of the previous release
+- **WHEN** an update started by a release with state format 5 is in progress and does not wait for its merge request
+- **THEN** every command that reads the update refuses, changes nothing, and says to finish or abort it with v0.3.6
+#### Scenario: State of format 4
+- **WHEN** an update started by a release with state format 4 is in progress and does not wait for its merge request
+- **THEN** every command that reads the update refuses, changes nothing, and names v0.3.2 to v0.3.6 as the releases to finish or abort it with
+#### Scenario: State that needs migration
+- **WHEN** an update started by a release with state format 3, which kept the update worktree in the git directory, is in progress
+- **THEN** every command that reads the update refuses, changes nothing, and names finishing or aborting it with a release that keeps format 3, or carrying it over with `migrate` of v0.3.6 and finishing it with that release
+#### Scenario: State of an older release
+- **WHEN** an update started by a release with a state format older than 3 is in progress
+- **THEN** every command that reads the update refuses and says to finish or abort it with a release that keeps that format
+
+### Requirement: Update carried on by another release
+Only `start` and `sync` SHALL record the release that started the update in the state. The first of `continue`, `verify` and `finish` run by another release of the same format SHALL warn once, without refusing, and record that it warned; it SHALL advise aborting and starting again only before `finish` has moved a branch or pushed the update.
 
 #### Scenario: Another release of the same format
 - **WHEN** an update started by one release is carried on by another release with the same state format
 - **THEN** the first of `continue`, `verify` and `finish` it runs warns once that another release started it, advises `abort` only before `finish` has moved a branch or pushed the update, and every command carries on
 
 ### Requirement: Verification of the published tree
-`verify` SHALL require the configuration at the update worktree head to be valid and to name the same integration branch, then run the install command and the update's checks, all of them or those a selection names, in the update worktree once every queued upstream is merged or its plan carried out, write each command's output to a log named after the install command or the check, report pass or fail per command, naming each check by its name, and record the worktree commit it verified. In a full run, a failed check, or one skipped because the install command failed, SHALL leave the update unverified. The checks of an update SHALL be those of the configuration it recorded: the one at the integration tip at `start`, or at its last catch-up merge. A full run SHALL run every one of them, and only a full run SHALL verify the update; wherever an update is required to be verified, a partial run SHALL not count.
+`verify` SHALL require the configuration at the update worktree head to be valid and to name the same integration branch, then run the install command and the update's checks, all of them or those a selection names, in the update worktree once every queued upstream is merged or its plan carried out, write each command's output to a log named after the install command or the check, report pass or fail per command, naming each check by its name, and record the worktree commit it verified.
 
 #### Scenario: Checks pass
 - **WHEN** every check succeeds
 - **THEN** the tool records the verified commit and names `finish` as the next step
-
 #### Scenario: Commit after verification
 - **WHEN** a commit is added to the update branch after `verify`, in push mode
 - **THEN** `finish` refuses until `verify` passes for the new commit
-
 #### Scenario: Upstreams still pending
 - **WHEN** `verify` runs while a queued upstream is at its plan, in conflict or pending
 - **THEN** the tool refuses and names the upstreams that still need `continue`
 
+### Requirement: Checks of an update
+The checks of an update SHALL be those of the configuration it recorded: the one at the integration tip at `start`, or at its last catch-up merge.
+
+#### Scenario: Checks changed on the integration branch
+- **WHEN** a commit that changes a check lands on the integration branch after `start`, and the update has made no catch-up merge
+- **THEN** `verify` runs the checks of the configuration at the integration tip at `start`
+
+### Requirement: Full runs
+A full run SHALL run every one of the update's checks, and only a full run SHALL verify the update; wherever an update is required to be verified, a partial run SHALL not count. In a full run, a failed check, or one skipped because the install command failed, SHALL leave the update unverified.
+
+#### Scenario: Check fails in a full run
+- **WHEN** a check fails in a full run, or the install command fails so that the checks are skipped
+- **THEN** the update stays unverified
+
 ### Requirement: Environment of the checks
-`verify` SHALL run the install command and every check with environment variables that describe the update, naming commits by their full ids: `GIT_INTAKE_BASE`, the update's base, which is the integration tip the update started from or, after a catch-up merge, the integration tip it caught up with; `GIT_INTAKE_HEAD`, the commit being verified; `GIT_INTAKE_INTEGRATION`, the integration branch's name; and `GIT_INTAKE_UPSTREAMS`, the names of the queued upstreams separated by spaces, in queue order. For each queued upstream, with `<NAME>` its name in upper case and every character other than a letter or a digit replaced by `_`, it SHALL set `GIT_INTAKE_UPSTREAM_<NAME>_MODE` to `follow` or `port` and `GIT_INTAKE_UPSTREAM_<NAME>_TARGET` to the follow target, or for a port upstream to the newest upstream commit the update takes or decides on, with no target when it takes and decides none. For a follow upstream with a last synced commit before the update, it SHALL set `GIT_INTAKE_UPSTREAM_<NAME>_PREVIOUS` to that commit; a port upstream SHALL get no such variable. A catch-up merge SHALL change none of the upstream variables. The verification that `finish` runs after a catch-up SHALL set the same variables. Every commit named SHALL be reachable from a reference while the commands run. Variables with the `GIT_INTAKE_` prefix that the tool inherits SHALL NOT reach the commands, and the tool SHALL NOT set these variables for the git commands it runs itself.
+`verify` SHALL run the install command and every check with environment variables that describe the update, naming commits by their full ids: `GIT_INTAKE_BASE`, the update's base, which is the integration tip the update started from or, after a catch-up merge, the integration tip it caught up with; `GIT_INTAKE_HEAD`, the commit being verified; and `GIT_INTAKE_INTEGRATION`, the integration branch's name.
 
 #### Scenario: Follow upstream with a last synced commit
 - **WHEN** an update merges a follow upstream that was synced before
 - **THEN** the install command and every check receive the base, the head, the integration branch, the upstream's name, its mode, its target and its last synced commit, and each commit exists and is contained in a reference
 
-#### Scenario: First import
-- **WHEN** an update imports a path upstream for the first time
-- **THEN** the commands receive the upstream's mode and target and no previous commit
+### Requirement: Commits named to the checks
+Every commit that a `GIT_INTAKE_` variable names SHALL be reachable from a reference while the commands run.
+
+#### Scenario: Commits of a port upstream
+- **WHEN** the checks run on an update that carries out a port plan
+- **THEN** the base, the head and the port upstream's target each exist and are contained in a reference while the commands run
+
+### Requirement: Upstream list of the checks
+`verify` SHALL also give the install command and every check `GIT_INTAKE_UPSTREAMS`, the names of the queued upstreams separated by spaces, in queue order.
 
 #### Scenario: Several upstreams
 - **WHEN** an update takes several upstreams, and leaves out another that is current
 - **THEN** `GIT_INTAKE_UPSTREAMS` lists the upstreams taken in queue order, each with its own variables, and the current upstream has none
 
+### Requirement: Upstream variables of the checks
+For each queued upstream, with `<NAME>` its name in upper case and every character other than a letter or a digit replaced by `_`, `verify` SHALL set `GIT_INTAKE_UPSTREAM_<NAME>_MODE` to `follow` or `port` and `GIT_INTAKE_UPSTREAM_<NAME>_TARGET` to the follow target, or for a port upstream to the newest upstream commit the update takes or decides on, with no target when it takes and decides none.
+
 #### Scenario: Port upstream
 - **WHEN** an update carries out a port plan whose newest commits are left `later`
 - **THEN** the commands receive the mode `port` and, as the target, the newest commit the plan takes or decides on, and no previous commit
 
+### Requirement: Previous commit of an upstream
+For a follow upstream with a last synced commit before the update, `verify` SHALL set `GIT_INTAKE_UPSTREAM_<NAME>_PREVIOUS` to that commit; a port upstream SHALL get no such variable.
+
+#### Scenario: First import
+- **WHEN** an update imports a path upstream for the first time
+- **THEN** the commands receive the upstream's mode and target and no previous commit
+
+### Requirement: Check variables after a catch-up
+A catch-up merge SHALL change none of the upstream variables. The verification that `finish` runs after a catch-up SHALL set the same variables.
+
 #### Scenario: After a catch-up
 - **WHEN** the checks run on a catch-up merge
 - **THEN** `GIT_INTAKE_BASE` is the integration tip the update caught up with, `GIT_INTAKE_HEAD` is the catch-up merge, and every upstream variable is as before the catch-up
+
+### Requirement: Inherited check variables
+Variables with the `GIT_INTAKE_` prefix that the tool inherits SHALL NOT reach the commands, and the tool SHALL NOT set these variables for the git commands it runs itself.
 
 #### Scenario: Inherited variables
 - **WHEN** `verify` is run with `GIT_INTAKE_BASE` or another `GIT_INTAKE_` variable already set
 - **THEN** the commands receive only the variables of the update, with the update's values
 
 ### Requirement: Guarded publication
-In push mode, and with `--no-publish`, `finish` SHALL require a verified update whose worktree commit is the verified one, or one whose head is a catch-up merge the tool made and has not verified, which it verifies itself; any other unverified head SHALL be refused until `verify` passes. In merge-request mode without `--no-publish` it SHALL require no verification. In `push` mode, unless `--no-publish` is given, it SHALL first fetch the publish remote and refuse with git's reason when the fetch fails: when the remote's integration branch holds commits the local one lacks and the local one holds none the remote lacks, it SHALL bring the local integration branch up to date as `start` does, which does not count as `finish` moving it; when each holds commits the other lacks, it SHALL refuse before moving anything and say that the local commits must be published or reconciled first. When the integration tip contains the update head, `finish` SHALL go on without a catch-up. The integration tip SHALL be the local integration branch's in `push` mode and the publish remote's in `merge-request` mode. When the integration tip is otherwise no longer the base, `finish` SHALL catch up with it, and where it requires verification, verify the result as `verify` does and go on only when the verification passes; it SHALL make at most one catch-up merge per run, and when the integration branch moves again meanwhile it SHALL stop and say to run `finish` again. In push mode and with `--no-publish`, before moving any branch it SHALL confirm that the move of the integration branch is a fast-forward, that the verified commit contains the base and every merged target, and that no checkout of the integration branch would lose changes. It SHALL record the planned move, fast-forward the integration branch to the verified commit, push exactly the planned commit without force when the publication mode is `push`, and only after publication succeeds remove the worktree, the update branch, the update's upstream references and the state. An interrupted or failed `finish` SHALL complete the remaining move and the push when run again, and SHALL never publish a commit other than the planned one. When the push was rejected because the publish remote's integration branch moved past the base, a `finish` run again SHALL catch up with the remote's branch from the finishing step, verify the result, fast-forward the local integration branch to it and push it; when the local integration branch moved past the planned commit meanwhile, it SHALL make no catch-up and name `finish --no-publish`. `finish --no-publish` SHALL not fetch, SHALL catch up only with the local integration branch, SHALL in the finishing step land a verified catch-up merge locally, and drop an unverified or conflicted one, recording the resolutions made so far and naming the commits it drops, closing the update at the planned commit, complete the local move and remove the worktree, the update branch, the upstream references and the state without pushing, and report that the integration branch remains unpublished. It SHALL never rewrite or force-push a branch, and SHALL never push to an upstream's URL.
-
-#### Scenario: Integration branch moved
-- **WHEN** a commit lands on the integration branch after `start` and `finish` runs on the verified update in push mode
-- **THEN** `finish` catches up with the new tip, runs the install command and the checks on the catch-up merge, fast-forwards the integration branch to it, publishes it, and afterwards `status` shows every merged upstream's target as its last synced commit
-
-#### Scenario: Catch-up that conflicts in finish
-- **WHEN** the commit that landed conflicts with the update
-- **THEN** `finish` stops with exit status 1 in the catch-up step and moves no branch to the update, and after the conflict is resolved and `continue` has run, `finish` verifies and publishes
-
-#### Scenario: Checks fail after a catch-up
-- **WHEN** the checks fail on the catch-up merge in push mode
-- **THEN** `finish` stops with the report of `verify`, the update stays unverified at the catch-up merge, and no branch moves to the update
+In push mode, and with `--no-publish`, `finish` SHALL require a verified update whose worktree commit is the verified one, or one whose head is a catch-up merge the tool made and has not verified, which it verifies itself; any other unverified head SHALL be refused until `verify` passes. In merge-request mode without `--no-publish` it SHALL require no verification. It SHALL never rewrite or force-push a branch, and SHALL never push to an upstream's URL.
 
 #### Scenario: Commit after a catch-up
 - **WHEN** a commit is added on top of a catch-up merge before it is verified, in push mode
 - **THEN** `finish` refuses until `verify` passes for the new commit
+#### Scenario: Merge-request mode
+- **WHEN** the publication mode is `merge-request` and the update was never verified
+- **THEN** `finish` publishes the update as a merge request, runs no check, and moves no local branch
 
-#### Scenario: Integration branch moves during verification
-- **WHEN** another commit lands on the integration branch while `finish` verifies a catch-up merge
-- **THEN** `finish` moves no branch to the update and says to run it again, which catches up once more
-
-#### Scenario: Integration branch already holds the update
-- **WHEN** the integration branch was moved to the verified commit, or past it, by other means
-- **THEN** `finish` makes no catch-up merge, counts the move as done, pushes the verified commit in push mode, and completes the update
-
-#### Scenario: Remote moved
-- **WHEN** the publish remote's integration branch is ahead of the local one, which holds no commit the remote lacks, and `finish` runs in push mode
-- **THEN** `finish` fast-forwards the local integration branch to the remote's, catches up with it, verifies, and publishes the catch-up merge
-
-#### Scenario: Diverged from the remote
-- **WHEN** the publish remote's integration branch and the local one each hold commits the other lacks
-- **THEN** `finish` refuses before moving any branch and says that the local commits must be published or reconciled first
+### Requirement: Publish remote in finish
+In `push` mode, unless `--no-publish` is given, `finish` SHALL first fetch the publish remote and refuse with git's reason when the fetch fails.
 
 #### Scenario: Publish remote unreachable
 - **WHEN** the publish remote cannot be fetched
 - **THEN** `finish` refuses with git's reason and moves no branch, and `finish --no-publish` closes the update locally without fetching
 
-#### Scenario: Push rejected after the move
-- **WHEN** the publish remote's integration branch moves after `finish` moved the local branch and before its push, so that the push is rejected
-- **THEN** no remote branch moves, the update stays in its finishing step, and running `finish` again catches up with the remote's branch, verifies, fast-forwards the local integration branch and pushes the catch-up merge
+### Requirement: Remote integration branch in finish
+After `finish` fetches the publish remote, when the remote's integration branch holds commits the local one lacks and the local one holds none the remote lacks, `finish` SHALL bring the local integration branch up to date as `start` does, which does not count as `finish` moving it; when each holds commits the other lacks, it SHALL refuse before moving anything and say that the local commits must be published or reconciled first.
 
-#### Scenario: Local commit and rejected push
-- **WHEN** a commit was added to the local integration branch after `finish` moved it, and the push was rejected because the remote moved
-- **THEN** `finish` makes no catch-up merge, moves no branch, and names `finish --no-publish`
+#### Scenario: Remote moved
+- **WHEN** the publish remote's integration branch is ahead of the local one, which holds no commit the remote lacks, and `finish` runs in push mode
+- **THEN** `finish` fast-forwards the local integration branch to the remote's, catches up with it, verifies, and publishes the catch-up merge
+#### Scenario: Diverged from the remote
+- **WHEN** the publish remote's integration branch and the local one each hold commits the other lacks
+- **THEN** `finish` refuses before moving any branch and says that the local commits must be published or reconciled first
 
-#### Scenario: Publication never allowed
-- **WHEN** the publish remote refuses every push to the integration branch, as for a protected branch
-- **THEN** `finish --no-publish` leaves the local integration branch advanced, removes the update, and names the unpublished branch
+### Requirement: Integration tip in finish
+When the integration tip contains the update head, `finish` SHALL go on without a catch-up. The integration tip SHALL be the local integration branch's in `push` mode and the publish remote's in `merge-request` mode.
 
-#### Scenario: Local commit while finishing
-- **WHEN** a commit is added to the integration branch after `finish` moved it and before the push succeeded
-- **THEN** running `finish` again pushes only the planned commit
+#### Scenario: Integration branch already holds the update
+- **WHEN** the integration branch was moved to the verified commit, or past it, by other means
+- **THEN** `finish` makes no catch-up merge, counts the move as done, pushes the verified commit in push mode, and completes the update
 
-#### Scenario: Interrupted finish
-- **WHEN** `finish` stops after moving the integration branch and before the push
-- **THEN** `status` shows the finishing step, `abort` refuses, and running `finish` again completes the push
+### Requirement: Catch-up in finish
+When the integration tip does not contain the update head and is no longer the base, `finish` SHALL catch up with it, and where it requires verification, verify the result as `verify` does and go on only when the verification passes; it SHALL make at most one catch-up merge per run, and when the integration branch moves again meanwhile it SHALL stop and say to run `finish` again.
+
+#### Scenario: Integration branch moved
+- **WHEN** a commit lands on the integration branch after `start` and `finish` runs on the verified update in push mode
+- **THEN** `finish` catches up with the new tip, runs the install command and the checks on the catch-up merge, fast-forwards the integration branch to it, publishes it, and afterwards `status` shows every merged upstream's target as its last synced commit
+#### Scenario: Catch-up that conflicts in finish
+- **WHEN** the commit that landed conflicts with the update
+- **THEN** `finish` stops with exit status 1 in the catch-up step and moves no branch to the update, and after the conflict is resolved and `continue` has run, `finish` verifies and publishes
+#### Scenario: Checks fail after a catch-up
+- **WHEN** the checks fail on the catch-up merge in push mode
+- **THEN** `finish` stops with the report of `verify`, the update stays unverified at the catch-up merge, and no branch moves to the update
+#### Scenario: Integration branch moves during verification
+- **WHEN** another commit lands on the integration branch while `finish` verifies a catch-up merge
+- **THEN** `finish` moves no branch to the update and says to run it again, which catches up once more
+
+### Requirement: Confirming the move in finish
+In push mode and with `--no-publish`, before moving any branch `finish` SHALL confirm that the move of the integration branch is a fast-forward, that the verified commit contains the base and every merged target, and that no checkout of the integration branch would lose changes.
+
+#### Scenario: Checkout that would lose changes
+- **WHEN** `finish` runs in push mode on a verified update while a checkout of the integration branch holds uncommitted changes that the fast-forward would overwrite
+- **THEN** `finish` moves no branch
+
+### Requirement: Moving the integration branch in finish
+`finish` SHALL record the planned move, fast-forward the integration branch to the verified commit, push exactly the planned commit without force when the publication mode is `push`, and only after publication succeeds remove the worktree, the update branch, the update's upstream references and the state.
 
 #### Scenario: No publish remote
 - **WHEN** no publish remote is configured
 - **THEN** `finish` advances the local integration branch and pushes nothing
 
-#### Scenario: Merge-request mode
-- **WHEN** the publication mode is `merge-request` and the update was never verified
-- **THEN** `finish` publishes the update as a merge request, runs no check, and moves no local branch
+### Requirement: Completing an interrupted finish
+An interrupted or failed `finish` SHALL complete the remaining move and the push when run again, and SHALL never publish a commit other than the planned one.
+
+#### Scenario: Local commit while finishing
+- **WHEN** a commit is added to the integration branch after `finish` moved it and before the push succeeded
+- **THEN** running `finish` again pushes only the planned commit
+#### Scenario: Interrupted finish
+- **WHEN** `finish` stops after moving the integration branch and before the push
+- **THEN** `status` shows the finishing step, `abort` refuses, and running `finish` again completes the push
+
+### Requirement: Rejected push in finish
+When the push was rejected because the publish remote's integration branch moved past the base, a `finish` run again SHALL catch up with the remote's branch from the finishing step, verify the result, fast-forward the local integration branch to it and push it; when the local integration branch moved past the planned commit meanwhile, it SHALL make no catch-up and name `finish --no-publish`.
+
+#### Scenario: Push rejected after the move
+- **WHEN** the publish remote's integration branch moves after `finish` moved the local branch and before its push, so that the push is rejected
+- **THEN** no remote branch moves, the update stays in its finishing step, and running `finish` again catches up with the remote's branch, verifies, fast-forwards the local integration branch and pushes the catch-up merge
+#### Scenario: Local commit and rejected push
+- **WHEN** a commit was added to the local integration branch after `finish` moved it, and the push was rejected because the remote moved
+- **THEN** `finish` makes no catch-up merge, moves no branch, and names `finish --no-publish`
+
+### Requirement: Finishing without publication
+`finish --no-publish` SHALL not fetch, SHALL catch up only with the local integration branch, SHALL in the finishing step land a verified catch-up merge locally, and drop an unverified or conflicted one, recording the resolutions made so far and naming the commits it drops, closing the update at the planned commit, complete the local move and remove the worktree, the update branch, the upstream references and the state without pushing, and report that the integration branch remains unpublished.
+
+#### Scenario: Publication never allowed
+- **WHEN** the publish remote refuses every push to the integration branch, as for a protected branch
+- **THEN** `finish --no-publish` leaves the local integration branch advanced, removes the update, and names the unpublished branch
 
 ### Requirement: Update report
-`report` SHALL summarise an update in progress or just merged, per upstream. For a `follow` upstream it SHALL give the number of upstream commits merged, the upstream tag of the target when one points at it, the conflicted files and whether each was resolved by hand or by a recorded resolution, and how the repository's own changes relative to that upstream grew or shrank. For a `port` upstream it SHALL give the taken commits in the order they were copied, each with its conflicted files and their resolution source, the commits recorded as `have` because their copy changed nothing, the `skip` and `have` decisions with their notes, the number of commits left pending, and, for each taken commit, the earlier upstream commits still pending that changed any of the same files.
+`report` SHALL summarise an update in progress or just merged, per upstream. For a `follow` upstream it SHALL give the number of upstream commits merged, the upstream tag of the target when one points at it, the conflicted files and whether each was resolved by hand or by a recorded resolution, and how the repository's own changes relative to that upstream grew or shrank.
 
 #### Scenario: Report after merge
 - **WHEN** the user runs `report` after resolving conflicts in a `follow` update
 - **THEN** the output lists, for each merged upstream, the merged range, each conflicted file with its resolution source, and the diff size against that upstream before and after
+
+### Requirement: Port upstreams in the report
+For a `port` upstream `report` SHALL give the taken commits in the order they were copied, each with its conflicted files and their resolution source, the commits recorded as `have` because their copy changed nothing, the `skip` and `have` decisions with their notes, the number of commits left pending, and, for each taken commit, the earlier upstream commits still pending that changed any of the same files.
 
 #### Scenario: Report of a port
 - **WHEN** the user runs `report` after a plan that took a commit whose files an earlier pending upstream commit also changed
 - **THEN** the output lists the taken commit with its conflicts and names the earlier pending commit beside it
 
 ### Requirement: Upstream status
-`status` SHALL fetch every upstream and report, for each, its path, its branch, its mode and its fetched tip. For a `follow` upstream it SHALL report its last synced commit with the upstream tag its sync record names, the number of commits the integration branch lacks, and one state: current, behind, not imported, no release when it has a `tags` pattern and its fetched branch has no release tag, path removed when a synced path upstream's path no longer exists, rewritten, or unavailable when its URL cannot be fetched, its branch is missing, or the tags of an upstream with a `tags` pattern cannot be listed. For a `follow` upstream with a `tags` pattern, the newest release takes the place of the tip: `status` SHALL show it as the tip, count the commits the integration branch lacks up to it, predict the conflicts of merging it, and show the fetched branch tip and the number of commits it lies past the release separately. For a `port` upstream it SHALL report its journal's base, the numbers of taken, decided and pending commits, and one state: current, pending, no base, rewritten, or unavailable. `status --check` SHALL additionally list the files a merge of each behind `follow` upstream's tip would conflict in, create no worktree, branch or state, and exit with a failure status unless every upstream is current, so that it can run on a schedule and gate a cutover or a port review.
+`status` SHALL fetch every upstream and report, for each, its path, its branch, its mode and its fetched tip.
 
 #### Scenario: Several upstreams
 - **WHEN** `status` runs on a repository with three upstreams, two of them behind
 - **THEN** it reports each upstream on its own line with its path and state, and the commit count for the two that are behind
 
-#### Scenario: Scheduled check
-- **WHEN** `status --check` runs on a repository whose single `follow` upstream is 30 commits ahead
-- **THEN** it reports the 30 commits and the files that would conflict, exits with a failure status, and leaves the repository unchanged
-
-#### Scenario: Zero drift
-- **WHEN** `status --check` runs and every upstream is current
-- **THEN** it reports every upstream as current and exits successfully
+### Requirement: Status of a follow upstream
+For a `follow` upstream `status` SHALL report its last synced commit with the upstream tag its sync record names, the number of commits the integration branch lacks, and one state.
 
 #### Scenario: Synced to a chosen target
 - **WHEN** the last update of a `follow` upstream merged a chosen target that lies three commits before the fetched branch tip
 - **THEN** `status` shows that target as the last synced commit, the tip, the state behind and three commits
 
-#### Scenario: Development commits after a release
-- **WHEN** a `follow` upstream with a `tags` pattern has merged its newest release, and its branch holds commits after it
-- **THEN** `status` reports the upstream as current, shows the release as the tip and the branch tip with the number of commits past the release, and `status --check` succeeds
-
-#### Scenario: Newer release
-- **WHEN** a `follow` upstream with a `tags` pattern has a release newer than its last synced commit
-- **THEN** `status` reports the upstream as behind by the commits up to that release, not up to the branch tip
+### Requirement: States of a follow upstream
+The state `status` reports for a `follow` upstream SHALL be one of current, behind, not imported, no release when it has a `tags` pattern and its fetched branch has no release tag, path removed when a synced path upstream's path no longer exists, rewritten, or unavailable when its URL cannot be fetched, its branch is missing, or the tags of an upstream with a `tags` pattern cannot be listed.
 
 #### Scenario: No release
 - **WHEN** a `follow` upstream with a `tags` pattern has no release tag on its fetched branch
 - **THEN** `status` reports the state no release and `status --check` exits with a failure status
 
+### Requirement: Newest release in status
+For a `follow` upstream with a `tags` pattern, the newest release takes the place of the tip: `status` SHALL show it as the tip, count the commits the integration branch lacks up to it, predict the conflicts of merging it, and show the fetched branch tip and the number of commits it lies past the release separately.
+
+#### Scenario: Development commits after a release
+- **WHEN** a `follow` upstream with a `tags` pattern has merged its newest release, and its branch holds commits after it
+- **THEN** `status` reports the upstream as current, shows the release as the tip and the branch tip with the number of commits past the release, and `status --check` succeeds
+#### Scenario: Newer release
+- **WHEN** a `follow` upstream with a `tags` pattern has a release newer than its last synced commit
+- **THEN** `status` reports the upstream as behind by the commits up to that release, not up to the branch tip
+
+### Requirement: Status of a port upstream
+For a `port` upstream `status` SHALL report its journal's base, the numbers of taken, decided and pending commits, and one state: current, pending, no base, rewritten, or unavailable.
+
 #### Scenario: Port with pending commits
 - **WHEN** `status --check` runs for a `port` upstream with twelve first-parent commits after its base, of which three were taken, two skipped and seven are undecided
 - **THEN** it reports the base, three taken, two decided and seven pending, the state pending, and exits with a failure status
-
 #### Scenario: Port without a base
 - **WHEN** `status --check` runs for a `port` upstream with no journal, no sync record and no history shared with the integration branch
 - **THEN** it reports the state no base with the advice to write the journal and its base by hand, and exits with a failure status
+
+### Requirement: Scheduled status check
+`status --check` SHALL additionally list the files a merge of each behind `follow` upstream's tip would conflict in, create no worktree, branch or state, and exit with a failure status unless every upstream is current, so that it can run on a schedule and gate a cutover or a port review.
+
+#### Scenario: Scheduled check
+- **WHEN** `status --check` runs on a repository whose single `follow` upstream is 30 commits ahead
+- **THEN** it reports the 30 commits and the files that would conflict, exits with a failure status, and leaves the repository unchanged
+#### Scenario: Zero drift
+- **WHEN** `status --check` runs and every upstream is current
+- **THEN** it reports every upstream as current and exits successfully
 
 ### Requirement: Pending commits
 `log` SHALL list, for the named upstreams or all of them, the commits on the fetched upstream branch that the integration branch does not contain for a `follow` upstream, and the pending commits for a `port` upstream.
@@ -336,24 +470,28 @@ In push mode, and with `--no-publish`, `finish` SHALL require a verified update 
 - **THEN** `branches` reports that no upstream holds unmerged work
 
 ### Requirement: Doctor
-`doctor` SHALL check, without changing the repository other than through the references of its own fetches, that the configuration is valid, every upstream's URL can be fetched and its branch exists, every imported upstream's path exists on the integration branch, every `follow` upstream's last synced commit is still contained in its branch, every `port` upstream's journal is valid and its base and its decided and taken commits that are not retired are still on its branch, the main checkout is clean, no merge is in progress, the update state, if any, matches its worktree and branch, no git remote names a configured upstream's repository, no reference under `refs/git-intake/` is left without an update, and no journal belongs to an upstream that is missing or in `follow` mode. It SHALL report each check with its result and exit with a failure status when any check fails.
+`doctor` SHALL run its checks without changing the repository other than through the references of its own fetches. It SHALL report each check with its result and exit with a failure status when any check fails.
 
 #### Scenario: Healthy repository
 - **WHEN** every check passes
 - **THEN** `doctor` lists the checks as passed and exits successfully
 
+### Requirement: Configuration and upstream checks in doctor
+`doctor` SHALL check that the configuration is valid, every upstream's URL can be fetched and its branch exists, every imported upstream's path exists on the integration branch, every `follow` upstream's last synced commit is still contained in its branch, and every `port` upstream's journal is valid and its base and its decided and taken commits that are not retired are still on its branch.
+
 #### Scenario: Upstream removed from the configuration
 - **WHEN** the integration branch carries sync records of an upstream that the configuration no longer lists
 - **THEN** `doctor` reports that upstream by name as dropped from the configuration
 
+### Requirement: Repository checks in doctor
+`doctor` SHALL check that the main checkout is clean, no merge is in progress, the update state, if any, matches its worktree and branch, no git remote names a configured upstream's repository, no reference under `refs/git-intake/` is left without an update, and no journal belongs to an upstream that is missing or in `follow` mode.
+
 #### Scenario: Remote left at an upstream's URL
 - **WHEN** a git remote's URL is a configured upstream's URL
 - **THEN** `doctor` fails the check, names the remote and the upstream, and says to remove the remote
-
 #### Scenario: Partial clone remote at an upstream's URL
 - **WHEN** such a remote is the one a partial clone fetches missing objects from
 - **THEN** `doctor` additionally says that the missing objects have to be fetched before the remote is removed
-
 #### Scenario: Stale journal
 - **WHEN** the integration branch carries a journal for an upstream in `follow` mode
 - **THEN** `doctor` fails the check and names the journal
@@ -374,47 +512,62 @@ In push mode, and with `--no-publish`, `finish` SHALL require a verified update 
 - **THEN** it receives an object whose keys are the variable names and whose values are their values, and an empty object for a commit that carries no update
 
 ### Requirement: Same behaviour from every directory
-Every command SHALL behave the same whichever directory of the repository it runs in: the main checkout, a subdirectory, a linked worktree, or the update worktree, whether the git directory is `.git` in the main worktree, lies outside it, or belongs to a submodule. Only finding the integration branch from the configuration committed at `HEAD` when no update is in progress, the note about an uncommitted configuration edit, and resolving the revisions named to `start` SHALL depend on the worktree the command runs in. The tool SHALL run git operations on the repository as a whole in the main worktree, or in the git directory when the repository is bare, so that a relative remote URL means what it means in the main worktree. A bare repository has no main worktree, so its update worktree SHALL be `git-intake/worktree` in the git directory; when that path contains `/.git`, which compilers, bundlers and watchers ignore, `start` SHALL refuse, say why, advise a clone with a checkout, and change nothing. `start` SHALL record the main worktree with the update so that the update's later commands find it from any worktree. When the main worktree cannot be located, because the git directory lies outside it without naming it, no update is in progress and the command runs elsewhere, a command that needs the main checkout SHALL refuse and say to run it in the main worktree, `doctor` SHALL warn that it did not check the main checkout and why, and a relative remote URL SHALL resolve against the git directory. The tool SHALL prefer the worktree it runs in, when that is the main worktree, and the main worktree the update recorded over taking the parent of a git directory named `.git` for it. A command that removes the update worktree it runs in SHALL complete and, after its own output, SHALL note that the current directory was removed.
+Every command SHALL behave the same whichever directory of the repository it runs in: the main checkout, a subdirectory, a linked worktree, or the update worktree, whether the git directory is `.git` in the main worktree, lies outside it, or belongs to a submodule.
 
 #### Scenario: Finish from the update worktree
 - **WHEN** `finish` runs in the update worktree, with or without a publish remote, with `--no-publish`, or opening a merge request
 - **THEN** it moves, publishes and cleans up exactly as from the main checkout, and notes that the current directory was removed
+#### Scenario: Linked checkout of the integration branch
+- **WHEN** a linked worktree has the integration branch checked out and `finish` runs in the update worktree
+- **THEN** that checkout follows the fast-forward and stays clean
 
-#### Scenario: Abort from the update worktree
-- **WHEN** `abort` runs in a directory of the update worktree
-- **THEN** no worktree, update branch, log or state of the update remains, and the tool notes that the current directory was removed
-
-#### Scenario: Relative remote URL
-- **WHEN** an upstream's URL is a relative path and `start` runs in a linked worktree, or a command fetches it from the update worktree
-- **THEN** the URL is resolved against the main worktree, as when the command runs in the main checkout
-
-#### Scenario: Git directory outside the checkout
-- **WHEN** the downstream is a submodule, or its git directory was placed elsewhere, and an update is started in its checkout and finished from the update worktree
-- **THEN** relative remote URLs resolve against the checkout, and `finish` fast-forwards the checkout
-
-#### Scenario: Main worktree that cannot be located
-- **WHEN** the git directory lies outside the checkout without naming it, no update is in progress, and `start` runs in a linked worktree
-- **THEN** `start` refuses and says to run it in the main worktree, and `doctor` warns that it did not check the main checkout
-
-#### Scenario: Bare repository
-- **WHEN** an update is started in a bare repository and finished from the update worktree
-- **THEN** the update worktree lies in the git directory, and `finish` moves the integration branch and removes it
-
-#### Scenario: Bare repository at a path containing `/.git`
-- **WHEN** `start` runs in a bare repository whose update worktree path would contain `/.git`
-- **THEN** it refuses, names the reason, advises a clone with a checkout, and creates no worktree, branch or state
-
-#### Scenario: Separate git directory named `.git`
-- **WHEN** the git directory is a directory named `.git` apart from the checkout, and an update is started in the checkout and finished from the update worktree
-- **THEN** the checkout is taken as the main worktree: nothing is written beside the git directory, and relative remote URLs resolve against the checkout
+### Requirement: Commands that depend on the worktree
+Only finding the integration branch from the configuration committed at `HEAD` when no update is in progress, the note about an uncommitted configuration edit, and resolving the revisions named to `start` SHALL depend on the worktree the command runs in.
 
 #### Scenario: Revision named in a linked worktree
 - **WHEN** `start` runs in a linked worktree with a revision relative to that worktree, such as `HEAD^2`
 - **THEN** the revision is resolved in that worktree
 
-#### Scenario: Linked checkout of the integration branch
-- **WHEN** a linked worktree has the integration branch checked out and `finish` runs in the update worktree
-- **THEN** that checkout follows the fast-forward and stays clean
+### Requirement: Repository operations in the main worktree
+The tool SHALL run git operations on the repository as a whole in the main worktree, or in the git directory when the repository is bare, so that a relative remote URL means what it means in the main worktree. `start` SHALL record the main worktree with the update so that the update's later commands find it from any worktree.
+
+#### Scenario: Relative remote URL
+- **WHEN** an upstream's URL is a relative path and `start` runs in a linked worktree, or a command fetches it from the update worktree
+- **THEN** the URL is resolved against the main worktree, as when the command runs in the main checkout
+#### Scenario: Git directory outside the checkout
+- **WHEN** the downstream is a submodule, or its git directory was placed elsewhere, and an update is started in its checkout and finished from the update worktree
+- **THEN** relative remote URLs resolve against the checkout, and `finish` fast-forwards the checkout
+
+### Requirement: Update worktree of a bare repository
+A bare repository has no main worktree, so its update worktree SHALL be `git-intake/worktree` in the git directory; when that path contains `/.git`, which compilers, bundlers and watchers ignore, `start` SHALL refuse, say why, advise a clone with a checkout, and change nothing.
+
+#### Scenario: Bare repository
+- **WHEN** an update is started in a bare repository and finished from the update worktree
+- **THEN** the update worktree lies in the git directory, and `finish` moves the integration branch and removes it
+#### Scenario: Bare repository at a path containing `/.git`
+- **WHEN** `start` runs in a bare repository whose update worktree path would contain `/.git`
+- **THEN** it refuses, names the reason, advises a clone with a checkout, and creates no worktree, branch or state
+
+### Requirement: Main worktree not located
+When the main worktree cannot be located, because the git directory lies outside it without naming it, no update is in progress and the command runs elsewhere, a command that needs the main checkout SHALL refuse and say to run it in the main worktree, `doctor` SHALL warn that it did not check the main checkout and why, and a relative remote URL SHALL resolve against the git directory.
+
+#### Scenario: Main worktree that cannot be located
+- **WHEN** the git directory lies outside the checkout without naming it, no update is in progress, and `start` runs in a linked worktree
+- **THEN** `start` refuses and says to run it in the main worktree, and `doctor` warns that it did not check the main checkout
+
+### Requirement: Choosing the main worktree
+The tool SHALL prefer the worktree it runs in, when that is the main worktree, and the main worktree the update recorded over taking the parent of a git directory named `.git` for it.
+
+#### Scenario: Separate git directory named `.git`
+- **WHEN** the git directory is a directory named `.git` apart from the checkout, and an update is started in the checkout and finished from the update worktree
+- **THEN** the checkout is taken as the main worktree: nothing is written beside the git directory, and relative remote URLs resolve against the checkout
+
+### Requirement: Removing the current directory
+A command that removes the update worktree it runs in SHALL complete and, after its own output, SHALL note that the current directory was removed.
+
+#### Scenario: Abort from the update worktree
+- **WHEN** `abort` runs in a directory of the update worktree
+- **THEN** no worktree, update branch, log or state of the update remains, and the tool notes that the current directory was removed
 
 ### Requirement: Upstream fetch by URL
 The tool SHALL fetch an upstream by its configured URL, in the main worktree and without tags, into a reference under `refs/git-intake/`, and SHALL NOT add, change or read a git remote for it. A command that reads upstreams SHALL fetch them itself. Apart from `contribute`, the tool SHALL create no branch, remote-tracking branch or tag from an upstream.
@@ -630,79 +783,79 @@ Where the tool compares a URL with an upstream's URL, URLs that name the same re
 - **WHEN** `contribute` names a branch that exists
 - **THEN** it refuses and changes nothing
 
-### Requirement: Follow update with a fixed target
-For upstreams in `follow` mode, `start` SHALL accept upstream names, each optionally followed by `=` and a revision, and select every configured upstream when none is named. It SHALL fetch the selected upstreams, record as each upstream's target the commit its revision names, or, when no revision is given, the newest release of an upstream with a `tags` pattern and the fetched upstream tip of any other, record the current integration tip as the base, and queue, in configuration order, the selected upstreams whose target the base does not yet contain.
-
-#### Scenario: Nothing to update
-- **WHEN** the integration branch already contains every selected target
-- **THEN** `start` reports that every selected upstream is current and creates nothing
-
-#### Scenario: Unchanged upstreams are skipped
-- **WHEN** some selected upstreams have new commits and others do not
-- **THEN** only the upstreams with new commits are queued and the others are reported as current
-
-#### Scenario: First import of an upstream
-- **WHEN** a queued upstream has a path that does not exist at the base and the integration branch carries no sync record of that upstream
-- **THEN** the tool imports the target's tree under that path with a merge commit that keeps the upstream's full history
-
-#### Scenario: Path already holds unrelated content
-- **WHEN** a queued upstream's path exists at the base, the integration branch carries no sync record of that upstream, and no merge on the integration line brought that upstream's history into its path
-- **THEN** `start` refuses and names the upstream and the path
-
-#### Scenario: Ancestry shared only through a template
-- **WHEN** two upstreams descend from one template, one of them is imported, and the other's path already holds the repository's own content
-- **THEN** the other upstream is not treated as imported, and `start` refuses for its path, whichever upstreams have been fetched
-
-#### Scenario: Upstreams that merge each other
-- **WHEN** an upstream imported without a sync record later appears in another upstream's history
-- **THEN** it is still treated as imported at its path and is updated by a subtree merge
-
-#### Scenario: Path imported by other means
-- **WHEN** a queued upstream's path exists at the base and the integration branch carries no sync record of that upstream but its integration line holds a merge that brought the upstream's history into the path, as after an import by `git subtree add`, including one made on a branch that was merged with a merge commit
-- **THEN** `status` shows the newest upstream commit contained in the integration branch as the last synced commit, and `start` updates the path by a subtree merge that records the sync
-
-#### Scenario: Imported path removed downstream
-- **WHEN** the integration branch carries a sync record of a path upstream but its path no longer exists at the base
-- **THEN** `start` refuses and explains that the path was removed downstream
-
-#### Scenario: File on the import path
-- **WHEN** a leading component of a queued upstream's path is a file at the base
-- **THEN** `start` refuses instead of replacing the file
-
-#### Scenario: Chosen commit
-- **WHEN** `start` names an upstream with a commit of its fetched branch that is older than the branch tip
-- **THEN** that commit is the upstream's target: the update merges, verifies and publishes it, and its sync record names it
-
-#### Scenario: Conflict at a chosen target
-- **WHEN** the merge of a chosen target stops on conflicts, and the user resolves them and runs `continue` and then `verify` and `finish`
-- **THEN** the merge records the chosen target, not the branch tip
+### Requirement: Selecting follow upstreams
+For upstreams in `follow` mode, `start` SHALL accept upstream names, each optionally followed by `=` and a revision, and select every configured upstream when none is named.
 
 #### Scenario: Several upstreams at chosen points
 - **WHEN** `start` names one upstream with a revision and another without
 - **THEN** the first is merged at the commit its revision names and the second at its fetched tip, in one update
 
+### Requirement: Follow update with a fixed target
+For upstreams in `follow` mode, `start` SHALL fetch the selected upstreams, record as each upstream's target the commit its revision names, or, when no revision is given, the newest release of an upstream with a `tags` pattern and the fetched upstream tip of any other, record the current integration tip as the base, and queue, in configuration order, the selected upstreams whose target the base does not yet contain.
+
+#### Scenario: Nothing to update
+- **WHEN** the integration branch already contains every selected target
+- **THEN** `start` reports that every selected upstream is current and creates nothing
+#### Scenario: Unchanged upstreams are skipped
+- **WHEN** some selected upstreams have new commits and others do not
+- **THEN** only the upstreams with new commits are queued and the others are reported as current
+#### Scenario: First import of an upstream
+- **WHEN** a queued upstream has a path that does not exist at the base and the integration branch carries no sync record of that upstream
+- **THEN** the tool imports the target's tree under that path with a merge commit that keeps the upstream's full history
+#### Scenario: Path already holds unrelated content
+- **WHEN** a queued upstream's path exists at the base, the integration branch carries no sync record of that upstream, and no merge on the integration line brought that upstream's history into its path
+- **THEN** `start` refuses and names the upstream and the path
+#### Scenario: Ancestry shared only through a template
+- **WHEN** two upstreams descend from one template, one of them is imported, and the other's path already holds the repository's own content
+- **THEN** the other upstream is not treated as imported, and `start` refuses for its path, whichever upstreams have been fetched
+#### Scenario: Upstreams that merge each other
+- **WHEN** an upstream imported without a sync record later appears in another upstream's history
+- **THEN** it is still treated as imported at its path and is updated by a subtree merge
+#### Scenario: Path imported by other means
+- **WHEN** a queued upstream's path exists at the base and the integration branch carries no sync record of that upstream but its integration line holds a merge that brought the upstream's history into the path, as after an import by `git subtree add`, including one made on a branch that was merged with a merge commit
+- **THEN** `status` shows the newest upstream commit contained in the integration branch as the last synced commit, and `start` updates the path by a subtree merge that records the sync
+#### Scenario: Imported path removed downstream
+- **WHEN** the integration branch carries a sync record of a path upstream but its path no longer exists at the base
+- **THEN** `start` refuses and explains that the path was removed downstream
+#### Scenario: File on the import path
+- **WHEN** a leading component of a queued upstream's path is a file at the base
+- **THEN** `start` refuses instead of replacing the file
+#### Scenario: Chosen commit
+- **WHEN** `start` names an upstream with a commit of its fetched branch that is older than the branch tip
+- **THEN** that commit is the upstream's target: the update merges, verifies and publishes it, and its sync record names it
+#### Scenario: Conflict at a chosen target
+- **WHEN** the merge of a chosen target stops on conflicts, and the user resolves them and runs `continue` and then `verify` and `finish`
+- **THEN** the merge records the chosen target, not the branch tip
+
 ### Requirement: Release tags as follow targets
-For a `follow` upstream with a `tags` pattern named without a revision, `start` SHALL take as the target the newest release: of the tags of the upstream's repository, listed from its URL, those whose name matches the pattern, is a semantic version without a prerelease part or build metadata once the pattern's literal prefix, and one `v` or `V` after it unless the prefix ends in one, are removed, and points at a commit of the fetched upstream branch, the one with the highest version by semantic versioning precedence. The tool SHALL fetch no tag into the repository. When the integration branch already contains the release, `start` SHALL report the upstream as current. When there is no release, `start` SHALL refuse, name the upstream, its URL and the pattern, and say to name the target as a revision. A revision named for the upstream SHALL override the pattern.
-
-#### Scenario: Newest release by version
-- **WHEN** an upstream with the pattern `v*` has the tags `v0.9.0` and `v0.10.0` on its branch, `v0.9.0` on the newer commit, and commits after both
-- **THEN** `start` takes the commit of `v0.10.0`, and the sync record names the tag `v0.10.0`
-
-#### Scenario: Tags that are not releases
-- **WHEN** an upstream's newest matching tags are a prerelease such as `v1.0.0-rc.1`, a version with build metadata such as `v1.0.0+build.5`, a name that is no semantic version, or a tag on a branch the fetched branch does not contain
-- **THEN** `start` ignores them and takes the newest release among the rest
+For a `follow` upstream with a `tags` pattern named without a revision, `start` SHALL list the tags of the upstream's repository from its URL and take as the target the newest release among them. The tool SHALL fetch no tag into the repository.
 
 #### Scenario: Repository tags untouched
 - **WHEN** an update takes an upstream at a release tag
 - **THEN** the repository's tags are the same before and after the update
 
+### Requirement: Newest release of an upstream
+The newest release of a `follow` upstream with a `tags` pattern SHALL be, of the tags of the upstream's repository whose name matches the pattern, is a semantic version without a prerelease part or build metadata once the pattern's literal prefix, and one `v` or `V` after it unless the prefix ends in one, are removed, and points at a commit of the fetched upstream branch, the one with the highest version by semantic versioning precedence.
+
+#### Scenario: Newest release by version
+- **WHEN** an upstream with the pattern `v*` has the tags `v0.9.0` and `v0.10.0` on its branch, `v0.9.0` on the newer commit, and commits after both
+- **THEN** `start` takes the commit of `v0.10.0`, and the sync record names the tag `v0.10.0`
+#### Scenario: Tags that are not releases
+- **WHEN** an upstream's newest matching tags are a prerelease such as `v1.0.0-rc.1`, a version with build metadata such as `v1.0.0+build.5`, a name that is no semantic version, or a tag on a branch the fetched branch does not contain
+- **THEN** `start` ignores them and takes the newest release among the rest
+
+### Requirement: Upstream without a new release
+When the integration branch already contains the newest release of a `follow` upstream with a `tags` pattern, `start` SHALL report the upstream as current. When there is no release, `start` SHALL refuse, name the upstream, its URL and the pattern, and say to name the target as a revision.
+
 #### Scenario: Release already taken
 - **WHEN** the integration branch contains the newest release, including after an earlier update took a later commit by naming it
 - **THEN** `start` reports the upstream as current at that release and creates nothing for it
-
 #### Scenario: No release on the branch
 - **WHEN** no tag of the upstream's repository is a release on its fetched branch
 - **THEN** `start` refuses, names the upstream, its URL and the pattern, and creates nothing
+
+### Requirement: Revision instead of a release
+A revision named to `start` for a `follow` upstream with a `tags` pattern SHALL override the pattern.
 
 #### Scenario: Revision overrides the pattern
 - **WHEN** `start` names an upstream with a `tags` pattern together with a revision of an untagged commit after its newest release
@@ -769,66 +922,73 @@ A revision named to `start` for a `follow` upstream, without a leading `refs/tag
 - **THEN** `start` refuses and names the last synced commit the target lacks
 
 ### Requirement: Conditions for starting an update
-`start` SHALL refuse when an update is in progress, when the main checkout or the integration branch has uncommitted changes, when the publish remote cannot be fetched, when the integration branch and its published counterpart each hold commits the other lacks, when a selected upstream is unknown, named more than once, or rewritten, or, in merge-request mode, when the forge cannot be reached as `finish` needs it, when the local integration branch holds commits its published counterpart lacks, or when an update's merge request into the integration branch is open, naming it, `sync` to carry it on and `abort --merge-request` to withdraw it. When the integration branch is strictly behind its published counterpart, `start`, having read the integration branch and the publish remote from the configuration at `HEAD`, SHALL fast-forward it to that counterpart, moving a checkout of the branch with `git merge --ff-only` and the branch otherwise with `git update-ref` against its old value, refusing when a checkout would lose changes, and say that it did. It SHALL then read the configuration again at the new tip and fix the base there, or refuse, keeping the fast-forward, when that configuration names another integration branch or publish remote.
+`start` SHALL refuse when an update is in progress, when the main checkout or the integration branch has uncommitted changes, when the publish remote cannot be fetched, when the integration branch and its published counterpart each hold commits the other lacks, or when a selected upstream is unknown, named more than once, or rewritten.
 
 #### Scenario: Update already in progress
 - **WHEN** `start` runs while an update is in progress
 - **THEN** it refuses, names the step the update has reached, and creates nothing
+#### Scenario: Integration branch diverged from the publish remote
+- **WHEN** the publish remote's integration branch and the local one each hold commits the other lacks
+- **THEN** `start` refuses, names how many commits each side lacks, moves no branch and creates nothing
+
+### Requirement: Conditions for starting in merge-request mode
+In merge-request mode, `start` SHALL also refuse when the forge cannot be reached as `finish` needs it, when the local integration branch holds commits its published counterpart lacks, or when an update's merge request into the integration branch is open, naming it, `sync` to carry it on and `abort --merge-request` to withdraw it.
 
 #### Scenario: Forge unreachable
 - **WHEN** `start` runs in merge-request mode without a token for the forge
 - **THEN** it refuses, names the token variables, and creates nothing
-
 #### Scenario: Merge request open
 - **WHEN** `start` runs in merge-request mode while the update's merge request is open
 - **THEN** it refuses, names the merge request, `sync` and `abort --merge-request`, and creates nothing
+
+### Requirement: Integration branch behind its published counterpart
+When the integration branch is strictly behind its published counterpart, `start`, having read the integration branch and the publish remote from the configuration at `HEAD`, SHALL fast-forward it to that counterpart, moving a checkout of the branch with `git merge --ff-only` and the branch otherwise with `git update-ref` against its old value, refusing when a checkout would lose changes, and say that it did.
 
 #### Scenario: Integration branch behind the publish remote
 - **WHEN** the publish remote's integration branch holds commits the local one lacks, and the local one holds none the remote lacks
 - **THEN** `start` fast-forwards the local integration branch to the remote's, says so, reads the configuration again at the new tip, and starts the update with that tip as its base
 
-#### Scenario: Integration branch diverged from the publish remote
-- **WHEN** the publish remote's integration branch and the local one each hold commits the other lacks
-- **THEN** `start` refuses, names how many commits each side lacks, moves no branch and creates nothing
+### Requirement: Configuration after the fast-forward in start
+After fast-forwarding the integration branch to its published counterpart, `start` SHALL read the configuration again at the new tip and fix the base there, or refuse, keeping the fast-forward, when that configuration names another integration branch or publish remote.
+
+#### Scenario: Other publish remote at the published tip
+- **WHEN** the integration branch is strictly behind its published counterpart, and the configuration at the counterpart's tip names another publish remote
+- **THEN** `start` fast-forwards the local integration branch, then refuses and keeps the fast-forward
 
 ### Requirement: Integration line
-The tool SHALL find its sync records, and the merges that brought a path upstream's history into its path, on the integration line: the first-parent line of the integration branch, where each merge on it is followed by the commits that `git rev-list --first-parent <merge>^1..<merge>^2` lists for it. A merge among those commits that carries the trailer `Intake-Catch-Up` SHALL in turn be followed by the first-parent line of its second parent, down to the first commit that the first parent of the merge on the first-parent line contains, at any depth; other merges among those commits SHALL contribute nothing further. An update SHALL count the same whether it was published by push or through a merge request merged by fast-forward or with a merge commit, and whether or not it caught up with the integration branch.
+The tool SHALL find its sync records, and the merges that brought a path upstream's history into its path, on the integration line: the first-parent line of the integration branch, where each merge on it is followed by the commits that `git rev-list --first-parent <merge>^1..<merge>^2` lists for it. An update SHALL count the same whether it was published by push or through a merge request merged by fast-forward or with a merge commit, and whether or not it caught up with the integration branch.
 
 #### Scenario: Merge request merged with a merge commit
 - **WHEN** an update's merge request is merged with a merge commit, with or without semi-linear history
 - **THEN** `status` shows each merged `follow` upstream's target as its last synced commit, taken from its sync record, and the next `start` plans each upstream from that commit
-
 #### Scenario: Merge request merged by fast-forward
 - **WHEN** an update's merge request is merged by fast-forward, or the update is published by push
 - **THEN** `status` shows each merged `follow` upstream's target as its last synced commit, taken from its sync record, as before
-
 #### Scenario: Path imported through a merge request
 - **WHEN** an update that imports a path upstream is merged through a merge request with a merge commit
 - **THEN** `status` shows the upstream as current with its sync record, and the next `start` updates its path by a subtree merge
-
 #### Scenario: Branch without a record merged with a merge commit
 - **WHEN** a branch that carries no sync record is merged into the integration branch with a merge commit
 - **THEN** every upstream's last synced commit stays what it was
-
 #### Scenario: Branch with a record merged with a merge commit
 - **WHEN** a branch that carries a sync record is merged into the integration branch with a merge commit
 - **THEN** that record counts as one of this repository's sync records
+#### Scenario: Caught-up update merged with a merge commit
+- **WHEN** an update that caught up is published through a merge request merged with a merge commit
+- **THEN** its sync records and copies count, and a port upstream's taken commits are not pending
+#### Scenario: Port started after a merge request merged with a merge commit
+- **WHEN** a `follow` update merged through a merge request with a merge commit is followed by switching that upstream to `port` mode
+- **THEN** the port's base is the update's target, and the journal the next port update writes starts there
+
+### Requirement: Catch-up merges on the integration line
+Among the commits that follow a merge on the first-parent line, a merge that carries the trailer `Intake-Catch-Up` SHALL in turn be followed by the first-parent line of its second parent, down to the first commit that the first parent of the merge on the first-parent line contains, at any depth; other merges among those commits SHALL contribute nothing further.
 
 #### Scenario: Branch merged into another branch
 - **WHEN** a branch that carries a sync record is merged into another branch with a merge that carries no `Intake-Catch-Up` trailer, which is then merged into the integration branch with a merge commit
 - **THEN** that record does not count
-
 #### Scenario: Update that caught up twice
 - **WHEN** an update caught up twice and was published by push
 - **THEN** its sync records and copies count, as for an update merged straight in
-
-#### Scenario: Caught-up update merged with a merge commit
-- **WHEN** an update that caught up is published through a merge request merged with a merge commit
-- **THEN** its sync records and copies count, and a port upstream's taken commits are not pending
-
-#### Scenario: Port started after a merge request merged with a merge commit
-- **WHEN** a `follow` update merged through a merge request with a merge commit is followed by switching that upstream to `port` mode
-- **THEN** the port's base is the update's target, and the journal the next port update writes starts there
 
 ### Requirement: Upstream history on the integration line
 A merge on the first-parent line that carries a sync record whose target is its second parent, as every sync merge does, SHALL bring nothing into the integration line, because what it merged is the upstream's history. Commits contained in a configured upstream's fetched branch SHALL NOT count as this repository's sync records.
@@ -1258,15 +1418,21 @@ Just before `sync` pushes to an open merge request's branch, it SHALL read the m
 - **THEN** `sync` pushes nothing, opens no merge request, says that the merge request was merged, and exits with status 0
 
 ### Requirement: Changes to the update's own checks
-When an update changes the forge's CI definition, `.github/workflows/` on GitHub or the project's CI configuration file on GitLab, or the install command or checks of `.git-intake.toml`, `finish` and `sync` SHALL name those changes in their output and in the merge request's description, naming each check added, removed or given another command by its name, and saying when only their order changed; a renamed check SHALL count as one removed and one added, and when `.git-intake.toml` differs between the base and the head and either side cannot be read, its install command and checks SHALL be named as changed without names, since the pipeline that verifies the update then runs what the update brings.
+When an update changes the forge's CI definition, `.github/workflows/` on GitHub or the project's CI configuration file on GitLab, or the install command or checks of `.git-intake.toml`, `finish` and `sync` SHALL name those changes in their output and in the merge request's description, naming each check added, removed or given another command by its name, and saying when only their order changed; a renamed check SHALL count as one removed and one added.
 
 #### Scenario: Upstream changes the pipeline
 - **WHEN** a root upstream's update changes `.gitlab-ci.yml`
 - **THEN** `sync` names the change in its output and in the merge request's description
-
 #### Scenario: Upstream changes a check
 - **WHEN** a root upstream's update adds the check `audit` and changes the command of the check `test` in `.git-intake.toml`
 - **THEN** `finish` names the checks `audit` as added and `test` as changed in its output and in the merge request's description
+
+### Requirement: Unreadable configuration in the update's own checks
+When `.git-intake.toml` differs between the base and the head and either side cannot be read, its install command and checks SHALL be named as changed without names, since the pipeline that verifies the update then runs what the update brings.
+
+#### Scenario: Configuration that cannot be read
+- **WHEN** an update's head holds a `.git-intake.toml` that differs from the base's and cannot be read
+- **THEN** `finish` names the install command and the checks as changed, without naming a check, in its output and in the merge request's description
 
 ### Requirement: Title and description of the merge request
 With every push of an update for a merge request, the tool SHALL set the title, naming the updated upstreams, and the description, listing each follow upstream's merged range with its target's tag and each port upstream's taken commits and decisions, and ending with a block, hidden when rendered, recording each follow target; a description too long for the forge SHALL be shortened before that block. On GitLab it SHALL ask again for squashing off. Title and description SHALL belong to the tool.
