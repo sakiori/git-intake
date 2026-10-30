@@ -46,7 +46,8 @@ fn merge_request_opened_waits_and_completes_after_a_merge_commit() {
     let (commit, target) = verified(&f);
     let branch = mr_branch(&commit);
 
-    let open = f.tool(&["finish"]).success();
+    // Opening the merge request is a success: the update waits as it should.
+    let open = f.tool(&["finish"]).code(0);
     let out = stdout(&open);
     assert!(
         out.contains(&format!(
@@ -74,6 +75,9 @@ fn merge_request_opened_waits_and_completes_after_a_merge_commit() {
     );
     assert!(description.contains(&commit), "{description}");
     assert!(options.contains(&"merge_request.remove_source_branch".to_string()));
+    // A squash would replace the verified commit, so the merge request is
+    // opened with squashing off, whatever the project's default.
+    assert!(options.contains(&"merge_request.squash=false".to_string()));
     // Nothing moved, locally or on the remote's integration branch.
     assert_eq!(env.rev(&f.down, "main"), base);
     assert_eq!(env.rev(&f.publish, "main"), published);
@@ -120,8 +124,9 @@ fn merge_request_opened_waits_and_completes_after_a_merge_commit() {
     let doctor = env.tool_json(&f.down, &["doctor", "--json"], 0);
     assert_eq!(doctor["healthy"], true);
 
-    // Not merged yet: the update waits and nothing changes.
-    let waiting = f.tool(&["finish"]).code(1);
+    // Not merged yet: the update waits and nothing changes. Waiting is not a
+    // failure; `status --check` is what reports the upstream as pending.
+    let waiting = f.tool(&["finish"]).code(0);
     assert!(
         stdout(&waiting).contains(&format!(
             "the update waits for the merge request from '{branch}' into 'main' on 'origin'"
@@ -129,7 +134,13 @@ fn merge_request_opened_waits_and_completes_after_a_merge_commit() {
         "{}",
         stdout(&waiting)
     );
+    assert!(
+        stdout(&waiting).contains("then run `git intake finish` again"),
+        "{}",
+        stdout(&waiting)
+    );
     assert_eq!(env.rev(&f.down, "main"), base);
+    f.tool(&["status", "--check"]).code(1);
 
     // The forge merges the request with a merge commit and keeps the branch.
     let forge = forge(&f);
@@ -231,6 +242,12 @@ fn squash_merge_is_refused_and_moves_nothing() {
     );
     assert!(
         err.contains("with a merge commit or by fast-forward"),
+        "{err}"
+    );
+    // A project that squashes every merge request overrides the request to
+    // leave squashing off; the refusal names that setting.
+    assert!(
+        err.contains("a project whose squash setting requires squashing"),
         "{err}"
     );
     assert_eq!(env.rev(&f.down, "main"), base);
@@ -350,7 +367,7 @@ fn remote_without_push_options_gets_the_branch_and_names_the_merge_request() {
     f.tool(&["finish"])
         .success()
         .stdout(contains(format!(
-            "'origin' does not accept push options, so no merge request was opened; open one from '{branch}' into 'main'"
+            "'origin' does not accept push options, so no merge request was opened; open one from '{branch}' into 'main' with squashing off"
         )));
     assert_eq!(env.rev(&f.publish, &format!("refs/heads/{branch}")), commit);
     assert!(recorded_push_options(&f.publish).is_empty());
@@ -362,11 +379,14 @@ fn remote_without_push_options_gets_the_branch_and_names_the_merge_request() {
             .as_str()
             .unwrap()
             .starts_with(&format!(
-                "unless a merge request from '{branch}' into 'main' is open on 'origin', open one"
+                "unless a merge request from '{branch}' into 'main' is open on 'origin', open one with squashing off"
             ))
     );
     let text = stdout(&f.tool(&["status"]).success());
-    assert!(text.contains("open it unless it is open"), "{text}");
+    assert!(
+        text.contains("open it with squashing off unless it is open"),
+        "{text}"
+    );
     f.tool(&["abort"]).success().stdout(contains(format!(
         "if a merge request from '{branch}' into 'main' was opened on 'origin', close it"
     )));
@@ -397,7 +417,7 @@ fn no_publish_keeps_its_meaning_in_merge_request_mode() {
     let (commit, target) = verified(&f);
     let branch = mr_branch(&commit);
     f.tool(&["finish"]).success();
-    f.tool(&["finish", "--no-publish"]).code(1).stdout(contains(
+    f.tool(&["finish", "--no-publish"]).code(0).stdout(contains(
         "`--no-publish` moves no branch before the merge request is merged",
     ));
     assert_eq!(env.rev(&f.down, "main"), base);
@@ -466,7 +486,7 @@ fn merge_request_branch_changed_before_the_merge_is_refused() {
     let extra = env.commit(&forge, &[("review.txt", "r\n")], "review: unverified");
     env.git(&forge, &["push", "-q", "origin", &format!("HEAD:{branch}")]);
     env.git(&forge, &["checkout", "-q", "main"]);
-    let waiting = stdout(&f.tool(&["finish"]).code(1));
+    let waiting = stdout(&f.tool(&["finish"]).code(0));
     assert!(
         waiting.contains(&format!(
             "no longer points at the verified commit {} but at {}",
@@ -586,9 +606,9 @@ fn interrupted_opening_does_not_claim_a_merge_request() {
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["update"]["step"], "waiting_for_merge_request");
     assert_eq!(status["update"]["merge_request"]["requested"], false);
-    f.tool(&["finish"])
-        .code(1)
-        .stdout(contains("open the merge request if it is not open yet"));
+    f.tool(&["finish"]).code(0).stdout(contains(
+        "if the merge request is not open yet, open it with squashing off",
+    ));
 }
 
 /// A repository the publish remote pushes to while it is still fetched from
@@ -906,7 +926,7 @@ fn branch_as_last_seen_judges_once_it_is_gone() {
 
     let extra = add_to_merge_request_branch(&f, &branch);
     // `finish` sees the changed branch while waiting.
-    f.tool(&["finish"]).code(1).stdout(contains(
+    f.tool(&["finish"]).code(0).stdout(contains(
         "the merge request branch no longer points at the verified commit",
     ));
     env.git(&f.publish, &["update-ref", "refs/heads/main", &extra]);

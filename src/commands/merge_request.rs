@@ -29,6 +29,10 @@ const NO_PUSH_OPTIONS: &str = "the receiving end does not support push options";
 /// How a merge request must be merged for the update to complete.
 const MERGE_METHOD: &str = "with a merge commit or by fast-forward, not by squash or rebase";
 
+/// How a merge request opened by hand must be set up: a squash would replace
+/// the verified commit, and GitLab otherwise applies the project's default.
+const SQUASH_OFF: &str = "with squashing off";
+
 /// Pushes the verified commit to its merge request branch and asks the remote
 /// to open the merge request. Applies the same checks as a push and moves no
 /// branch.
@@ -117,17 +121,17 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
         }
     } else if options_refused {
         println!(
-            "'{}' does not accept push options, so no merge request was opened; open one from '{branch}' into '{integration}'",
+            "'{}' does not accept push options, so no merge request was opened; open one from '{branch}' into '{integration}' {SQUASH_OFF}",
             publish.remote
         );
     } else if targets.is_empty() {
         println!(
-            "'{branch}' was already on '{}', so nothing was pushed and no merge request was asked for; if none is open, open one from '{branch}' into '{integration}'",
+            "'{branch}' was already on '{}', so nothing was pushed and no merge request was asked for; if none is open, open one from '{branch}' into '{integration}' {SQUASH_OFF}",
             publish.remote
         );
     } else {
         println!(
-            "'{branch}' was already on '{}', so this push asked for no merge request; if none is open, open one from '{branch}' into '{integration}'",
+            "'{branch}' was already on '{}', so this push asked for no merge request; if none is open, open one from '{branch}' into '{integration}' {SQUASH_OFF}",
             publish.remote
         );
     }
@@ -469,6 +473,9 @@ fn refusal(state: &UpdateState, mr: &MergeRequest, landing: &Landing) -> String 
             "'{remote_branch}' at {} holds the update's changes but not the verified commit {verified}: the merge request was \
              merged by squash or rebase, which replaces the verified commit with commits that were never verified. No branch moved. \
              A merge request of git intake must be merged {MERGE_METHOD}; set the project's merge method accordingly. \
+             The tool opens it {SQUASH_OFF}, but a project whose squash setting requires squashing squashes every \
+             merge request regardless; such a project cannot take updates through merge requests until that setting \
+             allows merging without squashing. \
              To take the upstreams in properly, run `git intake abort`, bring '{integration}' up to date with '{remote_branch}', \
              and run `git intake start`",
             abbrev(tip)
@@ -516,8 +523,10 @@ pub fn complete(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Result
                     head,
                     from_merge_request,
                 } => {
+                    // Waiting is the expected state, not a failure; `status
+                    // --check` reports the upstreams as pending meanwhile.
                     report_waiting(&state, &mr, &head, from_merge_request, no_publish);
-                    return Ok(Exit::Negative);
+                    return Ok(Exit::Success);
                 }
                 other => bail!("{}", refusal(&state, &mr, &other)),
             };
@@ -599,7 +608,7 @@ fn report_waiting(
             abbrev(&mr.commit)
         );
     } else if !mr.requested {
-        println!("open the merge request if it is not open yet");
+        println!("if the merge request is not open yet, open it {SQUASH_OFF}");
     }
     println!("merge it {MERGE_METHOD}, then run `git intake finish` again");
     if no_publish {
@@ -874,7 +883,7 @@ pub fn waiting_next(mr: &MergeRequest, integration: &str) -> String {
         String::new()
     } else {
         format!(
-            "unless a merge request from '{}' into '{integration}' is open on '{}', open one; then ",
+            "unless a merge request from '{}' into '{integration}' is open on '{}', open one {SQUASH_OFF}; then ",
             mr.branch, mr.remote
         )
     };
@@ -977,6 +986,9 @@ fn push_options(
         format!("merge_request.title={title}"),
         format!("merge_request.description={description}"),
         "merge_request.remove_source_branch".to_string(),
+        // An explicit value overrides the project's default squash setting;
+        // only a project that requires squashing ignores it.
+        "merge_request.squash=false".to_string(),
     ])
 }
 
