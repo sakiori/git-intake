@@ -102,11 +102,11 @@ fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Resu
             };
             let moves = match prepare(repo, &mut state, &tip, run, &recheck)? {
                 Ready::Publish(head) => {
-                    merge_request::name_check_changes_for_push(repo, &state, &head)?;
+                    merge_request::announce_check_changes(repo, &state, &head)?;
                     plan(repo, &state, &tip)?
                 }
                 Ready::Holds(head) => {
-                    merge_request::name_check_changes_for_push(repo, &state, &head)?;
+                    merge_request::announce_check_changes(repo, &state, &head)?;
                     held(repo, &state, &tip, &head)?
                 }
                 Ready::Stop(exit) => return Ok(exit),
@@ -263,6 +263,7 @@ fn resume(
         Ready::Publish(head) | Ready::Holds(head) => head,
         Ready::Stop(exit) => return Ok(Err(exit)),
     };
+    merge_request::announce_check_changes(repo, state, &head)?;
     check(repo, state, &head)?;
     // The integration branch moves on from the planned commit, which the
     // catch-up merge contains.
@@ -443,6 +444,9 @@ pub fn prepare(
         verify = true;
     }
     if verify {
+        // Named before the checks run, since they run what the update
+        // brings whether they pass or fail.
+        merge_request::announce_check_changes(repo, state, &head)?;
         if !verify::verify_head(repo, state, &head)? {
             println!(
                 "verification of the catch-up merge {} failed; no branch moved to the update. Fix it on the update \

@@ -440,10 +440,23 @@ pub fn guard<'a>(
     }
 }
 
-/// Names, for publication by push, the changes the update makes to its own
-/// checks, as publication through a merge request names them: the checks
-/// that verified the update ran what it brings.
-pub fn name_check_changes_for_push(repo: &Repo, state: &UpdateState, head: &str) -> Result<()> {
+/// The heads whose changes to the update's own checks this run has named.
+static ANNOUNCED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Names the changes the update makes, from its base to `head`, to its own
+/// checks, when `finish` or `sync` verifies or moves the integration branch
+/// itself: before checks run on `head`, and before the branch moves to it,
+/// with or without `--no-publish`, as publication through a merge request
+/// names them. Each head is named once per run. The CI definition counts
+/// when the tool can tell the forge without its API.
+pub fn announce_check_changes(repo: &Repo, state: &UpdateState, head: &str) -> Result<()> {
+    {
+        let mut announced = ANNOUNCED.lock().unwrap_or_else(|e| e.into_inner());
+        if announced.iter().any(|h| h == head) {
+            return Ok(());
+        }
+        announced.push(head.to_string());
+    }
     let ci_paths = match &state.config.publish {
         Some(publish) => crate::forge::ci_paths_without_api(&repo.git, publish)?,
         None => Vec::new(),
@@ -451,7 +464,7 @@ pub fn name_check_changes_for_push(repo: &Repo, state: &UpdateState, head: &str)
     let changes = check_changes(&repo.git, state, head, &ci_paths)?;
     if !changes.is_empty() {
         println!(
-            "the update changes its own checks: {}; the checks that verified it ran what the update brings",
+            "the update changes its own checks: {}; the checks that verify it are the ones it brings",
             changes.join(", ")
         );
     }

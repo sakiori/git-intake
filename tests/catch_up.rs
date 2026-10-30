@@ -1220,3 +1220,56 @@ fn a_remote_rewound_after_a_rejected_push_is_refused_as_rewritten() {
     assert_eq!(env.rev(&f.publish, "main"), older);
     assert_eq!(env.rev(&f.down, "main"), verified);
 }
+
+const CI_NOTICE: &str = "the update changes its own checks: `.gitlab-ci.yml`; the checks that verify it are \
+                         the ones it brings";
+
+#[test]
+fn a_catch_up_after_a_rejected_push_names_the_update_s_own_checks() {
+    let f = Fork::new();
+    let env = &f.env;
+    f.reconfigure("via = \"push\"", "via = \"push\"\nforge = \"gitlab\"");
+    env.push_upstream(
+        &f.up,
+        &[(".gitlab-ci.yml", "test:\n  script: [make]\n")],
+        "upstream: ci",
+    );
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    reject_pushes(&f);
+    let out = stdout(&f.tool(&["finish"]).code(2));
+    assert!(out.contains(CI_NOTICE), "{out}");
+    accept_pushes(&f);
+    land(&f, &[("other.txt", "o\n")], "other: published meanwhile");
+
+    // The resumed finish catches up and publishes another head, and names
+    // the change again.
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(out.contains("resuming finish"), "{out}");
+    assert!(out.contains(CI_NOTICE), "{out}");
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn a_catch_up_whose_checks_fail_names_the_update_s_own_checks() {
+    let f = Fork::new();
+    let env = &f.env;
+    f.reconfigure("via = \"push\"", "via = \"push\"\nforge = \"gitlab\"");
+    env.push_upstream(
+        &f.up,
+        &[(".gitlab-ci.yml", "test:\n  script: [make]\n")],
+        "upstream: ci",
+    );
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    // Work landed meanwhile removes the file the check needs, so the
+    // catch-up merge fails its checks.
+    let dir = other(&f);
+    env.git(&dir, &["rm", "-q", FORK_FILE]);
+    env.git(&dir, &["commit", "-q", "-m", "other: drop the app"]);
+    env.git(&dir, &["push", "-q", "origin", "HEAD:main"]);
+
+    let out = stdout(&f.tool(&["finish"]).code(1));
+    assert!(out.contains(CI_NOTICE), "{out}");
+    assert!(out.contains("verification of the catch-up merge"), "{out}");
+}

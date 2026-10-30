@@ -277,6 +277,9 @@ fn by_push(repo: &Repo, config: Config) -> Result<Exit> {
             Advanced::Plan | Advanced::Stopped(_) => return Ok(Some(stopped_on_conflict())),
         }
         let head = Git::worktree(&state.worktree).line(&["rev-parse", "HEAD"])?;
+        // Named before the checks run, since they run what the update
+        // brings whether they pass or fail.
+        merge_request::announce_check_changes(repo, &state, &head)?;
         if !verify::verify_head(repo, &mut state, &head)? {
             println!(
                 "the checks failed; nothing was published, and the update stays in progress, unverified, in {}. \

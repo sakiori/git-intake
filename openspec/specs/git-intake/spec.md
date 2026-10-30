@@ -1514,7 +1514,7 @@ Just before `sync` pushes to an open merge request's branch, it SHALL read the m
 - **THEN** `sync` pushes nothing, opens no merge request, says that the merge request was merged, and exits with status 0
 
 ### Requirement: Changes to the update's own checks
-When an update changes the forge's CI definition, `.github/workflows/` on GitHub or the project's CI configuration file on GitLab, or the install command or checks of `.git-intake.toml`, `finish` and `sync` SHALL name those changes in their output, in push mode as in merge-request mode, and in the merge request's description, since the pipeline or the checks that verify the update then run what the update brings.
+When an update changes the forge's CI definition, `.github/workflows/` on GitHub or the project's CI configuration file on GitLab, or the install command or checks of `.git-intake.toml`, `finish` and `sync` SHALL name those changes in their output, in push mode as in merge-request mode, and in the merge request's description, since the pipeline or the checks that verify the update then run what the update brings. For push mode, see *CI definition of an update published by push*.
 
 #### Scenario: Upstream changes the pipeline
 - **WHEN** a root upstream's update changes `.gitlab-ci.yml`
@@ -1526,6 +1526,13 @@ In push mode the forge's CI definition SHALL count as one of the update's own ch
 #### Scenario: Update published by push
 - **WHEN** the publish remote's forge is GitLab by the setting `forge`, publication is by push, and a root upstream's update changes `.gitlab-ci.yml`
 - **THEN** `finish` and `sync` name the change in their output
+
+### Requirement: When changes to the update's own checks are named in push mode
+In push mode `finish` and `sync` SHALL name the changes before the checks run whenever they verify the update themselves, and before the integration branch moves, with or without `--no-publish`.
+
+#### Scenario: Checks that fail
+- **WHEN** publication is by push and an update that changes `.gitlab-ci.yml` fails its checks in `sync`
+- **THEN** `sync` names the change before it reports the failed checks
 
 ### Requirement: Changed checks by name
 When an update changes the checks of `.git-intake.toml`, `finish` and `sync` SHALL, in their output and in the merge request's description, name each check added, removed or given another command by its name, and say when only their order changed; a renamed check SHALL count as one removed and one added.

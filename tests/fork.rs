@@ -890,7 +890,7 @@ fn finish_by_push_names_changes_to_the_update_s_own_checks() {
     assert!(
         out.contains(
             "the update changes its own checks: `.gitlab-ci.yml`, the check `audit` added to \
-             `.git-intake.toml`; the checks that verified it ran what the update brings"
+             `.git-intake.toml`; the checks that verify it are the ones it brings"
         ),
         "{out}"
     );

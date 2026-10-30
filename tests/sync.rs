@@ -1231,9 +1231,39 @@ fn sync_by_push_names_an_update_that_changes_the_pipeline() {
     let out = stdout(&f.tool(&["sync"]).success());
     assert!(
         out.contains(
-            "the update changes its own checks: `.gitlab-ci.yml`; the checks that verified it ran \
-             what the update brings"
+            "the update changes its own checks: `.gitlab-ci.yml`; the checks that verify it are \
+             the ones it brings"
         ),
         "{out}"
     );
+}
+
+#[test]
+fn sync_by_push_names_the_update_s_own_checks_when_they_fail() {
+    let f = Fork::new();
+    let env = &f.env;
+    f.reconfigure("via = \"push\"", "via = \"push\"\nforge = \"gitlab\"");
+    // The update brings a pipeline change and removes the file the check
+    // needs, so its checks fail.
+    env.push_upstream(
+        &f.up,
+        &[(".gitlab-ci.yml", "test:\n  script: [make]\n")],
+        "upstream: ci",
+    );
+    env.git(&f.up.work, &["rm", "-q", common::FORK_FILE]);
+    env.git(
+        &f.up.work,
+        &["commit", "-q", "-m", "upstream: drop the app"],
+    );
+    env.git(&f.up.work, &["push", "-q", "origin", "main"]);
+
+    let out = stdout(&f.tool(&["sync"]).code(1));
+    assert!(
+        out.contains(
+            "the update changes its own checks: `.gitlab-ci.yml`; the checks that verify it are \
+             the ones it brings"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("the checks failed"), "{out}");
 }
