@@ -4,7 +4,9 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::Exit;
+use crate::commands::update::unrelated_content;
 use crate::config::Config;
+use crate::drift::adopted_base;
 use crate::git::{Git, abbrev, branch_ref, tracking_ref};
 use crate::output::{Render, emit};
 use crate::remotes::{self, RemoteCheck};
@@ -151,34 +153,58 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
 
         let record = latest.get(&up.name);
         if let Some(path) = &up.path {
-            // Only a sync record makes a path upstream imported.
-            if record.is_some() {
-                let exists = git.path_exists(&integration, path)?;
-                checks.pass_or_fail(
-                    "path",
-                    name,
-                    exists,
-                    if exists {
-                        format!("path '{path}' exists on '{}'", config.integration)
-                    } else {
-                        format!(
-                            "upstream is imported but path '{path}' does not exist on '{}'",
-                            config.integration
-                        )
-                    },
-                );
-            } else {
-                checks.add(
-                    "path",
-                    name,
+            let exists = git.object_type(&integration, path)?.is_some();
+            let shared = match &tip {
+                Some(t) => Some(git.merge_base(&integration, t)?.is_some()),
+                None => None,
+            };
+            let (status, detail) = match (record.is_some(), exists, shared) {
+                (true, true, _) => (
+                    CheckStatus::Pass,
+                    format!("path '{path}' exists on '{}'", config.integration),
+                ),
+                (true, false, _) => (
+                    CheckStatus::Fail,
+                    format!(
+                        "upstream is imported but path '{path}' does not exist on '{}'",
+                        config.integration
+                    ),
+                ),
+                (false, false, _) => (
                     CheckStatus::Pass,
                     format!("not imported yet; path '{path}' will be created by the first update"),
-                );
-            }
+                ),
+                (false, true, Some(true)) => (
+                    CheckStatus::Pass,
+                    format!(
+                        "path '{path}' was imported without a sync record; the next update records it"
+                    ),
+                ),
+                (false, true, Some(false)) => (CheckStatus::Fail, unrelated_content(up, path)),
+                (false, true, None) => (
+                    CheckStatus::Fail,
+                    format!(
+                        "path '{path}' exists without a sync record and {} is not available to check it",
+                        up.source()
+                    ),
+                ),
+            };
+            checks.add("path", name, status, detail);
         }
 
         match (record, &tip) {
-            (None, _) => checks.add(
+            (None, Some(t)) => {
+                let detail = match adopted_base(git, &integration, up, t)? {
+                    Some(base) => format!(
+                        "no sync record yet; last synced from history is {}, contained in {}",
+                        abbrev(&base),
+                        up.source()
+                    ),
+                    None => "no sync record yet".to_string(),
+                };
+                checks.add("last_synced", name, CheckStatus::Pass, detail);
+            }
+            (None, None) => checks.add(
                 "last_synced",
                 name,
                 CheckStatus::Pass,

@@ -235,12 +235,6 @@ impl Git {
         Ok(lines(&out))
     }
 
-    /// Conflicted files that git's recorded resolutions did not resolve.
-    pub fn rerere_remaining(&self) -> Result<Vec<String>> {
-        let out = self.run(&["rerere", "remaining"])?;
-        Ok(lines(&out))
-    }
-
     /// Whether a merge is in progress in this worktree.
     pub fn merge_in_progress(&self) -> Result<bool> {
         Ok(self.commit("MERGE_HEAD")?.is_some())

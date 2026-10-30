@@ -172,6 +172,17 @@ impl Env {
         Assert::new(output)
     }
 
+    /// Runs the tool in `cwd` with extra environment variables.
+    pub fn tool_env(&self, cwd: &Path, args: &[&str], vars: &[(&str, &str)]) -> Assert {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("git-fork-sync"));
+        cmd.current_dir(cwd).args(args);
+        self.apply_env(&mut cmd);
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        Assert::new(cmd.output().expect("run git-fork-sync"))
+    }
+
     /// Runs the tool with `--json` style output and parses stdout.
     pub fn tool_json(&self, cwd: &Path, args: &[&str], code: i32) -> serde_json::Value {
         let assert = self.tool(cwd, args).code(code);

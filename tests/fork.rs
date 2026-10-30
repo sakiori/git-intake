@@ -265,7 +265,20 @@ fn remote_moved_rejects_push_without_force() {
     let finish = f.tool(&["finish"]).code(2);
     let err = stderr(&finish);
     assert!(err.contains("the local branches are advanced"), "{err}");
-    assert!(err.contains("Reconcile without force"), "{err}");
+    assert!(
+        err.contains("`git fork-sync finish --no-publish` to close the update locally"),
+        "{err}"
+    );
+    assert!(
+        err.contains(
+            "publish the result through a new verified update or the repository's usual review"
+        ),
+        "{err}"
+    );
+    assert!(
+        !err.contains("run the checks, then run `git fork-sync finish`"),
+        "{err}"
+    );
     assert_eq!(
         env.rev(&f.down, "main"),
         verified,
@@ -284,22 +297,35 @@ fn remote_moved_rejects_push_without_force() {
         status["update"]["next"]
             .as_str()
             .unwrap()
-            .contains("reconcile")
+            .contains("finish --no-publish")
     );
     f.tool(&["abort"]).code(2).stderr(contains(
         "can no longer be aborted. Run `git fork-sync finish`",
     ));
+    f.tool(&["start"]).code(2).stderr(contains(
+        "`git fork-sync finish --no-publish` to close it locally",
+    ));
 
-    // Reconcile without force, then finish publishes.
+    // Merging the remote's work locally does not get it published by this update.
     env.git(&f.down, &["fetch", "-q", "origin"]);
     env.git(&f.down, &["merge", "-q", "--no-edit", "origin/main"]);
-    f.tool(&["finish"])
+    f.tool(&["finish"]).code(2).stderr(contains("was rejected"));
+    assert_eq!(env.rev(&f.publish, "main"), theirs);
+
+    // Close the update locally.
+    f.tool(&["finish", "--no-publish"])
         .success()
-        .stdout(contains("pushed main, upstream-main to 'origin'"));
-    assert_eq!(env.rev(&f.publish, "main"), env.rev(&f.down, "main"));
-    assert!(env.is_ancestor(&f.down, &theirs, "main"));
-    assert!(env.is_ancestor(&f.down, &verified, "main"));
+        .stdout(contains(
+            "not published to 'origin' (advanced locally only): main, upstream-main",
+        ));
     env.assert_no_update(&f.down);
+    assert!(env.is_ancestor(&f.down, &verified, "main"));
+    assert_eq!(env.rev(&f.publish, "main"), theirs);
+    let report = env.tool_json(&f.down, &["report", "--json"], 0);
+    assert_eq!(
+        report["unpublished"],
+        serde_json::json!(["main", "upstream-main"])
+    );
 }
 
 #[test]
@@ -501,7 +527,9 @@ fn stacked_downstream_branch_follows_another_fork() {
 
     // The stacked line starts from the base fork's line, which carries the
     // base fork's own sync record under the same upstream name. That record
-    // is not this repository's: before its first merge, nothing is synced.
+    // is not this repository's: before its first merge, the last synced
+    // commit comes from the history (the base fork commit the stacked line
+    // contains), never from the base fork's record and its target.
     let base_record = env.git(
         &stacked,
         &[
@@ -515,11 +543,20 @@ fn stacked_downstream_branch_follows_another_fork() {
         base_record, "upstream",
         "the base fork's record is on the stacked line"
     );
-    let status = env.tool_json(&stacked, &["status", "--json"], 0);
-    assert_eq!(
-        status["upstreams"][0]["last_synced"],
-        serde_json::Value::Null
+    let cloned_tip = env.rev(&stacked, "develop^");
+    let base_target = env.git(
+        &stacked,
+        &[
+            "log",
+            "-1",
+            "--format=%(trailers:key=Fork-Sync-Target,valueonly)",
+            "develop^",
+        ],
     );
+    let status = env.tool_json(&stacked, &["status", "--json"], 0);
+    assert_eq!(status["upstreams"][0]["last_synced"], cloned_tip.as_str());
+    assert_ne!(status["upstreams"][0]["last_synced"], base_target.as_str());
+    assert_eq!(status["upstreams"][0]["last_synced_source"], "history");
     assert_eq!(status["upstreams"][0]["state"], "current");
 
     // The base fork moves on.
@@ -529,7 +566,8 @@ fn stacked_downstream_branch_follows_another_fork() {
     env.tool(&stacked, &["fetch"]).success();
     let status = env.tool_json(&stacked, &["status", "--json"], 0);
     let up = &status["upstreams"][0];
-    assert_eq!(up["last_synced"], serde_json::Value::Null);
+    assert_eq!(up["last_synced"], cloned_tip.as_str());
+    assert_eq!(up["last_synced_source"], "history");
     assert_eq!(up["tip"], fork_tip.as_str());
     assert_eq!(up["state"], "behind");
     assert_eq!(up["commits_behind"], 1);
@@ -601,7 +639,20 @@ fn atomic_push_publishes_nothing_when_one_ref_is_rejected() {
     let finish = f.tool(&["finish"]).code(2);
     let err = stderr(&finish);
     assert!(err.contains("pushing to 'origin' was rejected"), "{err}");
-    assert!(err.contains("Reconcile without force"), "{err}");
+    assert!(
+        err.contains("`git fork-sync finish --no-publish` to close the update locally"),
+        "{err}"
+    );
+    assert!(
+        err.contains(
+            "publish the result through a new verified update or the repository's usual review"
+        ),
+        "{err}"
+    );
+    assert!(
+        !err.contains("run the checks, then run `git fork-sync finish`"),
+        "{err}"
+    );
     assert_eq!(
         env.rev(&f.down, "main"),
         verified,
@@ -663,4 +714,44 @@ fn checks_that_modify_tracked_files_fail_verification() {
         .stdout(contains("the commands changed tracked files"))
         .stdout(contains("app.txt"));
     f.tool(&["finish"]).code(2);
+}
+
+#[test]
+fn cloned_fork_without_records_shows_history_sourced_last_synced() {
+    let f = Fork::new();
+    let env = &f.env;
+    // The fork was created by cloning: no sync record exists yet.
+    let cloned = env.rev(&f.down, "upstream/main");
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    let u = &status["upstreams"][0];
+    assert_eq!(u["last_synced"], cloned.as_str());
+    assert_eq!(u["last_synced_source"], "history");
+    assert_eq!(u["state"], "current");
+    f.tool(&["status"]).success().stdout(contains(
+        "upstream: no sync record yet; last synced is the newest upstream commit",
+    ));
+    f.tool(&["doctor"]).success().stdout(contains(format!(
+        "no sync record yet; last synced from history is {}",
+        &cloned[..12]
+    )));
+
+    let target = env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    f.tool(&["fetch"]).success();
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    let u = &status["upstreams"][0];
+    assert_eq!(u["last_synced"], cloned.as_str());
+    assert_eq!(u["last_synced_source"], "history");
+    assert_eq!(u["state"], "behind");
+    assert_eq!(u["commits_behind"], 1);
+
+    f.tool(&["start"]).success();
+    let report = env.tool_json(&f.down, &["report", "--json"], 0);
+    assert_eq!(report["upstreams"][0]["range_start"], cloned.as_str());
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    let u = &status["upstreams"][0];
+    assert_eq!(u["last_synced"], target.as_str());
+    assert_eq!(u["last_synced_source"], "record");
+    assert_eq!(u["state"], "current");
 }

@@ -65,7 +65,7 @@ git fork-sync finish       # fast-forward, publish, clean up
 - the main checkout or a checkout of the integration branch has uncommitted changes to tracked files;
 - the integration branch is behind its counterpart on the publish remote;
 - a selected upstream is unknown, unavailable or rewritten;
-- a path upstream that has no sync record yet finds its path already occupied, or finds a file where a directory of its path would go;
+- a path upstream that has no sync record yet finds its path holding content unrelated to the upstream's history, or finds a file where a directory of its path would go;
 - a path upstream that was imported before finds its path removed on the integration branch.
 
 When `start` runs, it does the following:
@@ -78,11 +78,12 @@ When `start` runs, it does the following:
 6. Merges each queued target with its own merge commit:
    - a root upstream: `git merge --no-ff`;
    - a path upstream, first import (no sync record for it yet, and the path is absent): an `ours` merge followed by `git read-tree --prefix=<path>/`. This keeps the upstream's full history. History shared through a common ancestor, such as a template both repositories started from, does not count as imported. The import is all or nothing: if any step fails, the merge is undone and the upstream stays pending;
-   - a path upstream, later updates (it has a sync record): `git merge --no-ff -X subtree=<path>`.
+   - a path upstream, later updates (it has a sync record): `git merge --no-ff -X subtree=<path>`;
+   - a path upstream imported by other means, such as `git subtree add` (no sync record, but the path exists and the integration branch contains part of the upstream's history): the same subtree merge, which writes the first sync record. A path that holds content sharing no history with the upstream is refused.
 
    Merges run with `--no-log` so that git configuration cannot push the trailers out of the last paragraph. Before an upstream counts as merged, the tool checks that the commit carries its sync record for the target, that the target is merged, and that a path upstream's path exists. If a hook rewrote the message, the tool stops and says so. Each step can be repeated: after an interruption, `continue` recognises a merge that is already committed and carries its record.
 
-On a conflict the tool stops with exit status 1. It names the upstream, lists the conflicted files (including files `rerere.autoupdate` already staged), and reports which upstreams are merged and which are pending. Resolve the files in the worktree, stage them, and run `continue`. If one upstream cannot be resolved now, `abort` and run `start` again with only the other upstreams named. Recorded resolutions make the repeated merges cheap.
+On a conflict the tool stops with exit status 1. It names the upstream, lists the conflicted files, and reports which upstreams are merged and which are pending. A file is labelled *resolved by a recorded resolution* only when git's rerere reports that it resolved it (including files `rerere.autoupdate` already staged); every other conflicted file waits for a resolution by hand. Resolve the files in the worktree, stage them, and run `continue`. If one upstream cannot be resolved now, `abort` and run `start` again with only the other upstreams named. Recorded resolutions make the repeated merges cheap.
 
 `verify` runs `install` and then every check through `sh -c` in the update worktree. Each command's output goes to its own log under `<git-common-dir>/fork-sync/logs/`. If `install` fails, the checks are skipped. Verification fails in any of these cases:
 
@@ -104,9 +105,11 @@ When it passes, `verify` records the commit it verified.
 
 It then fast-forwards the integration branch to the verified commit. A checkout of that branch is updated with `git merge --ff-only`, and other branches move with `git update-ref` against their old value. Each merged upstream's mirror is fast-forwarded to its target. When `publish` is set, `finish` pushes these branches with one atomic push and without force, so either every branch is published or none is. Finally it removes the worktree, the update branch and the state.
 
-`finish` saves its planned branch moves in the update state before it moves anything, and `status` shows the step as `finishing`. Running `finish` again after an interruption completes the remaining moves; a branch already at its planned value, or at a commit containing it, counts as done. It then publishes and cleans up. Once a branch has moved, `abort` refuses and points to `finish`.
+`finish` saves its planned branch moves in the update state before it moves anything, and `status` shows the step as `finishing`. Running `finish` again after an interruption completes the remaining moves; a branch already at its planned value, or at a commit containing it, counts as done. It then publishes and cleans up. Once a branch has moved, `abort` refuses and points to `finish` and `finish --no-publish`.
 
-If the push is rejected, nothing is published, the local branches stay advanced, and the update stays in the `finishing` step. The tool explains how to reconcile without force: fetch, merge the remote branch into the local one, run the checks, then run `finish` again to publish.
+The push sends exactly the planned commits (`<commit>:refs/heads/<branch>`), never whatever a local branch points to by then. A commit added to the integration branch while the update is finishing stays local.
+
+If the push is rejected, nothing is published, the local branches stay advanced, and the update stays in the `finishing` step. Running `finish` again retries the same push. If the remote holds work the local branches lack, or never accepts the push (for example a protected branch), run `finish --no-publish`. It closes the update locally: it completes any remaining local moves with the same checks, removes the worktree, the update branch and the state, and lists the branches it left unpublished (also in `report`). Then merge the remote's work and publish the result through a new verified update or the repository's usual review. `--no-publish` also works on a verified update before any push attempt.
 
 `abort` removes the worktree, the update branch and the state at any step before `finish` moves a branch. The integration and mirror branches stay exactly as they were. Resolutions already made by hand are recorded first, so a retry reapplies them.
 
@@ -121,7 +124,7 @@ Fork-Sync-Upstream: app-a
 Fork-Sync-Target: <full commit id>
 ```
 
-An upstream's **last synced commit** is the target in the newest such commit on the integration branch's first-parent line. It is not stored anywhere else. Only this repository's own records count. Records inside a configured upstream's fetched branch are skipped; this happens, for example, when a stacked branch starts from another fork's integration line that carries that fork's records. The tool's merges always stay on the first-parent line because `finish` only fast-forwards to the update branch, where each merge takes the previous head as its first parent. If an upstream's branch no longer contains its last synced commit, the upstream was rewritten: `status` reports it and `start` refuses to update it.
+An upstream's **last synced commit** is the target in the newest such commit on the integration branch's first-parent line. It is not stored anywhere else. An upstream without a record whose history is partly contained in the integration branch has its last synced commit taken from the history instead: the newest upstream commit the integration branch contains. This covers a fork created by cloning its upstream and a path imported by other means; for a path upstream the path must exist. `status` says so in text, and `status --json` marks the source as `history` instead of `record`. The first update writes a record. Only this repository's own records count. Records inside a configured upstream's fetched branch are skipped; this happens, for example, when a stacked branch starts from another fork's integration line that carries that fork's records. The tool's merges always stay on the first-parent line because `finish` only fast-forwards to the update branch, where each merge takes the previous head as its first parent. If an upstream's branch no longer contains its last synced commit, the upstream was rewritten: `status` reports it and `start` refuses to update it.
 
 ## Commands
 
@@ -132,8 +135,8 @@ An upstream's **last synced commit** is the target in the newest such commit on 
 | `continue` | Concludes the merge stopped on conflicts and merges the remaining queued upstreams. It also accepts a merge concluded by hand when the commit keeps the sync record. |
 | `abort` | Removes the update worktree, branch and state. |
 | `verify` | Runs `install` and the checks and records the verified commit. |
-| `finish` | Fast-forwards and publishes the verified update. |
-| `status [--check] [--json]` | Shows the configuration, then for every upstream its path, branch, last synced commit, fetched tip, the number of commits the integration branch lacks, and one state: `current`, `behind`, `not imported`, `rewritten` or `unavailable`. A path upstream is `not imported` until a sync record for it exists; a root upstream is `not imported` while it shares no history with the integration branch. While an update is in progress it also shows the step reached, the base, the worktree, each queued upstream's target and step, and the next command. Without `--check` it uses the remote-tracking refs as last fetched. |
+| `finish [--no-publish]` | Fast-forwards and publishes the verified update. With `--no-publish` it completes the local moves, closes the update without pushing, and lists the unpublished branches. |
+| `status [--check] [--json]` | Shows the configuration, then for every upstream its path, branch, last synced commit, fetched tip, the number of commits the integration branch lacks, and one state: `current`, `behind`, `not imported`, `rewritten` or `unavailable`. A path upstream is `not imported` until a sync record for it exists or, without one, while its path is absent or holds content unrelated to its history; a root upstream is `not imported` while it shares no history with the integration branch. While an update is in progress it also shows the step reached, the base, the worktree, each queued upstream's target and step, and the next command. Without `--check` it uses the remote-tracking refs as last fetched. |
 | `report [--json]` | For the update in progress, or the one just finished: per upstream, the merged range and commit count, each conflicted file with its resolution source (by hand or by a recorded resolution), and the size of the repository's own changes against that upstream before and after the merge. |
 | `log [UPSTREAM...] [--json]` | Lists the commits on each fetched upstream branch that the integration branch does not contain. |
 | `branches [UPSTREAM...] [--json]` | Lists every branch of each upstream remote that holds commits the integration branch does not contain, with the commit count. |
@@ -143,7 +146,7 @@ An upstream's **last synced commit** is the target in the newest such commit on 
 
 ### JSON output
 
-`status`, `report`, `log`, `branches` and `doctor` accept `--json`. They then write one JSON document to standard output, with the same facts as the text form under stable snake_case field names, and exit with the same status. Notes and errors go to standard error. For example, every entry of `status --json` `upstreams` carries `name`, `path`, `remote`, `branch`, `url`, `mirror`, `last_synced`, `tip`, `commits_behind`, `state` (`current`, `behind`, `not_imported`, `rewritten`, `unavailable`), `detail`, and, with `--check`, `conflicts`.
+`status`, `report`, `log`, `branches` and `doctor` accept `--json`. They then write one JSON document to standard output, with the same facts as the text form under stable snake_case field names, and exit with the same status. Notes and errors go to standard error. For example, every entry of `status --json` `upstreams` carries `name`, `path`, `remote`, `branch`, `url`, `mirror`, `last_synced`, `last_synced_source` (`record`, `history` or null), `tip`, `commits_behind`, `state` (`current`, `behind`, `not_imported`, `rewritten`, `unavailable`), `detail`, and, with `--check`, `conflicts`.
 
 ## Exit status
 
@@ -151,12 +154,12 @@ An upstream's **last synced commit** is the target in the newest such commit on 
 | --- | --- |
 | 0 | Success. |
 | 1 | A negative result: `status --check` found drift, a `doctor` check failed, `verify` failed, an upstream could not be fetched or its remote was refused, or `start`/`continue` stopped on conflicts. |
-| 2 | An error: invalid configuration, a refused command (for example `finish` on an unverified update), a git failure (including a push rejected by the publish remote, after which `finish` can be run again), or invalid usage. |
+| 2 | An error: invalid configuration, a refused command (for example `finish` on an unverified update), a git failure (including a push rejected by the publish remote, after which `finish` retries the same push and `finish --no-publish` closes the update locally), or invalid usage. |
 
 ## Monorepo migration
 
 1. Commit a configuration that lists one `[[upstream]]` per source repository, each with its own `path` and `url`.
-2. Run `git fork-sync start`. Each source is imported under its path with its full history, then verified and finished like any update. A path that already holds other content is refused, and so is an import that would replace a file.
+2. Run `git fork-sync start`. Each source is imported under its path with its full history, then verified and finished like any update. A path imported earlier with `git subtree add` is adopted by its first update. A path that holds content unrelated to the source's history is refused, and so is an import that would replace a file.
 3. Until cutover, keep taking the sources in with the same cycle. Conflicts against the monorepo's new layout are resolved once and recorded. Files moved within an upstream's path merge as renames. Files moved out of the path may conflict or arrive at their old location; resolve them like any other conflict.
 4. Run `git fork-sync status --check` on a schedule. It fails whenever a source has moved on and lists the files that would conflict. Zero drift, meaning every upstream is current, is the cutover gate.
 5. Before freezing the sources, run `git fork-sync branches` to find work left on other branches of each source. It reports when no upstream holds unmerged work.
@@ -169,7 +172,7 @@ An upstream's **last synced commit** is the target in the newest such commit on 
 - Nothing is written to the main working tree. The update lives in its own worktree, on `fork-sync/update`, with its state in `<git-common-dir>/fork-sync/`, which every worktree shares and no commit can carry.
 - Each target is fixed when the update starts. What is merged, verified and published is the same commit.
 - `finish` moves no ref unless the verified commit is the worktree head, the base is still the integration tip, and every move is a fast-forward. It validates every move before making any, and it can be resumed.
-- Publication is a single atomic push. If any branch is rejected, none moves on the remote, and the tool explains how to reconcile without force.
+- Publication is a single atomic push of exactly the planned commits. If any branch is rejected, none moves on the remote; nothing unverified is ever published by a retry, and `finish --no-publish` closes an update that cannot be published.
 - An existing remote is never retargeted.
 - A rewritten upstream is detected from the sync record and is not merged.
 - The configuration is read from the committed integration tip, never from a working copy or from the tree being merged.

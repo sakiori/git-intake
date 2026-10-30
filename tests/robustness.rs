@@ -421,3 +421,214 @@ fn verify_rejects_an_invalid_merged_configuration() {
     f.tool(&["verify"]).success();
     let _ = stderr(&f.tool(&["finish"]).success());
 }
+
+fn reject_pushes(bare: &Path) {
+    let dir = bare.join("hooks");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("pre-receive");
+    fs::write(&path, "#!/bin/sh\necho 'protected branch' >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn rerun_finish_publishes_only_the_planned_commits() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    let planned = env.rev(&env.update_worktree(&f.down), "HEAD");
+
+    reject_pushes(&f.publish);
+    f.tool(&["finish"]).code(2).stderr(contains("was rejected"));
+    // A local commit lands on the integration branch while finishing.
+    let local = env.commit(
+        &f.down,
+        &[("local.txt", "unverified\n")],
+        "fork: unverified work",
+    );
+    fs::remove_file(f.publish.join("hooks/pre-receive")).unwrap();
+
+    f.tool(&["finish"])
+        .success()
+        .stdout(contains(format!(
+            "main: at {}, which contains",
+            &local[..12]
+        )))
+        .stdout(contains("pushed main, upstream-main to 'origin'"));
+    assert_eq!(
+        env.rev(&f.publish, "main"),
+        planned,
+        "only the planned commit is published"
+    );
+    assert_eq!(
+        env.rev(&f.down, "main"),
+        local,
+        "the local commit stays local"
+    );
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn finish_no_publish_closes_an_update_the_remote_always_rejects() {
+    let f = Fork::new();
+    let env = &f.env;
+    let target = env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    let planned = env.rev(&env.update_worktree(&f.down), "HEAD");
+    let published = env.rev(&f.publish, "main");
+
+    reject_pushes(&f.publish);
+    f.tool(&["finish"])
+        .code(2)
+        .stderr(contains("finish --no-publish"));
+    f.tool(&["finish"]).code(2);
+    f.tool(&["finish", "--no-publish"])
+        .success()
+        .stdout(contains(
+            "not published to 'origin' (advanced locally only): main, upstream-main",
+        ))
+        .stdout(contains("update finished"));
+    assert_eq!(env.rev(&f.down, "main"), planned);
+    assert_eq!(env.rev(&f.down, "upstream-main"), target);
+    assert_eq!(
+        env.rev(&f.publish, "main"),
+        published,
+        "the remote is unchanged"
+    );
+    assert!(!env.has_rev(&f.publish, "refs/heads/upstream-main"));
+    env.assert_no_update(&f.down);
+    let report = env.tool_json(&f.down, &["report", "--json"], 0);
+    assert_eq!(report["in_progress"], false);
+    assert_eq!(
+        report["unpublished"],
+        serde_json::json!(["main", "upstream-main"])
+    );
+    f.tool(&["report"]).success().stdout(contains(
+        "not published (advanced locally only): main, upstream-main",
+    ));
+}
+
+#[test]
+fn finish_no_publish_works_before_any_push_attempt() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    f.tool(&["start"]).success();
+    f.tool(&["finish", "--no-publish"])
+        .code(2)
+        .stderr(contains("not verified"));
+    f.tool(&["verify"]).success();
+    let planned = env.rev(&env.update_worktree(&f.down), "HEAD");
+    let published = env.rev(&f.publish, "main");
+    f.tool(&["finish", "--no-publish"])
+        .success()
+        .stdout(contains("not published to 'origin'"));
+    assert_eq!(env.rev(&f.down, "main"), planned);
+    assert_eq!(env.rev(&f.publish, "main"), published);
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn path_imported_by_subtree_add_is_adopted() {
+    let env = Env::new();
+    let up = env.upstream("app-a", &[("a.txt", "a1\na2\n")]);
+    let down = env.work("mono");
+    let cfg = format!(
+        "integration = \"main\"\nchecks = [\"test -f apps/a/a.txt\"]\n\n[[upstream]]\nname = \"app-a\"\nremote = \"app-a\"\nbranch = \"main\"\nurl = {:?}\npath = \"apps/a\"\n",
+        up.url()
+    );
+    env.commit(&down, &[(".fork-sync.toml", &cfg)], "mono: configuration");
+    env.tool(&down, &["fetch"]).success();
+    let first = env.rev(&down, "refs/remotes/app-a/main");
+    // What `git subtree add --prefix=apps/a` does: no sync record.
+    env.git(
+        &down,
+        &[
+            "merge",
+            "-q",
+            "-s",
+            "ours",
+            "--no-commit",
+            "--allow-unrelated-histories",
+            "app-a/main",
+        ],
+    );
+    env.git(
+        &down,
+        &["read-tree", "--prefix=apps/a/", "-u", "app-a/main"],
+    );
+    env.git(&down, &["commit", "-q", "-m", "Add 'apps/a/' from app-a"]);
+
+    let status = env.tool_json(&down, &["status", "--json"], 0);
+    let u = &status["upstreams"][0];
+    assert_eq!(u["state"], "current");
+    assert_eq!(u["last_synced"], first.as_str());
+    assert_eq!(u["last_synced_source"], "history");
+
+    let second = env.push_upstream(&up, &[("a.txt", "a1\na2-up\n")], "app-a: change");
+    env.tool(&down, &["fetch"]).success();
+    let status = env.tool_json(&down, &["status", "--json"], 0);
+    let u = &status["upstreams"][0];
+    assert_eq!(u["state"], "behind");
+    assert_eq!(u["commits_behind"], 1);
+    assert_eq!(u["last_synced"], first.as_str());
+    assert_eq!(u["last_synced_source"], "history");
+    env.tool(&down, &["status"])
+        .success()
+        .stdout(contains("app-a: no sync record yet"));
+    let check = env.tool_json(&down, &["status", "--check", "--json"], 1);
+    assert_eq!(check["upstreams"][0]["conflicts"], serde_json::json!([]));
+    env.tool(&down, &["doctor"])
+        .success()
+        .stdout(contains("path 'apps/a' was imported without a sync record"));
+
+    env.tool(&down, &["start"]).success();
+    env.tool(&down, &["verify"]).success();
+    env.tool(&down, &["finish"]).success();
+    assert_eq!(
+        fs::read_to_string(down.join("apps/a/a.txt")).unwrap(),
+        "a1\na2-up\n"
+    );
+    assert!(!down.join("a.txt").exists());
+    let status = env.tool_json(&down, &["status", "--json"], 0);
+    let u = &status["upstreams"][0];
+    assert_eq!(u["state"], "current");
+    assert_eq!(u["last_synced"], second.as_str());
+    assert_eq!(u["last_synced_source"], "record");
+}
+
+#[test]
+fn conflicts_are_labelled_recorded_only_when_rerere_reports_them() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.commit(
+        &f.down,
+        &[(FORK_FILE, "one\nTWO-fork\nthree\n")],
+        "fork: change two",
+    );
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
+    env.push_upstream(
+        &f.up,
+        &[(FORK_FILE, "one\nTWO-upstream\nthree\n")],
+        "upstream: change two",
+    );
+    // rerere is switched off for this run, so nothing can be resolved by it.
+    let start = env.tool_env(
+        &f.down,
+        &["start"],
+        &[
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "rerere.enabled"),
+            ("GIT_CONFIG_VALUE_0", "false"),
+        ],
+    );
+    let out = stdout(&start.code(1));
+    assert!(out.contains("app.txt  (unresolved)"), "{out}");
+    let report = env.tool_json(&f.down, &["report", "--json"], 0);
+    assert_eq!(
+        report["upstreams"][0]["conflicts"][0]["resolution"],
+        "unresolved"
+    );
+}

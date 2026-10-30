@@ -3,8 +3,9 @@
 //! `finish` is re-entrant. It validates every ref move first, persists the
 //! planned moves in the update state, and only then moves refs. Running it
 //! again after an interruption or a rejected push completes the remaining
-//! moves (a branch already at its planned value counts as done), publishes,
-//! and cleans up.
+//! moves (a branch already at its planned value counts as done), publishes
+//! exactly the planned commits, and cleans up. `--no-publish` closes the
+//! update locally without pushing.
 
 use std::path::Path;
 
@@ -16,7 +17,7 @@ use crate::git::{Git, abbrev, branch_ref};
 use crate::repo::{Repo, bullet};
 use crate::state::{self, Finishing, PlannedMove, UpdateState};
 
-pub fn run(repo: &Repo) -> Result<Exit> {
+pub fn run(repo: &Repo, no_publish: bool) -> Result<Exit> {
     let mut state = repo.require_state()?;
     let finishing = match &state.finishing {
         Some(f) => {
@@ -29,6 +30,7 @@ pub fn run(repo: &Repo) -> Result<Exit> {
             let f = Finishing {
                 moves,
                 push_error: None,
+                unpublished: Vec::new(),
             };
             state.finishing = Some(f.clone());
             repo.save_state(&state)?;
@@ -40,42 +42,53 @@ pub fn run(repo: &Repo) -> Result<Exit> {
         apply(repo, m)?;
     }
 
-    if let Some(publish) = state.config.publish.clone() {
-        // All or nothing: either every branch is published or none moves.
-        let mut args = vec![
-            "push".to_string(),
-            "--quiet".to_string(),
-            "--atomic".to_string(),
-            publish.clone(),
-        ];
-        for m in &finishing.moves {
-            let r = branch_ref(&m.branch);
-            args.push(format!("{r}:{r}"));
-        }
-        let out = repo.git.raw(&args)?;
-        if !out.success() {
-            let err = out.into_error().to_string();
-            if let Some(f) = state.finishing.as_mut() {
-                f.push_error = Some(err.clone());
-            }
-            repo.save_state(&state)?;
-            let integration = &state.config.integration;
-            bail!(
-                "the local branches are advanced, but pushing to '{publish}' was rejected: {err}\n\
-                 Nothing was published. Reconcile without force: run \
-                 `git fetch {publish}`, merge '{publish}/{integration}' into '{integration}', run the checks, \
-                 then run `git fork-sync finish` again to publish. The update stays in the finishing step until it is published."
+    let branches: Vec<String> = finishing.moves.iter().map(|m| m.branch.clone()).collect();
+    let mut unpublished = Vec::new();
+    match state.config.publish.clone() {
+        Some(publish) if no_publish => {
+            unpublished = branches.clone();
+            println!(
+                "not published to '{publish}' (advanced locally only): {}",
+                branches.join(", ")
             );
         }
-        let names: Vec<&str> = finishing.moves.iter().map(|m| m.branch.as_str()).collect();
-        println!("pushed {} to '{publish}'", names.join(", "));
-    } else {
-        println!("no publish remote is configured; nothing was pushed");
+        Some(publish) => {
+            // All or nothing, and exactly the planned commits: whatever the
+            // local branches point to now is never published by this update.
+            let mut args = vec![
+                "push".to_string(),
+                "--quiet".to_string(),
+                "--atomic".to_string(),
+                publish.clone(),
+            ];
+            for m in &finishing.moves {
+                args.push(format!("{}:{}", m.new, branch_ref(&m.branch)));
+            }
+            let out = repo.git.raw(&args)?;
+            if !out.success() {
+                let err = out.into_error().to_string();
+                if let Some(f) = state.finishing.as_mut() {
+                    f.push_error = Some(err.clone());
+                }
+                repo.save_state(&state)?;
+                bail!(
+                    "the local branches are advanced, but pushing to '{publish}' was rejected: {err}\n\
+                     Nothing was published, and the update stays in its finishing step. Run `git fork-sync finish` \
+                     to retry the same push, or `git fork-sync finish --no-publish` to close the update locally. \
+                     If '{publish}' holds work the local branches lack, close the update with `finish --no-publish`, \
+                     merge that work, and publish the result through a new verified update or the repository's usual review. \
+                     Never force-push."
+                );
+            }
+            println!("pushed {} to '{publish}'", branches.join(", "));
+        }
+        None => println!("no publish remote is configured; nothing was pushed"),
     }
 
     state.finished = true;
     if let Some(f) = state.finishing.as_mut() {
         f.push_error = None;
+        f.unpublished = unpublished;
     }
     state::save(&repo.paths.last_update, &state)?;
     repo.remove_update_artifacts()?;

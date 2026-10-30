@@ -15,6 +15,8 @@ pub struct ReportDoc {
     pub in_progress: bool,
     pub integration: String,
     pub base: String,
+    /// Branches `finish --no-publish` advanced locally without publishing.
+    pub unpublished: Vec<String>,
     pub upstreams: Vec<UpstreamReport>,
 }
 
@@ -125,6 +127,11 @@ fn build(git: &Git, state: &UpdateState, in_progress: bool) -> Result<ReportDoc>
         in_progress,
         integration: state.config.integration.clone(),
         base: state.base.clone(),
+        unpublished: state
+            .finishing
+            .as_ref()
+            .map(|f| f.unpublished.clone())
+            .unwrap_or_default(),
         upstreams,
     })
 }
@@ -176,6 +183,12 @@ impl Render for ReportDoc {
                 "finished"
             }
         );
+        if !self.unpublished.is_empty() {
+            out.push_str(&format!(
+                "not published (advanced locally only): {}\n",
+                self.unpublished.join(", ")
+            ));
+        }
         for u in &self.upstreams {
             let step = match u.step {
                 UpstreamStep::Pending => "pending",

@@ -150,6 +150,9 @@ pub struct Finishing {
     pub moves: Vec<PlannedMove>,
     /// The error of the last rejected or failed push, if any.
     pub push_error: Option<String>,
+    /// Branches `finish --no-publish` advanced locally without publishing.
+    #[serde(default)]
+    pub unpublished: Vec<String>,
 }
 
 /// An update from `start` to `finish`.

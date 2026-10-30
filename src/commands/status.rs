@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::Exit;
-use crate::commands::update::{blocking_prefix, next_step, step_name};
-use crate::drift::{self, Drift, DriftState};
+use crate::commands::update::{blocking_prefix, next_step, step_name, unrelated_content};
+use crate::drift::{self, Drift, DriftState, SyncSource};
 use crate::git::{Git, abbrev, branch_ref};
 use crate::output::{Render, emit, table};
 use crate::remotes;
@@ -39,6 +39,8 @@ pub struct UpstreamStatus {
     pub url: Option<String>,
     pub mirror: Option<String>,
     pub last_synced: Option<String>,
+    /// `record` or `history`; `null` when nothing is synced.
+    pub last_synced_source: Option<SyncSource>,
     pub tip: Option<String>,
     pub commits_behind: Option<u64>,
     pub state: DriftState,
@@ -114,6 +116,7 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
             url: up.url.clone(),
             mirror: up.mirror.clone(),
             last_synced: d.last_synced,
+            last_synced_source: d.last_synced_source,
             tip: d.tip,
             commits_behind: d.commits_behind,
             state: d.state,
@@ -162,9 +165,7 @@ fn predicted(
         DriftState::NotImported => {
             if let Some(path) = &up.path {
                 if git.path_exists(tip, path)? {
-                    d.detail = Some(format!(
-                        "path '{path}' already holds content that this tool did not import from the upstream"
-                    ));
+                    d.detail = Some(unrelated_content(up, path));
                 } else if let Some(prefix) = blocking_prefix(git, tip, path)? {
                     d.detail = Some(format!(
                         "'{prefix}' is a file on the integration branch; importing under '{path}' would replace it"
@@ -271,6 +272,12 @@ impl Render for StatusDoc {
             &rows,
         ));
         for u in &self.upstreams {
+            if u.last_synced_source == Some(SyncSource::History) {
+                out.push_str(&format!(
+                    "{}: no sync record yet; last synced is the newest upstream commit the integration branch contains\n",
+                    u.name
+                ));
+            }
             if let Some(detail) = &u.detail {
                 out.push_str(&format!("{}: {detail}\n", u.name));
             }

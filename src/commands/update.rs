@@ -18,6 +18,12 @@ use crate::sync_record;
 
 pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
     if let Some(state) = repo.state()? {
+        if state.finishing.is_some() {
+            bail!(
+                "the previous update is finishing; run `git fork-sync finish` to publish it, \
+                 or `git fork-sync finish --no-publish` to close it locally"
+            );
+        }
         bail!(
             "an update is already in progress (worktree {}); run `git fork-sync status` to see it, then `continue`, `verify`, `finish` or `abort`",
             state.worktree.display()
@@ -90,7 +96,8 @@ pub fn start(repo: &Repo, names: &[String]) -> Result<Exit> {
             current.push((up.name.clone(), target));
             continue;
         }
-        match merge_kind(git, &base, up, &target, d.last_synced.is_some())? {
+        let has_record = d.last_synced_source == Some(drift::SyncSource::Record);
+        match merge_kind(git, &base, up, &target, has_record)? {
             Ok(kind) => queue.push(QueuedUpstream {
                 name: up.name.clone(),
                 commits: d.commits_behind.unwrap_or_default(),
@@ -179,10 +186,12 @@ fn require_not_behind_published(
 
 /// Decides how a queued upstream is merged, or why it cannot be.
 ///
-/// A root upstream needs shared history. A path upstream is imported when it
-/// has no sync record and its path is absent, and merged with the subtree
-/// strategy once it has a record; shared ancestry alone (for example
-/// repositories created from one template) does not count as imported.
+/// A root upstream needs shared history. A path upstream with a sync record
+/// is merged with the subtree strategy. Without a record it is imported when
+/// its path is absent (shared ancestry alone, such as a common template, does
+/// not count as imported); when its path exists, it is adopted by a subtree
+/// merge if the integration branch contains part of its history (an import by
+/// other means, such as `git subtree add`), and refused otherwise.
 fn merge_kind(
     git: &Git,
     base: &str,
@@ -205,6 +214,12 @@ fn merge_kind(
     };
     let exists = git.object_type(base, path)?.is_some();
     Ok(match (has_record, exists) {
+        (true, true) => Ok(MergeKind::Subtree),
+        (true, false) => Err(format!(
+            "upstream '{}' was imported before, but path '{path}' was removed on the integration branch; \
+             restore the path or correct the configuration",
+            up.name
+        )),
         (false, false) => match blocking_prefix(git, base, path)? {
             None => Ok(MergeKind::Import),
             Some(prefix) => Err(format!(
@@ -212,18 +227,24 @@ fn merge_kind(
                 up.name
             )),
         },
-        (true, true) => Ok(MergeKind::Subtree),
-        (false, true) => Err(format!(
-            "upstream '{}': path '{path}' already holds content that this tool did not import from the upstream; \
-             move that content away or choose another path",
-            up.name
-        )),
-        (true, false) => Err(format!(
-            "upstream '{}' was imported before, but path '{path}' was removed on the integration branch; \
-             restore the path or correct the configuration",
-            up.name
-        )),
+        (false, true) => {
+            if git.merge_base(base, target)?.is_some() {
+                Ok(MergeKind::Subtree)
+            } else {
+                Err(unrelated_content(up, path))
+            }
+        }
     })
+}
+
+/// Why a path that holds content outside the upstream's history cannot take it.
+pub fn unrelated_content(up: &Upstream, path: &str) -> String {
+    format!(
+        "upstream '{}': path '{path}' holds content unrelated to the history of {}; \
+         the integration branch shares no commit with it, so it cannot be merged there",
+        up.name,
+        up.source()
+    )
 }
 
 /// The first leading component of `path` that exists in `rev` as something
@@ -262,9 +283,8 @@ fn merge_pending(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
             let ours = wt.commit("MERGE_HEAD")?.as_deref() == Some(target.as_str());
             if ours && kind != MergeKind::Import {
                 // A merge of this upstream that stopped before the state was saved.
-                let head_before = wt.line(&["rev-parse", "HEAD"])?;
-                state.upstreams[i].head_before = Some(head_before.clone());
-                return stop_on_conflict(repo, state, i, &head_before, "");
+                state.upstreams[i].head_before = Some(wt.line(&["rev-parse", "HEAD"])?);
+                return stop_on_conflict(repo, state, i, "");
             }
             wt.run(&["merge", "--abort"])?;
         }
@@ -312,7 +332,8 @@ fn merge_pending(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
                     return Err(anyhow::Error::new(out.into_error()))
                         .with_context(|| format!("merging upstream '{}' failed", up.name));
                 }
-                return stop_on_conflict(repo, state, i, &head_before, &out.stderr);
+                let output = format!("{}{}", out.stdout, out.stderr);
+                return stop_on_conflict(repo, state, i, &output);
             }
         }
     }
@@ -335,57 +356,60 @@ fn mark_merged(repo: &Repo, state: &mut UpdateState, i: usize, commit: String) -
 }
 
 /// Records the conflicts of the merge stopped in the worktree and reports them.
-fn stop_on_conflict(
-    repo: &Repo,
-    state: &mut UpdateState,
-    i: usize,
-    head_before: &str,
-    stderr: &str,
-) -> Result<Exit> {
+/// `output` is what the merge printed; rerere reports there the files it
+/// resolved from a recorded resolution.
+fn stop_on_conflict(repo: &Repo, state: &mut UpdateState, i: usize, output: &str) -> Result<Exit> {
     let wt = Git::worktree(&state.worktree);
-    let up = upstream_of(state, i)?;
-    let q = &state.upstreams[i];
-    let subtree = (q.kind == MergeKind::Subtree)
-        .then_some(up.path.as_deref())
-        .flatten();
-    let conflicts = conflict_files(&wt, head_before, &q.target, subtree)?;
+    let conflicts = label_conflicts(&wt.unmerged_files()?, &rerere_resolved(output));
     let q = &mut state.upstreams[i];
     q.conflicts = conflicts;
     q.step = UpstreamStep::Conflict;
     repo.save_state(state)?;
-    print_conflict(state, i, stderr);
+    print_conflict(state, i, output);
     Ok(Exit::Negative)
 }
 
-/// Files the stopped merge conflicted in, and where each resolution came from.
-///
-/// Unmerged index entries alone miss files that `rerere.autoupdate` already
-/// staged, so the conflicts are also derived from the merge itself with
-/// `git merge-tree`, which is independent of rerere and of the index.
-fn conflict_files(
-    wt: &Git,
-    head_before: &str,
-    target: &str,
-    subtree: Option<&str>,
-) -> Result<Vec<ConflictFile>> {
-    let mut paths = wt.unmerged_files()?;
-    for p in drift::predict_conflicts(wt, head_before, target, subtree)? {
-        if !paths.contains(&p) {
-            paths.push(p);
+/// Files git's rerere reports as resolved from a recorded resolution, either
+/// left in the worktree (`Resolved '<path>' ...`) or already staged under
+/// `rerere.autoupdate` (`Staged '<path>' ...`). Git runs with `LC_ALL=C`, so
+/// these messages are stable.
+fn rerere_resolved(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let rest = l
+                .strip_prefix("Resolved '")
+                .or_else(|| l.strip_prefix("Staged '"))?;
+            rest.strip_suffix("' using previous resolution.")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Conflicted files and where each resolution comes from: a file rerere
+/// reported is resolved by a recorded resolution; every other file left
+/// unmerged waits for a resolution by hand.
+fn label_conflicts(unmerged: &[String], recorded: &[String]) -> Vec<ConflictFile> {
+    let mut files: Vec<ConflictFile> = unmerged
+        .iter()
+        .map(|p| ConflictFile {
+            path: p.clone(),
+            resolution: if recorded.contains(p) {
+                Resolution::Recorded
+            } else {
+                Resolution::Unresolved
+            },
+        })
+        .collect();
+    for p in recorded {
+        if !unmerged.contains(p) {
+            files.push(ConflictFile {
+                path: p.clone(),
+                resolution: Resolution::Recorded,
+            });
         }
     }
-    let remaining = wt.rerere_remaining()?;
-    Ok(paths
-        .into_iter()
-        .map(|path| ConflictFile {
-            resolution: if remaining.contains(&path) {
-                Resolution::Unresolved
-            } else {
-                Resolution::Recorded
-            },
-            path,
-        })
-        .collect())
+    files
 }
 
 /// First import of a path upstream: keep its history with an `ours` merge and
@@ -595,7 +619,8 @@ pub fn abort(repo: &Repo) -> Result<Exit> {
         }
         if !moved.is_empty() {
             bail!(
-                "`finish` has already moved {}; the update can no longer be aborted. Run `git fork-sync finish` to complete it",
+                "`finish` has already moved {}; the update can no longer be aborted. Run `git fork-sync finish` to complete it, \
+                 or `git fork-sync finish --no-publish` to close it without publishing",
                 moved.join(", ")
             );
         }
@@ -663,13 +688,7 @@ pub fn next_step(state: &UpdateState, wt: &Git) -> Result<String> {
         "merging" => "git fork-sync continue".to_string(),
         "verified" => "git fork-sync finish".to_string(),
         "finishing" => match state.finishing.as_ref().and_then(|f| f.push_error.as_ref()) {
-            Some(_) => match &state.config.publish {
-                Some(p) => format!(
-                    "reconcile '{0}' with '{p}/{0}' without force (`git fetch {p}`, merge, run the checks), then run `git fork-sync finish` to publish",
-                    state.config.integration
-                ),
-                None => "git fork-sync finish".to_string(),
-            },
+            Some(_) => "`git fork-sync finish` to retry the same push, or `git fork-sync finish --no-publish` to close the update locally".to_string(),
             None => "git fork-sync finish".to_string(),
         },
         "verification_failed" => format!(
@@ -696,5 +715,34 @@ fn list_or_none(items: &[&str]) -> String {
         "none".to_string()
     } else {
         items.join(", ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rerere_reports_are_parsed() {
+        let out = "Auto-merging a\nCONFLICT (content): Merge conflict in a\nResolved 'a' using previous resolution.\n\
+                   Staged 'dir/b c' using previous resolution.\nRecorded preimage for 'd'\n";
+        assert_eq!(rerere_resolved(out), vec!["a", "dir/b c"]);
+    }
+
+    #[test]
+    fn only_reported_files_are_recorded() {
+        let files = label_conflicts(&["a".into(), "d".into()], &["a".into(), "b".into()]);
+        let labels: Vec<(&str, Resolution)> = files
+            .iter()
+            .map(|f| (f.path.as_str(), f.resolution))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("a", Resolution::Recorded),
+                ("d", Resolution::Unresolved),
+                ("b", Resolution::Recorded)
+            ]
+        );
     }
 }

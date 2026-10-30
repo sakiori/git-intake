@@ -214,9 +214,18 @@ fn path_with_unrelated_content_is_refused() {
         &[("apps/b/local.txt", "mine\n")],
         "mono: unrelated content at apps/b",
     );
-    m.tool(&["start"]).code(2).stderr(contains(
-        "upstream 'app-b': path 'apps/b' already holds content",
-    ));
+    let start = m.tool(&["start"]).code(2);
+    let err = common::stderr(&start);
+    assert!(
+        err.contains(
+            "upstream 'app-b': path 'apps/b' holds content unrelated to the history of app-b/main"
+        ),
+        "{err}"
+    );
+    assert!(
+        !err.contains("move"),
+        "the refusal must not advise moving content: {err}"
+    );
     env.assert_no_update(&m.down);
 
     let check = env.tool_json(&m.down, &["status", "--check", "--json"], 1);
@@ -225,8 +234,11 @@ fn path_with_unrelated_content_is_refused() {
         check["upstreams"][1]["detail"]
             .as_str()
             .unwrap()
-            .contains("already holds content")
+            .contains("holds content unrelated to the history")
     );
+    m.tool(&["doctor"]).code(1).stdout(contains(
+        "[FAIL] app-b: upstream 'app-b': path 'apps/b' holds content unrelated",
+    ));
     m.tool(&["start", "app-a"]).success();
 }
 

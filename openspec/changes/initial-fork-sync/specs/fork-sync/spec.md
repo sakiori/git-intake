@@ -39,7 +39,7 @@ Before fetching, the tool SHALL ensure that every selected upstream's remote exi
 - **THEN** the tool fetches the others, reports the failed upstream with the git error, and exits with a failure status
 
 ### Requirement: Sync record in history
-Every merge commit the tool creates SHALL name the upstream and its target commit in commit trailers. The tool SHALL derive the last synced commit of each upstream from these trailers on the integration branch and SHALL NOT store it in the configuration or outside the history. When an upstream's last synced commit is no longer contained in its branch, the tool SHALL report that upstream's history as rewritten and SHALL refuse to update it.
+Every merge commit the tool creates SHALL name the upstream and its target commit in commit trailers. The tool SHALL derive the last synced commit of each upstream from these trailers on the integration branch and SHALL NOT store it in the configuration or outside the history. For an upstream that carries no sync record but whose history is partly contained in the integration branch (at the root, or at a path that exists), the last synced commit SHALL be the newest upstream commit the integration branch contains, and the tool SHALL show that it comes from the history rather than a record. When an upstream's last synced commit is no longer contained in its branch, the tool SHALL report that upstream's history as rewritten and SHALL refuse to update it.
 
 #### Scenario: Last synced commit
 - **WHEN** the integration branch contains a merge of an upstream
@@ -77,8 +77,12 @@ Every merge commit the tool creates SHALL name the upstream and its target commi
 - **THEN** the tool imports the target's tree under that path with a merge commit that keeps the upstream's full history
 
 #### Scenario: Path already holds unrelated content
-- **WHEN** a queued upstream's path exists at the base but the integration branch carries no sync record of that upstream
+- **WHEN** a queued upstream's path exists at the base, the integration branch carries no sync record of that upstream, and none of the upstream's history is part of the integration branch
 - **THEN** `start` refuses and names the upstream and the path
+
+#### Scenario: Path imported by other means
+- **WHEN** a queued upstream's path exists at the base and the integration branch carries no sync record of that upstream but contains part of its history, as after an import by `git subtree add`
+- **THEN** `status` shows the newest upstream commit contained in the integration branch as the last synced commit, and `start` updates the path by a subtree merge that records the sync
 
 #### Scenario: Imported path removed downstream
 - **WHEN** the integration branch carries a sync record of a path upstream but its path no longer exists at the base
@@ -126,7 +130,7 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **THEN** the tool refuses and names the upstreams that still need `continue`
 
 ### Requirement: Guarded publication
-`finish` SHALL require a verified update whose worktree commit is the verified one and whose base is still the integration tip. Before moving any branch it SHALL confirm that every move is a fast-forward, that the verified commit contains the base and every merged target, and that no checkout of a moved branch would lose changes. It SHALL record the planned moves, fast-forward the integration branch to the verified commit and each merged upstream's mirror branch, where one is configured, to that upstream's target, push them without force in one atomic push when a publish remote is configured, and only after publication succeeds remove the worktree, the update branch and the state. An interrupted or failed `finish` SHALL complete the remaining moves and the push when run again. It SHALL never rewrite or force-push a branch, and SHALL never push to an upstream remote.
+`finish` SHALL require a verified update whose worktree commit is the verified one and whose base is still the integration tip. Before moving any branch it SHALL confirm that every move is a fast-forward, that the verified commit contains the base and every merged target, and that no checkout of a moved branch would lose changes. It SHALL record the planned moves, fast-forward the integration branch to the verified commit and each merged upstream's mirror branch, where one is configured, to that upstream's target, push exactly the planned commits without force in one atomic push when a publish remote is configured, and only after publication succeeds remove the worktree, the update branch and the state. An interrupted or failed `finish` SHALL complete the remaining moves and the push when run again, and SHALL never publish a commit other than the planned ones. `finish --no-publish` SHALL complete the local moves and remove the worktree, the update branch and the state without pushing, and report which branches remain unpublished. It SHALL never rewrite or force-push a branch, and SHALL never push to an upstream remote.
 
 #### Scenario: Integration branch moved
 - **WHEN** a commit lands on the integration branch after `start`
@@ -134,7 +138,15 @@ The tool SHALL keep the state of an update in the repository's common git direct
 
 #### Scenario: Remote moved
 - **WHEN** the publish remote's branch is ahead of the local one
-- **THEN** the push is rejected, no remote branch moves, the local branches stay advanced, the update stays in its finishing step, and the tool reports how to reconcile without force and run `finish` again
+- **THEN** the push is rejected, no remote branch moves, the local branches stay advanced, the update stays in its finishing step, and the tool explains that `finish --no-publish` closes the update locally so that the remote's work can be merged and the result published by a new verified update or the repository's usual review
+
+#### Scenario: Publication never allowed
+- **WHEN** the publish remote refuses every push to the integration branch, as for a protected branch
+- **THEN** `finish --no-publish` leaves the local branches advanced, removes the update, and names the unpublished branches
+
+#### Scenario: Local commit while finishing
+- **WHEN** a commit is added to the integration branch after `finish` moved it and before the push succeeded
+- **THEN** running `finish` again pushes only the planned commits
 
 #### Scenario: Interrupted finish
 - **WHEN** `finish` stops after moving some branches

@@ -59,7 +59,11 @@ enum Command {
     /// Run the install command and checks on the merged update
     Verify,
     /// Fast-forward and publish the verified update
-    Finish,
+    Finish {
+        /// Complete the local moves and close the update without pushing
+        #[arg(long)]
+        no_publish: bool,
+    },
     /// Show each upstream's drift and the update in progress
     Status {
         /// Fetch every upstream, predict conflicts, and fail unless all are current
@@ -107,7 +111,7 @@ fn run(command: Command) -> anyhow::Result<Exit> {
         Command::Continue => commands::update::resume(&repo),
         Command::Abort => commands::update::abort(&repo),
         Command::Verify => commands::verify::run(&repo),
-        Command::Finish => commands::finish::run(&repo),
+        Command::Finish { no_publish } => commands::finish::run(&repo, no_publish),
         Command::Status { check, json } => commands::status::run(&repo, check, json),
         Command::Report { json } => commands::report::run(&repo, json),
         Command::Log { upstreams, json } => commands::log::run(&repo, &upstreams, json),
