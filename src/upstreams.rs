@@ -52,6 +52,25 @@ pub fn held_by(state: &UpdateState) -> HashMap<String, String> {
         .collect()
 }
 
+/// Restores the references the update in `state` holds that are missing,
+/// as after a `start` interrupted before it wrote them, at the tips the state
+/// names, when those commits are still in the repository. Returns the
+/// references it restored. A reference at another value is left alone;
+/// `doctor` reports it.
+pub fn restore_held(git: &Git, state: &UpdateState) -> Result<Vec<String>> {
+    let mut held: Vec<(String, String)> = held_by(state).into_iter().collect();
+    held.sort();
+    let mut restored = Vec::new();
+    for (name, tip) in held {
+        if git.commit(&name)?.is_none() && git.object_exists(&tip)? {
+            // An empty old value creates the reference only where none exists.
+            git.run(&["update-ref", "-m", "git-intake: restore", &name, &tip, ""])?;
+            restored.push(name);
+        }
+    }
+    Ok(restored)
+}
+
 /// Removes the references an update holds. Returns their names.
 pub fn release(git: &Git, state: &UpdateState) -> Result<Vec<String>> {
     let mut removed = Vec::new();
@@ -183,8 +202,10 @@ impl Drop for Fetches<'_> {
 }
 
 /// Whether two URLs name the same repository: local paths and `file://`
-/// URLs once resolved against `base` and made canonical, other URLs once a
-/// trailing `/` and `.git` are dropped and the host is in lower case.
+/// URLs once resolved as git resolves them, against `base`, and made
+/// canonical; other URLs once the scp-like form is written as `ssh://`, the
+/// scheme and host are in lower case, a default port is dropped, and a
+/// leading `/` and a trailing `/` and `.git` of the path are dropped.
 pub fn same_repository(a: &str, b: &str, base: &Path) -> bool {
     normalise_url(a, base) == normalise_url(b, base)
 }
@@ -198,25 +219,69 @@ fn normalise_url(url: &str, base: &Path) -> String {
         } else {
             base.join(path)
         };
-        let full = std::fs::canonicalize(&full).unwrap_or_else(|_| clean(&full));
-        return format!("file:{}", full.display());
+        return format!("file:{}", local_repository(&full).display());
     }
-    // `scheme://[user@]host[:port]/path`, or the scp-like `[user@]host:path`.
-    let (prefix, rest, sep) = match url.split_once("://") {
-        Some((scheme, rest)) => (format!("{}://", scheme.to_ascii_lowercase()), rest, '/'),
-        None => (String::new(), url, ':'),
+    // `scheme://[user@]host[:port]/path`, or the scp-like `[user@]host:path`,
+    // which is the `ssh` scheme.
+    let (scheme, authority, path) = match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            (scheme.to_ascii_lowercase(), authority, path)
+        }
+        None => {
+            let (authority, path) = url.split_once(':').unwrap_or((url, ""));
+            ("ssh".to_string(), authority, path)
+        }
     };
-    let (authority, path) = rest.split_once(sep).unwrap_or((rest, ""));
-    let authority = match authority.rsplit_once('@') {
-        Some((user, host)) => format!("{user}@{}", host.to_ascii_lowercase()),
-        None => authority.to_ascii_lowercase(),
+    let scheme = match scheme.as_str() {
+        "git+ssh" | "ssh+git" => "ssh".to_string(),
+        _ => scheme,
     };
-    let path = path.trim_end_matches('/');
+    let (user, host) = match authority.rsplit_once('@') {
+        Some((user, host)) => (format!("{user}@"), host),
+        None => (String::new(), authority),
+    };
+    let mut host = host.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "ssh" => Some(":22"),
+        "https" => Some(":443"),
+        "http" => Some(":80"),
+        "git" => Some(":9418"),
+        _ => None,
+    };
+    if let Some(port) = default_port
+        && host.ends_with(port)
+    {
+        host.truncate(host.len() - port.len());
+    }
+    let path = path.trim_start_matches('/').trim_end_matches('/');
     let path = path
         .strip_suffix(".git")
         .unwrap_or(path)
         .trim_end_matches('/');
-    format!("{prefix}{authority}{sep}{path}")
+    format!("{scheme}://{user}{host}/{path}")
+}
+
+/// The repository a local path names, as git finds it: the first of
+/// `<path>/.git`, `<path>`, `<path>.git/.git` and `<path>.git` that is a git
+/// directory, made canonical; the path itself, cleaned, when none is.
+fn local_repository(path: &Path) -> PathBuf {
+    let plain = path.as_os_str().to_string_lossy();
+    let plain = plain.trim_end_matches('/');
+    for candidate in [
+        format!("{plain}/.git"),
+        plain.to_string(),
+        format!("{plain}.git/.git"),
+        format!("{plain}.git"),
+    ] {
+        let dir = Path::new(&candidate);
+        if dir.join("HEAD").is_file()
+            && let Ok(found) = std::fs::canonicalize(dir)
+        {
+            return found;
+        }
+    }
+    std::fs::canonicalize(path).unwrap_or_else(|_| clean(path))
 }
 
 /// The path of a URL that names a local repository, as git tells them
@@ -282,19 +347,50 @@ mod tests {
         assert!(!same("../up.git", "/srv/up"));
         assert!(same(
             "https://Example.COM/team/up.git",
-            "https://example.com/team/up/"
+            "https://example.com:443/team/up/"
         ));
         assert!(same(
             "git@Example.com:team/up.git",
             "git@example.com:team/up"
+        ));
+        assert!(same(
+            "git@example.com:team/up.git",
+            "ssh://git@EXAMPLE.com:22/team/up"
+        ));
+        assert!(same(
+            "example.com:/srv/up.git",
+            "git+ssh://example.com/srv/up"
         ));
         assert!(!same(
             "git@example.com:team/up",
             "git@example.com:team/other"
         ));
         assert!(!same(
+            "git@example.com:team/up",
+            "ssh://git@example.com:2222/team/up"
+        ));
+        assert!(!same(
             "https://example.com/Team/up",
             "https://example.com/team/up"
         ));
+    }
+
+    #[test]
+    fn local_paths_resolve_as_git_finds_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("up.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        std::fs::write(work.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let base = dir.path().join("product");
+        std::fs::create_dir_all(&base).unwrap();
+        let same = |a: &str, b: &str| same_repository(a, b, &base);
+        let bare_path = bare.to_string_lossy();
+        assert!(same("../up", &bare_path));
+        assert!(same("../up/", &bare_path));
+        assert!(same("../work", &format!("{}/.git", work.to_string_lossy())));
+        assert!(!same("../work", &bare_path));
     }
 }

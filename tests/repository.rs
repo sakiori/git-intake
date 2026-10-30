@@ -284,6 +284,39 @@ fn publish_remote_at_an_upstream_url_is_refused() {
 }
 
 #[test]
+fn local_paths_and_ssh_urls_are_matched_as_git_reads_them() {
+    let f = Fork::new();
+    let env = &f.env;
+    // Git finds `../upstream` at `../upstream.git`.
+    env.git(&f.down, &["remote", "set-url", "origin", "../upstream"]);
+    f.tool(&["status"]).code(2).stderr(contains(
+        "has the URL ../upstream, which names the repository of upstream 'upstream'",
+    ));
+
+    // The scp-like form and the `ssh://` form of one hosted repository.
+    env.git(
+        &f.down,
+        &["remote", "set-url", "origin", &f.publish.to_string_lossy()],
+    );
+    f.reconfigure(
+        &format!("url = {:?}", f.up.url()),
+        "url = \"git@example.com:team/upstream.git\"",
+    );
+    env.git(
+        &f.down,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "ssh://git@Example.com:22/team/upstream",
+        ],
+    );
+    f.tool(&["status"]).code(2).stderr(contains(
+        "has the URL ssh://git@Example.com:22/team/upstream, which names the repository of upstream 'upstream'",
+    ));
+}
+
+#[test]
 fn hosted_urls_naming_the_same_repository_count_as_one() {
     let f = Fork::new();
     let env = &f.env;
@@ -321,7 +354,21 @@ fn hosted_urls_naming_the_same_repository_count_as_one() {
             "https://EXAMPLE.com/team/upstream",
         ],
     );
+    // The hosted URL is served from the local upstream, in this test's own
+    // git configuration, so that doctor's fetch stays local.
+    std::fs::write(
+        env.path("gitconfig"),
+        format!(
+            "[url {:?}]\n\tinsteadOf = https://Example.com/team/upstream.git\n",
+            f.up.url()
+        ),
+    )
+    .unwrap();
     let doctor = stdout(&f.tool(&["doctor"]).code(1));
+    assert!(
+        doctor.contains("[pass] upstream: branch 'main' of"),
+        "{doctor}"
+    );
     assert!(
         doctor.contains(
             "[FAIL] upstream: git remote 'mirror' names the repository of upstream 'upstream' \
@@ -381,9 +428,9 @@ fn remote_at_an_upstream_url_is_neither_used_nor_changed_and_doctor_names_it() {
         "{doctor}"
     );
     env.git(&m.down, &["remote", "remove", "app-a"]);
-    m.tool(&["doctor"])
-        .success()
-        .stdout(contains("[pass] no git remote has an upstream's URL"));
+    m.tool(&["doctor"]).success().stdout(contains(
+        "[pass] no git remote names an upstream's repository",
+    ));
 }
 
 #[test]
@@ -465,7 +512,7 @@ fn doctor_healthy_and_dropped_upstream() {
         "{out}"
     );
     assert!(
-        out.contains("[pass] no git remote has an upstream's URL"),
+        out.contains("[pass] no git remote names an upstream's repository"),
         "{out}"
     );
     assert!(

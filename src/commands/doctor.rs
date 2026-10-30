@@ -103,17 +103,89 @@ pub fn run(repo: &Repo, json: bool) -> Result<Exit> {
     })
 }
 
-/// References under `refs/git-intake/` that no update accounts for.
+/// The references the update in progress holds, and references under
+/// `refs/git-intake/` that no update accounts for.
 fn reference_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
-    let held = match repo.state() {
-        Ok(Some(state)) => upstreams::held_by(&state),
-        _ => Default::default(),
-    };
-    let stray: Vec<String> = upstreams::existing(&repo.git)?
-        .into_iter()
-        .filter(|(name, _)| !held.contains_key(name))
-        .map(|(name, oid)| format!("{name} at {}", abbrev(&oid)))
-        .collect();
+    let state = repo.state().ok().flatten();
+    let held = state.as_ref().map(upstreams::held_by).unwrap_or_default();
+    let existing = upstreams::existing(&repo.git)?;
+    let value = |name: &str| existing.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+    // The commits of held references that are missing: another reference
+    // that still holds one keeps it in the repository and is not stray.
+    let mut held_names: Vec<&String> = held.keys().collect();
+    held_names.sort();
+    let mut needed: Vec<&String> = Vec::new();
+    for name in held_names {
+        let tip = &held[name];
+        let (ok, detail) = match value(name) {
+            Some(v) if v == tip => (true, String::new()),
+            Some(v) => (
+                false,
+                format!(
+                    "the update's reference {name} is at {} instead of {}, the tip `start` fetched; \
+                     set it back with `git update-ref {name} {tip}`",
+                    abbrev(v),
+                    abbrev(tip)
+                ),
+            ),
+            None if repo.git.object_exists(tip)? => {
+                needed.push(tip);
+                (
+                    false,
+                    format!(
+                        "the update's reference {name} is missing; `git intake status`, `continue`, `verify` or \
+                         `finish` restores it at {} from the update state",
+                        abbrev(tip)
+                    ),
+                )
+            }
+            None => (
+                false,
+                format!(
+                    "the update's reference {name} is missing, and its commit {} is no longer in the repository; \
+                     run `git intake abort` and start again",
+                    abbrev(tip)
+                ),
+            ),
+        };
+        if !ok {
+            checks.add("update_references", None, CheckStatus::Fail, detail);
+        }
+    }
+    if !held.is_empty() && !checks.0.iter().any(|c| c.check == "update_references") {
+        checks.add(
+            "update_references",
+            None,
+            CheckStatus::Pass,
+            "the update's references are at the tips `start` fetched".to_string(),
+        );
+    }
+    let mut keeping = Vec::new();
+    let mut stray = Vec::new();
+    for (name, oid) in &existing {
+        if held.contains_key(name) {
+            continue;
+        }
+        let shown = format!("{name} at {}", abbrev(oid));
+        if needed.contains(&oid) {
+            keeping.push(shown);
+        } else {
+            stray.push(shown);
+        }
+    }
+    if !keeping.is_empty() {
+        checks.add(
+            "references",
+            None,
+            CheckStatus::Warn,
+            format!(
+                "{} still hold{} commits the update in progress needs; keep {} until the update's references are restored",
+                keeping.join(", "),
+                if keeping.len() == 1 { "s" } else { "" },
+                if keeping.len() == 1 { "it" } else { "them" }
+            ),
+        );
+    }
     checks.pass_or_fail(
         "references",
         None,
@@ -406,7 +478,7 @@ fn remote_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<()
             "remote",
             None,
             CheckStatus::Pass,
-            "no git remote has an upstream's URL".to_string(),
+            "no git remote names an upstream's repository".to_string(),
         );
     }
     Ok(())

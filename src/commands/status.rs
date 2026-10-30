@@ -211,7 +211,10 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
 
     let all_current = upstreams.iter().all(|u| u.state == DriftState::Current);
     let update = match repo.state()? {
-        Some(state) => Some(update_view(&state)?),
+        Some(state) => {
+            repo.restore_held_references(&state)?;
+            Some(update_view(&state)?)
+        }
         None => None,
     };
     let doc = StatusDoc {

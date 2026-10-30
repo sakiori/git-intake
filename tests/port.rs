@@ -1216,7 +1216,7 @@ fn a_failed_copy_commit_stops_and_continue_commits_the_fix() {
     let out = stdout(&f.tool(&["continue"]).code(1));
     assert!(
         out.contains(&format!(
-            "upstream: the commit of the copy of {} upstream: add bad.txt failed",
+            "upstream: the copy of {} upstream: add bad.txt could not be committed",
             &bad[..12]
         )),
         "{out}"
@@ -1426,4 +1426,115 @@ fn reading_commands_never_move_the_update_references() {
         vec!["refs/git-intake/upstreams/upstream".to_string()],
         "nothing else is left"
     );
+}
+
+/// Edits the update state as an interrupted command would have left it.
+fn edit_state(f: &Fork, edit: impl FnOnce(&mut serde_json::Value)) {
+    let path = f.env.intake_dir(&f.down).join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    edit(&mut state);
+    fs::write(&path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+}
+
+#[test]
+fn a_start_interrupted_before_holding_its_references_is_repaired() {
+    let f = Fork::port();
+    let env = &f.env;
+    let c = upstream_commits(&f, 2);
+    f.tool(&["start"]).success();
+    let held = "refs/git-intake/upstreams/upstream";
+    let fetched = env.rev(&f.down, held);
+    // The window between saving the state and holding the references: the
+    // fetched commits live only in the namespace of the interrupted start.
+    let left = "refs/git-intake/read/7-1f/upstreams/upstream";
+    env.git(&f.down, &["update-ref", left, &fetched]);
+    env.git(&f.down, &["update-ref", "-d", held]);
+    env.git(&f.down, &["gc", "-q", "--prune=now"]);
+
+    let doctor = stdout(&f.tool(&["doctor"]).code(1));
+    assert!(
+        doctor.contains(&format!(
+            "[FAIL] the update's reference {held} is missing; `git intake status`, `continue`, `verify` or `finish` \
+             restores it at {} from the update state",
+            &fetched[..12]
+        )),
+        "{doctor}"
+    );
+    assert!(
+        doctor.contains(&format!(
+            "[warn] {left} at {} still holds commits the update in progress needs; keep it",
+            &fetched[..12]
+        )),
+        "{doctor}"
+    );
+    assert!(!doctor.contains("are left without an update"), "{doctor}");
+
+    // `continue` restores the reference and carries the plan out.
+    write_plan(&f, &[("take", &c[0], ""), ("take", &c[1], "")]);
+    let out = f.tool(&["continue"]).success();
+    assert!(
+        stderr(&out).contains(&format!("note: restored the update's reference {held}")),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.rev(&f.down, held), fetched);
+    // The leftover namespace no longer protects anything and is stray now.
+    f.tool(&["doctor"])
+        .code(1)
+        .stdout(contains(format!("left without an update: {left} at")));
+    env.git(&f.down, &["update-ref", "-d", left]);
+    f.tool(&["doctor"]).success();
+
+    // status restores it as well, and doctor names a reference moved by hand.
+    env.git(&f.down, &["update-ref", "-d", held]);
+    f.tool(&["status"])
+        .success()
+        .stderr(contains("note: restored the update's reference"));
+    assert_eq!(env.rev(&f.down, held), fetched);
+    env.git(&f.down, &["update-ref", held, &env.rev(&f.down, "main")]);
+    f.tool(&["doctor"]).code(1).stdout(contains(format!(
+        "the update's reference {held} is at {} instead of {}",
+        &env.rev(&f.down, "main")[..12],
+        &fetched[..12]
+    )));
+}
+
+#[test]
+fn an_interrupted_copy_left_unstaged_stops_until_it_is_staged() {
+    let f = Fork::port();
+    let env = &f.env;
+    let c = upstream_commits(&f, 1);
+    f.tool(&["start"]).success();
+    let wt = env.update_worktree(&f.down);
+    let head = env.rev(&wt, "HEAD");
+    // The plan was read and the copy began; what it applied sits in the
+    // worktree, unstaged.
+    edit_state(&f, |s| {
+        let q = &mut s["upstreams"][0];
+        q["step"] = "pending".into();
+        q["takes"] = serde_json::json!([0]);
+        q["commits"][0]["verb"] = "take".into();
+        q["commits"][0]["head_before"] = head.clone().into();
+    });
+    fs::write(wt.join("p1.txt"), "1\n").unwrap();
+    env.git(&wt, &["add", "-N", "p1.txt"]);
+    let out = stdout(&f.tool(&["continue"]).code(1));
+    assert!(
+        out.contains("nothing of the copy is staged, but tracked files have unstaged changes"),
+        "{out}"
+    );
+    assert!(out.contains("stage what belongs to the copy"), "{out}");
+    assert_eq!(env.rev(&wt, "HEAD"), head, "nothing is committed");
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["step"], "commit_failed");
+    assert!(wt.join("p1.txt").exists(), "the worktree is kept");
+
+    env.git(&wt, &["add", "p1.txt"]);
+    f.tool(&["continue"])
+        .success()
+        .stdout(contains(format!("upstream: copied {} as", &c[0][..12])));
+    assert_eq!(taken_by(&f, &env.rev(&wt, "HEAD~1")), c[0]);
+    let journal = fs::read_to_string(wt.join(JOURNAL)).unwrap();
+    assert!(!journal.contains("verdict = \"have\""), "{journal}");
 }

@@ -251,6 +251,20 @@ fn finish_copy(
     let name = state.upstreams[i].name.clone();
     let entry = plan_of(state, i)?.commits[index].clone();
     if wt.test(&["diff", "--cached", "--quiet"])? {
+        let unstaged = wt.tracked_changes()?;
+        if !unstaged.is_empty() {
+            // Only what is staged is committed: a copy left in the worktree
+            // would be recorded as present though nothing was taken.
+            let why = format!(
+                "nothing of the copy is staged, but tracked files have unstaged changes:\n{}",
+                bullet(&unstaged)
+            );
+            stop_on_failed_commit(repo, state, i, index, &why)?;
+            println!(
+                "stage what belongs to the copy with `git add`, discard the rest, then run `git intake continue`"
+            );
+            return Ok(Some(Exit::Negative));
+        }
         // Record a resolution made for this copy, so that a retry
         // reapplies it.
         let _ = wt.raw(&["rerere"]);
@@ -271,18 +285,7 @@ fn finish_copy(
     ])?;
     if !out.success() {
         let why = format!("{}{}", out.stdout, out.stderr).trim().to_string();
-        let plan_entry = &mut plan_mut(state, i)?.commits[index];
-        plan_entry.copy = CopyStep::CommitFailed;
-        plan_entry.failure = Some(why.clone());
-        state.upstreams[i].step = UpstreamStep::Conflict;
-        repo.save_state(state)?;
-        println!(
-            "{name}: the commit of the copy of {} {} failed in {}:\n{}",
-            abbrev(&entry.commit),
-            entry.subject,
-            state.worktree.display(),
-            why
-        );
+        stop_on_failed_commit(repo, state, i, index, &why)?;
         println!(
             "the copy stays staged; fix the cause there, stage the result with `git add`, then run \
              `git intake continue`, which commits it as the copy with its author, message and trailers"
@@ -303,6 +306,29 @@ fn finish_copy(
     state.upstreams[i].step = UpstreamStep::Pending;
     record_copy(repo, state, i, index, Some(head))?;
     Ok(None)
+}
+
+/// Records that the copy could not be committed, and why, and reports it.
+fn stop_on_failed_commit(
+    repo: &Repo,
+    state: &mut UpdateState,
+    i: usize,
+    index: usize,
+    why: &str,
+) -> Result<()> {
+    let name = state.upstreams[i].name.clone();
+    let entry = &mut plan_mut(state, i)?.commits[index];
+    entry.copy = CopyStep::CommitFailed;
+    entry.failure = Some(why.to_string());
+    let (commit, subject) = (entry.commit.clone(), entry.subject.clone());
+    state.upstreams[i].step = UpstreamStep::Conflict;
+    repo.save_state(state)?;
+    println!(
+        "{name}: the copy of {} {subject} could not be committed in {}:\n{why}",
+        abbrev(&commit),
+        state.worktree.display()
+    );
+    Ok(())
 }
 
 /// Records the outcome of one copy.

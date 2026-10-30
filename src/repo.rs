@@ -102,12 +102,26 @@ impl Repo {
         state::load(&self.paths.state)
     }
 
-    /// The update in progress, or a refusal naming the situation.
+    /// The update in progress, or a refusal naming the situation. The
+    /// references the update holds are restored first where they are
+    /// missing.
     pub fn require_state(&self) -> Result<UpdateState> {
         match self.state()? {
-            Some(s) => Ok(s),
+            Some(s) => {
+                self.restore_held_references(&s)?;
+                Ok(s)
+            }
             None => bail!("no update is in progress; run `git intake start` to begin one"),
         }
+    }
+
+    /// Restores the references an update holds where they are missing, as
+    /// after an interrupted `start`, and says so.
+    pub fn restore_held_references(&self, state: &UpdateState) -> Result<()> {
+        for name in crate::upstreams::restore_held(&self.git, state)? {
+            eprintln!("note: restored the update's reference {name} at the tip `start` fetched");
+        }
+        Ok(())
     }
 
     pub fn save_state(&self, state: &UpdateState) -> Result<()> {
