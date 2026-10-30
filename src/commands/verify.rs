@@ -87,13 +87,12 @@ fn select<'a>(checks: &'a [Check], only: &[String], skip: &[String]) -> Result<V
     if !only.is_empty() && !skip.is_empty() {
         bail!("`--only` and `--skip` cannot be given together; nothing was run");
     }
-    let mut unknown: Vec<&str> = only
-        .iter()
-        .chain(skip)
-        .map(String::as_str)
-        .filter(|n| !checks.iter().any(|c| c.name == *n))
-        .collect();
-    unknown.dedup();
+    let mut unknown: Vec<&str> = Vec::new();
+    for name in only.iter().chain(skip).map(String::as_str) {
+        if !checks.iter().any(|c| c.name == name) && !unknown.contains(&name) {
+            unknown.push(name);
+        }
+    }
     if !unknown.is_empty() {
         let known = if checks.is_empty() {
             "the update has no checks".to_string()
@@ -481,4 +480,61 @@ fn run_logged(
         .status()
         .with_context(|| format!("cannot run `{command}`"))?;
     Ok(status.code())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checks() -> Vec<Check> {
+        ["lint", "test", "audit"]
+            .iter()
+            .map(|n| Check {
+                name: n.to_string(),
+                run: format!("make {n}"),
+            })
+            .collect()
+    }
+
+    fn names(selected: &[&Check]) -> Vec<String> {
+        selected.iter().map(|c| c.name.clone()).collect()
+    }
+
+    fn strings(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn selections_keep_the_order_of_the_checks() {
+        let checks = checks();
+        let only = select(&checks, &strings(&["audit", "lint", "audit"]), &[]).unwrap();
+        assert_eq!(names(&only), ["lint", "audit"]);
+        let skip = select(&checks, &[], &strings(&["test", "test"])).unwrap();
+        assert_eq!(names(&skip), ["lint", "audit"]);
+        assert_eq!(select(&checks, &[], &[]).unwrap().len(), 3);
+        let none = select(&checks, &[], &strings(&["lint", "test", "audit"])).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn unknown_names_are_named_once_with_the_checks() {
+        let checks = checks();
+        let err = select(&checks, &[], &strings(&["x", "lint", "y", "x"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown check 'x', 'y'; the update's checks are 'lint', 'test', 'audit'"),
+            "{err}"
+        );
+        // Names are matched exactly.
+        assert!(select(&checks, &strings(&["Lint"]), &[]).is_err());
+        let err = select(&[], &strings(&["lint"]), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the update has no checks"), "{err}");
+        let err = select(&checks, &strings(&["lint"]), &strings(&["test"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be given together"), "{err}");
+    }
 }
