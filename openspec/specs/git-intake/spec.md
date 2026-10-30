@@ -507,6 +507,13 @@ For a `port` upstream `status` SHALL report its journal's base, the numbers of t
 ### Requirement: Configuration and upstream checks in doctor
 `doctor` SHALL check that the configuration is valid, every upstream's URL can be fetched and its branch exists, every imported upstream's path exists on the integration branch, every `follow` upstream's last synced commit is still contained in its branch, and every `port` upstream's journal is valid and its base and its decided and taken commits that are not retired are still on its branch.
 
+#### Scenario: Invalid configuration
+- **WHEN** `doctor` runs while the configuration on the integration branch is invalid
+- **THEN** the configuration check fails with the problem, and `doctor` exits with a failure status
+
+### Requirement: Upstream dropped from the configuration
+`doctor` SHALL warn, without failing, about each upstream whose sync records the integration branch carries but that the configuration no longer lists, naming it.
+
 #### Scenario: Upstream removed from the configuration
 - **WHEN** the integration branch carries sync records of an upstream that the configuration no longer lists
 - **THEN** `doctor` reports that upstream by name as dropped from the configuration
