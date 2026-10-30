@@ -75,6 +75,15 @@ pub enum Command {
         #[arg(long)]
         no_publish: bool,
     },
+    /// Carry an update in progress over from the previous release's state format
+    ///
+    /// Rewrites the state of an update started by the previous release in the current format, in
+    /// place, keeping its branch, commits, merge in progress, index, uncommitted and untracked
+    /// files, plan, logs and references. An update worktree in the git directory moves to
+    /// `.worktrees/git-intake/update` in the main worktree; stop the processes, shells and editors
+    /// that use it before running this command. A verification run in the old location is dropped
+    /// unless `finish` has begun. Run again after an interruption, it completes the migration.
+    Migrate,
     /// Fetch every upstream and show its drift, and the update in progress
     Status {
         /// Predict conflicts, and fail unless every upstream is current

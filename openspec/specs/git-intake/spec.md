@@ -72,7 +72,7 @@ The tool SHALL enable git's recorded conflict resolution for the repository befo
 - **THEN** git reapplies the recorded resolution and the tool reports the file as resolved by a recorded resolution
 
 ### Requirement: Resumable state
-The tool SHALL keep the state of an update in the repository's common git directory, visible from every worktree, and the update worktree at `.worktrees/git-intake/update` in the main worktree, never inside the git directory. Unless that path is ignored already, `start` SHALL add the line `/.worktrees/` to the repository's `info/exclude` once, without changing a committed ignore file, so that the main checkout does not show the update worktree. Every command SHALL act on that state: `continue` carries out a plan, concludes a resolved merge or copy, and goes on with the remaining queued upstreams or planned commits; `status` shows the step reached, each queued upstream as merged, at its plan, in conflict or pending, and what comes next; and `abort` removes the worktree, the update branch, the plan, the update's upstream references, its logs and the state without touching the integration branch. A `follow` upstream SHALL count as merged only when the update branch head carries its sync record for its target, and a `port` upstream as carried out only when its plan has been carried out to the journal commit. Once `finish` has begun moving branches, `abort` SHALL refuse and name `finish` as the way to complete the update. While an update waits for its merge request, `abort` SHALL delete the merge request branch from the publish remote, remove the update, and name the merge request that is left to close. The tool SHALL refuse an update state in any format other than its own, older or newer, or without a format, name both formats and, where the state records it, the release that started the update, and advise finishing or aborting the update with a release that keeps that format, naming the releases of every earlier format (1: v0.1.0; 2: v0.2.0 to v0.2.2; 3: v0.3.0 to v0.3.1; 4: v0.3.2 and later), or for a newer format with the release that started it or a later one that reads it. Only `start` SHALL record the release that started the update in the state. The first of `continue`, `verify` and `finish` run by another release of the same format SHALL warn once, without refusing, and record that it warned; it SHALL advise aborting and starting again only before `finish` has moved a branch or opened the merge request.
+The tool SHALL keep the state of an update in the repository's common git directory, visible from every worktree, and the update worktree at `.worktrees/git-intake/update` in the main worktree, never inside the git directory. Unless that path is ignored already, `start` SHALL add the line `/.worktrees/` to the repository's `info/exclude` once, without changing a committed ignore file, so that the main checkout does not show the update worktree. Every command SHALL act on that state: `continue` carries out a plan, concludes a resolved merge or copy, and goes on with the remaining queued upstreams or planned commits; `status` shows the step reached, each queued upstream as merged, at its plan, in conflict or pending, and what comes next; and `abort` removes the worktree, the update branch, the plan, the update's upstream references, its logs and the state without touching the integration branch. A `follow` upstream SHALL count as merged only when the update branch head carries its sync record for its target, and a `port` upstream as carried out only when its plan has been carried out to the journal commit. Once `finish` has begun moving branches, `abort` SHALL refuse and name `finish` as the way to complete the update. While an update waits for its merge request, `abort` SHALL delete the merge request branch from the publish remote, remove the update, and name the merge request that is left to close. The tool SHALL refuse an update state in any format other than its own, older or newer, or without a format, name both formats and, where the state records it, the release that started the update, and advise finishing or aborting the update with a release that keeps that format, naming the releases of every earlier format (1: v0.1.0; 2: v0.2.0 to v0.2.2; 3: v0.3.0 to v0.3.1; 4: v0.3.2 and later), or for a newer format with the release that started it or a later one that reads it. For format 3, the format of the release just before this one, the refusal SHALL name `migrate` first. Only `start` SHALL record the release that started the update in the state. The first of `continue`, `verify` and `finish` run by another release of the same format SHALL warn once, without refusing, and record that it warned; it SHALL advise aborting and starting again only before `finish` has moved a branch or opened the merge request.
 
 #### Scenario: Update worktree in the main worktree
 - **WHEN** `start` creates the update worktree
@@ -102,9 +102,13 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **WHEN** no update is in progress and a worktree other than the tool's update worktree has `git-intake/update` checked out
 - **THEN** `abort` and `start` refuse and `doctor` fails, each naming that worktree and saying to remove or switch it, and the worktree and its uncommitted changes are kept
 
-#### Scenario: State of an earlier release
-- **WHEN** an update started by a release with another state format is in progress, such as one that kept the update worktree in the git directory
-- **THEN** every command that reads the update refuses and says to finish or abort it with that release
+#### Scenario: State of the previous release
+- **WHEN** an update started by the previous release, which kept the update worktree in the git directory, is in progress
+- **THEN** every command that reads the update, other than `migrate`, refuses and names `migrate`, and also finishing or aborting the update with a release that keeps format 3
+
+#### Scenario: State of an older release
+- **WHEN** an update started by a release with a state format older than the previous release's is in progress
+- **THEN** every command that reads the update refuses and says to finish or abort it with a release that keeps that format
 
 #### Scenario: State of a newer release
 - **WHEN** an update started by a release with a newer state format is in progress
@@ -113,6 +117,37 @@ The tool SHALL keep the state of an update in the repository's common git direct
 #### Scenario: Another release of the same format
 - **WHEN** an update started by one release is carried on by another release with the same state format
 - **THEN** the first of `continue`, `verify` and `finish` it runs warns once that another release started it, advises `abort` only before `finish` has moved a branch or opened the merge request, and every command carries on
+
+### Requirement: Migration of an update in progress
+`migrate` SHALL carry an update in progress over from the previous release's state format to the current one, in place, keeping its branch, commits, merge in progress, index, uncommitted and untracked files, plan, logs and references. An update worktree in the git directory SHALL move with `git worktree move` to `.worktrees/git-intake/update` in the main worktree, under the placement rules of `start`, before the state is written; an update worktree outside the git directory, or that of a bare repository, SHALL stay, and only the state is rewritten. An update worktree already at the destination SHALL be kept: when git still records it at the old path, `migrate` SHALL repair git's record with `git worktree repair` instead of refusing. `migrate` SHALL say that the processes and editors using the old path must be stopped, since the directory moves. A verification recorded before a move, or at a path containing `/.git` that a bare repository keeps, SHALL be dropped unless `finish` has begun. `migrate` SHALL refuse, before changing anything, when no update is in progress, when the state is in the current format or a format older than the previous release's, when the main worktree cannot be located, when the destination exists, or when git refuses the move, giving git's reason.
+
+#### Scenario: Update with a merge in progress
+- **WHEN** an update started by the previous release stopped on conflicts, some resolved and staged and some not, and `migrate` runs
+- **THEN** the update worktree is at `.worktrees/git-intake/update` with the same merge in progress, index, and staged, unstaged and untracked changes, and `status`, `continue`, `verify` and `finish` work on it
+
+#### Scenario: Migration in a bare repository
+- **WHEN** `migrate` runs in a bare repository
+- **THEN** the update worktree stays in the git directory and the state changes only in its format, except that a verification run at a path containing `/.git` is dropped
+
+#### Scenario: Verification in the old location
+- **WHEN** the update was verified in the old location and `finish` has not begun
+- **THEN** `migrate` drops the verification, and `finish` refuses until `verify` runs again
+
+#### Scenario: Destination taken or move refused
+- **WHEN** `.worktrees/git-intake/update` exists and is not the update worktree, or git refuses the move, as for a locked worktree
+- **THEN** `migrate` refuses, giving the reason and never suggesting removal, and the state, the worktree and its files are unchanged
+
+#### Scenario: Interrupted migration
+- **WHEN** a `migrate` moved the worktree but did not write the state
+- **THEN** running `migrate` again finds the worktree at its new place and writes the state
+
+#### Scenario: Worktree moved by hand
+- **WHEN** the update worktree was moved to `.worktrees/git-intake/update` without git, which still records the old path
+- **THEN** `migrate` repairs git's record, keeps the worktree and its files, and writes the state
+
+#### Scenario: Verification kept once finish has begun
+- **WHEN** `finish` has planned its moves, or pushed the merge request branch, before `migrate` runs
+- **THEN** the verification is kept
 
 ### Requirement: Verification of the published tree
 `verify` SHALL require the configuration at the update worktree head to be valid and to name the same integration branch, then run the configured install command and every check in the update worktree once every queued upstream is merged or its plan carried out, write each command's output to a log, report pass or fail per command, and record the worktree commit it verified. A failed or skipped check SHALL leave the update unverified.

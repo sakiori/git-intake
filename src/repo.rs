@@ -345,6 +345,50 @@ impl Repo {
         fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))
     }
 
+    /// Moves the update worktree from `old` to `new` with `git worktree
+    /// move`, which keeps its branch, index, merge in progress and files,
+    /// creating the directories that hold `new`. When git refuses, the
+    /// directories made for it are removed again and git's reason is given.
+    pub fn move_update_worktree(&self, old: &Path, new: &Path) -> Result<()> {
+        let made: Vec<&Path> = new
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| fs::symlink_metadata(dir).is_err())
+            .collect();
+        if let Some(parent) = new.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        let out = self.git.raw(&[
+            "worktree",
+            "move",
+            &old.to_string_lossy(),
+            &new.to_string_lossy(),
+        ])?;
+        if !out.success() {
+            for dir in made {
+                let _ = fs::remove_dir(dir);
+            }
+            bail!(
+                "git refused to move the update worktree from {} to {}: {}",
+                old.display(),
+                new.display(),
+                out.stderr.trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// The repository's common git directory.
+    pub fn common_dir(&self) -> &Path {
+        &self.common
+    }
+
+    /// Whether the tool was started in the worktree at `dir`.
+    pub fn started_in(&self, dir: &Path) -> bool {
+        self.toplevel.as_deref() == Some(canonical(dir).as_path())
+    }
+
     /// Whether the update worktree is registered with git.
     pub fn update_worktree_registered(&self) -> Result<bool> {
         let Some(wt) = self.update_worktree()? else {
@@ -634,16 +678,14 @@ fn locate_main_worktree(
     if let Some(top) = started_in {
         return Ok(MainWorktree::At(top.to_path_buf()));
     }
-    // An unreadable state, or one of another format, gives no record and is
+    // A state in the previous format records it too, for `migrate`. An
+    // unreadable state, or one of another format, gives no record and is
     // not reported here. `continue`, `verify`, `finish` and `abort` read the
     // state before they need the main worktree and stop on its error; `start`
     // refuses on it as well. Read-only commands carry on: run outside the
     // main worktree of such a layout, they find it from the guess below or
     // say that it cannot be located, and `doctor` also reports the state.
-    let recorded = state::load(&paths.state)
-        .ok()
-        .flatten()
-        .and_then(|s| s.main_worktree);
+    let recorded = state::recorded_main_worktree(&paths.state);
     if let Some(dir) = recorded
         && is_main_worktree(&dir, common)?
     {
