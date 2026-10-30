@@ -134,6 +134,8 @@ git intake finish       # fast-forward, publish, clean up
 # once the merge request is merged, run finish again to complete the update
 ```
 
+Every command works the same from any directory of the repository: the main checkout, a linked worktree, or the update worktree itself. Git operations on the repository as a whole, such as fetching, pushing and moving branches, run in the main worktree, so a relative remote URL means what it means there. When `finish` or `abort` removes the update worktree it was run from, the command still completes and notes that the current directory is gone; change to another directory before the next command.
+
 `start` refuses to begin if any of these hold:
 
 - an update is already in progress;

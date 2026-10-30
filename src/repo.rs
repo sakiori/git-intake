@@ -11,9 +11,17 @@ use crate::git::{Git, branch_ref};
 use crate::state::{self, Paths, UpdateState};
 
 pub struct Repo {
+    /// Runs every repository-wide git command. It is bound to the main
+    /// worktree, or to the repository itself when it is bare, never to the
+    /// directory the tool was started in: that directory may be the update
+    /// worktree, which `finish` and `abort` remove, and relative remote URLs
+    /// must mean what they mean in the main worktree.
     pub git: Git,
     pub paths: Paths,
+    /// The top of the worktree the tool was started in.
     toplevel: Option<PathBuf>,
+    /// The commit at `HEAD` of the worktree the tool was started in.
+    head: Option<String>,
 }
 
 /// One entry of `git worktree list`.
@@ -31,23 +39,31 @@ pub struct Loaded {
 }
 
 impl Repo {
-    /// Opens the repository containing the current directory.
+    /// Opens the repository containing the current directory. Everything
+    /// that depends on that directory is resolved here, once.
     pub fn open() -> Result<Self> {
         let cwd = std::env::current_dir().context("cannot determine the current directory")?;
-        let git = Git::new(cwd);
-        let out = git.raw(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
-        if !out.success() {
-            bail!("not inside a git repository: {}", out.stderr.trim());
-        }
-        let common = canonical(Path::new(out.stdout.trim()));
-        let top = git.raw(&["rev-parse", "--show-toplevel"])?;
+        let here = Git::new(cwd);
+        let common = common_dir(&here)?
+            .map_err(|why| anyhow::anyhow!("not inside a git repository: {why}"))?;
+        let top = here.raw(&["rev-parse", "--show-toplevel"])?;
         let toplevel = top
             .success()
             .then(|| canonical(Path::new(top.stdout.trim())));
+        let head = here.commit("HEAD")?;
+        let worktrees = here.run(&["worktree", "list", "--porcelain", "-z"])?;
+        let main = parse_worktrees(&worktrees)
+            .into_iter()
+            .next()
+            .map(|w| w.path)
+            .filter(|main| matches!(common_dir(&Git::worktree(main)), Ok(Ok(c)) if c == common));
         Ok(Self {
-            git,
+            // A main worktree that is gone or no longer belongs to this
+            // repository leaves the repository itself as the place to run in.
+            git: Git::worktree(main.unwrap_or_else(|| common.clone())),
             paths: Paths::new(&common),
             toplevel,
+            head,
         })
     }
 
@@ -71,30 +87,7 @@ impl Repo {
     /// Every worktree of the repository, the main one first.
     pub fn worktrees(&self) -> Result<Vec<Worktree>> {
         let out = self.git.run(&["worktree", "list", "--porcelain", "-z"])?;
-        let mut list = Vec::new();
-        let mut current: Option<Worktree> = None;
-        for line in out.split('\0') {
-            if let Some(path) = line.strip_prefix("worktree ") {
-                if let Some(w) = current.take() {
-                    list.push(w);
-                }
-                current = Some(Worktree {
-                    path: canonical(Path::new(path)),
-                    branch: None,
-                    bare: false,
-                });
-            } else if let Some(w) = current.as_mut() {
-                if let Some(b) = line.strip_prefix("branch ") {
-                    w.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
-                } else if line == "bare" {
-                    w.bare = true;
-                }
-            }
-        }
-        if let Some(w) = current {
-            list.push(w);
-        }
-        Ok(list)
+        Ok(parse_worktrees(&out))
     }
 
     /// The main checkout, unless the repository is bare.
@@ -171,7 +164,11 @@ impl Repo {
         if let Some(state) = self.state()? {
             return Ok(state.config.integration);
         }
-        let Some(text) = self.git.show_file("HEAD", config::FILE_NAME)? else {
+        let committed = match &self.head {
+            Some(head) => self.git.show_file(head, config::FILE_NAME)?,
+            None => None,
+        };
+        let Some(text) = committed else {
             bail!(
                 "no {} is committed at HEAD; run the tool from a checkout of the integration branch",
                 config::FILE_NAME
@@ -228,7 +225,7 @@ impl Repo {
         let Some(top) = &self.toplevel else {
             return false;
         };
-        if *top == canonical(&self.paths.worktree) {
+        if self.started_in_update_worktree() {
             return false;
         }
         match fs::read_to_string(top.join(config::FILE_NAME)) {
@@ -251,6 +248,7 @@ impl Repo {
 
     /// Removes the update worktree if it exists, keeping the update branch.
     pub fn remove_update_worktree(&self) -> Result<Vec<String>> {
+        let started_inside = self.started_in_update_worktree();
         let mut removed = Vec::new();
         let wt = &self.paths.worktree;
         if self.update_worktree_registered()? {
@@ -275,7 +273,17 @@ impl Repo {
             }
         }
         self.git.run(&["worktree", "prune"])?;
+        if started_inside && !removed.is_empty() {
+            eprintln!(
+                "note: the current directory was in the update worktree, which is now removed"
+            );
+        }
         Ok(removed)
+    }
+
+    /// Whether the tool was started in the update worktree.
+    fn started_in_update_worktree(&self) -> bool {
+        self.toplevel.as_deref() == Some(canonical(&self.paths.worktree).as_path())
     }
 
     /// Removes the update's logs: the verification logs and saved merge output.
@@ -287,6 +295,45 @@ impl Repo {
         fs::remove_dir_all(logs).with_context(|| format!("cannot remove {}", logs.display()))?;
         Ok(vec![format!("logs {}", logs.display())])
     }
+}
+
+/// The canonical common git directory of the repository `git` runs in, or
+/// git's message when it runs in none.
+fn common_dir(git: &Git) -> Result<std::result::Result<PathBuf, String>> {
+    let out = git.raw(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    Ok(if out.success() {
+        Ok(canonical(Path::new(out.stdout.trim())))
+    } else {
+        Err(out.stderr.trim().to_string())
+    })
+}
+
+/// The entries of `git worktree list --porcelain -z`, the main one first.
+fn parse_worktrees(out: &str) -> Vec<Worktree> {
+    let mut list = Vec::new();
+    let mut current: Option<Worktree> = None;
+    for line in out.split('\0') {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(w) = current.take() {
+                list.push(w);
+            }
+            current = Some(Worktree {
+                path: canonical(Path::new(path)),
+                branch: None,
+                bare: false,
+            });
+        } else if let Some(w) = current.as_mut() {
+            if let Some(b) = line.strip_prefix("branch ") {
+                w.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+            } else if line == "bare" {
+                w.bare = true;
+            }
+        }
+    }
+    if let Some(w) = current {
+        list.push(w);
+    }
+    list
 }
 
 /// Canonical form of a path when it exists, the path itself otherwise.
