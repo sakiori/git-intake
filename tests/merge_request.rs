@@ -641,8 +641,15 @@ fn a_branch_left_by_a_closed_merge_request_is_deleted_first() {
     // The pull request is closed; GitHub keeps its branch.
     f.forge().end(first, "closed");
     let left = on_remote(&f, MERGE_REQUEST_BRANCH).unwrap();
-    // A new update by hand publishes the same targets again.
-    f.tool(&["start"]).success();
+    // A new update by hand publishes the same targets again. Its merge is
+    // dated apart from the first, which a fast run could make in the same
+    // second and so as the very same commit.
+    env.tool_env(
+        &f.down,
+        &["start"],
+        &[("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")],
+    )
+    .success();
     let head = env.rev(&env.update_worktree(&f.down), "HEAD");
     assert_ne!(head, left);
     let out = stdout(&f.tool(&["finish"]).success());
