@@ -1,8 +1,15 @@
 # release-plz configuration; .github/workflows/release.yml runs it.
 
 [workspace]
-# Release only when a release pull request is merged, not on every push.
-release_always = false
+# Only a commit that asks for a release opens or updates the release pull
+# request: a feature, fix, performance change or revert, or a breaking change
+# of any type (`!` after the type or a BREAKING CHANGE footer). The regex is
+# matched against each commit's whole message.
+release_commits = '(?m)\A(feat|fix|perf|revert)(\([^)]*\))?!?:|\A[a-z]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:'
+# Release whatever version in Cargo.toml is not published yet, whichever
+# commit the run is for. Versions change only through the release pull
+# request, and a run superseded while it waits loses no release.
+release_always = true
 # The release workflow publishes the GitHub Release once every archive, its
 # checksum and its attestation are in place.
 git_release_draft = true
