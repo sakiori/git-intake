@@ -355,7 +355,8 @@ fn credentials_in_urls_never_reach_the_output() {
     );
     let sync = f.tool(&["sync"]).code(2);
     let (out, err) = (stdout(&sync), stderr(&sync));
-    assert!(err.contains("ssh://127.0.0.1/team/app.git"), "{err}");
+    // An SSH URL keeps its user, never the password.
+    assert!(err.contains("ssh://user@127.0.0.1/team/app.git"), "{err}");
     assert!(
         !out.contains("s3cret") && !err.contains("s3cret"),
         "{out}{err}"
