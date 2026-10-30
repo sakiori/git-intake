@@ -418,11 +418,20 @@ fn comparable(url: &Url, destination: Option<(String, u16)>) -> String {
     if let Some(home) = path.strip_prefix("~/") {
         path = home.to_string();
     }
-    if path.len() >= 4 && path[path.len() - 4..].eq_ignore_ascii_case(".git") {
-        path.truncate(path.len() - 4);
+    if let Some(stem) = strip_suffix_ignore_ascii_case(&path, ".git") {
+        path.truncate(stem.len());
     }
     let path = path.trim_end_matches('/').to_lowercase();
     format!("{host}{port}/{path}")
+}
+
+/// `text` without `suffix`, compared in ASCII case, when it ends with it. The
+/// suffix is ASCII, so a match starts at a character boundary, and text that
+/// ends in a multi-byte character is never sliced inside it.
+fn strip_suffix_ignore_ascii_case<'a>(text: &'a str, suffix: &str) -> Option<&'a str> {
+    let at = text.len().checked_sub(suffix.len())?;
+    let tail = text.get(at..)?;
+    tail.eq_ignore_ascii_case(suffix).then(|| &text[..at])
 }
 
 /// The scp-like `[user@]host:path` as the `ssh://` URL it stands for.
@@ -516,6 +525,20 @@ fn clean(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_suffix_is_stripped_between_characters() {
+        assert_eq!(strip_suffix_ignore_ascii_case("up.GIT", ".git"), Some("up"));
+        assert_eq!(strip_suffix_ignore_ascii_case("éabc", ".git"), None);
+        assert_eq!(strip_suffix_ignore_ascii_case("€x.git", ".git"), Some("€x"));
+        assert_eq!(strip_suffix_ignore_ascii_case("git", ".git"), None);
+        let base = Path::new("/srv/product");
+        assert!(same_repository(
+            "https://example.invalid/%C3%A9abc",
+            "https://example.invalid/éabc.git",
+            base
+        ));
+    }
 
     #[test]
     fn urls_naming_the_same_repository_match() {
