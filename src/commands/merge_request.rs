@@ -50,13 +50,39 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
             publish.remote
         ),
     };
+    let targets = push_targets(&publish.remote, &places, |at| at != Some(commit.as_str()));
     let (mut requested, mut options_refused, mut number) = (false, false, None);
-    for target in push_targets(&publish.remote, &places, |at| at != Some(commit.as_str())) {
-        let (asked, refused, named) =
-            push_merge_request_branch(repo, &state, &target, &branch, &commit)?;
-        requested |= asked;
-        options_refused |= refused;
-        number = number.or(named);
+    let mut received: Vec<&str> = Vec::new();
+    for target in &targets {
+        match push_merge_request_branch(repo, &state, target, &branch, &commit)? {
+            Ok(pushed) => {
+                requested |= pushed.requested;
+                options_refused |= pushed.options_refused;
+                number = number.or(pushed.number);
+                received.push(target);
+            }
+            Err(why) => {
+                // A push through the remote goes to each of its push URLs in
+                // turn and can stop after some of them received the branch.
+                let moved = if !received.is_empty() {
+                    format!(
+                        "The branch is already on {}; no other ref moved",
+                        received.join(", ")
+                    )
+                } else if *target == publish.remote && places.len() > 1 {
+                    format!(
+                        "The branch may already be on some of the push URLs of '{}'; no other ref moved",
+                        publish.remote
+                    )
+                } else {
+                    "Nothing moved".to_string()
+                };
+                bail!(
+                    "{why}\n{moved}, and the update stays verified; fix the cause and run `git intake finish` again, \
+                     which pushes only where the branch is missing"
+                );
+            }
+        }
     }
 
     let mr = MergeRequest {
@@ -71,11 +97,13 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     repo.save_state(&state)?;
     repo.remove_update_worktree()?;
 
-    println!(
-        "pushed the verified commit {} to '{}' as branch '{branch}'",
-        abbrev(&commit),
-        publish.remote
-    );
+    if !targets.is_empty() {
+        println!(
+            "pushed the verified commit {} to '{}' as branch '{branch}'",
+            abbrev(&commit),
+            publish.remote
+        );
+    }
     if requested {
         println!(
             "asked '{}' to open a merge request from '{branch}' into '{integration}'",
@@ -89,6 +117,11 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
             "'{}' does not accept push options, so no merge request was opened; open one from '{branch}' into '{integration}'",
             publish.remote
         );
+    } else if targets.is_empty() {
+        println!(
+            "'{branch}' was already on '{}', so nothing was pushed and no merge request was asked for; if none is open, open one from '{branch}' into '{integration}'",
+            publish.remote
+        );
     } else {
         println!(
             "'{branch}' was already on '{}', so this push asked for no merge request; if none is open, open one from '{branch}' into '{integration}'",
@@ -100,18 +133,26 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     Ok(Exit::Success)
 }
 
+/// What one push of the merge request branch achieved.
+struct Pushed {
+    /// A push carrying the options transferred the branch.
+    requested: bool,
+    /// The remote refused push options, so the branch was pushed without.
+    options_refused: bool,
+    /// The number of the merge request the remote's reply names.
+    number: Option<u64>,
+}
+
 /// Pushes the verified commit to the merge request branch on `target`, the
 /// publish remote or one of its push URLs, asking it to open the merge
-/// request. Returns whether a push carrying the options transferred the
-/// branch, whether the remote refused push options, and the number its reply
-/// names.
+/// request. Returns what the push achieved, or why it failed.
 fn push_merge_request_branch(
     repo: &Repo,
     state: &UpdateState,
     target: &str,
     branch: &str,
     commit: &str,
-) -> Result<(bool, bool, Option<u64>)> {
+) -> Result<std::result::Result<Pushed, String>> {
     let refspec = format!("{commit}:{}", branch_ref(branch));
     let mut args: Vec<String> = vec!["push".into(), "--porcelain".into()];
     for option in push_options(&repo.git, state, &state.config.integration, commit)? {
@@ -121,36 +162,34 @@ fn push_merge_request_branch(
     args.push(target.to_string());
     args.push(refspec.clone());
     let out = repo.git.raw(&args)?;
+    let failed = |err: crate::git::GitError| {
+        format!("pushing the merge request branch '{branch}' to '{target}' failed: {err}")
+    };
     Ok(if out.success() {
         relay_remote_messages(&out.stderr);
         // The remote applies push options only to a push that updates a ref:
         // a branch that appeared since it was looked up opens no merge
         // request.
-        (
-            transferred(&out.stdout, branch),
-            false,
-            merge_request_number(&out.stderr, branch),
-        )
+        Ok(Pushed {
+            requested: transferred(&out.stdout, branch),
+            options_refused: false,
+            number: merge_request_number(&out.stderr, branch),
+        })
     } else if out.stderr.contains(NO_PUSH_OPTIONS) {
         // Refused before anything was written: push the branch alone.
         let retry = repo.git.raw(&["push", target, &refspec])?;
-        if !retry.success() {
-            bail!(
-                "pushing the merge request branch '{branch}' to '{}' failed: {}\n\
-                 Nothing moved, and the update stays verified; fix the cause and run `git intake finish` again",
-                target,
-                retry.into_error()
-            );
+        if retry.success() {
+            relay_remote_messages(&retry.stderr);
+            Ok(Pushed {
+                requested: false,
+                options_refused: true,
+                number: None,
+            })
+        } else {
+            Err(failed(retry.into_error()))
         }
-        relay_remote_messages(&retry.stderr);
-        (false, true, None)
     } else {
-        bail!(
-            "pushing the merge request branch '{branch}' to '{}' failed: {}\n\
-             Nothing moved, and the update stays verified; fix the cause and run `git intake finish` again",
-            target,
-            out.into_error()
-        );
+        Err(failed(out.into_error()))
     })
 }
 
