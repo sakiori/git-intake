@@ -179,7 +179,19 @@ fn merge(repo: &Repo, state: &mut UpdateState) -> Result<Option<Exit>> {
         abbrev(&c.tip),
         abbrev(&c.head_before)
     );
-    wt.run(&["checkout", "--quiet", "--detach", &c.tip])?;
+    let checkout = wt.raw(&["checkout", "--quiet", "--detach", &c.tip])?;
+    if !checkout.success() {
+        // Nothing began: the update stays as it was.
+        state.catch_ups.pop();
+        repo.save_state(state)?;
+        bail!(
+            "cannot check out '{integration}' at {} in {} to catch up with it: {}\n\
+             Nothing was merged and no branch moved; clear what is in the way, then run `git intake finish` again",
+            abbrev(&c.tip),
+            state.worktree.display(),
+            checkout.stderr.trim()
+        );
+    }
     let msg = sync_record::catch_up_message(&integration, &repo.git.short(&c.tip)?);
     let output_path = output_path(repo);
     state::remove(&output_path)?;
@@ -258,15 +270,31 @@ fn stop_on_conflict(repo: &Repo, state: &mut UpdateState, output: &str) -> Resul
     Ok(Exit::Negative)
 }
 
+/// What [`conclude`] did with the catch-up merge in progress.
+pub enum Concluded {
+    /// No catch-up was in progress.
+    Nothing,
+    /// The catch-up merge is made and the update branch is at it: this run's
+    /// catch-up.
+    Merged,
+    /// The catch-up was given up by hand in the update worktree and is no
+    /// longer recorded.
+    Dropped,
+    /// The catch-up merge stopped on conflicts again.
+    Stopped(Exit),
+}
+
 /// Completes the catch-up merge in progress, if any. With `resolved`, as
 /// `continue` runs it, a merge whose conflicts are all resolved and staged
 /// is committed; otherwise a merge in progress is refused. A merge already
 /// committed is never made again: the update branch is moved to it. A
-/// catch-up that never got as far as its merge is merged again. Returns the
-/// exit status when the merge stopped on conflicts.
-pub fn conclude(repo: &Repo, state: &mut UpdateState, resolved: bool) -> Result<Option<Exit>> {
+/// catch-up that got as far as checking out the tip is merged again. A
+/// catch-up given up by hand, with no merge in progress, no catch-up merge
+/// made and the worktree on the update branch, as after `git merge --abort`
+/// and a checkout of the branch, is no longer recorded.
+pub fn conclude(repo: &Repo, state: &mut UpdateState, resolved: bool) -> Result<Concluded> {
     let Some(c) = state.catching_up().cloned() else {
-        return Ok(None);
+        return Ok(Concluded::Nothing);
     };
     let wt = Git::worktree(&state.worktree);
     let integration = state.config.integration.clone();
@@ -300,29 +328,83 @@ pub fn conclude(repo: &Repo, state: &mut UpdateState, resolved: bool) -> Result<
     }
     let head = wt.line(&["rev-parse", "HEAD"])?;
     let branch = repo.git.commit(&branch_ref(UPDATE_BRANCH))?;
-    if is_catch_up_merge(repo, &state.config.integration, &c, &head)? {
+    if is_catch_up_merge(repo, &integration, &c, &head)? {
         conclude_at(repo, state, &head)?;
-        return Ok(None);
+        return Ok(Concluded::Merged);
     }
     // Moved before the state could say so.
     if let Some(b) = &branch
-        && is_catch_up_merge(repo, &state.config.integration, &c, b)?
+        && is_catch_up_merge(repo, &integration, &c, b)?
     {
         conclude_at(repo, state, b)?;
-        return Ok(None);
+        return Ok(Concluded::Merged);
     }
-    // The merge never began, or was aborted by hand.
-    if (head == c.tip || head == c.head_before) && branch.as_deref() == Some(c.head_before.as_str())
-    {
-        return merge(repo, state);
+    if on_update_branch(&wt)? {
+        state.catch_ups.pop();
+        repo.save_state(state)?;
+        println!(
+            "the catch-up with '{integration}' at {} was given up in {}; it is no longer recorded",
+            abbrev(&c.tip),
+            state.worktree.display()
+        );
+        return Ok(Concluded::Dropped);
+    }
+    // Interrupted after checking out the tip, before the merge began.
+    if head == c.tip && branch.as_deref() == Some(c.head_before.as_str()) {
+        return Ok(match merge(repo, state)? {
+            Some(exit) => Concluded::Stopped(exit),
+            None => Concluded::Merged,
+        });
     }
     bail!(
         "the catch-up merge with '{integration}' at {} is no longer in progress in {}, and no commit there merges \
-         {} into it; run `git intake abort` to end the update",
+         {} into it; check out '{UPDATE_BRANCH}' there and run `git intake continue`, or run `git intake abort`",
         abbrev(&c.tip),
         state.worktree.display(),
         abbrev(&c.head_before)
     )
+}
+
+/// [`conclude`] as `finish` runs it: returns whether this run made its
+/// catch-up merge by concluding one, or the exit status when the merge
+/// stopped on conflicts.
+pub fn conclude_for_finish(
+    repo: &Repo,
+    state: &mut UpdateState,
+) -> Result<std::result::Result<bool, Exit>> {
+    Ok(match conclude(repo, state, false)? {
+        Concluded::Merged => Ok(true),
+        Concluded::Nothing | Concluded::Dropped => Ok(false),
+        Concluded::Stopped(exit) => Err(exit),
+    })
+}
+
+/// Gives up the catch-up merge in progress, as `finish --no-publish` does in
+/// the finishing step: the resolutions made so far are recorded, so that a
+/// later merge reapplies them, and the merge is no longer recorded.
+pub fn abandon(repo: &Repo, state: &mut UpdateState) -> Result<()> {
+    let Some(c) = state.catching_up().cloned() else {
+        return Ok(());
+    };
+    let wt = Git::worktree(&state.worktree);
+    if state.worktree.exists() && wt.merge_in_progress()? {
+        wt.run(&["rerere"])?;
+        wt.run(&["merge", "--abort"])?;
+    }
+    state.catch_ups.pop();
+    repo.save_state(state)?;
+    println!(
+        "recorded the resolutions made so far and dropped the catch-up merge with '{}' at {}",
+        state.config.integration,
+        abbrev(&c.tip)
+    );
+    Ok(())
+}
+
+/// Whether the worktree has the update branch checked out.
+fn on_update_branch(wt: &Git) -> Result<bool> {
+    let attached = wt.raw(&["symbolic-ref", "--quiet", "HEAD"])?;
+    Ok(attached.stdout.trim() == branch_ref(UPDATE_BRANCH))
 }
 
 /// Whether `commit` is the catch-up merge `c` describes: its parents are the
@@ -371,8 +453,7 @@ fn conclude_at(repo: &Repo, state: &mut UpdateState, merge: &str) -> Result<()> 
         }
     }
     let wt = Git::worktree(&state.worktree);
-    let attached = wt.raw(&["symbolic-ref", "--quiet", "HEAD"])?;
-    if attached.stdout.trim() != full {
+    if !on_update_branch(&wt)? {
         wt.run(&["checkout", "--quiet", UPDATE_BRANCH])?;
     }
     if let Some(Ok(merged)) = git

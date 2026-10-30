@@ -915,10 +915,10 @@ pub fn resume(repo: &Repo) -> Result<Exit> {
     require_worktree(repo, &state)?;
     let wt = Git::worktree(&state.worktree);
     if state.catching_up().is_some() {
-        if let Some(exit) = catch_up::conclude(repo, &mut state, true)? {
+        if let catch_up::Concluded::Stopped(exit) = catch_up::conclude(repo, &mut state, true)? {
             return Ok(exit);
         }
-        println!("next: git intake finish");
+        println!("next: {}", next_step(&state, &wt)?);
         return Ok(Exit::Success);
     }
     if let Some(i) = state

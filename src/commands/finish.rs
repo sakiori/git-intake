@@ -58,9 +58,10 @@ fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Resu
         }
         None => {
             require_worktree(repo, &state)?;
-            if let Some(exit) = catch_up::conclude(repo, &mut state, false)? {
-                return Ok(exit);
-            }
+            let caught = match catch_up::conclude_for_finish(repo, &mut state)? {
+                Ok(caught) => caught,
+                Err(exit) => return Ok(exit),
+            };
             require_finishable(&state)?;
             if let Some(remote) = &remote {
                 follow_published(repo, remote, &integration)?;
@@ -79,10 +80,14 @@ fn finish_by_push(repo: &Repo, mut state: UpdateState, no_publish: bool) -> Resu
                     }
                 }
                 let tip = local_tip(&repo.git, &integration)?;
-                Ok((tip != state.base)
+                Ok((!repo.git.is_ancestor(&tip, &state.base)?)
                     .then(|| format!("'{integration}' moved to {}", abbrev(&tip))))
             };
-            let moves = match prepare(repo, &mut state, &tip, false, &recheck)? {
+            let run = Run {
+                moved: false,
+                caught,
+            };
+            let moves = match prepare(repo, &mut state, &tip, run, &recheck)? {
                 Ready::Publish(_) => plan(repo, &state, &tip)?,
                 Ready::Holds(head) => held(repo, &state, &tip, &head)?,
                 Ready::Stop(exit) => return Ok(exit),
@@ -162,39 +167,33 @@ fn resume(
         return Ok(Ok(f));
     };
     let wt = Git::worktree(&state.worktree);
-    let head = if state.worktree.exists() {
-        wt.commit("HEAD")?
-    } else {
-        None
-    };
     if no_publish {
-        if head.is_some_and(|h| h != planned.new) || state.catching_up().is_some() {
-            println!(
-                "dropped the catch-up of the update; it closes at the planned commit {}",
-                abbrev(&planned.new)
-            );
-        }
-        return Ok(Ok(f));
+        return close_locally(repo, state, f, &planned).map(Ok);
     }
     let Some(remote) = remote else {
         return Ok(Ok(f));
     };
     let git = &repo.git;
-    if let Some(exit) = catch_up::conclude(repo, state, false)? {
-        return Ok(Err(exit));
-    }
+    let caught = match catch_up::conclude_for_finish(repo, state)? {
+        Ok(caught) => caught,
+        Err(exit) => return Ok(Err(exit)),
+    };
+    let head = if state.worktree.exists() {
+        wt.commit("HEAD")?
+    } else {
+        None
+    };
     fetch(git, remote)?;
     let published = git.commit(&tracking_ref(remote, &integration))?;
     // A catch-up made from this step is still to be verified or planned.
     let caught_up = head.is_some_and(|h| h != planned.new) || state.catching_up().is_some();
     let published = match published {
-        Some(p) if caught_up => p,
-        // The remote did not move past the planned commit, or holds it
-        // already: retry the same push, or skip it.
+        // The remote did not move past the planned commit, or received it:
+        // retry the same push, or skip it.
         None => return Ok(Ok(f)),
-        Some(p) if git.is_ancestor(&p, &planned.new)? || git.is_ancestor(&planned.new, &p)? => {
-            return Ok(Ok(f));
-        }
+        Some(p) if git.is_ancestor(&planned.new, &p)? => return Ok(Ok(f)),
+        Some(p) if caught_up => p,
+        Some(p) if git.is_ancestor(&p, &planned.new)? => return Ok(Ok(f)),
         Some(p) => p,
     };
     let local = git.commit(&branch_ref(&integration))?;
@@ -213,11 +212,18 @@ fn resume(
     let recheck = |repo: &Repo, state: &mut UpdateState| -> Result<Option<String>> {
         fetch(&repo.git, remote)?;
         let now = repo.git.commit(&tracking_ref(remote, &integration))?;
-        Ok(now
-            .filter(|n| *n != state.base)
-            .map(|n| format!("'{remote}/{integration}' moved to {}", abbrev(&n))))
+        Ok(match now {
+            Some(n) if !repo.git.is_ancestor(&n, &state.base)? => {
+                Some(format!("'{remote}/{integration}' moved to {}", abbrev(&n)))
+            }
+            _ => None,
+        })
     };
-    let head = match prepare(repo, state, &published, true, &recheck)? {
+    let run = Run {
+        moved: true,
+        caught,
+    };
+    let head = match prepare(repo, state, &published, run, &recheck)? {
         Ready::Publish(head) | Ready::Holds(head) => head,
         Ready::Stop(exit) => return Ok(Err(exit)),
     };
@@ -237,6 +243,83 @@ fn resume(
     Ok(Ok(f))
 }
 
+/// `finish --no-publish` in the finishing step: closes the update at the
+/// planned commit, or lands locally a verified catch-up made from the
+/// finishing step instead. A catch-up merge still in conflict is dropped
+/// after its resolutions are recorded; a concluded one that is not verified
+/// is refused until `verify` passes.
+fn close_locally(
+    repo: &Repo,
+    state: &mut UpdateState,
+    mut f: Finishing,
+    planned: &PlannedMove,
+) -> Result<Finishing> {
+    let wt = Git::worktree(&state.worktree);
+    if state.catching_up().is_some() {
+        if state.worktree.exists() && wt.merge_in_progress()? {
+            catch_up::abandon(repo, state)?;
+            println!(
+                "the update closes at the planned commit {}",
+                abbrev(&planned.new)
+            );
+            return Ok(f);
+        }
+        if catch_up::conclude_for_finish(repo, state)?.is_err() {
+            // Merged again, it stopped on conflicts: dropped as well.
+            catch_up::abandon(repo, state)?;
+            return Ok(f);
+        }
+    }
+    let head = if state.worktree.exists() {
+        wt.commit("HEAD")?
+    } else {
+        None
+    };
+    let Some(head) = head.filter(|h| *h != planned.new) else {
+        return Ok(f);
+    };
+    let verified = state
+        .verification
+        .as_ref()
+        .is_some_and(|v| v.passed && v.commit == head);
+    if !verified {
+        bail!(
+            "the update branch is at {}, past the planned commit {}, and {} is not verified; run `git intake verify`, \
+             then `git intake finish --no-publish` lands it locally",
+            abbrev(&head),
+            abbrev(&planned.new),
+            abbrev(&head)
+        );
+    }
+    check(repo, state, &head)?;
+    let m = PlannedMove {
+        branch: planned.branch.clone(),
+        old: planned.old.clone(),
+        new: head.clone(),
+    };
+    validate_checkouts(repo, std::slice::from_ref(&m))?;
+    println!(
+        "lands the verified catch-up of the update, {}, instead of the planned commit {}",
+        abbrev(&head),
+        abbrev(&planned.new)
+    );
+    f.moves = vec![m];
+    f.push_error = None;
+    state.finishing = Some(f.clone());
+    repo.save_state(state)?;
+    Ok(f)
+}
+
+/// What this run of `finish` has done so far, for [`prepare`].
+#[derive(Clone, Copy)]
+pub struct Run {
+    /// `finish` has moved the integration branch already.
+    pub moved: bool,
+    /// This run concluded a catch-up merge, which counts as its one
+    /// catch-up.
+    pub caught: bool,
+}
+
 /// The update as `prepare` leaves it.
 pub enum Ready {
     /// The verified update head, ready to land on the integration tip.
@@ -254,13 +337,14 @@ pub enum Ready {
 /// nothing more. When `tip` is otherwise not the base, the update catches
 /// up with it and the catch-up merge is verified. After a verification,
 /// `recheck` tells whether the integration branch moved again meanwhile, in
-/// which case `finish` stops: it makes at most one catch-up per run.
-/// `moved` says that `finish` has moved the integration branch already.
+/// which case `finish` stops: it makes at most one catch-up per run. A tip
+/// the base contains, as a publish remote behind a local integration branch
+/// that holds commits of its own, is not a move.
 pub fn prepare(
     repo: &Repo,
     state: &mut UpdateState,
     tip: &str,
-    moved: bool,
+    run: Run,
     recheck: &dyn Fn(&Repo, &mut UpdateState) -> Result<Option<String>>,
 ) -> Result<Ready> {
     let mut head = require_finishable(state)?;
@@ -282,8 +366,9 @@ pub fn prepare(
         return Ok(Ready::Holds(head));
     }
     let mut verify = !verified(state, &head);
-    if tip != state.base {
-        catch_up::require_possible(repo, state, tip, moved)?;
+    let moved_on = !git.is_ancestor(tip, &state.base)?;
+    if moved_on && !run.caught {
+        catch_up::require_possible(repo, state, tip, run.moved)?;
         if let Some(exit) = catch_up::run(repo, state, tip)? {
             return Ok(Ready::Stop(exit));
         }
@@ -301,13 +386,23 @@ pub fn prepare(
             return Ok(Ready::Stop(Exit::Negative));
         }
         println!("verified {}", abbrev(&head));
-        if let Some(why) = recheck(repo, state)? {
-            println!(
-                "{why} while the update was verified; no branch moved to the update. \
-                 Run `git intake finish` again to catch up with it"
-            );
-            return Ok(Ready::Stop(Exit::Negative));
-        }
+    }
+    if moved_on && run.caught {
+        // The catch-up this run concluded took in an earlier tip.
+        println!(
+            "'{}' moved to {} since the catch-up merge was made; no branch moved to the update. \
+             Run `git intake finish` again to catch up with it",
+            state.config.integration,
+            abbrev(tip)
+        );
+        return Ok(Ready::Stop(Exit::Negative));
+    }
+    if verify && let Some(why) = recheck(repo, state)? {
+        println!(
+            "{why} while the update was verified; no branch moved to the update. \
+             Run `git intake finish` again to catch up with it"
+        );
+        return Ok(Ready::Stop(Exit::Negative));
     }
     Ok(Ready::Publish(head))
 }
@@ -538,15 +633,17 @@ pub fn check(repo: &Repo, state: &UpdateState, head: &str) -> Result<()> {
 }
 
 /// Validates the update and plans the move of the integration branch from
-/// its tip `tip`, which is the base, to the verified commit; moves nothing.
+/// its tip `tip`, which the base contains, to the verified commit; moves
+/// nothing.
 fn plan(repo: &Repo, state: &UpdateState, tip: &str) -> Result<Vec<PlannedMove>> {
     let wt = Git::worktree(&state.worktree);
     let head = clean_head(state, &wt)?;
     require_verified(state, &head)?;
     let integration = state.config.integration.clone();
-    if tip != state.base {
+    if !repo.git.is_ancestor(tip, &state.base)? {
         bail!(
-            "'{integration}' is at {}, not at the update's base {}; run `git intake finish` again to catch up with it",
+            "'{integration}' is at {}, which the update's base {} does not contain; run `git intake finish` again \
+             to catch up with it",
             abbrev(tip),
             abbrev(&state.base)
         );
@@ -554,7 +651,7 @@ fn plan(repo: &Repo, state: &UpdateState, tip: &str) -> Result<Vec<PlannedMove>>
     check(repo, state, &head)?;
     let moves = vec![PlannedMove {
         branch: integration,
-        old: Some(state.base.clone()),
+        old: Some(tip.to_string()),
         new: head,
     }];
     validate_checkouts(repo, &moves)?;

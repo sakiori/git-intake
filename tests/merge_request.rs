@@ -405,6 +405,16 @@ fn a_lagging_merge_request_head_follows_the_pushed_branch() {
     );
     assert!(!out.contains("no longer points at"), "{out}");
     assert_eq!(env.rev(&f.down, "main"), base);
+
+    // Still lagging when the integration branch moves again, the head is
+    // one of the pushed commits, and the next catch-up is pushed.
+    let first = env.rev(&f.publish, &format!("refs/heads/{MERGE_REQUEST_BRANCH}"));
+    let again = land(&f, &[("again.txt", "a\n")], "other: again");
+    f.tool(&["finish"])
+        .success()
+        .stdout(contains("pushed the verified catch-up merge"));
+    let second = env.rev(&f.publish, &format!("refs/heads/{MERGE_REQUEST_BRANCH}"));
+    assert_eq!(parents(&f, &second), [again, first]);
 }
 
 #[test]
@@ -565,12 +575,144 @@ fn a_branch_left_on_the_remote_is_refused_before_the_first_push() {
 }
 
 #[test]
+fn a_local_integration_branch_ahead_of_the_remote_is_carried_by_the_merge_request() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let published = env.rev(&f.publish, "main");
+    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
+    let (commit, _) = verified(&f);
+    assert!(env.is_ancestor(&f.down, &local, &commit));
+
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(!out.contains("catching up"), "{out}");
+    assert_eq!(
+        env.rev(&f.publish, &format!("refs/heads/{MERGE_REQUEST_BRANCH}")),
+        commit
+    );
+    assert_eq!(env.rev(&f.publish, "main"), published);
+    f.tool(&["finish"])
+        .code(0)
+        .stdout(contains("the update waits for the merge request"));
+    merge_on_forge(&f, MERGE_REQUEST_BRANCH);
+    f.tool(&["finish"]).success();
+    assert!(env.is_ancestor(&f.down, &commit, "main"));
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn an_interrupted_first_push_is_taken_over_after_a_catch_up() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, _) = verified(&f);
+    // An earlier `finish` pushed the branch and stopped before saving the
+    // state; then other work landed.
+    env.git(
+        &f.down,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{commit}:refs/heads/{MERGE_REQUEST_BRANCH}"),
+        ],
+    );
+    let other = land(&f, &[("other.txt", "o\n")], "other: lands first");
+
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(out.contains("catching up with 'main'"), "{out}");
+    assert!(
+        out.contains("asked 'origin' to open a merge request from 'git-intake/update' into 'main'"),
+        "{out}"
+    );
+    let caught = env.rev(&f.publish, &format!("refs/heads/{MERGE_REQUEST_BRANCH}"));
+    assert_eq!(parents(&f, &caught), [other, commit]);
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["step"], "waiting_for_merge_request");
+    assert_eq!(status["update"]["merge_request"]["commit"], caught.as_str());
+}
+
+#[test]
+fn a_remote_that_holds_the_verified_commit_completes_and_drops_a_leftover_branch() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let (commit, _) = verified(&f);
+    // An interrupted first push left the branch, and the verified commit
+    // reached the remote's integration branch by other means.
+    env.git(
+        &f.down,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{commit}:refs/heads/{MERGE_REQUEST_BRANCH}"),
+        ],
+    );
+    env.git(&f.publish, &["update-ref", "refs/heads/main", &commit]);
+
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(
+        out.contains(&format!(
+            "already contains the verified commit {}",
+            &commit[..12]
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("deleted the merge request branch 'git-intake/update' from 'origin'"),
+        "{out}"
+    );
+    assert_eq!(env.rev(&f.down, "main"), commit);
+    assert!(!env.has_rev(&f.publish, &format!("refs/heads/{MERGE_REQUEST_BRANCH}")));
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn a_move_while_a_catch_up_is_verified_pushes_nothing_until_the_next_finish() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    // The check lands a commit through the forge once, while the catch-up
+    // merge is verified.
+    f.reconfigure(
+        "checks = [\"test -f app.txt\"]",
+        "checks = [\"test -f app.txt\", \"if [ -f \\\"$HOME/move\\\" ]; then rm \\\"$HOME/move\\\"; \
+         cd \\\"$(cat \\\"$HOME/forge\\\")\\\" && git pull -q --ff-only origin main && \
+         git commit -q --allow-empty -m meanwhile && git push -q origin HEAD:main; fi\"]",
+    );
+    let (commit, _) = verified(&f);
+    f.tool(&["finish"]).success();
+    land(&f, &[("other.txt", "o\n")], "other: lands first");
+    fs::write(
+        env.path("home").join("forge"),
+        forge(&f).to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    fs::write(env.path("home").join("move"), "").unwrap();
+
+    let out = stdout(&f.tool(&["finish"]).code(1));
+    assert!(!env.path("home").join("move").exists());
+    assert!(out.contains("while the update was verified"), "{out}");
+    assert!(!out.contains("pushed the verified catch-up merge"), "{out}");
+    assert_eq!(
+        env.rev(&f.publish, &format!("refs/heads/{MERGE_REQUEST_BRANCH}")),
+        commit
+    );
+    let first = env.rev(&f.down, "git-intake/update");
+
+    f.tool(&["finish"])
+        .success()
+        .stdout(contains("pushed the verified catch-up merge"));
+    let second = env.rev(&f.publish, &format!("refs/heads/{MERGE_REQUEST_BRANCH}"));
+    assert_eq!(parents(&f, &second)[1], first);
+    assert_eq!(parents(&f, &second)[0], env.rev(&f.publish, "main"));
+}
+
+#[test]
 fn a_merge_request_closed_with_its_branch_kept_is_treated_as_open() {
     let f = Fork::merge_request();
     let env = &f.env;
     verified(&f);
     let branch = MERGE_REQUEST_BRANCH;
     f.tool(&["finish"]).success();
+    assert!(env.intake_dir(&f.down).join("logs").exists());
     // Closed on the forge, its branch kept: nothing tells it from an open one.
     f.tool(&["finish"])
         .code(0)
@@ -584,6 +726,7 @@ fn a_merge_request_closed_with_its_branch_kept_is_treated_as_open() {
             "close the merge request from '{branch}' into 'main' on 'origin'"
         )));
     assert!(!env.has_rev(&f.publish, &format!("refs/heads/{branch}")));
+    assert!(!env.intake_dir(&f.down).join("logs").exists());
     env.assert_no_update(&f.down);
 }
 

@@ -102,7 +102,8 @@ pub enum Command {
     Finish {
         /// Complete only the local moves and close the update without fetching or pushing; a
         /// catch-up takes in only the local integration branch, and after a rejected push the
-        /// update closes at the planned commit
+        /// update lands a verified catch-up merge, or closes at the planned commit after dropping
+        /// one still in conflict
         #[arg(long)]
         no_publish: bool,
     },

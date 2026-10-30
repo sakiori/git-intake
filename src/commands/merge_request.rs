@@ -45,14 +45,41 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     require_worktree(repo, &state)?;
     let publish = publish_of(&state)?;
     let integration = state.config.integration.clone();
-    if let Some(exit) = catch_up::conclude(repo, &mut state, false)? {
-        return Ok(exit);
+    let caught = match catch_up::conclude_for_finish(repo, &mut state)? {
+        Ok(caught) => caught,
+        Err(exit) => return Ok(exit),
+    };
+    let head = finish::require_finishable(&state)?;
+    let branch = UPDATE_BRANCH.to_string();
+    // A branch left on the remote is taken over only when the base contains
+    // it, as after a merge request merged with its branch kept, or the
+    // update head does, as after this update's own first push was
+    // interrupted: any other may carry a merge request the tool knows
+    // nothing of. Checked before anything is merged or verified.
+    let places = listed_places(repo, &publish.remote, &branch)?;
+    let mut leftovers = Vec::new();
+    for place in &places {
+        if let Some(at) = place.at.as_deref()
+            && !(repo.git.object_exists(at)?
+                && (repo.git.is_ancestor(at, &state.base)? || repo.git.is_ancestor(at, &head)?))
+        {
+            leftovers.push(format!("{} at {}", place.url, abbrev(at)));
+        }
     }
-    finish::require_finishable(&state)?;
+    if !leftovers.is_empty() {
+        bail!(
+            "the branch '{branch}' already exists where '{}' pushes to, at a commit neither the update's base nor its \
+             head contains:\n{}\n\
+             It may carry a merge request the tool knows nothing of. Nothing was pushed, and the update stays verified; \
+             delete or merge that branch, then run `git intake finish` again",
+            publish.remote,
+            bullet(&leftovers)
+        );
+    }
     let tip = fetch_integration(&repo.git, &publish.remote, &integration)?;
     let recheck = |repo: &Repo, state: &mut UpdateState| -> Result<Option<String>> {
         let now = fetch_integration(&repo.git, &publish.remote, &integration)?;
-        Ok((now != state.base).then(|| {
+        Ok((!repo.git.is_ancestor(&now, &state.base)?).then(|| {
             format!(
                 "'{}/{integration}' moved to {}",
                 publish.remote,
@@ -60,47 +87,23 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
             )
         }))
     };
-    let commit = match finish::prepare(repo, &mut state, &tip, false, &recheck)? {
+    let run = finish::Run {
+        moved: false,
+        caught,
+    };
+    let commit = match finish::prepare(repo, &mut state, &tip, run, &recheck)? {
         Ready::Publish(head) => head,
-        Ready::Holds(_) => return complete_held(repo, state, &publish.remote, &tip),
+        Ready::Holds(head) => return complete_held(repo, state, &publish.remote, &tip, &head),
         Ready::Stop(exit) => return Ok(exit),
     };
     finish::check(repo, &state, &commit)?;
-    let branch = UPDATE_BRANCH.to_string();
 
     // A branch already in place, as after an interrupted `finish`, needs no
     // push. Pushing it again with options would update no ref, and git then
     // writes the options to a remote that has stopped reading, which can end
-    // the push with SIGPIPE. It is looked up, and pushed, only where pushes
-    // go and the branch is not yet at the verified commit.
-    let places = match pushed_branch(&repo.git, &publish.remote, &branch) {
-        Ok(places) => places,
-        Err(err) => bail!(
-            "cannot check whether the merge request branch '{branch}' is on '{}': {err:#}\n\
-             Nothing moved, and the update stays verified; fix the cause and run `git intake finish` again",
-            publish.remote
-        ),
-    };
-    // A branch left by an earlier update is taken over only when the base
-    // contains it, as after a merge request merged with its branch kept: any
-    // other may carry a merge request the tool knows nothing of.
-    let mut leftovers = Vec::new();
-    for place in &places {
-        if let Some(at) = place.at.as_deref().filter(|at| *at != commit)
-            && !(repo.git.object_exists(at)? && repo.git.is_ancestor(at, &state.base)?)
-        {
-            leftovers.push(format!("{} at {}", place.url, abbrev(at)));
-        }
-    }
-    if !leftovers.is_empty() {
-        bail!(
-            "the branch '{branch}' already exists where '{}' pushes to, at a commit the update's base does not contain:\n{}\n\
-             It may carry a merge request the tool knows nothing of. Nothing was pushed, and the update stays verified; \
-             delete or merge that branch, then run `git intake finish` again",
-            publish.remote,
-            bullet(&leftovers)
-        );
-    }
+    // the push with SIGPIPE. It is looked up again, and pushed, only where
+    // pushes go and the branch is not yet at the verified commit.
+    let places = listed_places(repo, &publish.remote, &branch)?;
     let targets = push_targets(&publish.remote, &places, |at| at != Some(commit.as_str()));
     let (mut requested, mut options_refused, mut number) = (false, false, None);
     let mut received: Vec<&str> = Vec::new();
@@ -185,10 +188,29 @@ pub fn open(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     Ok(Exit::Success)
 }
 
-/// Completes an update whose verified commit the publish remote's
+/// Where the merge request branch is on each place pushes to `remote` go,
+/// refusing, with nothing moved, when that cannot be read.
+fn listed_places(repo: &Repo, remote: &str, branch: &str) -> Result<Vec<Place>> {
+    match pushed_branch(&repo.git, remote, branch) {
+        Ok(places) => Ok(places),
+        Err(err) => bail!(
+            "cannot check whether the merge request branch '{branch}' is on '{remote}': {err:#}\n\
+             Nothing moved, and the update stays verified; fix the cause and run `git intake finish` again"
+        ),
+    }
+}
+
+/// Completes an update whose verified commit `head` the publish remote's
 /// integration branch at `tip` already holds, as when it was pushed there by
-/// other means: the local integration branch follows it.
-fn complete_held(repo: &Repo, mut state: UpdateState, remote: &str, tip: &str) -> Result<Exit> {
+/// other means: the local integration branch follows it, and a merge
+/// request branch an interrupted first push left at `head` is deleted.
+fn complete_held(
+    repo: &Repo,
+    mut state: UpdateState,
+    remote: &str,
+    tip: &str,
+    head: &str,
+) -> Result<Exit> {
     let integration = state.config.integration.clone();
     let mut moves = Vec::new();
     if let Some(m) = integration_move(&repo.git, &integration, remote, tip)? {
@@ -203,6 +225,21 @@ fn complete_held(repo: &Repo, mut state: UpdateState, remote: &str, tip: &str) -
     repo.save_state(&state)?;
     for m in &moves {
         finish::apply(repo, m)?;
+    }
+    let left = pushed_branch(&repo.git, remote, UPDATE_BRANCH)?
+        .iter()
+        .any(|p| p.at.as_deref() == Some(head));
+    if left {
+        let mr = MergeRequest {
+            remote: remote.to_string(),
+            branch: UPDATE_BRANCH.to_string(),
+            commit: head.to_string(),
+            requested: false,
+            number: None,
+            last_seen_head: None,
+            pushed: vec![head.to_string()],
+        };
+        delete_branch(&repo.git, &mr)?;
     }
     finish::close(repo, state, Vec::new())
 }
@@ -772,11 +809,16 @@ fn catch_up_while_waiting(
         .context("the update does not wait for a merge request")?;
     let integration = state.config.integration.clone();
     restore_worktree(repo, &state)?;
-    if let Some(exit) = catch_up::conclude(repo, &mut state, false)? {
-        return Ok(exit);
-    }
+    let caught = match catch_up::conclude_for_finish(repo, &mut state)? {
+        Ok(caught) => caught,
+        Err(exit) => return Ok(exit),
+    };
     let tip = tip.unwrap_or_else(|| state.base.clone());
-    let head = match finish::prepare(repo, &mut state, &tip, false, &recheck_waiting)? {
+    let run = finish::Run {
+        moved: false,
+        caught,
+    };
+    let head = match finish::prepare(repo, &mut state, &tip, run, &recheck_waiting)? {
         Ready::Publish(head) => head,
         Ready::Holds(head) => bail!(
             "'{}/{integration}' at {} already contains {}, which the update has not pushed to '{}'; \
@@ -838,11 +880,15 @@ fn recheck_waiting(repo: &Repo, state: &mut UpdateState) -> Result<Option<String
     let mut wanted = vec![branch.clone(), target.clone()];
     wanted.extend(head.clone());
     let listed = remote_refs(&repo.git, &mr.remote, &wanted)?;
+    // The remote moves the merge request's head after a push, so a head at
+    // an earlier pushed commit is as fetched.
+    let pushed = mr.pushed();
+    let fetched = repo.git.commit(&tracking_ref(&mr.remote, &integration))?;
     let as_fetched = listed.get(&branch) == Some(&mr.commit)
         && head
             .as_ref()
-            .is_none_or(|h| listed.get(h).is_none_or(|c| *c == mr.commit))
-        && listed.get(&target) == Some(&state.base);
+            .is_none_or(|h| listed.get(h).is_none_or(|c| pushed.contains(c)))
+        && listed.get(&target) == fetched.as_ref();
     if as_fetched {
         return Ok(None);
     }
