@@ -24,7 +24,7 @@ Pin the version in the repository's tool configuration, so that an update of the
 mise use gitlab:sakiori-oss/git-intake@0.1.0
 ```
 
-mise's GitLab backend picks the release asset for the running platform by its target triple and finds the binary at the archive root without further options.
+mise's GitLab backend picks the release asset for the running platform by its target triple and finds the binary at the archive root without further options. The manual pages come with it; *Help and the manual page* below says how `man` finds them.
 
 ### Direct download
 
@@ -65,13 +65,17 @@ From a checkout, `cargo install --locked --path .` installs the working tree. `c
 
 `git intake -h`, and `-h` or `--help` after a command (`git intake finish --help`), print the built-in help. `git intake --help` is different: git turns it into `git help intake`, which opens the manual page `git-intake(1)`, so it works only where `man` finds that page.
 
-`man` finds the pages of a release archive when its `man` directory is on the manual search path. On Linux, man-db derives that path from `PATH`: for every directory on `PATH` it also searches that directory's `man` subdirectory, so the pages are found when the directory holding `git-intake` is on `PATH`, as with `mise activate`. Otherwise, or when `MANPATH` is set, add the directory to `MANPATH`; with mise:
+Every release archive carries the manual pages of that release under `man/man1/`, and mise installs them with the binary. `man` finds them when that `man` directory is on the manual search path. Unless `MANPATH` is set, both man-db and the BSD `man` derive the search path from `PATH`: for every directory on `PATH` they also search its `man` subdirectory. The pages are therefore found when the directory holding `git-intake` itself is on `PATH`, as with `mise activate`, and they then belong to the binary that runs. They are not found through mise's shims, whose directory holds no pages, nor when `MANPATH` is set without an empty component (a leading or trailing `:`, or `::`), which replaces that search.
+
+When the current pages are not on the search path, `man` opens any other `git-intake` pages it finds there, such as pages extracted from an earlier release's archive, and they describe that release. `man -w git-intake-verify` names the file `man` opens, and the footer of every page names its release. Remove such leftover pages, or put the current pages first:
 
 ```sh
 export MANPATH="$(mise where gitlab:sakiori-oss/git-intake)/man:$MANPATH"
 ```
 
-After a direct download, extracting the pages into `/usr/local/share` puts them on the default search path.
+`mise where` answers for the directory it runs in, so in a shell startup file this line names the version mise uses there, not the version a repository pins. `git intake <command> -h` always describes the binary that runs.
+
+After a direct download, extracting the pages into `/usr/local/share` puts them on the default search path; extract the pages of every new release there as well, or the old pages stay.
 
 ## Releasing
 
