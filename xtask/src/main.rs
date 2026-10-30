@@ -3,9 +3,14 @@
 //! `cargo run --locked -p xtask -- man <dir>` writes the manual pages
 //! `git-intake.1` and `git-intake-<command>.1` into `<dir>`, generated from
 //! the same command-line definition the binary is built from.
+//!
+//! `cargo run --locked -p xtask -- notices <file>` writes the third-party
+//! notices of the crates the binary is built from into `<file>`, with
+//! cargo-about, `about.toml` and the template `about.hbs`.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command as Process;
 
 use anyhow::{Context, Result, bail};
 use clap::{Arg, ArgAction, Command, CommandFactory};
@@ -24,7 +29,8 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [task, dir] if task == "man" => man(Path::new(dir)),
-        _ => bail!("usage: cargo run -p xtask -- man <dir>"),
+        [task, file] if task == "notices" => notices(Path::new(file)),
+        _ => bail!("usage: cargo run -p xtask -- man <dir> | notices <file>"),
     }
 }
 
@@ -173,4 +179,109 @@ fn write(path: &Path, page: &[u8]) -> Result<()> {
     fs::write(path, page).with_context(|| format!("cannot write {}", path.display()))?;
     println!("wrote {}", path.display());
     Ok(())
+}
+
+/// The cargo-about release the notices are generated with; CI installs the
+/// same one.
+const CARGO_ABOUT_VERSION: &str = "0.9.2";
+
+/// Writes the third-party notices into `file`: the license texts cargo-about
+/// finds for every crate of the release targets' dependency graph, followed by
+/// the NOTICE files of those crates, which the Apache License asks a
+/// redistribution to carry and cargo-about does not collect. Fails when a
+/// crate's license cannot be read or is not accepted, and on any warning, such
+/// as a clarification in `about.toml` whose file no longer matches.
+fn notices(file: &Path) -> Result<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("xtask is not inside the workspace")?;
+    let file =
+        std::path::absolute(file).with_context(|| format!("cannot resolve {}", file.display()))?;
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+
+    let version = Process::new(&cargo)
+        .args(["about", "--version"])
+        .output()
+        .context("cannot run cargo-about")?;
+    let version = String::from_utf8_lossy(&version.stdout);
+    if version.split_whitespace().nth(1) != Some(CARGO_ABOUT_VERSION) {
+        bail!(
+            "the notices are generated with cargo-about {CARGO_ABOUT_VERSION}, not '{}'; install it \
+             with `cargo install --locked --features cli cargo-about@{CARGO_ABOUT_VERSION}`",
+            version.trim()
+        );
+    }
+
+    let about = |args: &[&str]| -> Result<Vec<u8>> {
+        let out = Process::new(&cargo)
+            .current_dir(root)
+            .args([
+                "about",
+                "generate",
+                "--locked",
+                "--fail",
+                "--config",
+                "about.toml",
+            ])
+            .args(args)
+            .output()
+            .context("cannot run cargo-about")?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprint!("{stderr}");
+        if !out.status.success() {
+            bail!("cargo-about failed with {}", out.status);
+        }
+        if stderr.contains("WARN") || stderr.contains("ERROR") {
+            bail!("cargo-about warned; the notices would be incomplete");
+        }
+        Ok(out.stdout)
+    };
+
+    let mut text =
+        String::from_utf8(about(&["about.hbs"])?).context("the notices are not UTF-8")?;
+    let graph: serde_json::Value = serde_json::from_slice(&about(&["--format", "json"])?)
+        .context("cannot parse cargo-about's JSON output")?;
+    for krate in graph["crates"]
+        .as_array()
+        .context("cargo-about listed no crates")?
+    {
+        let package = &krate["package"];
+        let (Some(name), Some(version), Some(manifest)) = (
+            package["name"].as_str(),
+            package["version"].as_str(),
+            package["manifest_path"].as_str(),
+        ) else {
+            bail!("cargo-about listed a crate without name, version or manifest path");
+        };
+        for notice in notice_files(Path::new(manifest).parent().unwrap_or(root))? {
+            let body = fs::read_to_string(&notice)
+                .with_context(|| format!("cannot read {}", notice.display()))?;
+            let file_name = notice.file_name().unwrap_or_default().to_string_lossy();
+            text.push_str(&format!(
+                "\n{}\n{file_name} of {name} {version}\n\n{}\n",
+                "-".repeat(80),
+                body.trim_end()
+            ));
+        }
+    }
+
+    if let Some(dir) = file.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    write(&file, text.as_bytes())
+}
+
+/// The files at a crate's root whose name starts with `NOTICE`, in any letter
+/// case, sorted by name.
+fn notice_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("cannot list {}", dir.display()))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_ascii_uppercase();
+        if name.starts_with("NOTICE") && entry.file_type()?.is_file() {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    Ok(files)
 }

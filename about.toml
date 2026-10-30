@@ -1,0 +1,97 @@
+# cargo-about configuration: `cargo run --locked -p xtask -- notices <file>`
+# writes the third-party notices that every release archive carries, from this
+# file and the template about.hbs.
+
+# The licenses of the crates the binary links, in order of preference: of a
+# crate offered under several licenses, the notices carry the first one listed
+# here. deny.toml allows the same licenses, and Unlicense besides, which no
+# crate needs here because each crate under it also offers MIT.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+# The release targets: a crate only another platform uses is not linked.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+# Build scripts' dependencies and dev-dependencies are not part of the binary.
+# Procedural macros are not either, but cargo-about cannot tell them apart, so
+# their notices are carried too.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# xtask is never published nor shipped.
+private = { ignore = true }
+
+# ring is "Apache-2.0 AND ISC", with its terms spread over several files: its
+# own code under the ISC terms of LICENSE-other-bits, code from BoringSSL under
+# Apache-2.0 (LICENSE-BoringSSL) or under ISC terms with the copyright notice
+# at the top of each file, fiat-crypto's code under Apache-2.0, and once_cell's
+# polyfill under Apache-2.0. cargo-about's built-in workaround for ring checks
+# files of older releases, so the files are named here. Each checksum is the
+# SHA-256 of the text between `start` and `end`, or of the whole file; when
+# ring changes one, the notices refuse to build until the files are checked
+# again.
+[ring]
+clarify.license = "Apache-2.0 AND ISC"
+
+[[ring.clarify.files]]
+path = "LICENSE-other-bits"
+license = "ISC"
+checksum = "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f"
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/ec/ecp_nistz.c"
+license = "ISC"
+checksum = "4e622e20d04fd552b8b528b950c08a8125b0c7f934f20a2a1df75f8273a17773"
+start = "Copyright (c) 2014, Intel Corporation."
+end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "crypto/poly1305/poly1305.c"
+license = "ISC"
+checksum = "ed6813e62aea0e5af661f769415dc44e1d316c37487634181661d9c2ea974391"
+start = "Copyright (c) 2014, Google Inc."
+end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/ec/ecp_nistz.h"
+license = "ISC"
+checksum = "a4716a1ece644e3e80c2fab29012c567f6c4edb4a5ad8ff0590e42c2c751b34f"
+start = "Copyright (c) 2015, Google Inc."
+end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "src/aead/chacha.rs"
+license = "ISC"
+checksum = "dfafd9dadfdf390b9f25a6548cd235b8aeffb7dc63ea023df99e9f1d85232bb9"
+start = "Portions Copyright (c) 2016, Google Inc."
+end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/aes_nohw.c"
+license = "ISC"
+checksum = "a3e1cc5cfe20882b769f280a2090cbbee3d33f844901379401b6840f7861f7ae"
+start = "Copyright (c) 2019, Google Inc."
+end = "CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+
+[[ring.clarify.files]]
+path = "LICENSE-BoringSSL"
+license = "Apache-2.0"
+checksum = "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d"
+
+[[ring.clarify.files]]
+path = "third_party/fiat/LICENSE"
+license = "Apache-2.0"
+checksum = "9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f"
+
+[[ring.clarify.files]]
+path = "src/polyfill/once_cell/LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
