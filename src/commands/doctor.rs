@@ -6,8 +6,9 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::Exit;
+use crate::commands::merge_request;
 use crate::commands::update::unrelated_content;
-use crate::config::{Config, Mode, Upstream};
+use crate::config::{Config, Mode, PublishVia, Upstream};
 use crate::drift::adopted_base;
 use crate::git::{Git, abbrev, branch_ref, lines};
 use crate::output::{Render, emit};
@@ -84,6 +85,7 @@ pub fn run(repo: &Repo, json: bool) -> Result<Exit> {
         upstream_checks(repo, &loaded.config, &mut checks)?;
         remote_checks(repo, &loaded.config, &mut checks)?;
         journal_checks(repo, &loaded.config, &mut checks)?;
+        forge_checks(repo, &loaded.config, &mut checks);
     }
     checkout_checks(repo, &mut checks)?;
     state_checks(repo, &mut checks)?;
@@ -435,6 +437,78 @@ fn port_checks(
     checks.add("journal", name, status, detail);
 }
 
+/// In merge-request mode: the forge is recognised, a token is set and
+/// accepted, and the merge settings guarantee that only a tree the required
+/// pipeline tested is merged.
+fn forge_checks(repo: &Repo, config: &Config, checks: &mut Checks) {
+    let Some(publish) = config
+        .publish
+        .as_ref()
+        .filter(|p| p.via == PublishVia::MergeRequest)
+    else {
+        return;
+    };
+    let forge = match merge_request::connect(repo, publish) {
+        Ok(forge) => forge,
+        Err(err) => {
+            checks.add("forge", None, CheckStatus::Fail, format!("{err:#}"));
+            return;
+        }
+    };
+    let location = forge.location();
+    checks.add(
+        "forge",
+        None,
+        CheckStatus::Pass,
+        format!(
+            "the publish remote '{}' is the {} project '{}', reached at {} with the token in {}",
+            publish.remote,
+            forge.kind().name(),
+            location.project,
+            location.api,
+            location.token_variable
+        ),
+    );
+    if let Err(err) = forge.check_access() {
+        checks.add("forge_token", None, CheckStatus::Fail, format!("{err:#}"));
+        return;
+    }
+    checks.add(
+        "forge_token",
+        None,
+        CheckStatus::Pass,
+        format!("the {} API accepts the token", forge.kind().name()),
+    );
+    match forge.review(&config.integration) {
+        Err(err) => checks.add(
+            "merge_settings",
+            None,
+            CheckStatus::Fail,
+            format!("{err:#}"),
+        ),
+        Ok(review) => {
+            if review.refusals.is_empty() {
+                checks.add(
+                    "merge_settings",
+                    None,
+                    CheckStatus::Pass,
+                    format!(
+                        "the {} settings let only a tree the required pipeline tested be merged into '{}'",
+                        forge.kind().name(),
+                        config.integration
+                    ),
+                );
+            }
+            for refusal in review.refusals {
+                checks.add("merge_settings", None, CheckStatus::Fail, refusal);
+            }
+            for warning in review.warnings {
+                checks.add("merge_settings", None, CheckStatus::Warn, warning);
+            }
+        }
+    }
+}
+
 /// Git remotes left at an upstream's URL.
 fn remote_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<()> {
     let git = &repo.git;
@@ -609,23 +683,21 @@ fn state_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
         );
         return Ok(());
     };
-    // The worktree was removed when the merge request branch was pushed,
-    // unless the update catches up with the integration branch meanwhile.
-    if let Some(mr) = &state.merge_request
-        && !(registered && state.worktree.exists())
-    {
-        let detail = if state.finishing.is_some() {
+    // An earlier release removed the worktree once it pushed the merge
+    // request branch, unless the update caught up meanwhile.
+    if let Some(mr) = &state.merge_request {
+        checks.add(
+            "update_state",
+            None,
+            CheckStatus::Warn,
             format!(
-                "`finish` is completing the update merged through '{}'; run `git intake finish`",
-                mr.branch
-            )
-        } else {
-            format!(
-                "the update waits for its merge request from '{}' into '{}' on '{}'",
-                mr.branch, state.config.integration, mr.remote
-            )
-        };
-        checks.add("update_state", None, CheckStatus::Pass, detail);
+                "the update waits for its merge request from '{}' into '{}' on '{}', as an earlier release left it; {}",
+                mr.branch,
+                state.config.integration,
+                mr.remote,
+                merge_request::earlier_next(mr)
+            ),
+        );
         return Ok(());
     }
     let mut problems = Vec::new();

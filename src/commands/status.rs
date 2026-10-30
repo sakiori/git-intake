@@ -6,10 +6,11 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::Exit;
+use crate::commands::merge_request;
 use crate::commands::update::{
     blocking_prefix, described, next_step, no_release, plural, step_name, unrelated_content,
 };
-use crate::config::{Mode, Upstream};
+use crate::config::{Mode, PublishVia, Upstream};
 use crate::drift::{self, Drift, DriftState, SyncSource};
 use crate::git::{Git, abbrev, branch_ref};
 use crate::output::{Render, emit, table};
@@ -35,7 +36,38 @@ pub struct StatusDoc {
     pub checked: bool,
     pub all_current: bool,
     pub upstreams: Vec<UpstreamStatus>,
+    /// Merge-request mode: the update's open merge request, or `null`.
+    pub merge_request: Option<OpenRequestView>,
+    /// Merge-request mode: the newest merge request of the update merged
+    /// without its history, or `null`.
+    pub merged_without_history: Option<RequestView>,
+    /// Merge-request mode: why the forge could not be read, or `null`.
+    pub forge_error: Option<String>,
+    /// The forge's term for a merge request, for the text form.
+    #[serde(skip)]
+    pub term: &'static str,
     pub update: Option<UpdateView>,
+}
+
+#[derive(Serialize)]
+pub struct OpenRequestView {
+    pub number: u64,
+    pub url: String,
+    /// Its head commit.
+    pub head: String,
+    /// Whether its head contains the integration branch's tip.
+    pub current: bool,
+    /// How messages write its number, such as `!7` or `#7`.
+    #[serde(skip)]
+    pub reference: String,
+}
+
+#[derive(Serialize)]
+pub struct RequestView {
+    pub number: u64,
+    pub url: String,
+    #[serde(skip)]
+    pub reference: String,
 }
 
 #[derive(Serialize)]
@@ -139,8 +171,11 @@ pub struct UpdateView {
     pub verified_commit: Option<String>,
     /// The error of the last rejected push while finishing, if any.
     pub publish_error: Option<String>,
-    /// The merge request the update waits for, in merge-request mode.
+    /// The merge request an earlier release left the update waiting for.
     pub merge_request: Option<MergeRequestView>,
+    /// The merge request whose update `sync` carried on, for an update it
+    /// carried on.
+    pub carried_from: Option<CarriedView>,
     /// The catch-up merge of the steps `catch_up_conflict` and `catch_up`.
     pub catch_up: Option<CatchUpView>,
     pub next: String,
@@ -159,16 +194,22 @@ pub struct CatchUpView {
 
 #[derive(Serialize)]
 pub struct MergeRequestView {
-    /// The merge request's number, when the remote's reply named it.
+    /// The merge request's number, when the earlier release recorded it.
     pub number: Option<u64>,
     pub remote: String,
-    /// The branch on the publish remote that holds the verified commit.
+    /// The branch on the publish remote the earlier release pushed to.
     pub source_branch: String,
     pub target_branch: String,
+    /// The commit the earlier release last pushed to it.
     pub commit: String,
-    /// Whether the push that carried the options asking the remote to open
-    /// the merge request transferred the branch; when not, it is opened by hand.
-    pub requested: bool,
+}
+
+#[derive(Serialize)]
+pub struct CarriedView {
+    pub number: u64,
+    pub url: String,
+    /// The branch the merge request comes from.
+    pub source_branch: String,
 }
 
 #[derive(Serialize)]
@@ -260,6 +301,35 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     drop(fetches);
 
     let all_current = upstreams.iter().all(|u| u.state == DriftState::Current);
+    let mut merge_request = None;
+    let mut merged_without_history = None;
+    let mut forge_error = None;
+    let mut term = "merge request";
+    if let Some(publish) = &config.publish
+        && publish.via == PublishVia::MergeRequest
+    {
+        match merge_request::overview(repo, publish, &config.integration, &tip) {
+            Ok(o) => {
+                term = o.kind.term();
+                if let Some(open) = o.open {
+                    merge_request = Some(OpenRequestView {
+                        current: git.object_exists(&open.head)?
+                            && git.is_ancestor(&tip, &open.head)?,
+                        reference: o.kind.reference(open.number),
+                        number: open.number,
+                        url: open.url,
+                        head: open.head,
+                    });
+                }
+                merged_without_history = o.merged_without_history.map(|m| RequestView {
+                    reference: o.kind.reference(m.number),
+                    number: m.number,
+                    url: m.url,
+                });
+            }
+            Err(err) => forge_error = Some(format!("{err:#}")),
+        }
+    }
     let update = match repo.state()? {
         Some(state) => {
             repo.restore_held_references(&state)?;
@@ -281,6 +351,10 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
         checked: check,
         all_current,
         upstreams,
+        merge_request,
+        merged_without_history,
+        forge_error,
+        term,
         update,
     };
     emit(&doc, json)?;
@@ -513,7 +587,11 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
             source_branch: mr.branch.clone(),
             target_branch: state.config.integration.clone(),
             commit: mr.commit.clone(),
-            requested: mr.requested,
+        }),
+        carried_from: state.carried_from.as_ref().map(|c| CarriedView {
+            number: c.number,
+            url: c.url.clone(),
+            source_branch: c.branch.clone(),
         }),
         catch_up: state
             .catch_ups
@@ -673,6 +751,36 @@ impl Render for StatusDoc {
                 "drift: not every upstream is current\n"
             });
         }
+        let term = self.term;
+        if let Some(mr) = &self.merge_request {
+            out.push_str(&format!(
+                "\n{term} {} ({}) at {}: ",
+                mr.reference,
+                mr.url,
+                abbrev(&mr.head)
+            ));
+            if mr.current {
+                out.push_str(&format!(
+                    "it contains '{}' and waits to be merged\n",
+                    self.integration
+                ));
+            } else {
+                out.push_str(&format!(
+                    "behind '{}'; run `git intake sync` to catch it up\n",
+                    self.integration
+                ));
+            }
+        }
+        if let Some(m) = &self.merged_without_history {
+            out.push_str(&format!(
+                "{term} {} ({}) was merged without the update's history, which a squash or rebase drops; its sync \
+                 records never landed, and `git intake sync` proposes its targets again\n",
+                m.reference, m.url
+            ));
+        }
+        if let Some(why) = &self.forge_error {
+            out.push_str(&format!("\ncannot read the forge: {why}\n"));
+        }
         if let Some(update) = &self.update {
             out.push('\n');
             out.push_str(&render_update(update));
@@ -698,20 +806,20 @@ pub fn render_update(u: &UpdateView) -> String {
     }
     out.push_str(&format!("  branch: {}\n", u.branch));
     match &u.merge_request {
-        // The worktree is removed once the merge request branch is pushed.
         Some(mr) => out.push_str(&format!(
-            "  merge request{}: {} into {} on {}{}\n",
-            mr.number.map(|n| format!(" !{n}")).unwrap_or_default(),
+            "  waiting, as an earlier release left it, for the merge request{} from {} into {} on {}\n",
+            mr.number.map(|n| format!(" {n}")).unwrap_or_default(),
             mr.source_branch,
             mr.target_branch,
-            mr.remote,
-            if mr.requested {
-                ""
-            } else {
-                " (the remote was not asked to open it; open it with squashing off unless it is open)"
-            }
+            mr.remote
         )),
         None => out.push_str(&format!("  worktree: {}\n", u.worktree.display())),
+    }
+    if let Some(c) = &u.carried_from {
+        out.push_str(&format!(
+            "  carried on from {} on {}\n",
+            c.url, c.source_branch
+        ));
     }
     for q in &u.upstreams {
         let step = q.step.describe(q.mode == Mode::Port);
