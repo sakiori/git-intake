@@ -754,56 +754,57 @@ impl Repo {
     /// where the update worktree is placed: `.worktrees` or
     /// `.worktrees/git-intake` as anything but a directory, which would
     /// replace the directory holding the update worktree, or anything at
-    /// [`state::UPDATE_WORKTREE`] itself. Names are compared as the checkout
-    /// compares them, without case when `core.ignoreCase` is set. `None`
-    /// when nothing collides.
+    /// [`state::UPDATE_WORKTREE`] itself. Names are compared under full
+    /// Unicode case folding whatever `core.ignoreCase` says, as a file
+    /// system or directory that ignores case would take them for the same
+    /// name. `None` when nothing collides.
     pub fn placement_collision(&self, rev: &str) -> Result<Option<String>> {
-        let ignore_case = self
-            .git
-            .raw(&["config", "--bool", "--get", "core.ignorecase"])?
-            .stdout
-            .trim()
-            == "true";
         let parts: Vec<&str> = state::UPDATE_WORKTREE.split('/').collect();
-        let mut tree = format!("{rev}^{{tree}}");
-        let mut path = String::new();
-        for (i, part) in parts.iter().enumerate() {
-            let listing = self
-                .git
-                .run(&["ls-tree", "-z", "--end-of-options", &tree])?;
-            // `<mode> SP <type> SP <object> TAB <name>`
-            let entry = listing.split('\0').find_map(|e| {
-                let (meta, name) = e.split_once('\t')?;
-                let same = if ignore_case {
-                    name.eq_ignore_ascii_case(part)
-                } else {
-                    name == *part
-                };
-                same.then(|| (meta.split(' ').collect::<Vec<_>>(), name))
-            });
-            let Some((meta, name)) = entry else {
-                return Ok(None);
+        self.collision_below(&format!("{rev}^{{tree}}"), &parts, "")
+    }
+
+    /// [`Self::placement_collision`] in `tree`, at `path`, for the rest
+    /// `parts` of the placement.
+    fn collision_below(&self, tree: &str, parts: &[&str], path: &str) -> Result<Option<String>> {
+        let Some((part, rest)) = parts.split_first() else {
+            return Ok(None);
+        };
+        let listing = self.git.run(&["ls-tree", "-z", "--end-of-options", tree])?;
+        let wanted = unicase::UniCase::unicode(*part);
+        // `<mode> SP <type> SP <object> TAB <name>`
+        for entry in listing.split('\0') {
+            let Some((meta, name)) = entry.split_once('\t') else {
+                continue;
             };
-            if !path.is_empty() {
-                path.push('/');
+            if unicase::UniCase::unicode(name) != wanted {
+                continue;
             }
-            path.push_str(name);
+            let meta: Vec<&str> = meta.split(' ').collect();
+            let at = if path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{path}/{name}")
+            };
             let kind = match meta.as_slice() {
                 ["120000", ..] => "a symbolic link",
                 ["160000", ..] => "a submodule",
                 [_, "tree", _] => "a directory",
                 _ => "a file",
             };
-            if i + 1 == parts.len() {
+            if rest.is_empty() {
                 return Ok(Some(format!(
-                    "it has {kind} at '{path}', where the tool keeps the update worktree"
+                    "it has {kind} at '{at}', where the tool keeps the update worktree"
                 )));
             }
             match meta.as_slice() {
-                [_, "tree", oid] => tree = oid.to_string(),
+                [_, "tree", oid] => {
+                    if let Some(found) = self.collision_below(oid, rest, &at)? {
+                        return Ok(Some(found));
+                    }
+                }
                 _ => {
                     return Ok(Some(format!(
-                        "it has '{path}' as {kind}, where the tool keeps the update worktree, at {} in the main \
+                        "it has '{at}' as {kind}, where the tool keeps the update worktree, at {} in the main \
                          worktree; checked out there, it would replace the directory that holds the worktree",
                         state::UPDATE_WORKTREE
                     )));

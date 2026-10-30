@@ -102,9 +102,21 @@ impl Paths {
     /// them, if it exists: a directory with what it holds, anything else
     /// itself. Returns whether something was removed. Refuses, removing
     /// nothing, a path outside the tool's directory or reached through a
-    /// symbolic link or something other than a directory, which could lead
-    /// out of the git directory.
+    /// symbolic link or something other than a directory, or written with
+    /// `..`, which could lead out of the git directory.
     pub fn remove(&self, path: &Path) -> Result<bool> {
+        // `..` would lead anywhere once the path is resolved.
+        if path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        }) {
+            anyhow::bail!(
+                "{} holds `.` or `..`, so it may lie outside the tool's directory; it was not removed",
+                path.display()
+            );
+        }
         let Ok(inside) = path.strip_prefix(&self.common) else {
             anyhow::bail!(
                 "{} lies outside the git directory {}; it was not removed",
@@ -1089,6 +1101,9 @@ mod tests {
         fs::create_dir_all(&paths.root).unwrap();
         assert!(paths.remove(&elsewhere).is_err());
         assert!(paths.remove(&common.join("HEAD")).is_err());
+        let escaping = paths.root.join("..").join("..").join("elsewhere");
+        let err = paths.remove(&escaping).unwrap_err().to_string();
+        assert!(err.contains("not removed"), "{err}");
         assert!(elsewhere.exists());
         // A link inside it is removed itself, not what it points to.
         std::os::unix::fs::symlink(&elsewhere, &paths.logs).unwrap();

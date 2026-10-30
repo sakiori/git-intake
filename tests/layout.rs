@@ -874,3 +874,27 @@ fn a_directory_git_does_not_register_at_the_update_worktree_is_left_and_named() 
     assert!(!wt.exists());
     f.tool(&["start"]).success();
 }
+
+#[test]
+fn an_update_that_brings_a_link_named_in_another_case_is_refused() {
+    let f = Fork::new();
+    let env = &f.env;
+    let (victim, kept) = outside_directory(env);
+    // `git-intake` with the Kelvin sign, which a case-insensitive file
+    // system takes for the same name.
+    let dir = f.up.work.join(".worktrees");
+    fs::create_dir_all(&dir).unwrap();
+    std::os::unix::fs::symlink(victim.join("git-intake"), dir.join("git-inta\u{212A}e")).unwrap();
+    env.push_upstream(&f.up, &[], "upstream: link git-intake in another case");
+    let main = env.rev(&f.down, "main");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(err.contains("git-inta\u{212A}e"), "{err}");
+    assert!(err.contains("symbolic link"), "{err}");
+    assert_eq!(env.rev(&f.down, "main"), main);
+    assert_eq!(env.rev(&f.publish, "main"), main);
+    f.tool(&["abort"]).success();
+    assert_eq!(fs::read_to_string(&kept).unwrap(), "kept\n");
+    env.assert_no_update(&f.down);
+}
