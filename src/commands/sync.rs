@@ -21,9 +21,9 @@ use anyhow::{Context, Result, bail};
 use crate::Exit;
 use crate::commands::catch_up::{self, Advice};
 use crate::commands::merge_request::{
-    self, Branch, Publication, Published, Stage, Stopped, classify, connect, delete_branch,
-    fetch_integration, merged_without_history, named, publish, refuse_elsewhere, remote_branch,
-    requests, require_publishable, unknown_branch,
+    self, Branch, Publication, Published, classify, connect, delete_branch, fetch_integration,
+    merged_without_history, named, publish, refuse_elsewhere, remote_branch, requests,
+    require_publishable, unknown_branch,
 };
 use crate::commands::update::{
     self, Advanced, Fetched, Queued, advance, begin, plural, queue_follow, refuse_leftovers,
@@ -610,7 +610,7 @@ fn carry_and_publish(
         };
         let outcome = match open {
             Some(open) => {
-                let mut guard = guard(repo, forge, remote, open, head, tip);
+                let mut guard = merge_request::guard(repo, forge, remote, open, head, tip);
                 publish(
                     repo,
                     &mut state,
@@ -629,75 +629,6 @@ fn carry_and_publish(
             Err(err)
         }
         ok => ok,
-    }
-}
-
-/// Reads the merge request's state and head and the remote's integration
-/// branch again just before the push, and the merge request's state right
-/// after it.
-fn guard<'a>(
-    repo: &'a Repo,
-    forge: &'a dyn Forge,
-    remote: &'a str,
-    open: &'a MergeRequest,
-    head: &'a str,
-    tip: &'a str,
-) -> impl FnMut(Stage) -> Result<Option<Stopped>> + 'a {
-    let kind = forge.kind();
-    move |stage| {
-        let now = forge.merge_request(open.number)?;
-        match stage {
-            Stage::BeforePush => {
-                if now.state != State::Open {
-                    return Ok(Some(Stopped {
-                        exit: Exit::Success,
-                        message: format!(
-                            "the {} was {} while sync caught it up; nothing was pushed, and no {} was opened",
-                            named(kind, &now),
-                            now.state.describe(),
-                            kind.term()
-                        ),
-                    }));
-                }
-                let integration = format!("refs/heads/{}", open.target);
-                let source = branch_ref(&open.source);
-                let listed = merge_request::remote_refs(
-                    &repo.git,
-                    remote,
-                    &[integration.clone(), source.clone()],
-                )?;
-                let unchanged = now.head == open.head
-                    && listed.get(&source).map(String::as_str) == Some(head)
-                    && listed.get(&integration).map(String::as_str) == Some(tip);
-                if !unchanged {
-                    return Ok(Some(Stopped {
-                        exit: Exit::Code(2),
-                        message: format!(
-                            "the {} or '{remote}/{}' changed while sync caught it up; nothing was pushed. Run \
-                             `git intake sync` again",
-                            named(kind, &now),
-                            open.target
-                        ),
-                    }));
-                }
-                Ok(None)
-            }
-            Stage::AfterPush(pushed) => {
-                if now.state == State::Open {
-                    return Ok(None);
-                }
-                // The push recreated a branch the merge removed.
-                delete_branch(&repo.git, remote, &open.source, pushed)?;
-                Ok(Some(Stopped {
-                    exit: Exit::Success,
-                    message: format!(
-                        "the {} was {} just before the push; the catch-up merge it no longer needs was removed again",
-                        named(kind, &now),
-                        now.state.describe()
-                    ),
-                }))
-            }
-        }
     }
 }
 

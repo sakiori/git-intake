@@ -333,6 +333,71 @@ pub fn publish(
     Ok(Published::Done(mr))
 }
 
+/// Reads the merge request's state and head and the remote's integration
+/// branch again just before the push, and the merge request's state right
+/// after it.
+pub fn guard<'a>(
+    repo: &'a Repo,
+    forge: &'a dyn Forge,
+    remote: &'a str,
+    open: &'a MergeRequest,
+    head: &'a str,
+    tip: &'a str,
+) -> impl FnMut(Stage) -> Result<Option<Stopped>> + 'a {
+    let kind = forge.kind();
+    move |stage| {
+        let now = forge.merge_request(open.number)?;
+        match stage {
+            Stage::BeforePush => {
+                if now.state != State::Open {
+                    return Ok(Some(Stopped {
+                        exit: Exit::Success,
+                        message: format!(
+                            "the {} was {} before the update was pushed to it; nothing was pushed, and no {} was opened",
+                            named(kind, &now),
+                            now.state.describe(),
+                            kind.term()
+                        ),
+                    }));
+                }
+                let integration = format!("refs/heads/{}", open.target);
+                let source = branch_ref(&open.source);
+                let listed =
+                    remote_refs(&repo.git, remote, &[integration.clone(), source.clone()])?;
+                let unchanged = now.head == open.head
+                    && listed.get(&source).map(String::as_str) == Some(head)
+                    && listed.get(&integration).map(String::as_str) == Some(tip);
+                if !unchanged {
+                    return Ok(Some(Stopped {
+                        exit: Exit::Code(2),
+                        message: format!(
+                            "the {} or '{remote}/{}' changed meanwhile; nothing was pushed. Run the command again",
+                            named(kind, &now),
+                            open.target
+                        ),
+                    }));
+                }
+                Ok(None)
+            }
+            Stage::AfterPush(pushed) => {
+                if now.state == State::Open {
+                    return Ok(None);
+                }
+                // The push recreated a branch the merge removed.
+                delete_branch(&repo.git, remote, &open.source, pushed)?;
+                Ok(Some(Stopped {
+                    exit: Exit::Success,
+                    message: format!(
+                        "the {} was {} just before the push; the branch the push recreated was deleted again",
+                        named(kind, &now),
+                        now.state.describe()
+                    ),
+                }))
+            }
+        }
+    }
+}
+
 /// The changes the update makes, from its base to `head`, to its own
 /// checks: the forge's CI definition at `ci_paths`, and the install command
 /// and checks of the configuration.
@@ -946,7 +1011,17 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
         open: open.as_ref(),
         retry_of: None,
     };
-    let mr = match publish(repo, &mut state, &head, publication, None)? {
+    // An open merge request is read again just before and right after the
+    // push, as `sync` reads it.
+    let read_head = open.as_ref().map(|o| o.head.clone()).unwrap_or_default();
+    let published = match &open {
+        Some(open) => {
+            let mut guard = guard(repo, forge.as_ref(), &remote, open, &read_head, &tip);
+            publish(repo, &mut state, &head, publication, Some(&mut guard))?
+        }
+        None => publish(repo, &mut state, &head, publication, None)?,
+    };
+    let mr = match published {
         Published::Done(mr) => mr,
         Published::Stopped(stop) => {
             println!("{}", stop.message);
