@@ -160,7 +160,7 @@ fn partial_run(
         state.worktree.display(),
         left_out.join(", ")
     );
-    let run = run_checks(state, head, selected, &repo.paths.partial_logs)?;
+    let run = run_checks(repo, state, head, selected, &repo.paths.partial_logs)?;
     let passed = run.passed;
     state.partial_run = Some(PartialRun { run, left_out });
     repo.save_state(state)?;
@@ -199,7 +199,7 @@ fn partial_run(
 pub fn verify_head(repo: &Repo, state: &mut UpdateState, head: &str) -> Result<bool> {
     println!("verifying {} in {}", abbrev(head), state.worktree.display());
     let checks = state.config.checks.clone();
-    let run = run_checks(state, head, &checks, &repo.paths.verify_logs)?;
+    let run = run_checks(repo, state, head, &checks, &repo.paths.verify_logs)?;
     let passed = run.passed;
     state.verification = Some(run);
     repo.drop_partial_run(state)?;
@@ -212,15 +212,14 @@ pub fn verify_head(repo: &Repo, state: &mut UpdateState, head: &str) -> Result<b
 /// each check's to `check-<name>.log`, so that no check's log takes the
 /// install command's place.
 fn run_checks(
+    repo: &Repo,
     state: &UpdateState,
     head: &str,
     checks: &[Check],
     logs: &Path,
 ) -> Result<Verification> {
     let wt = Git::worktree(&state.worktree);
-    if logs.exists() {
-        fs::remove_dir_all(logs).with_context(|| format!("cannot clear {}", logs.display()))?;
-    }
+    repo.paths.remove(logs)?;
     fs::create_dir_all(logs).with_context(|| format!("cannot create {}", logs.display()))?;
 
     let environment = check_environment(state, head);

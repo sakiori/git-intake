@@ -8,6 +8,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 
+use crate::redact::redacted;
+
 /// Environment variables that would redirect git away from the directory a
 /// [`Git`] handle is bound to. They are cleared for worktree handles.
 const REDIRECTING_ENV: &[&str] = &[
@@ -32,7 +34,8 @@ impl fmt::Display for GitError {
             Some(code) => format!("exit status {code}"),
             None => "terminated by a signal".to_string(),
         };
-        // The arguments and git's message may name a URL with credentials.
+        // The arguments and git's message may name a URL with credentials,
+        // and git's message may quote a token.
         write!(
             f,
             "`git {}` failed ({code})",
@@ -44,48 +47,6 @@ impl fmt::Display for GitError {
         }
         Ok(())
     }
-}
-
-/// `text` with the credentials removed from every URL in it: a password
-/// always, and for `http` and `https` a user without one, which is where a
-/// token is usually written (`https://<token>@host/path`). Another scheme's
-/// user, as `git` in `ssh://git@host/path`, stays, as it does in the
-/// scp-like form `git@host:path`. A credential written into a remote's or
-/// an upstream's URL thus never reaches a message.
-pub fn redacted(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find("://") {
-        let (head, tail) = rest.split_at(at + 3);
-        out.push_str(head);
-        let scheme: String = head[..at]
-            .chars()
-            .rev()
-            .take_while(|c| c.is_ascii_alphanumeric() || "+.-".contains(*c))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<String>()
-            .to_ascii_lowercase();
-        let end = tail
-            .find(|c: char| "/?#".contains(c) || c.is_whitespace() || "'\"`<>()[]".contains(c))
-            .unwrap_or(tail.len());
-        let authority = &tail[..end];
-        match authority.rsplit_once('@') {
-            None => out.push_str(authority),
-            Some((user, host)) => {
-                let user = user.split_once(':').map_or(user, |(name, _)| name);
-                if !(scheme == "http" || scheme == "https") && !user.is_empty() {
-                    out.push_str(user);
-                    out.push('@');
-                }
-                out.push_str(host);
-            }
-        }
-        rest = &tail[end..];
-    }
-    out.push_str(rest);
-    out
 }
 
 impl std::error::Error for GitError {}
@@ -128,6 +89,9 @@ impl Output {
 pub struct Git {
     dir: PathBuf,
     isolated: bool,
+    /// Whether git may find a repository only at `dir` itself, never in a
+    /// directory above it.
+    exact: bool,
 }
 
 impl Git {
@@ -137,6 +101,7 @@ impl Git {
         Self {
             dir: dir.into(),
             isolated: false,
+            exact: false,
         }
     }
 
@@ -146,6 +111,18 @@ impl Git {
         Self {
             dir: dir.into(),
             isolated: true,
+            exact: false,
+        }
+    }
+
+    /// A handle for the repository at `dir` itself, as for a local URL:
+    /// like [`Self::worktree`], and git never looks for a repository in a
+    /// directory above `dir`.
+    pub fn exactly_at(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            isolated: true,
+            exact: true,
         }
     }
 
@@ -165,6 +142,11 @@ impl Git {
                 cmd.env_remove(var);
             }
         }
+        if self.exact
+            && let Some(parent) = self.dir.parent()
+        {
+            cmd.env("GIT_CEILING_DIRECTORIES", parent);
+        }
         cmd
     }
 
@@ -174,7 +156,7 @@ impl Git {
         let out = self
             .command(args)
             .output()
-            .with_context(|| format!("cannot run `git {}`", owned.join(" ")))?;
+            .with_context(|| format!("cannot run `git {}`", redacted(&owned.join(" "))))?;
         Ok(Output {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -195,16 +177,18 @@ impl Git {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("cannot run `git {}`", owned.join(" ")))?;
+            .with_context(|| format!("cannot run `git {}`", redacted(&owned.join(" "))))?;
         let mut stdin = child.stdin.take().context("no stdin for git")?;
         let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
         let out = child
             .wait_with_output()
-            .with_context(|| format!("cannot run `git {}`", owned.join(" ")))?;
+            .with_context(|| format!("cannot run `git {}`", redacted(&owned.join(" "))))?;
         writer
             .join()
-            .map_err(|_| anyhow::anyhow!("writing to `git {}` panicked", owned.join(" ")))?
-            .with_context(|| format!("cannot write to `git {}`", owned.join(" ")))?;
+            .map_err(|_| {
+                anyhow::anyhow!("writing to `git {}` panicked", redacted(&owned.join(" ")))
+            })?
+            .with_context(|| format!("cannot write to `git {}`", redacted(&owned.join(" "))))?;
         Ok(Output {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -410,33 +394,6 @@ mod tests {
             parse_porcelain_z(" M caf\u{e9}.txt\0R  new name\0old name\0M  q\"uote.txt\0"),
             vec!["caf\u{e9}.txt", "new name", "q\"uote.txt"]
         );
-    }
-
-    #[test]
-    fn credentials_in_urls_are_removed() {
-        assert_eq!(
-            redacted("push to https://user:s3cret@gitlab.example.com/g/app.git failed"),
-            "push to https://gitlab.example.com/g/app.git failed"
-        );
-        assert_eq!(
-            redacted("https://ghp_token@github.com/team/app.git"),
-            "https://github.com/team/app.git"
-        );
-        // Another scheme keeps its user, and loses only a password.
-        assert_eq!(
-            redacted("'ssh://git@host:22/x' and ssh://deploy:s3cret@host/y"),
-            "'ssh://git@host:22/x' and ssh://deploy@host/y"
-        );
-        // The authority ends at a path, a query or a fragment.
-        assert_eq!(
-            redacted("https://host?u=a@b and https://host#a@b"),
-            "https://host?u=a@b and https://host#a@b"
-        );
-        assert_eq!(
-            redacted("git@example.com:team/app.git"),
-            "git@example.com:team/app.git"
-        );
-        assert_eq!(redacted("no url here"), "no url here");
     }
 
     #[test]

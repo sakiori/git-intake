@@ -883,3 +883,358 @@ fn another_release_after_the_push_is_not_advised_to_abort() {
     assert!(!first.contains("abort"), "{first}");
     env.assert_no_update(&f.down);
 }
+
+/// A way the publish remote can push to the upstream's repository under a
+/// URL that differs from the upstream's.
+#[derive(Debug, Clone, Copy)]
+enum Alias {
+    /// An `https` URL with credentials, which git serves from the same
+    /// repository as the upstream's URL.
+    Credentials,
+    /// A push URL that `url.<base>.insteadOf` rewrites to the upstream's.
+    InsteadOf,
+    /// The publish remote's own URL, which `url.<base>.pushInsteadOf`
+    /// rewrites to the upstream's for pushes.
+    PushInsteadOf,
+    /// A `file://localhost/` push URL of the upstream's repository.
+    FileLocalhost,
+    /// An `ssh` push URL of the repository the upstream reaches by `https`.
+    SshForHttps,
+    /// The path of a linked worktree of the upstream's repository.
+    LinkedWorktree,
+    /// An `ssh` push URL on a host alias of the SSH client's configuration
+    /// for the upstream's host.
+    SshHostNickname,
+}
+
+const ALIASES: [Alias; 7] = [
+    Alias::Credentials,
+    Alias::InsteadOf,
+    Alias::PushInsteadOf,
+    Alias::FileLocalhost,
+    Alias::SshForHttps,
+    Alias::LinkedWorktree,
+    Alias::SshHostNickname,
+];
+
+impl Alias {
+    /// What the configuration needs before an update starts: for
+    /// [`Alias::Credentials`] and [`Alias::SshForHttps`], the upstream
+    /// reached by an `https` URL that the test's git configuration serves
+    /// from its local repository, which the SSH shim serves as well; for
+    /// [`Alias::LinkedWorktree`], the linked worktree.
+    fn prepare(self, f: &Fork) {
+        if let Alias::LinkedWorktree = self {
+            f.env.git(
+                &f.up.bare,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "side",
+                    &f.env.path("upstream-linked").to_string_lossy(),
+                    "main",
+                ],
+            );
+        }
+        if let Alias::SshHostNickname = self {
+            f.env.ssh_alias("upstream-alias", "example.com");
+            std::fs::create_dir_all(f.env.path("served")).unwrap();
+            std::os::unix::fs::symlink(&f.up.bare, f.env.path("served/upstream.git")).unwrap();
+            f.reconfigure(
+                &format!("url = {:?}", f.up.url()),
+                "url = \"ssh://git@example.com/upstream.git\"",
+            );
+        }
+        if let Alias::SshForHttps = self {
+            std::fs::create_dir_all(f.env.path("served")).unwrap();
+            std::os::unix::fs::symlink(&f.up.bare, f.env.path("served/upstream.git")).unwrap();
+        }
+        if let Alias::Credentials | Alias::SshForHttps = self {
+            let config = f.env.path("gitconfig");
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(&format!(
+                "[url {:?}]\n\tinsteadOf = https://example.com/\n\tinsteadOf = https://user:s3cret@example.com/\n",
+                format!("{}/", f.env.path("").display())
+            ));
+            std::fs::write(&config, text).unwrap();
+            f.reconfigure(
+                &format!("url = {:?}", f.up.url()),
+                "url = \"https://example.com/upstream.git\"",
+            );
+        }
+    }
+
+    /// Makes the publish remote push to the upstream's repository.
+    fn apply(self, f: &Fork) {
+        let env = &f.env;
+        let up = f.up.url();
+        match self {
+            Alias::Credentials => env.git(
+                &f.down,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    "https://user:s3cret@example.com/upstream.git",
+                ],
+            ),
+            Alias::InsteadOf => {
+                env.git(
+                    &f.down,
+                    &["config", &format!("url.{up}.insteadOf"), "upstream-alias:"],
+                );
+                env.git(
+                    &f.down,
+                    &["remote", "set-url", "--push", "origin", "upstream-alias:"],
+                )
+            }
+            Alias::PushInsteadOf => env.git(
+                &f.down,
+                &[
+                    "config",
+                    &format!("url.{up}.pushInsteadOf"),
+                    &f.publish.to_string_lossy(),
+                ],
+            ),
+            Alias::FileLocalhost => env.git(
+                &f.down,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    &format!("file://localhost{up}"),
+                ],
+            ),
+            Alias::SshForHttps => env.git(
+                &f.down,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    "ssh://git@example.com/upstream.git",
+                ],
+            ),
+            Alias::SshHostNickname => env.git(
+                &f.down,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    "ssh://upstream-alias/upstream.git",
+                ],
+            ),
+            Alias::LinkedWorktree => env.git(
+                &f.down,
+                &[
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    &env.path("upstream-linked").to_string_lossy(),
+                ],
+            ),
+        };
+    }
+}
+
+/// Asserts that nothing of the downstream reached the upstream's
+/// repository, whose `main` is still at `tip`.
+fn assert_upstream_untouched(f: &Fork, tip: &str, alias: Alias) {
+    assert_eq!(f.env.rev(&f.up.bare, "main"), tip, "{alias:?}");
+    assert!(
+        !f.env
+            .git_output(&f.up.bare, &["cat-file", "-e", "main:.git-intake.toml"])
+            .status
+            .success(),
+        "{alias:?}"
+    );
+}
+
+#[test]
+fn sync_never_pushes_to_an_upstream_under_another_url() {
+    for alias in ALIASES {
+        let f = Fork::new();
+        alias.prepare(&f);
+        alias.apply(&f);
+        let tip = f
+            .env
+            .push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+        let err = stderr(&f.tool(&["sync"]).code(2));
+        assert!(
+            err.contains("names the repository of upstream 'upstream'"),
+            "{alias:?}: {err}"
+        );
+        assert!(
+            err.contains("the tool never pushes to an upstream"),
+            "{alias:?}: {err}"
+        );
+        assert!(!err.contains("s3cret"), "{alias:?}: {err}");
+        assert_upstream_untouched(&f, &tip, alias);
+        f.env.assert_no_update(&f.down);
+        let doctor = stdout(&f.tool(&["doctor"]).code(1));
+        assert!(
+            doctor.contains("names the repository of upstream 'upstream'")
+                && doctor.contains("the tool never pushes to an upstream"),
+            "{alias:?}: {doctor}"
+        );
+        assert!(!doctor.contains("s3cret"), "{alias:?}: {doctor}");
+    }
+}
+
+#[test]
+fn finish_never_pushes_to_an_upstream_under_another_url() {
+    for alias in ALIASES {
+        let f = Fork::new();
+        alias.prepare(&f);
+        let tip = f
+            .env
+            .push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+        f.tool(&["start"]).success();
+        f.tool(&["verify"]).success();
+        let main = f.env.rev(&f.down, "main");
+        // The remote changes once the update is under way, after the
+        // configuration was read.
+        alias.apply(&f);
+        let err = stderr(&f.tool(&["finish"]).code(2));
+        assert!(
+            err.contains("names the repository of upstream 'upstream'"),
+            "{alias:?}: {err}"
+        );
+        assert!(
+            err.contains("the tool never pushes to an upstream"),
+            "{alias:?}: {err}"
+        );
+        assert!(!err.contains("s3cret"), "{alias:?}: {err}");
+        assert_eq!(f.env.rev(&f.down, "main"), main, "{alias:?}");
+        assert_upstream_untouched(&f, &tip, alias);
+    }
+}
+
+/// Asserts that no run of `args` shows `secret`, in text or JSON.
+fn assert_never_shown(f: &Fork, secret: &str, runs: &[&[&str]]) {
+    for args in runs {
+        let run = f.tool(args);
+        let out = run.get_output();
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!shown.is_empty(), "{args:?}");
+        assert!(!shown.contains(secret), "{args:?}: {shown}");
+    }
+}
+
+#[test]
+fn an_api_url_with_credentials_is_refused_without_showing_them() {
+    let f = Fork::new();
+    f.reconfigure(
+        "via = \"push\"",
+        "via = \"push\"\napi = \"https://user:s3cret@gitlab.example.com/api/v4\"",
+    );
+    let err = stderr(&f.tool(&["status"]).code(2));
+    assert!(err.contains("carries credentials"), "{err}");
+    assert!(err.contains("https://gitlab.example.com/api/v4"), "{err}");
+    assert_never_shown(
+        &f,
+        "s3cret",
+        &[
+            &["status"],
+            &["status", "--json"],
+            &["doctor"],
+            &["doctor", "--json"],
+        ],
+    );
+}
+
+#[test]
+fn a_git_command_that_cannot_start_is_named_without_credentials() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    // An argument this long is more than the system lets a process start
+    // with, so git cannot be run with it when the push URL is read.
+    let url = format!(
+        "https://user:s3cret@example.com/{}.git",
+        "a".repeat(3 * 1024 * 1024)
+    );
+    let config = f.down.join(".git").join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("[remote \"origin\"]\n\tpushurl = {url}\n"));
+    std::fs::write(&config, text).unwrap();
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(
+        err.contains("cannot run `git"),
+        "{}",
+        &err[..err.len().min(400)]
+    );
+    assert!(!err.contains("s3cret"), "{}", &err[..err.len().min(400)]);
+}
+
+#[test]
+fn an_upstream_url_with_credentials_is_refused_without_showing_them() {
+    let f = Fork::new();
+    for (url, shown) in [
+        (
+            "https://user:s3cret@example.com/upstream.git",
+            "https://example.com/upstream.git",
+        ),
+        (
+            "https://s3cret@example.com/upstream.git",
+            "https://example.com/upstream.git",
+        ),
+        (
+            "ssh://deploy:s3cret@example.com/upstream.git",
+            "ssh://deploy@example.com/upstream.git",
+        ),
+    ] {
+        let path = f.down.join(".git-intake.toml");
+        let committed = std::fs::read_to_string(&path).unwrap();
+        let at = committed.find("url = ").unwrap();
+        let end = at + committed[at..].find('\n').unwrap();
+        let config = format!("{}url = {url:?}{}", &committed[..at], &committed[end..]);
+        f.env.commit(
+            &f.down,
+            &[(".git-intake.toml", &config)],
+            "fork: an upstream URL with credentials",
+        );
+        let err = stderr(&f.tool(&["status"]).code(2));
+        assert!(
+            err.contains(&format!("url: '{shown}' carries credentials")),
+            "{url}: {err}"
+        );
+        assert_never_shown(
+            &f,
+            "s3cret",
+            &[&["status"], &["status", "--json"], &["doctor", "--json"]],
+        );
+        f.env.git(&f.down, &["reset", "-q", "--hard", "HEAD~1"]);
+    }
+    // The user of an SSH URL names an account, not a credential.
+    f.reconfigure(
+        &format!("url = {:?}", f.up.url()),
+        "url = \"ssh://git@example.com/upstream.git\"",
+    );
+    let err = stderr(&f.tool(&["status"]));
+    assert!(!err.contains("carries credentials"), "{err}");
+}
+
+#[test]
+fn a_short_token_value_leaves_the_output_intact() {
+    let f = Fork::new();
+    let run = f
+        .env
+        .tool_env(&f.down, &["status", "--json"], &[("GITLAB_TOKEN", "a")])
+        .success();
+    let json: serde_json::Value = serde_json::from_slice(&run.get_output().stdout).unwrap();
+    assert_eq!(json["integration"], "main");
+    assert_eq!(json["publish_via"], "push");
+}

@@ -92,11 +92,43 @@ impl Env {
             ),
         )
         .unwrap();
+        // The `ssh` the tool finds first: `-G <host>` answers as a client
+        // whose configuration holds only the aliases a test sets with
+        // [`Env::ssh_alias`], so that no test reads the configuration of
+        // the machine it runs on; anything else goes to the shim.
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let ssh = bin.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = -G ]; then\n  shift\n  [ \"$1\" = -- ] && shift\n  host=$1\n  \
+                 alias=$(awk -v a=\"$1\" '$1 == a {{ print $2 }}' {aliases} 2>/dev/null)\n  \
+                 [ -n \"$alias\" ] && host=$alias\n  printf 'hostname %s\\nport 22\\n' \"$host\"\n  exit 0\nfi\n\
+                 exec {shim} \"$@\"\n",
+                aliases = dir.path().join("ssh-aliases").display(),
+                shim = shim.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
         fs::create_dir_all(dir.path().join("home")).unwrap();
         Self {
             dir,
             vars: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Makes the SSH client's configuration, as the stub `ssh` answers it,
+    /// let `alias` stand for `host`.
+    pub fn ssh_alias(&self, alias: &str, host: &str) {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path("ssh-aliases"))
+            .unwrap();
+        writeln!(file, "{alias} {host}").unwrap();
     }
 
     /// Gives every later run of the tool the variable `name`.
@@ -138,7 +170,11 @@ impl Env {
         for var in ISOLATION_CLEARED {
             cmd.env_remove(var);
         }
-        cmd.env("GIT_CONFIG_GLOBAL", &config)
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs = vec![self.path("bin")];
+        dirs.extend(std::env::split_paths(&path));
+        cmd.env("PATH", std::env::join_paths(dirs).unwrap())
+            .env("GIT_CONFIG_GLOBAL", &config)
             .env("GIT_CONFIG_SYSTEM", &config)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("HOME", self.path("home"))
