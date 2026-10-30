@@ -681,7 +681,7 @@ fn state_files_of_another_format_are_named_or_ignored() {
         assert!(
             err.contains(
                 "the update in progress was started by a release that keeps its state in format 2; \
-                 this release understands format 3. Finish or abort the update with the release that started it"
+                 this release understands format 4. Finish or abort the update with the release that started it"
             ),
             "{args:?}: {err}"
         );
@@ -689,4 +689,65 @@ fn state_files_of_another_format_are_named_or_ignored() {
     assert!(dir.join("state.json").exists(), "the state is kept");
     let doctor = stdout(&f.tool(&["doctor"]).code(1));
     assert!(doctor.contains("keeps its state in format 2"), "{doctor}");
+}
+
+#[test]
+fn update_with_its_worktree_in_the_git_directory_is_refused() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    f.tool(&["start"]).success();
+    // An update as a release that kept the update worktree in the git
+    // directory left it: the worktree there, and the state in format 3.
+    let old = env.intake_dir(&f.down).join("worktree");
+    let new = env.update_worktree(&f.down);
+    env.git(
+        &f.down,
+        &[
+            "worktree",
+            "move",
+            &new.to_string_lossy(),
+            &old.to_string_lossy(),
+        ],
+    );
+    std::fs::remove_dir_all(f.down.join(".worktrees")).unwrap();
+    let path = env.intake_dir(&f.down).join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    state["version"] = 3.into();
+    state["worktree"] = old.to_string_lossy().into_owned().into();
+    let written = serde_json::to_string_pretty(&state).unwrap();
+    std::fs::write(&path, &written).unwrap();
+    let main = env.rev(&f.down, "main");
+
+    for args in [
+        vec!["status"],
+        vec!["continue"],
+        vec!["verify"],
+        vec!["finish"],
+        vec!["abort"],
+        vec!["start"],
+        vec!["report"],
+    ] {
+        for dir in [&f.down, &old] {
+            let err = stderr(&env.tool(dir, &args).code(2));
+            assert!(
+                err.contains(
+                    "the update in progress was started by a release that keeps its state in format 3; \
+                     this release understands format 4. Finish or abort the update with the release that started it"
+                ),
+                "{args:?} in {}: {err}",
+                dir.display()
+            );
+        }
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+    assert!(
+        old.join("n.txt").exists(),
+        "the update worktree was touched"
+    );
+    assert_eq!(env.rev(&f.down, "main"), main);
+    assert!(!f.down.join(".worktrees").exists());
+    let doctor = stdout(&f.tool(&["doctor"]).code(1));
+    assert!(doctor.contains("keeps its state in format 3"), "{doctor}");
 }

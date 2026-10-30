@@ -201,8 +201,23 @@ impl Env {
         repo.join(".git").join("git-intake")
     }
 
+    /// The update worktree of the repository whose main worktree is `repo`.
     pub fn update_worktree(&self, repo: &Path) -> PathBuf {
-        self.intake_dir(repo).join("worktree")
+        repo.join(".worktrees").join("git-intake").join("update")
+    }
+
+    /// The `info/exclude` file of the repository whose main worktree is
+    /// `repo`.
+    pub fn info_exclude(&self, repo: &Path) -> PathBuf {
+        PathBuf::from(self.git(
+            repo,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "info/exclude",
+            ],
+        ))
     }
 
     /// The references under `refs/git-intake/`.
@@ -229,7 +244,10 @@ impl Env {
             "the plan remains"
         );
         let dir = self.intake_dir(repo);
-        assert!(!dir.join("worktree").exists(), "update worktree remains");
+        assert!(
+            !repo.join(".worktrees").exists(),
+            "the update worktree or its directories remain"
+        );
         assert!(!dir.join("state.json").exists(), "update state remains");
         assert!(
             !self.has_rev(repo, "refs/heads/git-intake/update"),
