@@ -1,5 +1,9 @@
 # Pinned versions bumped by hand (Dependabot updates only the actions):
 # - cargo-deny 0.20.2 (the deny job's install-action input)
+# - cargo-about 0.9.2 (the release-build job's install-action input, and
+#   CARGO_ABOUT_VERSION in xtask/src/main.rs, which refuses another release)
+# - zig 0.17.0 and cargo-zigbuild 0.23.4 (the release-build job's setup-zig
+#   and install-action inputs; release.yml and binaries.yml pin the same)
 # - git 2.43.0 and 2.47.3, with their source archives' SHA-256 (the git job's
 #   matrix)
 # The Rust toolchain is the current stable release, except in the msrv job,
@@ -159,3 +163,54 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       - run: cargo deny --locked check
+
+  # Builds and packs the release archive of every release target exactly as
+  # binaries.yml does for a release tag, with the third-party notices and the
+  # manual pages, and checks its layout; it attests and uploads nothing. A
+  # release publishes the crate before it builds the binaries, so the build of
+  # every target must pass here first: the release job of release.yml requires
+  # these checks on the release pull request's commit, and the ruleset of main
+  # requires them on every pull request. A license cargo-about cannot read or
+  # does not accept fails the notices here, not in a release.
+  release-build:
+    name: release-build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            build-tool: cargo-zigbuild
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            build-tool: cargo-zigbuild
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            build-tool: cargo
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            build-tool: cargo
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      BUILD_TOOL: ${{ matrix.build-tool }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+      - if: matrix.build-tool == 'cargo-zigbuild'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          use-cache: false
+      - if: matrix.build-tool == 'cargo-zigbuild'
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-zigbuild@0.23.4
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-about@0.9.2
+      - run: .github/scripts/build-archive.sh "$TARGET" "$BUILD_TOOL"

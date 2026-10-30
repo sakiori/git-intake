@@ -10,9 +10,10 @@ release_commits = '(?m)\A(feat|fix|perf|revert)(\([^)]*\))?!?:|\ARevert "|\A[a-z
 # Release only from the merge commit of a release pull request, so that a
 # release holds exactly the commits its changelog lists.
 release_always = false
-# The release workflow publishes the GitHub Release once every archive, its
-# checksum and its attestation are in place.
-git_release_draft = true
+# release-plz publishes the crate and creates the tag; binaries.yml, which the
+# tag starts, creates the GitHub Release with the changelog entry and publishes
+# it once every archive, its checksum and its attestation are in place.
+git_release_enable = false
 # A binary has no library API for cargo-semver-checks to compare.
 semver_check = false
 
