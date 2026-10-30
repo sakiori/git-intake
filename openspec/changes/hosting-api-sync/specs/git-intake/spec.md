@@ -97,7 +97,7 @@ When the token cannot read what the GitHub merge settings require, as a protecte
 - **THEN** `finish` and `sync` refuse, push nothing, say that the requirement could not be confirmed, and name a ruleset or administration read access
 
 ### Requirement: Merging the update's merge request
-The description of the update's merge request SHALL say to merge it without squashing and without rebasing its branch, by the forge's rebase or update-with-rebase buttons included, because either drops the update's history, and to keep it current with `sync` instead.
+The description of the update's merge request SHALL say to merge it without squashing and without rebasing its branch, including with the forge's rebase or update-with-rebase buttons, because either drops the update's history, and to keep it current with `sync` instead.
 
 #### Scenario: Squash on request
 - **WHEN** a GitLab project's squash option is `default_off`, and `finish` opens the update's merge request
@@ -189,7 +189,7 @@ Like `start`, `sync` SHALL read the configuration at `HEAD`, fetch the publish r
 - **THEN** the second run exits with status 2, says to run it again, and opens no merge request
 
 ### Requirement: Synchronising an open merge request
-In merge-request mode `sync` SHALL run no install command and no check. With the update's merge request open, it SHALL fetch the merge request's head. When the head contains the integration tip, it SHALL change nothing, say that the update waits for the merge request, and name the upstreams that moved on since, which the next update takes.
+In merge-request mode `sync` SHALL run no install command and no check. With the update's merge request open, it SHALL fetch the merge request's head and apply "Rewritten merge request branch" first. When the head contains the integration tip, it SHALL change nothing, say that the update waits for the merge request, and name the upstreams that moved on since, which the next update takes.
 
 #### Scenario: Run again without change
 - **WHEN** `sync` runs while the update's merge request is open and the integration branch did not move
@@ -252,7 +252,7 @@ When the update's merge request is not open and the one closed or merged most re
 - **THEN** the update is published and its merge request opened as for any other
 
 ### Requirement: Update branch without an open merge request
-With `git-intake/update` at the fetch URL and no merge request open from it, `finish` and `sync` SHALL treat the branch as left over when it holds only catch-up merges beyond the integration tip or a closed or merged merge request's head, and delete it on each push URL while it is at the commit read. Otherwise `sync` SHALL carry on a branch holding an update, `finish` SHALL push over one its head contains, and both SHALL refuse any other.
+With `git-intake/update` at the fetch URL and no merge request open from it, `finish` and `sync` SHALL treat the branch as left over when it holds only catch-up merges beyond the integration tip or a closed or merged merge request's head, and delete it on each push URL while it is at the commit read. Otherwise `sync` SHALL carry on a branch holding an update, except as "Declined branch" requires, `finish` SHALL push over one its head contains, and both SHALL refuse any other.
 
 #### Scenario: Branch kept after a decline
 - **WHEN** a pull request from `git-intake/update` was closed without merging, GitHub kept its branch, and an upstream moved on
@@ -268,17 +268,17 @@ With `git-intake/update` at the fetch URL and no merge request open from it, `fi
 
 #### Scenario: Branch of unknown origin
 - **WHEN** `git-intake/update` holds commits that carry no update and no merge request of the update points at
-- **THEN** `finish` and `sync` refuse, push nothing, and name the branch, the push URL and `abort --merge-request`
+- **THEN** `finish` and `sync` refuse, push nothing, and name the branch, the push URL, and `abort --merge-request` as the way to delete it after fetching what should be kept
 
 ### Requirement: Declined branch
-When `sync` would carry on a branch whose recorded targets a closed merge request declined, it SHALL refuse with status 2, naming the branch and `abort --merge-request`.
+When every follow target on the update line of a branch `sync` would carry on was recorded by the merge request that "Declined update targets" would apply, `sync` SHALL refuse with status 2, naming the branch and `abort --merge-request`, which deletes the branch.
 
 #### Scenario: Declined branch with a fix
 - **WHEN** the branch of a declined pull request holds a fix a person pushed after the decline, and `sync` runs
 - **THEN** `sync` refuses with exit status 2, pushes nothing, and names the branch and `abort --merge-request`
 
 ### Requirement: Carrying on a merge request's update
-To carry on the update a merge request or its branch holds, `sync` SHALL put the update branch at that head in the update worktree, the base at the head's merge base with the integration tip, and queue as merged or carried out each upstream whose sync record or copy is on the update line: a follow upstream with the target of its newest sync record there and the last synced commit at the base as its previous commit, a port upstream with the commits its copies take and its journal decides there.
+To carry on the update a merge request or its branch holds, `sync` SHALL put the update branch at its head in the update worktree, the base at the head's merge base with the integration tip, and queue as merged or carried out each upstream whose sync merge, copies or journal change is on the update line: a follow upstream at its newest sync record's target, with the last synced commit at the base as its previous one, and a port upstream with the commits its copies take and its journal decides.
 
 #### Scenario: Status of a carried-on update
 - **WHEN** `sync` stopped on a catch-up conflict of a merge request opened by another clone, and `status` runs
@@ -289,7 +289,7 @@ To carry on the update a merge request or its branch holds, `sync` SHALL put the
 - **THEN** the local update is removed, the merge request stays open, and `abort` names `abort --merge-request` to withdraw it
 
 ### Requirement: Commands on a carried-on update
-An update carried on from a merge request SHALL record that merge request and be recorded as started by the release that carried it on; `finish` SHALL refuse to publish it once that merge request is no longer open, naming it, and every command SHALL act on it as on an update `start` began. `report` SHALL show what history holds of it and say that the conflicts of the steps taken before it was carried on are not known.
+An update carried on from a merge request SHALL record that merge request and be recorded as started by the release that carried it on; `finish` SHALL refuse with status 2 to publish it once that merge request is no longer open, keeping the update and naming the merge request and `abort`, and every command SHALL act on it as on an update `start` began. `report` SHALL show what history holds of it and say that the conflicts of the steps taken before it was carried on are not known.
 
 #### Scenario: Report of a carried-on update
 - **WHEN** `report` runs on an update carried on from a merge request whose upstream merge had conflicts
@@ -319,14 +319,14 @@ In merge-request mode `finish` SHALL move no local branch, catch up with the pub
 - **THEN** `finish` pushes nothing, opens no merge request, removes the update, and says that the update already landed
 
 ### Requirement: Merge request branch on the remote
-`finish` SHALL refuse, pushing nothing and keeping the update, when the update's open merge request has a head the update head does not contain, naming it, `abort` followed by `sync` to carry it on, and `abort --merge-request` to withdraw it, which declines its targets. It SHALL push only where the branch is not at the update head, and never rewrite or force-push it.
+`finish` SHALL refuse, pushing nothing and keeping the update, when the update's open merge request has a head the update head does not contain, naming it, `abort` followed by `sync` to carry it on, and `abort --merge-request` to withdraw it, which also removes the local update and declines the merge request's targets until `start` and `finish` publish them again. It SHALL push only where the branch is not at the update head, and never rewrite or force-push it.
 
 #### Scenario: Merge request of another update open
 - **WHEN** an update started with `start` reaches `finish` while the update's merge request is open with a head the update head does not contain
 - **THEN** `finish` pushes nothing, names the merge request, `abort` followed by `sync`, and `abort --merge-request`, and keeps the update
 
 ### Requirement: Merge request state before the push
-Just before it pushes to an open merge request's branch, the tool SHALL read the merge request's state and head and the remote's integration branch again, and push nothing unless all are as read before: a merge request merged or closed meanwhile SHALL end the run with status 0, and any other change with status 2 and the advice to run again. Right after the push it SHALL read the state again and, when the merge request is no longer open, delete the branch while it is at the pushed commit.
+Just before `sync` pushes to an open merge request's branch, it SHALL read the merge request's state and head and the remote's integration branch again, and push nothing unless all are as read before: a merge request merged or closed meanwhile SHALL end the run with status 0, and any other change with status 2 and the advice to run again. Right after the push it SHALL read the state again and, when the merge request is no longer open, delete the branch while it is at the pushed commit.
 
 #### Scenario: Merged during a catch-up
 - **WHEN** the merge request is merged while `sync` catches it up, before the push
@@ -388,17 +388,17 @@ Only after the merge request exists SHALL `finish` remove the update worktree, t
 - **THEN** `GIT_INTAKE_BASE` is that integration tip, `GIT_INTAKE_HEAD` is the merge, and the upstream variables are those of the update
 
 ### Requirement: Integration tip of the update variables
-The integration tip of `env` SHALL be the publish remote's integration branch, fetched for the command, or without a publish remote the local integration branch. `env` SHALL refuse when the fetch fails.
+The integration tip of `env` SHALL be the publish remote's integration branch, fetched for the command, or, when the configuration names no publish remote, the local integration branch. `env` SHALL refuse when the fetch fails, as for a configured remote the clone does not define.
 
 #### Scenario: Publish remote unreachable
 - **WHEN** `env` runs while the publish remote cannot be fetched
 - **THEN** it refuses with git's reason and sets no variable, and `env -- <command>` does not run the command
 
 ### Requirement: Commit without an update
-When the integration tip contains the commit, or its update line carries no sync record and no copy, `env` SHALL set no variable, say on standard error that the commit carries no update, and exit with status 0.
+When the integration tip contains the commit, or its update line carries no update, `env` SHALL set no variable, say on standard error that the commit carries no update, and exit with status 0.
 
 #### Scenario: Not an update
-- **WHEN** `env` runs on a commit of the integration branch or of a branch without sync records or copies
+- **WHEN** `env` runs on a commit of the integration branch or of a branch whose update line holds no sync merge, copy or journal change
 - **THEN** it prints no variable, says that the commit carries no update, exits with status 0, and `env -- <command>` runs the command without any `GIT_INTAKE_` variable
 
 ### Requirement: Output of the update variables
@@ -670,6 +670,10 @@ In push mode, and with `--no-publish`, `finish` SHALL require a verified update 
 - **WHEN** `start` runs while an update is in progress
 - **THEN** it refuses, names the step the update has reached, and creates nothing
 
+#### Scenario: Forge unreachable
+- **WHEN** `start` runs in merge-request mode without a token for the forge
+- **THEN** it refuses, names the token variables, and creates nothing
+
 #### Scenario: Merge request open
 - **WHEN** `start` runs in merge-request mode while the update's merge request is open
 - **THEN** it refuses, names the merge request, `sync` and `abort --merge-request`, and creates nothing
@@ -806,7 +810,7 @@ The tool SHALL find its sync records, and the merges that brought a path upstrea
 - **THEN** the port's base is the update's target, and the journal the next port update writes starts there
 
 ### Requirement: Catch-up preconditions
-The tool SHALL make a catch-up merge only when the new tip contains the base and not the update head. It SHALL refuse and merge nothing, naming `abort`, or `finish --no-publish` once `finish` moved the integration branch, or for `sync` naming the merge request and `abort --merge-request`, when the new tip does not contain the base, or when the commits it adds carry a sync record or a copy of a queued upstream, change the journal of a queued port upstream, or change the configuration other than its install command and checks.
+The tool SHALL make a catch-up merge only when the new tip contains the base and not the update head. It SHALL refuse and merge nothing, naming `abort`, or `finish --no-publish` once `finish` moved the integration branch, or for `sync` naming the merge request, `abort --merge-request` with the warning that withdrawing declines its targets, and `start` and `finish` to publish them again, when the new tip does not contain the base, or when the commits it adds carry a sync record or a copy of a queued upstream, change the journal of a queued port upstream, or change the configuration other than its install command and checks.
 
 #### Scenario: Rewritten integration branch
 - **WHEN** the integration branch moves to a commit that does not contain the update's base
