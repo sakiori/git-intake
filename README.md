@@ -908,16 +908,19 @@ jobs:
 name: upstream checks
 on:
   pull_request:
+permissions:
+  contents: read          # enough for env to fetch the publish remote
 jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
-          persist-credentials: false
+          fetch-depth: 0      # keep the checkout's credential: env fetches the integration branch
       - run: git intake env -- ./scripts/check.sh
 ```
+
+`git intake env` fetches the publish remote's integration branch, so in a private repository the job needs the read-only credential `actions/checkout` leaves in the clone, and `permissions: contents: read` keeps the workflow's token at reading.
 
 The scheduled job pushes and opens the pull request with a GitHub App installation token, or a fine-grained personal access token with *Contents: write*, *Pull requests: write* and *Metadata: read*. Keep the App's private key, or the personal access token, as a secret of an [environment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments) (`git-intake` above) whose deployment branches are limited to the integration branch, not as a repository secret: a `pull_request` workflow of a branch of the same repository receives the repository's secrets, and with them could push and open pull requests as the job does, while an environment's secrets reach only a job that names the environment on a branch its policy allows. With a personal access token, store it there as a secret, pass it to `actions/checkout` as `token` and to `git intake sync` as `GH_TOKEN`, and drop the App step. Not the workflow's `GITHUB_TOKEN`: pushes made with it start no workflow, and pull requests it opens start their runs only after someone with write access approves them, so the pull request would wait untested until a person approves its runs. `actions/checkout` keeps the token it was given for the job's later pushes. A `pull_request` workflow checks out the merge of the pull request into its base by default; `env` then gives the base branch's tip as `GIT_INTAKE_BASE`, which is the base of the tree being tested. To hand the variables to later steps, append them to the environment file: `git intake env --dotenv >> "$GITHUB_ENV"`.
 
