@@ -245,8 +245,8 @@ impl Env {
         );
         let dir = self.intake_dir(repo);
         assert!(
-            !repo.join(".worktrees").exists(),
-            "the update worktree or its directories remain"
+            !self.update_worktree(repo).exists(),
+            "the update worktree remains"
         );
         assert!(!dir.join("state.json").exists(), "update state remains");
         assert!(

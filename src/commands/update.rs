@@ -149,10 +149,10 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
         return Ok(Exit::Success);
     }
 
+    repo.exclude_update_worktree()?;
     git.run(&["config", "rerere.enabled", "true"])?;
     fs::create_dir_all(&repo.paths.root)
         .with_context(|| format!("cannot create {}", repo.paths.root.display()))?;
-    repo.exclude_update_worktree()?;
     git.run(&[
         "worktree",
         "add",

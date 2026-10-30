@@ -28,6 +28,10 @@ const STATE_VERSION: u32 = 4;
 /// would not see the tree as it is.
 pub const UPDATE_WORKTREE: &str = ".worktrees/git-intake/update";
 
+/// The update worktree of a bare repository, which has no main worktree,
+/// relative to its git directory.
+pub const BARE_UPDATE_WORKTREE: &str = "git-intake/worktree";
+
 /// The line `start` adds to the repository's `info/exclude` when the update
 /// worktree is not ignored yet, so that the main checkout does not show it.
 pub const WORKTREES_EXCLUDE: &str = "/.worktrees/";

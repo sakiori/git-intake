@@ -587,7 +587,8 @@ fn state_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
         }
     };
     let Some(state) = state else {
-        let leftover = registered || branch || repo.update_worktree().is_some_and(|wt| wt.exists());
+        let leftover =
+            registered || branch || repo.update_worktree()?.is_some_and(|wt| wt.exists());
         checks.pass_or_fail(
             "update_state",
             None,

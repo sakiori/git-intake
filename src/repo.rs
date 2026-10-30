@@ -27,9 +27,11 @@ pub struct Repo {
     /// The repository's common git directory.
     common: PathBuf,
     main: MainWorktree,
-    /// Where the update worktree is placed: [`state::UPDATE_WORKTREE`] in the
-    /// main worktree, or `None` when that is bare or cannot be located.
-    update_worktree: Option<PathBuf>,
+    /// Where `start` places the update worktree: [`state::UPDATE_WORKTREE`]
+    /// in the main worktree, [`state::BARE_UPDATE_WORKTREE`] in the git
+    /// directory of a bare repository, or `None` when the main worktree
+    /// cannot be located.
+    placed_worktree: Option<PathBuf>,
     /// The top of the worktree the tool was started in.
     toplevel: Option<PathBuf>,
     /// The commit at `HEAD` of the worktree the tool was started in.
@@ -88,9 +90,10 @@ impl Repo {
             MainWorktree::At(dir) => dir.clone(),
             MainWorktree::Bare | MainWorktree::Unknown => common.clone(),
         };
-        let update_worktree = match &main {
+        let placed_worktree = match &main {
             MainWorktree::At(dir) => Some(dir.join(state::UPDATE_WORKTREE)),
-            MainWorktree::Bare | MainWorktree::Unknown => None,
+            MainWorktree::Bare => Some(common.join(state::BARE_UPDATE_WORKTREE)),
+            MainWorktree::Unknown => None,
         };
         Ok(Self {
             git: Git::worktree(anchor),
@@ -98,7 +101,7 @@ impl Repo {
             paths,
             common,
             main,
-            update_worktree,
+            placed_worktree,
             toplevel,
             head,
             left_removed_directory: Cell::new(false),
@@ -191,30 +194,76 @@ impl Repo {
             .collect())
     }
 
-    /// Where the update worktree is placed, when the main worktree is known.
-    pub fn update_worktree(&self) -> Option<&Path> {
-        self.update_worktree.as_deref()
+    /// The update worktree: the one the update in progress records, else the
+    /// linked worktree that has the update branch checked out, as an
+    /// interrupted `start` leaves it, else where `start` places it. `None`
+    /// when there is none of these.
+    pub fn update_worktree(&self) -> Result<Option<PathBuf>> {
+        if let Some(state) = state::load(&self.paths.state).ok().flatten() {
+            return Ok(Some(state.worktree));
+        }
+        // The first entry is the main worktree, which is never the update's.
+        if let Some(w) = self
+            .worktrees()?
+            .into_iter()
+            .skip(1)
+            .find(|w| w.branch.as_deref() == Some(state::UPDATE_BRANCH))
+        {
+            return Ok(Some(w.path));
+        }
+        Ok(self.placed_worktree.clone())
     }
 
-    /// Where `start` places the update worktree. Refuses when the repository
-    /// has no main worktree to hold it, or it cannot be located: the update
-    /// worktree is never placed in the git directory.
+    /// Where `start` places the update worktree. Refuses where no correct
+    /// place exists, before anything changes: the main worktree cannot be
+    /// located; a directory on the way to [`state::UPDATE_WORKTREE`] is a
+    /// symbolic link or not a directory, which would put the update worktree
+    /// outside the checkout; or a bare repository's update worktree would lie
+    /// at a path containing `/.git`, which compilers, bundlers and watchers
+    /// ignore, so checks run there would not see the tree as it is.
     pub fn place_update_worktree(&self) -> Result<PathBuf> {
-        match (&self.update_worktree, &self.main) {
-            (Some(wt), _) => Ok(wt.clone()),
-            (None, MainWorktree::Bare) => bail!(
-                "the repository is bare: the update worktree is placed at {} in the main worktree, \
-                 and a bare repository has none; run the tool in a clone with a checkout",
-                state::UPDATE_WORKTREE
+        let Some(wt) = &self.placed_worktree else {
+            bail!("{}", self.unknown_main_worktree());
+        };
+        match &self.main {
+            MainWorktree::At(main) => {
+                for rel in [".worktrees", ".worktrees/git-intake"] {
+                    let Ok(meta) = fs::symlink_metadata(main.join(rel)) else {
+                        continue;
+                    };
+                    if meta.file_type().is_symlink() {
+                        bail!(
+                            "{rel} in the main worktree is a symbolic link; the update worktree has to lie in the checkout, \
+                             at {}. Replace the link with a directory",
+                            state::UPDATE_WORKTREE
+                        );
+                    }
+                    if !meta.is_dir() {
+                        bail!(
+                            "{rel} in the main worktree is not a directory; the update worktree is placed at {}",
+                            state::UPDATE_WORKTREE
+                        );
+                    }
+                }
+            }
+            MainWorktree::Bare if wt.to_string_lossy().contains("/.git") => bail!(
+                "the update worktree of this bare repository would be {}, a path containing `/.git`, \
+                 which compilers, bundlers and watchers ignore, so checks run there would not see the tree as it is; \
+                 run the tool in a clone with a checkout",
+                wt.display()
             ),
-            (None, _) => bail!("{}", self.unknown_main_worktree()),
+            MainWorktree::Bare | MainWorktree::Unknown => {}
         }
+        Ok(wt.clone())
     }
 
     /// Keeps the update worktree out of the main checkout's status: unless it
     /// is ignored already, adds [`state::WORKTREES_EXCLUDE`] to the
-    /// repository's `info/exclude`, once.
+    /// repository's `info/exclude`, once. A bare repository has no checkout.
     pub fn exclude_update_worktree(&self) -> Result<()> {
+        if !matches!(self.main, MainWorktree::At(_)) {
+            return Ok(());
+        }
         let ignored = self
             .git
             .raw(&["check-ignore", "-q", state::UPDATE_WORKTREE])?;
@@ -250,10 +299,10 @@ impl Repo {
 
     /// Whether the update worktree is registered with git.
     pub fn update_worktree_registered(&self) -> Result<bool> {
-        let Some(wt) = self.update_worktree() else {
+        let Some(wt) = self.update_worktree()? else {
             return Ok(false);
         };
-        let wt = canonical(wt);
+        let wt = canonical(&wt);
         Ok(self.worktrees()?.iter().any(|w| w.path == wt))
     }
 
@@ -350,7 +399,7 @@ impl Repo {
                 config.integration
             );
         }
-        let working_copy_differs = self.working_copy_differs(&text);
+        let working_copy_differs = self.working_copy_differs(&text)?;
         if working_copy_differs {
             eprintln!(
                 "note: the working copy of {} differs from the version committed on '{integration}'; using the committed version",
@@ -399,17 +448,17 @@ impl Repo {
         Ok(())
     }
 
-    fn working_copy_differs(&self, committed: &str) -> bool {
+    fn working_copy_differs(&self, committed: &str) -> Result<bool> {
         let Some(top) = &self.toplevel else {
-            return false;
+            return Ok(false);
         };
-        if self.started_in_update_worktree() {
-            return false;
+        if self.started_in_update_worktree()? {
+            return Ok(false);
         }
-        match fs::read_to_string(top.join(config::FILE_NAME)) {
+        Ok(match fs::read_to_string(top.join(config::FILE_NAME)) {
             Ok(text) => text != committed,
             Err(_) => false,
-        }
+        })
     }
 
     /// Removes the update worktree and branch if they exist. Resolutions made
@@ -428,9 +477,9 @@ impl Repo {
     /// Removes the update worktree if it exists, keeping the update branch,
     /// and the directories that held it once they are empty.
     pub fn remove_update_worktree(&self) -> Result<Vec<String>> {
-        let started_inside = self.started_in_update_worktree();
+        let started_inside = self.started_in_update_worktree()?;
         let mut removed = Vec::new();
-        let Some(wt) = self.update_worktree() else {
+        let Some(wt) = self.update_worktree()? else {
             self.git.run(&["worktree", "prune"])?;
             return Ok(removed);
         };
@@ -439,7 +488,7 @@ impl Repo {
                 // Best effort: record resolutions already made by hand in a
                 // stopped merge or copy; with nothing pending, rerere does
                 // nothing.
-                let _ = Git::worktree(wt).raw(&["rerere"]);
+                let _ = Git::worktree(&wt).raw(&["rerere"]);
             }
             self.git.run(&[
                 "worktree",
@@ -451,15 +500,19 @@ impl Repo {
             removed.push(format!("worktree {}", wt.display()));
         }
         if wt.exists() {
-            fs::remove_dir_all(wt).with_context(|| format!("cannot remove {}", wt.display()))?;
+            fs::remove_dir_all(&wt).with_context(|| format!("cannot remove {}", wt.display()))?;
             if removed.is_empty() {
                 removed.push(format!("worktree {}", wt.display()));
             }
         }
-        // `.worktrees/git-intake`, then `.worktrees`; either may hold other
-        // worktrees, which keeps it.
-        for dir in wt.ancestors().skip(1).take(2) {
-            let _ = fs::remove_dir(dir);
+        // `.worktrees/git-intake`, then `.worktrees` in the main worktree;
+        // either may hold other worktrees or files, which keep it.
+        if let MainWorktree::At(main) = &self.main
+            && wt == main.join(state::UPDATE_WORKTREE)
+        {
+            for dir in wt.ancestors().skip(1).take(2) {
+                let _ = fs::remove_dir(dir);
+            }
         }
         self.git.run(&["worktree", "prune"])?;
         if started_inside && !removed.is_empty() {
@@ -479,9 +532,13 @@ impl Repo {
     }
 
     /// Whether the tool was started in the update worktree.
-    fn started_in_update_worktree(&self) -> bool {
-        self.update_worktree()
-            .is_some_and(|wt| self.toplevel.as_deref() == Some(canonical(wt).as_path()))
+    fn started_in_update_worktree(&self) -> Result<bool> {
+        let Some(top) = &self.toplevel else {
+            return Ok(false);
+        };
+        Ok(self
+            .update_worktree()?
+            .is_some_and(|wt| *top == canonical(&wt)))
     }
 
     /// Removes the plan of a port update, if any.

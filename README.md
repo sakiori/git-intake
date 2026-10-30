@@ -152,7 +152,8 @@ Git cannot locate the main worktree of a repository whose git directory lies out
 `start` refuses to begin if any of these hold:
 
 - an update is already in progress;
-- the repository is bare, so no main worktree can hold the update worktree;
+- `.worktrees` or `.worktrees/git-intake` in the main worktree is a symbolic link or not a directory;
+- the repository is bare and the path of its update worktree contains `/.git`, as when the bare repository is itself a directory named `.git`; run the tool in a clone with a checkout instead;
 - the main checkout or a checkout of the integration branch has uncommitted changes to tracked files;
 - the integration branch is behind its counterpart on the publish remote;
 - a selected upstream is unknown, named more than once, cannot be fetched, or was rewritten;
@@ -166,7 +167,7 @@ When `start` runs, it does the following:
 1. Fetches the selected upstreams. With no names it selects all of them.
 2. For a follow upstream, records the fetched tip, or the commit a revision names (see *Choosing a target*), as that upstream's **target**. For every upstream it records the integration tip as the **base**. Targets never change during the update, even if the upstream or a tag moves on.
 3. Queues, in configuration order, the follow upstreams whose target the base does not contain yet, and a port upstream that has pending commits. The others are reported as current. If nothing is queued, nothing is created and no reference is kept.
-4. Creates the worktree `.worktrees/git-intake/update` in the main worktree on the branch `git-intake/update` from the base, so its path never contains `/.git`, which compilers, bundlers and watchers ignore. Unless that path is ignored already, it adds the line `/.worktrees/` to the repository's `info/exclude` once, so the main checkout does not show the update worktree; a committed `.gitignore` is never changed. The files of the main checkout are never touched.
+4. Creates the worktree `.worktrees/git-intake/update` in the main worktree on the branch `git-intake/update` from the base. It is never placed inside the git directory, because compilers, bundlers and watchers ignore paths that contain `/.git`. Unless that path is ignored already, `start` adds the line `/.worktrees/` to the repository's `info/exclude` once, so the main checkout does not show the update worktree; a committed `.gitignore` is never changed. The files of the main checkout are never touched. While an update is in progress, its tree sits under `.worktrees/` in the checkout, so a tool that crawls dot-directories of the main checkout may see it. A bare repository has no main worktree, so its update worktree is `<git-common-dir>/git-intake/worktree`.
 5. Enables `rerere.enabled` for the repository. A resolution recorded in one attempt is reapplied when the same conflict recurs, in a merge or in a copy, and the tool reports such files as *resolved by a recorded resolution*. Review those files and stage them like any other resolution.
 6. For a port upstream, writes the plan and stops (see *Port mode*). For follow upstreams, merges each queued target with its own merge commit:
    - a root upstream: `git merge --no-ff`;
@@ -408,7 +409,7 @@ Earlier releases kept a git remote per upstream, its remote-tracking branches, a
 
 - The tool never rewrites history and never force-pushes. Local branches only fast-forward.
 - It never pushes to an upstream. The publish remote may not be fetched from or pushed to an upstream's URL, and the tool keeps no remote for an upstream: a reference to an upstream exists only while a command or an update needs it.
-- No file of the main checkout is changed. The update lives in its own worktree, `.worktrees/git-intake/update` in the main worktree, on `git-intake/update`, with its state and plan in `<git-common-dir>/git-intake/`, which every worktree shares and no commit can carry.
+- No file of the main checkout is changed. The update lives in its own worktree, `.worktrees/git-intake/update` in the main worktree (in the git directory of a bare repository), on `git-intake/update`, with its state and plan in `<git-common-dir>/git-intake/`, which every worktree shares and no commit can carry.
 - Each target is fixed when the update starts, and an update keeps the references that hold its targets and planned commits until it ends. What is merged or copied, verified and published is the same commit.
 - `finish` moves no ref unless the verified commit is the worktree head, the base is still the integration tip, and the move is a fast-forward. It validates the move before making it, and it can be resumed.
 - Publication by push pushes exactly the planned commit. Nothing unverified is ever published by a retry, and `finish --no-publish` closes an update that cannot be published.

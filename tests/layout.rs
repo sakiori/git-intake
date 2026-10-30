@@ -162,13 +162,16 @@ fn integration_branch_in_a_linked_worktree_follows_a_finish_from_the_update_work
     assert_eq!(env.git(&f.down, &["branch", "--show-current"]), "feature");
 }
 
-#[test]
-fn bare_downstream_is_refused_without_writing_into_its_git_directory() {
-    let m = Mono::new();
-    let env = &m.env;
-    let bare = env.path("mono-bare.git");
-    env.git(
-        &env.path(""),
+/// The update worktree of a bare repository whose git directory is `git_dir`.
+fn bare_update_worktree(git_dir: &Path) -> PathBuf {
+    git_dir.join("git-intake").join("worktree")
+}
+
+/// A bare clone of `m`'s downstream at `path` in the environment.
+fn bare_downstream(m: &Mono, path: &str) -> PathBuf {
+    let bare = m.env.path(path);
+    m.env.git(
+        &m.env.path(""),
         &[
             "clone",
             "-q",
@@ -177,36 +180,42 @@ fn bare_downstream_is_refused_without_writing_into_its_git_directory() {
             &bare.to_string_lossy(),
         ],
     );
-    let linked = env.path("mono-bare-main");
-    env.git(
-        &bare,
-        &["worktree", "add", "-q", &linked.to_string_lossy(), "main"],
-    );
-    for dir in [&bare, &linked] {
-        let start = env.tool(dir, &["start"]).code(2);
-        assert!(
-            stderr(&start).contains("the repository is bare"),
-            "{}",
-            stderr(&start)
-        );
-        assert!(
-            stderr(&start).contains(".worktrees/git-intake/update"),
-            "{}",
-            stderr(&start)
-        );
-    }
-    assert!(
-        !bare.join("git-intake").exists(),
-        "the git directory was written to"
-    );
+    fs::canonicalize(bare).unwrap()
+}
+
+#[test]
+fn bare_downstream_finishes_from_the_update_worktree() {
+    let m = Mono::new();
+    let env = &m.env;
+    let bare = bare_downstream(&m, "mono-bare.git");
+    env.tool(&bare, &["start"]).success();
+    let wt = bare_update_worktree(&bare);
+    env.tool(&wt, &["verify"]).success();
+    let verified = env.rev(&wt, "HEAD");
+    env.tool(&wt, &["finish"])
+        .success()
+        .stdout(contains("update finished"))
+        .stderr(contains(LEFT_REMOVED_DIRECTORY));
+    assert_eq!(env.rev(&bare, "main"), verified);
+    assert!(!wt.exists(), "the update worktree remains");
+    assert!(!env.has_rev(&bare, "refs/heads/git-intake/update"));
+}
+
+#[test]
+fn bare_downstream_whose_update_worktree_path_holds_dot_git_is_refused() {
+    let m = Mono::new();
+    let env = &m.env;
+    let bare = bare_downstream(&m, "bare-store/.git");
+    let start = env.tool(&bare, &["start"]).code(2);
+    let err = stderr(&start);
+    assert!(err.contains("/.git"), "{err}");
+    assert!(err.contains("ignore"), "{err}");
+    assert!(err.contains("clone with a checkout"), "{err}");
+    assert!(!bare.join("git-intake").exists(), "the update was started");
     assert!(!env.has_rev(&bare, "refs/heads/git-intake/update"));
     assert_eq!(
-        env.git(&bare, &["worktree", "list", "--porcelain"])
-            .lines()
-            .filter(|l| l.starts_with("worktree "))
-            .count(),
-        2,
-        "an update worktree was added"
+        env.git_output(&bare, &["config", "rerere.enabled"]).stdout,
+        b""
     );
 }
 
@@ -270,6 +279,10 @@ fn update_worktree_lives_in_the_main_worktree_outside_the_git_directory() {
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
     env.assert_no_update(&f.down);
+    assert!(
+        !f.down.join(".worktrees").exists(),
+        "the directories that held the update worktree remain"
+    );
 }
 
 /// The lines of `path` that equal `line`.
@@ -441,6 +454,94 @@ fn submodule_downstream_resolves_relative_urls_from_its_checkout() {
     env.tool(&sub, &["doctor"]).success();
 }
 
+#[test]
+fn update_worktree_of_a_submodule_shows_in_neither_status() {
+    let (env, up, sub) = submodule_downstream();
+    let sup = sub.parent().unwrap();
+    env.git(sup, &["commit", "-q", "-m", "super: add sub"]);
+    env.push_upstream(&up, &[("n.txt", "n\n")], "upstream: n");
+    env.tool(&sub, &["start"]).success();
+    assert!(env.update_worktree(&sub).join("n.txt").exists());
+    assert_eq!(count_lines(&env.info_exclude(&sub), "/.worktrees/"), 1);
+    for dir in [&sub, sup] {
+        assert_eq!(
+            env.git(dir, &["status", "--porcelain", "--untracked-files=all"]),
+            "",
+            "{}",
+            dir.display()
+        );
+    }
+}
+
+#[test]
+fn start_from_a_linked_worktree_excludes_the_update_worktree_in_the_repository() {
+    let f = Fork::new();
+    let env = &f.env;
+    let linked = env.path("side");
+    add_worktree(env, &f.down, "side", &linked);
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    env.tool(&linked, &["start"]).success();
+    assert!(env.update_worktree(&f.down).join("n.txt").exists());
+    assert_eq!(env.info_exclude(&linked), env.info_exclude(&f.down));
+    assert_eq!(count_lines(&env.info_exclude(&f.down), "/.worktrees/"), 1);
+    for dir in [&f.down, &linked] {
+        assert_eq!(
+            env.git(dir, &["status", "--porcelain", "--untracked-files=all"]),
+            "",
+            "{}",
+            dir.display()
+        );
+    }
+}
+
+#[test]
+fn own_worktrees_beside_the_update_worktree_are_kept() {
+    let f = Fork::new();
+    let env = &f.env;
+    let other = f.down.join(".worktrees").join("other");
+    add_worktree(env, &f.down, "other", &other);
+    let notes = f.down.join(".worktrees").join("git-intake").join("notes");
+    fs::create_dir_all(&notes).unwrap();
+    fs::write(notes.join("n.md"), "mine\n").unwrap();
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+
+    f.tool(&["start"]).success();
+    f.tool(&["abort"]).success();
+    assert!(!env.update_worktree(&f.down).exists());
+    assert!(notes.join("n.md").exists(), "own files were removed");
+    assert_eq!(env.git(&other, &["branch", "--show-current"]), "other");
+
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+    assert!(!env.update_worktree(&f.down).exists());
+    assert!(notes.join("n.md").exists(), "own files were removed");
+    assert_eq!(env.git(&other, &["branch", "--show-current"]), "other");
+    assert!(!env.has_rev(&f.down, "refs/heads/git-intake/update"));
+}
+
+#[test]
+fn worktrees_directory_that_is_a_symbolic_link_is_refused_before_anything_changes() {
+    let f = Fork::new();
+    let env = &f.env;
+    let elsewhere = env.path("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, f.down.join(".worktrees")).unwrap();
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    let start = f.tool(&["start"]).code(2);
+    let err = stderr(&start);
+    assert!(err.contains(".worktrees"), "{err}");
+    assert!(err.contains("symbolic link"), "{err}");
+    assert!(!env.has_rev(&f.down, "refs/heads/git-intake/update"));
+    assert!(!env.intake_dir(&f.down).join("state.json").exists());
+    assert_eq!(
+        env.git_output(&f.down, &["config", "rerere.enabled"])
+            .stdout,
+        b""
+    );
+    assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+}
+
 /// A downstream whose git directory lies outside its checkout, at `git_dir`
 /// in the environment, with its upstream reached by a URL relative to the
 /// checkout. Returns the environment, the upstream, the checkout and the git
@@ -519,6 +620,35 @@ fn separate_git_dir_named_dot_git_is_not_taken_for_its_parent() {
         [".git"],
         "files were written beside the git directory"
     );
+}
+
+#[test]
+fn abort_from_a_linked_worktree_removes_an_update_whose_start_was_interrupted() {
+    let (env, _up, down, git_dir) = separate_git_dir_downstream("git-dirs/down.git");
+    // `start` stopped after adding the update worktree, before it saved the
+    // state that records the main worktree.
+    let wt = env.update_worktree(&down);
+    env.git(
+        &down,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "git-intake/update",
+            &wt.to_string_lossy(),
+            "main",
+        ],
+    );
+    let linked = env.path("side");
+    add_worktree(&env, &down, "side", &linked);
+    env.tool(&linked, &["abort"])
+        .success()
+        .stdout(contains("removed worktree"))
+        .stdout(contains("removed branch git-intake/update"));
+    assert!(!wt.exists(), "the update worktree remains");
+    assert!(!env.has_rev(&down, "refs/heads/git-intake/update"));
+    assert!(!git_dir.join("git-intake").join("worktree").exists());
 }
 
 #[test]
