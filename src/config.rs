@@ -123,6 +123,22 @@ impl Upstream {
     }
 }
 
+/// The part of the environment variable names `verify` gives the checks,
+/// `GIT_INTAKE_UPSTREAM_<NAME>_*`, that stands for the upstream `name`: the
+/// name in upper case with every character other than a letter or a digit
+/// replaced by `_`.
+pub fn env_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 impl Config {
     pub fn upstream(&self, name: &str) -> Option<&Upstream> {
         self.upstreams.iter().find(|u| u.name == name)
@@ -293,10 +309,27 @@ fn parse_publish(value: toml::Value) -> std::result::Result<Publish, String> {
     })
 }
 
-/// Cross-entry rules: unique names and sources, non-nesting paths, a root
-/// upstream alone.
+/// Cross-entry rules: unique names and sources, distinct environment
+/// variables, non-nesting paths, a root upstream alone.
 fn check_layout(integration: &str, upstreams: &[Upstream], problems: &mut Vec<String>) {
     duplicates(upstreams.iter().map(|u| u.name.as_str()), "name", problems);
+    let mut by_variable: Vec<(String, Vec<&str>)> = Vec::new();
+    for up in upstreams.iter().filter(|u| !u.name.is_empty()) {
+        let variable = env_name(&up.name);
+        match by_variable.iter_mut().find(|(v, _)| *v == variable) {
+            Some((_, names)) if !names.contains(&up.name.as_str()) => names.push(&up.name),
+            Some(_) => {}
+            None => by_variable.push((variable, vec![&up.name])),
+        }
+    }
+    for (variable, names) in by_variable.into_iter().filter(|(_, n)| n.len() > 1) {
+        let (last, first) = names.split_last().unwrap_or((&"", &[]));
+        problems.push(format!(
+            "upstreams {} and '{last}' share the environment variables GIT_INTAKE_UPSTREAM_{variable}_* \
+             that verify gives the checks; rename them so that they differ in more than case and punctuation",
+            quote_list(first)
+        ));
+    }
     let mut sources: Vec<(&str, &str, usize)> = Vec::new();
     for up in upstreams.iter().filter(|u| !u.url.is_empty()) {
         match sources
@@ -730,6 +763,44 @@ via = "merge-request"
             parse("integration = \"main\"\n[[upstream]]\nname = \"a.b_c-1\"\nurl = \"u\"\nbranch = \"main\"\n")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn env_names_are_upper_case_with_underscores() {
+        assert_eq!(env_name("app-a"), "APP_A");
+        assert_eq!(env_name("Web.v2_x"), "WEB_V2_X");
+        assert_eq!(env_name("up"), "UP");
+    }
+
+    #[test]
+    fn rejects_names_that_share_environment_variables() {
+        let up = |name: &str, path: &str| {
+            format!(
+                "[[upstream]]\nname = \"{name}\"\nurl = \"https://example.com/{path}.git\"\nbranch = \"main\"\npath = \"{path}\"\n"
+            )
+        };
+        let e = err(&format!(
+            "integration = \"main\"\n{}{}{}{}",
+            up("app-a", "a"),
+            up("app_a", "b"),
+            up("APP.A", "c"),
+            up("other", "d")
+        ));
+        assert!(
+            e.contains(
+                "upstreams 'app-a', 'app_a' and 'APP.A' share the environment variables GIT_INTAKE_UPSTREAM_APP_A_*"
+            ),
+            "{e}"
+        );
+        assert!(!e.contains("OTHER"), "{e}");
+        // A repeated name is reported once, as a shared name.
+        let e = err(&format!(
+            "integration = \"main\"\n{}{}",
+            up("a", "a"),
+            up("a", "b")
+        ));
+        assert!(e.contains("2 upstreams share the name 'a'"), "{e}");
+        assert!(!e.contains("environment variables"), "{e}");
     }
 
     #[test]

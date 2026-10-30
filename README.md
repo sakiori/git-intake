@@ -101,7 +101,7 @@ remote = "origin"                     # the publish remote, a git remote of the 
 via = "push"                          # optional: "push" (default) or "merge-request"
 
 [[upstream]]
-name = "app-a"                        # unique; used on the command line, in sync records and trailers
+name = "app-a"                        # unique; used on the command line, in sync records, trailers and check variables
 url = "git@example.com:team/app-a.git"  # required: where the upstream is fetched from
 branch = "main"                       # the upstream branch to take from
 mode = "follow"                       # optional: "follow" (default) or "port"
@@ -112,7 +112,7 @@ Validation rules. The tool refuses to run when any of them is broken, and it nam
 
 - Unknown keys are rejected. The settings `remote` and `mirror` of earlier releases are refused with what replaces them: upstreams are fetched by their `url`, and mirror branches are no longer kept.
 - At least one `[[upstream]]` is required, and every upstream needs a `url`.
-- Upstream names are unique, and no two upstreams have the same URL and branch. A name may contain only letters, digits, `-`, `_` and `.`, may not start with `-` or `.`, and, since it is part of a git reference name, may not contain `..` or end with `.` or `.lock`.
+- Upstream names are unique, and no two upstreams have the same URL and branch. A name may contain only letters, digits, `-`, `_` and `.`, may not start with `-` or `.`, and, since it is part of a git reference name, may not contain `..` or end with `.` or `.lock`. Since a name is also part of the variables the checks receive, no two names may differ only in letter case or in which of `-`, `_` and `.` they use (see [The environment of the checks](#the-environment-of-the-checks)).
 - A path is normalised: no leading or trailing slash, no empty, `.` or `..` segment, no `.git` segment in any letter case, and it may not be empty. Omit `path` for the root.
 - Paths may not nest; one upstream's path cannot lie inside another's.
 - An upstream at the root must be the only upstream.
@@ -183,7 +183,7 @@ When `start` runs, it does the following:
 
 On a conflict the tool stops with exit status 1. It names the upstream, lists the conflicted files, and reports which upstreams are merged and which are pending. A file is labelled *resolved by a recorded resolution* only when git's rerere reports that it resolved it (including files `rerere.autoupdate` already staged); every other conflicted file waits for a resolution by hand. Resolve the files in the worktree, stage them, and run `continue`. If one upstream cannot be resolved now, `abort` and run `start` again with only the other upstreams named. Recorded resolutions make the repeated merges cheap.
 
-`verify` runs `install` and then every check through `sh -c` in the update worktree, once every queued upstream is merged or its plan carried out. Each command's output goes to its own log under `<git-common-dir>/git-intake/logs/`. If `install` fails, the checks are skipped. Verification fails in any of these cases:
+`verify` runs `install` and then every check through `sh -c` in the update worktree, once every queued upstream is merged or its plan carried out. Each command receives variables that describe the update (see [The environment of the checks](#the-environment-of-the-checks)), and its output goes to its own log under `<git-common-dir>/git-intake/logs/`. If `install` fails, the checks are skipped. Verification fails in any of these cases:
 
 - the `.git-intake.toml` of the update branch is missing or invalid, or names a different integration branch (the commands are then skipped);
 - a command fails or is skipped;
@@ -207,6 +207,35 @@ It then fast-forwards the integration branch to the verified commit. A checkout 
 The push sends exactly the planned commit (`<commit>:refs/heads/<branch>`), never whatever the local branch points to by then. A commit added to the integration branch while the update is finishing stays local.
 
 If the push is rejected, nothing is published, the local integration branch stays advanced, and the update stays in the `finishing` step. Running `finish` again retries the same push. If the remote holds work the local branch lacks, or never accepts the push (for example a protected branch), run `finish --no-publish`. It closes the update locally: it completes the local move with the same checks, removes the worktree, the update branch, the plan, the references and the state, and names the branch it left unpublished (also in `report`). Then merge the remote's work and publish the result through a new verified update or the repository's usual review. `--no-publish` also works on a verified update before any push attempt.
+
+### The environment of the checks
+
+A check that compares the tree with a baseline, such as a ratchet that may not grow or an audit of the changes since `merge-base origin/main HEAD`, would count every change an update brings in as the downstream's own. The upstream already checked its changes; what an update adds on top of them is the downstream's delta, so the baseline to compare an update with is the upstream's target. Comparing `GIT_INTAKE_HEAD` with that target measures everything the downstream carries on top of the upstream, not only what this update changed; a ratchet that should judge the update alone compares that difference with the one before the update, between `GIT_INTAKE_BASE` and `GIT_INTAKE_UPSTREAM_<NAME>_PREVIOUS`. `verify` runs `install` and every check with these variables, which name commits by their full ids:
+
+| Variable | Value |
+| --- | --- |
+| `GIT_INTAKE_BASE` | The integration tip the update started from. |
+| `GIT_INTAKE_HEAD` | The commit being verified, the head of the update branch. |
+| `GIT_INTAKE_INTEGRATION` | The name of the integration branch. |
+| `GIT_INTAKE_UPSTREAMS` | The names of the upstreams the update takes, separated by spaces, in the order they were merged or carried out. An upstream that was current at `start` is not among them. |
+| `GIT_INTAKE_UPSTREAM_<NAME>_MODE` | `follow` or `port`. |
+| `GIT_INTAKE_UPSTREAM_<NAME>_TARGET` | Follow mode: the target the update merges. Port mode: the newest commit of the plan; after the update, every upstream commit up to it is taken, decided, or left pending by the plan. A port target is not merged, so it is not an ancestor of `GIT_INTAKE_HEAD`. |
+| `GIT_INTAKE_UPSTREAM_<NAME>_PREVIOUS` | Follow mode only: the last synced commit before the update; absent on a first import or when the history names none. A port upstream has no such commit; its journal names the commit the port started from. |
+
+`<NAME>` is the upstream's name in upper case, with every character other than a letter or a digit replaced by `_`: `app-a` gives `GIT_INTAKE_UPSTREAM_APP_A_TARGET`. Two upstream names that give the same `<NAME>`, such as `app-a` and `app.a`, are refused when the configuration is read. Every commit named stays in the repository while `verify` runs: the base and the head are on the update branch, and an upstream's commits are in the history of `refs/git-intake/upstreams/<name>`, which the update holds. Variables with the `GIT_INTAKE_` prefix that `git intake` itself inherits are not passed on, so a check sees only those of the update it verifies; git commands the tool runs itself never see them.
+
+The target is a baseline for the tree only for a follow upstream at the repository root. A path upstream's target has the upstream's own layout, with its files at its root rather than under the path, so a check that compares trees with it has to compare the path's subtree, or measure the upstream on its own.
+
+A fork that follows one upstream at the root, named `upstream`, can give an audit the upstream's target as the baseline it takes from `FALLOW_AUDIT_BASE`:
+
+```toml
+checks = [
+    "pnpm test",
+    'FALLOW_AUDIT_BASE="$GIT_INTAKE_UPSTREAM_UPSTREAM_TARGET" fallow audit',
+]
+```
+
+A script that the repository's own CI also runs can fall back to its usual baseline outside an update: `"${GIT_INTAKE_UPSTREAM_UPSTREAM_TARGET:-$(git merge-base origin/main HEAD)}"`.
 
 ### Choosing a target
 

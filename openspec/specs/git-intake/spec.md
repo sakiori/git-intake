@@ -164,6 +164,29 @@ The tool SHALL keep the state of an update in the repository's common git direct
 - **WHEN** `verify` runs while a queued upstream is at its plan, in conflict or pending
 - **THEN** the tool refuses and names the upstreams that still need `continue`
 
+### Requirement: Environment of the checks
+`verify` SHALL run the install command and every check with environment variables that describe the update, naming commits by their full ids: `GIT_INTAKE_BASE`, the integration tip the update started from; `GIT_INTAKE_HEAD`, the commit being verified; `GIT_INTAKE_INTEGRATION`, the integration branch's name; and `GIT_INTAKE_UPSTREAMS`, the names of the queued upstreams separated by spaces, in queue order. For each queued upstream, with `<NAME>` its name in upper case and every character other than a letter or a digit replaced by `_`, it SHALL set `GIT_INTAKE_UPSTREAM_<NAME>_MODE` to `follow` or `port` and `GIT_INTAKE_UPSTREAM_<NAME>_TARGET` to the follow target, or for a port upstream to the newest commit of its plan. For a follow upstream with a last synced commit before the update, it SHALL set `GIT_INTAKE_UPSTREAM_<NAME>_PREVIOUS` to that commit; a port upstream SHALL get no such variable. Every commit named SHALL be reachable from a reference while the commands run. Variables with the `GIT_INTAKE_` prefix that the tool inherits SHALL NOT reach the commands, and the tool SHALL NOT set these variables for the git commands it runs itself.
+
+#### Scenario: Follow upstream with a last synced commit
+- **WHEN** an update merges a follow upstream that was synced before
+- **THEN** the install command and every check receive the base, the head, the integration branch, the upstream's name, its mode, its target and its last synced commit, and each commit exists and is contained in a reference
+
+#### Scenario: First import
+- **WHEN** an update imports a path upstream for the first time
+- **THEN** the commands receive the upstream's mode and target and no previous commit
+
+#### Scenario: Several upstreams
+- **WHEN** an update takes several upstreams, and leaves out another that is current
+- **THEN** `GIT_INTAKE_UPSTREAMS` lists the upstreams taken in queue order, each with its own variables, and the current upstream has none
+
+#### Scenario: Port upstream
+- **WHEN** an update carries out a port plan
+- **THEN** the commands receive the mode `port` and the newest commit of the plan as the target, and no previous commit
+
+#### Scenario: Inherited variables
+- **WHEN** `verify` is run with `GIT_INTAKE_BASE` or another `GIT_INTAKE_` variable already set
+- **THEN** the commands receive only the variables of the update, with the update's values
+
 ### Requirement: Guarded publication
 `finish` SHALL require a verified update whose worktree commit is the verified one and whose base is still the integration tip. Before moving any branch it SHALL confirm that the move of the integration branch is a fast-forward, that the verified commit contains the base and every merged target, and that no checkout of the integration branch would lose changes. It SHALL record the planned move, fast-forward the integration branch to the verified commit, push exactly the planned commit without force when the publication mode is `push`, and only after publication succeeds remove the worktree, the update branch, the update's upstream references and the state. An interrupted or failed `finish` SHALL complete the remaining move and the push when run again, and SHALL never publish a commit other than the planned one. `finish --no-publish` SHALL complete the local move and remove the worktree, the update branch, the upstream references and the state without pushing, and report that the integration branch remains unpublished. It SHALL never rewrite or force-push a branch, and SHALL never push to an upstream's URL.
 
@@ -558,11 +581,15 @@ A copy SHALL NOT change `.git-intake.toml` or anything under `.git-intake/`. The
 - **THEN** the first copy changes only the other files and names the paths it left out, and the second is recorded as `have`
 
 ### Requirement: Upstream names
-An upstream's name SHALL be usable in a git reference name, as `refs/git-intake/upstreams/<name>` needs it. The tool SHALL refuse a name that contains `..` or ends with `.` or `.lock`, naming it.
+An upstream's name SHALL be usable in a git reference name, as `refs/git-intake/upstreams/<name>` needs it, and SHALL give its own environment variables to the checks. The tool SHALL refuse a name that contains `..` or ends with `.` or `.lock`, naming it. It SHALL refuse two upstream names whose variable part, the name in upper case with every character other than a letter or a digit replaced by `_`, is the same, naming both names and the shared variable prefix.
 
 #### Scenario: Name git cannot use
 - **WHEN** an upstream is named `app.lock`
 - **THEN** the tool refuses to run and names the upstream and why
+
+#### Scenario: Names that share variables
+- **WHEN** two upstreams are named `app-a` and `APP.a`
+- **THEN** the tool refuses to run, names both upstreams and `GIT_INTAKE_UPSTREAM_APP_A_*`, and starts no update
 
 ### Requirement: Same repository by URL
 Where the tool compares a URL with an upstream's URL, URLs that name the same repository SHALL count as equal: local paths and `file://` URLs once resolved against the main worktree as git finds a repository (`<path>/.git`, `<path>`, `<path>.git`) and made canonical; other URLs once the scp-like form is read as `ssh://`, scheme and host are in lower case, a default port is dropped, and a leading `/` and a trailing `/` and `.git` of the path are dropped.
