@@ -71,21 +71,18 @@ fn tag_name(rev: &str) -> &str {
 
 /// The repository's own tag that `rev` resolves through, as a full ref name:
 /// the revision itself, or the name an expression such as `v2.3~1` starts
-/// from.
+/// from. The tag ref is looked up directly, so that a name that is also a
+/// branch, which git resolves through the tag, is still found.
 fn own_tag(git: &Git, rev: &str) -> Result<Option<String>> {
     let start = rev.split(['~', '^', '@', ':']).next().unwrap_or_default();
     for name in [rev, start] {
         if name.is_empty() {
             continue;
         }
-        let out = git.raw(&["rev-parse", "--symbolic-full-name", name])?;
-        if let Some(full) = out
-            .stdout
-            .lines()
-            .map(str::trim)
-            .find(|l| l.starts_with("refs/tags/"))
-        {
-            return Ok(Some(full.to_string()));
+        let full = format!("refs/tags/{}", tag_name(name));
+        let out = git.raw(&["rev-parse", "-q", "--verify", "--end-of-options", &full])?;
+        if out.success() {
+            return Ok(Some(full));
         }
     }
     Ok(None)

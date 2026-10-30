@@ -222,7 +222,7 @@ fn target_beside_the_last_sync_is_refused() {
 }
 
 #[test]
-fn conflict_at_a_chosen_target_resumes_and_records_that_target() {
+fn conflict_at_a_chosen_target_resumes_and_records_that_target_after_the_tag_moves() {
     let f = Fork::new();
     let env = &f.env;
     env.commit(
@@ -256,6 +256,9 @@ fn conflict_at_a_chosen_target_resumes_and_records_that_target() {
     // commit `start` resolved.
     env.git(&f.up.work, &["tag", "-f", "v2.0", &later]);
     env.git(&f.up.work, &["push", "-q", "-f", "origin", "v2.0"]);
+    assert_eq!(env.rev(&f.up.bare, "v2.0^{commit}"), later);
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["upstreams"][0]["target"], c1.as_str());
 
     let wt = env.update_worktree(&f.down);
     std::fs::write(wt.join(FORK_FILE), "one\nTWO-both\nthree\n").unwrap();
@@ -264,6 +267,9 @@ fn conflict_at_a_chosen_target_resumes_and_records_that_target() {
         .success()
         .stdout(contains("upstream: merged as"));
     assert!(!wt.join("later.txt").exists());
+    assert_eq!(env.rev(&wt, "HEAD^2"), c1, "continue merged the moved tag");
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["upstreams"][0]["target"], c1.as_str());
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
     env.assert_no_update(&f.down);
@@ -501,4 +507,66 @@ fn unreachable_remote_during_tag_lookup_is_refused_clearly() {
         "{err}"
     );
     env.assert_no_update(&f.down);
+}
+
+#[test]
+fn own_tag_that_is_also_a_branch_is_refused() {
+    let f = Fork::new();
+    let env = &f.env;
+    let [c1, c2, _] = three_upstream_commits(&f);
+    // `v2.3` is both a branch and a tag of the repository, on upstream
+    // commits; the upstream has no tag `v2.3`. Git resolves the name through
+    // the tag.
+    env.git(&f.down, &["fetch", "-q", "upstream"]);
+    env.git(&f.down, &["branch", "v2.3", &c1]);
+    env.git(&f.down, &["tag", "v2.3", &c2]);
+
+    for rev in ["v2.3", "v2.3~1"] {
+        f.tool(&["start", &format!("upstream={rev}")])
+            .code(2)
+            .stderr(contains(
+                "resolves through the repository's own tag refs/tags/v2.3",
+            ));
+    }
+    env.assert_no_update(&f.down);
+
+    // The branch named in full is a revision of the repository like any other.
+    f.tool(&["start", "upstream=refs/heads/v2.3"])
+        .success()
+        .stdout(contains(format!("upstream: queued at {}", &c1[..12])));
+}
+
+#[test]
+fn expression_on_a_tag_only_the_upstream_has_is_refused() {
+    let f = Fork::new();
+    let env = &f.env;
+    let [_, c2, _] = three_upstream_commits(&f);
+    env.git(&f.up.work, &["tag", "v3.0", &c2]);
+    env.git(&f.up.work, &["push", "-q", "origin", "v3.0"]);
+
+    f.tool(&["start", "upstream=v3.0~1"])
+        .code(2)
+        .stderr(contains(
+            "'v3.0~1' names no commit and no tag of remote 'upstream'",
+        ));
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn mirror_ahead_of_the_fetched_tip_is_refused_at_start() {
+    let f = Fork::new();
+    let env = &f.env;
+    let [_, c2, c3] = three_upstream_commits(&f);
+    // The mirror holds a commit the upstream branch no longer has.
+    env.git(&f.down, &["fetch", "-q", "upstream"]);
+    env.git(&f.down, &["branch", "upstream-main", &c3]);
+    env.git(&f.up.bare, &["update-ref", "refs/heads/main", &c2]);
+
+    f.tool(&["start"]).code(2).stderr(contains(format!(
+        "upstream 'upstream': the mirror branch 'upstream-main' at {} is not contained in the target {}",
+        &c3[..12],
+        &c2[..12]
+    )));
+    env.assert_no_update(&f.down);
+    assert_eq!(env.rev(&f.down, "upstream-main"), c3);
 }
