@@ -1,0 +1,339 @@
+//! `status`: per-upstream drift, the update in progress, and the cutover gate.
+
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use serde::Serialize;
+
+use crate::Exit;
+use crate::commands::update::{next_step, step_name};
+use crate::drift::{self, Drift, DriftState};
+use crate::git::{Git, abbrev, branch_ref};
+use crate::output::{Render, emit, table};
+use crate::remotes;
+use crate::repo::Repo;
+use crate::state::{ConflictFile, MergeKind, UpdateState, UpstreamStep};
+use crate::sync_record;
+
+#[derive(Serialize)]
+pub struct StatusDoc {
+    pub integration: String,
+    pub integration_tip: String,
+    pub publish: Option<String>,
+    pub install: Option<String>,
+    pub checks: Vec<String>,
+    pub config_working_copy_differs: bool,
+    /// Whether `--check` fetched the upstreams and predicted conflicts.
+    pub checked: bool,
+    pub all_current: bool,
+    pub upstreams: Vec<UpstreamStatus>,
+    pub update: Option<UpdateView>,
+}
+
+#[derive(Serialize)]
+pub struct UpstreamStatus {
+    pub name: String,
+    pub path: Option<String>,
+    pub remote: String,
+    pub branch: String,
+    pub url: Option<String>,
+    pub mirror: Option<String>,
+    pub last_synced: Option<String>,
+    pub tip: Option<String>,
+    pub commits_behind: Option<u64>,
+    pub state: DriftState,
+    pub detail: Option<String>,
+    /// Files a merge of the tip would conflict in; only with `--check`.
+    pub conflicts: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+pub struct UpdateView {
+    pub step: String,
+    pub base: String,
+    pub branch: String,
+    pub worktree: PathBuf,
+    pub upstreams: Vec<QueuedView>,
+    pub verified_commit: Option<String>,
+    pub next: String,
+}
+
+#[derive(Serialize)]
+pub struct QueuedView {
+    pub name: String,
+    pub target: String,
+    pub kind: MergeKind,
+    pub step: UpstreamStep,
+    pub merge_commit: Option<String>,
+    pub conflicts: Vec<ConflictFile>,
+}
+
+pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
+    let loaded = repo.load_config()?;
+    let config = &loaded.config;
+    let git = &repo.git;
+
+    let mut fetch_errors = vec![None; config.upstreams.len()];
+    if check {
+        for (i, up) in config.upstreams.iter().enumerate() {
+            fetch_errors[i] = match remotes::ensure_one(git, up)? {
+                Err(why) => Some(why),
+                Ok(_) => remotes::fetch(git, up)?.err(),
+            };
+        }
+    }
+
+    let tip = git
+        .commit(&branch_ref(&config.integration))?
+        .with_context(|| {
+            format!(
+                "the integration branch '{}' does not exist",
+                config.integration
+            )
+        })?;
+    let latest = sync_record::latest(&sync_record::records(git, &tip, config)?);
+    let mut upstreams = Vec::new();
+    for (i, up) in config.upstreams.iter().enumerate() {
+        let mut d: Drift = drift::evaluate(git, &tip, up, latest.get(&up.name))?;
+        if let Some(why) = fetch_errors[i].take() {
+            d.state = DriftState::Unavailable;
+            d.detail = Some(format!("fetch failed: {why}"));
+        }
+        let conflicts = if check {
+            Some(predicted(git, &tip, up, &mut d)?)
+        } else {
+            None
+        };
+        upstreams.push(UpstreamStatus {
+            name: up.name.clone(),
+            path: up.path.clone(),
+            remote: up.remote.clone(),
+            branch: up.branch.clone(),
+            url: up.url.clone(),
+            mirror: up.mirror.clone(),
+            last_synced: d.last_synced,
+            tip: d.tip,
+            commits_behind: d.commits_behind,
+            state: d.state,
+            detail: d.detail,
+            conflicts,
+        });
+    }
+    let all_current = upstreams.iter().all(|u| u.state == DriftState::Current);
+    let update = match repo.state()? {
+        Some(state) => Some(update_view(&state)?),
+        None => None,
+    };
+    let doc = StatusDoc {
+        integration: config.integration.clone(),
+        integration_tip: tip,
+        publish: config.publish.clone(),
+        install: config.install.clone(),
+        checks: config.checks.clone(),
+        config_working_copy_differs: loaded.working_copy_differs,
+        checked: check,
+        all_current,
+        upstreams,
+        update,
+    };
+    emit(&doc, json)?;
+    Ok(if check && !all_current {
+        Exit::Negative
+    } else {
+        Exit::Success
+    })
+}
+
+/// Predicted conflicts for one upstream; may add a detail when a merge could
+/// not run at all.
+fn predicted(
+    git: &Git,
+    tip: &str,
+    up: &crate::config::Upstream,
+    d: &mut Drift,
+) -> Result<Vec<String>> {
+    let Some(upstream_tip) = d.tip.clone() else {
+        return Ok(Vec::new());
+    };
+    match d.state {
+        DriftState::Behind => drift::predict_conflicts(git, tip, &upstream_tip, up.path.as_deref()),
+        DriftState::NotImported => {
+            if let Some(path) = &up.path
+                && git.path_exists(tip, path)?
+            {
+                d.detail = Some(format!(
+                    "path '{path}' already holds content that does not come from the upstream's history"
+                ));
+            } else if up.path.is_none() {
+                d.detail = Some("shares no history with the integration branch".to_string());
+            }
+            Ok(Vec::new())
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
+    let wt = Git::worktree(&state.worktree);
+    Ok(UpdateView {
+        step: step_name(state, &wt)?.to_string(),
+        base: state.base.clone(),
+        branch: state.branch.clone(),
+        worktree: state.worktree.clone(),
+        upstreams: state
+            .upstreams
+            .iter()
+            .map(|q| QueuedView {
+                name: q.name.clone(),
+                target: q.target.clone(),
+                kind: q.kind,
+                step: q.step,
+                merge_commit: q.merge_commit.clone(),
+                conflicts: q.conflicts.clone(),
+            })
+            .collect(),
+        verified_commit: state
+            .verification
+            .as_ref()
+            .filter(|v| v.passed)
+            .map(|v| v.commit.clone()),
+        next: next_step(state, &wt)?,
+    })
+}
+
+fn opt_abbrev(oid: &Option<String>) -> String {
+    oid.as_deref().map(abbrev).unwrap_or("-").to_string()
+}
+
+fn config_lines(doc: &StatusDoc, out: &mut String) {
+    out.push_str(&format!(
+        "integration: {} at {}\n",
+        doc.integration,
+        abbrev(&doc.integration_tip)
+    ));
+    out.push_str(&format!(
+        "publish: {}\n",
+        doc.publish.as_deref().unwrap_or("none")
+    ));
+    out.push_str(&format!(
+        "install: {}\n",
+        doc.install.as_deref().unwrap_or("none")
+    ));
+    if doc.checks.is_empty() {
+        out.push_str("checks: none\n");
+    } else {
+        out.push_str("checks:\n");
+        for c in &doc.checks {
+            out.push_str(&format!("  {c}\n"));
+        }
+    }
+}
+
+impl Render for StatusDoc {
+    fn render(&self) -> String {
+        let mut out = String::new();
+        config_lines(self, &mut out);
+        out.push('\n');
+        let rows: Vec<Vec<String>> = self
+            .upstreams
+            .iter()
+            .map(|u| {
+                vec![
+                    u.name.clone(),
+                    u.path.clone().unwrap_or_else(|| "/".into()),
+                    format!("{}/{}", u.remote, u.branch),
+                    opt_abbrev(&u.last_synced),
+                    opt_abbrev(&u.tip),
+                    u.commits_behind
+                        .map(|n| n.to_string())
+                        .unwrap_or("-".into()),
+                    u.state.label().to_string(),
+                ]
+            })
+            .collect();
+        out.push_str(&table(
+            &[
+                "UPSTREAM",
+                "PATH",
+                "BRANCH",
+                "LAST SYNCED",
+                "TIP",
+                "BEHIND",
+                "STATE",
+            ],
+            &rows,
+        ));
+        for u in &self.upstreams {
+            if let Some(detail) = &u.detail {
+                out.push_str(&format!("{}: {detail}\n", u.name));
+            }
+            if let Some(conflicts) = &u.conflicts
+                && u.state == DriftState::Behind
+            {
+                if conflicts.is_empty() {
+                    out.push_str(&format!(
+                        "{}: {} commit{} behind, would merge without conflicts\n",
+                        u.name,
+                        u.commits_behind.unwrap_or_default(),
+                        crate::commands::update::plural(u.commits_behind.unwrap_or_default())
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{}: {} commit{} behind, would conflict in:\n",
+                        u.name,
+                        u.commits_behind.unwrap_or_default(),
+                        crate::commands::update::plural(u.commits_behind.unwrap_or_default())
+                    ));
+                    for f in conflicts {
+                        out.push_str(&format!("  {f}\n"));
+                    }
+                }
+            }
+        }
+        if self.checked {
+            out.push_str(if self.all_current {
+                "every upstream is current\n"
+            } else {
+                "drift: not every upstream is current\n"
+            });
+        }
+        if let Some(update) = &self.update {
+            out.push('\n');
+            out.push_str(&render_update(update));
+        }
+        out
+    }
+}
+
+pub fn render_update(u: &UpdateView) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "update in progress: {}\n",
+        u.step.replace('_', " ")
+    ));
+    out.push_str(&format!("  base: {}\n", abbrev(&u.base)));
+    out.push_str(&format!("  branch: {}\n", u.branch));
+    out.push_str(&format!("  worktree: {}\n", u.worktree.display()));
+    for q in &u.upstreams {
+        let step = match q.step {
+            UpstreamStep::Pending => "pending",
+            UpstreamStep::Conflict => "in conflict",
+            UpstreamStep::Merged => "merged",
+        };
+        out.push_str(&format!(
+            "  {}: target {}, {step}\n",
+            q.name,
+            abbrev(&q.target)
+        ));
+        if q.step == UpstreamStep::Conflict {
+            for c in &q.conflicts {
+                out.push_str(&format!("    {}  ({})\n", c.path, c.resolution.describe()));
+            }
+        }
+    }
+    if let Some(v) = &u.verified_commit {
+        out.push_str(&format!("  verified: {}\n", abbrev(v)));
+    }
+    out.push_str(&format!("  next: {}\n", u.next));
+    out
+}
