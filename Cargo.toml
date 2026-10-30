@@ -1,0 +1,31 @@
+[package]
+name = "git-intake"
+version = "0.1.0"
+edition = "2024"
+description = "Merge-based, verified, resumable updates of a downstream repository from its upstreams"
+readme = "README.md"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.6"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"
+
+# Release binaries are shipped as small, self-contained downloads:
+# - lto and a single codegen unit let the optimiser see the whole program,
+#   which removes unused code across crates and shrinks the binary;
+# - strip drops symbols and debug information nobody uses at run time;
+# - panic = "abort" removes the unwinding machinery; the tool reports errors
+#   through its exit status, and a panic is a bug that ends the process anyway.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
