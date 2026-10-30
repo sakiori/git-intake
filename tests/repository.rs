@@ -681,7 +681,7 @@ fn state_files_of_another_format_are_named_or_ignored() {
         assert!(
             err.contains(
                 "the update in progress was started by a release that keeps its state in format 2; \
-                 this release (git-intake 0.0.0) understands format 4. Finish or abort the update with a release that keeps format 2 (git-intake v0.2.0 to v0.2.2), then start it again with this release"
+                 this release (git-intake 0.0.0) understands format 5. Finish or abort the update with a release that keeps format 2 (git-intake v0.2.0 to v0.2.2), then start it again with this release"
             ),
             "{args:?}: {err}"
         );
@@ -717,7 +717,7 @@ fn state_of_a_newer_or_unknown_format_is_refused() {
         assert!(
             err.contains(
                 "the update in progress was started by a release (git-intake 9.9.9) that keeps its state in format 99; \
-                 this release (git-intake 0.0.0) understands format 4, an older one"
+                 this release (git-intake 0.0.0) understands format 5, an older one"
             ),
             "{args:?}: {err}"
         );
@@ -735,7 +735,7 @@ fn state_of_a_newer_or_unknown_format_is_refused() {
         let err = stderr(&f.tool(args).code(2));
         assert!(
             err.contains(
-                "names no state format; this release (git-intake 0.0.0) understands format 4"
+                "names no state format; this release (git-intake 0.0.0) understands format 5"
             ),
             "{args:?}: {err}"
         );

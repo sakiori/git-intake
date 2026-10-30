@@ -139,7 +139,9 @@ fn start_refusals() {
         .stderr(contains("the main checkout has uncommitted changes"));
     env.git(&f.down, &["checkout", "--", FORK_FILE]);
 
-    // Someone published to the integration branch first.
+    // Someone published to the integration branch first, and it holds a
+    // commit of its own: the two diverged.
+    let base = env.rev(&f.down, "main");
     let other = env.path("other");
     env.git(
         &env.path(""),
@@ -150,18 +152,84 @@ fn start_refusals() {
             &other.to_string_lossy(),
         ],
     );
-    env.commit(&other, &[("other.txt", "o\n")], "other: change");
+    let theirs = env.commit(&other, &[("other.txt", "o\n")], "other: change");
     env.git(&other, &["push", "-q", "origin", "main"]);
-    f.tool(&["start"])
-        .code(2)
-        .stderr(contains("is behind 'origin/main' by 1 commit"));
+    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local");
+    f.tool(&["start"]).code(2).stderr(contains(
+        "'main' and 'origin/main' have diverged: 'main' lacks 1 commit of 'origin/main', which lacks 1 of 'main'",
+    ));
+    assert_eq!(env.rev(&f.down, "main"), local);
     env.assert_no_update(&f.down);
 
-    env.git(&f.down, &["merge", "-q", "--ff-only", "origin/main"]);
-    f.tool(&["start"]).success();
+    // Strictly behind: `start` fast-forwards it and starts from there.
+    env.git(&f.down, &["reset", "-q", "--hard", &base]);
+    f.tool(&["start"]).success().stdout(contains(format!(
+        "fast-forwarded 'main' from {} to {} to match 'origin/main'",
+        &base[..12],
+        &theirs[..12]
+    )));
+    assert_eq!(env.rev(&f.down, "main"), theirs);
+    assert!(f.down.join("other.txt").exists());
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["base"], theirs.as_str());
     f.tool(&["start"])
         .code(2)
         .stderr(contains("an update is already in progress"));
+}
+
+#[test]
+fn start_reads_the_configuration_again_after_a_fast_forward() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    let other = env.path("other");
+    env.git(
+        &env.path(""),
+        &[
+            "clone",
+            "-q",
+            &f.publish.to_string_lossy(),
+            &other.to_string_lossy(),
+        ],
+    );
+    // The new tip adds a check.
+    let cfg = fs::read_to_string(other.join(".git-intake.toml"))
+        .unwrap()
+        .replace(
+            "checks = [\"test -f app.txt\"]",
+            "checks = [\"test -f n.txt\"]",
+        );
+    env.commit(&other, &[(".git-intake.toml", &cfg)], "other: check n");
+    env.git(&other, &["push", "-q", "origin", "main"]);
+    f.tool(&["start"]).success();
+    f.tool(&["verify"])
+        .success()
+        .stdout(contains("passed   test -f n.txt"));
+    f.tool(&["abort"]).success();
+
+    // A new tip that names another publish remote: the fast-forward is kept,
+    // and the update is not started.
+    let mirror = env.bare("mirror");
+    env.git(
+        &f.down,
+        &["remote", "add", "mirror", &mirror.to_string_lossy()],
+    );
+    let cfg = cfg.replace("remote = \"origin\"", "remote = \"mirror\"");
+    let moved = env.commit(
+        &other,
+        &[(".git-intake.toml", &cfg)],
+        "other: publish elsewhere",
+    );
+    env.git(&other, &["push", "-q", "origin", "main"]);
+    let err = stderr(&f.tool(&["start"]).code(2));
+    assert!(
+        err.contains(
+            "names 'mirror' as the publish remote instead of 'origin'; the fast-forward is kept"
+        ),
+        "{err}"
+    );
+    assert_eq!(env.rev(&f.down, "main"), moved);
+    env.assert_no_update(&f.down);
 }
 
 #[test]
@@ -222,114 +290,6 @@ fn failed_install_skips_checks() {
     let out = stdout(&v);
     assert!(out.contains("FAILED   exit 3  (exit 3;"), "{out}");
     assert!(out.contains("skipped  true"), "{out}");
-}
-
-#[test]
-fn integration_moved_blocks_finish() {
-    let f = Fork::new();
-    let env = &f.env;
-    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
-    f.tool(&["start"]).success();
-    f.tool(&["verify"]).success();
-    let moved = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
-    f.tool(&["finish"])
-        .code(2)
-        .stderr(contains("'main' moved from"))
-        .stderr(contains(
-            "must take the new integration tip and be verified again",
-        ));
-    assert_eq!(env.rev(&f.down, "main"), moved);
-    f.tool(&["abort"]).success();
-    env.assert_no_update(&f.down);
-    assert_eq!(env.rev(&f.down, "main"), moved);
-}
-
-#[test]
-fn remote_moved_rejects_push_without_force() {
-    let f = Fork::new();
-    let env = &f.env;
-    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
-    f.tool(&["start"]).success();
-    f.tool(&["verify"]).success();
-
-    let other = env.path("other");
-    env.git(
-        &env.path(""),
-        &[
-            "clone",
-            "-q",
-            &f.publish.to_string_lossy(),
-            &other.to_string_lossy(),
-        ],
-    );
-    let theirs = env.commit(&other, &[("other.txt", "o\n")], "other: published first");
-    env.git(&other, &["push", "-q", "origin", "main"]);
-
-    let verified = env.rev(&env.update_worktree(&f.down), "HEAD");
-    let finish = f.tool(&["finish"]).code(2);
-    let err = stderr(&finish);
-    assert!(
-        err.contains("the local integration branch is advanced"),
-        "{err}"
-    );
-    assert!(
-        err.contains("`git intake finish --no-publish` to close the update locally"),
-        "{err}"
-    );
-    assert!(
-        err.contains(
-            "publish the result through a new verified update or the repository's usual review"
-        ),
-        "{err}"
-    );
-    assert!(
-        !err.contains("run the checks, then run `git intake finish`"),
-        "{err}"
-    );
-    assert_eq!(
-        env.rev(&f.down, "main"),
-        verified,
-        "local branch stays advanced"
-    );
-    assert_eq!(
-        env.rev(&f.publish, "main"),
-        theirs,
-        "the remote branch is not overwritten"
-    );
-    // The update stays in the finishing step until it is published.
-    let status = env.tool_json(&f.down, &["status", "--json"], 0);
-    assert_eq!(status["update"]["step"], "finishing");
-    assert!(status["update"]["publish_error"].is_string());
-    assert!(
-        status["update"]["next"]
-            .as_str()
-            .unwrap()
-            .contains("finish --no-publish")
-    );
-    f.tool(&["abort"]).code(2).stderr(contains(
-        "can no longer be aborted. Run `git intake finish`",
-    ));
-    f.tool(&["start"]).code(2).stderr(contains(
-        "`git intake finish --no-publish` to close it locally",
-    ));
-
-    // Merging the remote's work locally does not get it published by this update.
-    env.git(&f.down, &["fetch", "-q", "origin"]);
-    env.git(&f.down, &["merge", "-q", "--no-edit", "origin/main"]);
-    f.tool(&["finish"]).code(2).stderr(contains("was rejected"));
-    assert_eq!(env.rev(&f.publish, "main"), theirs);
-
-    // Close the update locally.
-    f.tool(&["finish", "--no-publish"])
-        .success()
-        .stdout(contains(
-            "not published to 'origin' (advanced locally only): main",
-        ));
-    env.assert_no_update(&f.down);
-    assert!(env.is_ancestor(&f.down, &verified, "main"));
-    assert_eq!(env.rev(&f.publish, "main"), theirs);
-    let report = env.tool_json(&f.down, &["report", "--json"], 0);
-    assert_eq!(report["unpublished"], serde_json::json!(["main"]));
 }
 
 #[test]

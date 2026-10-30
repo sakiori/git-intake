@@ -1,8 +1,10 @@
 //! The sync record: trailers on the merge commits the tool creates and on
 //! the commits it copies, the last synced commit of each upstream derived
-//! from the merges, and the upstream commits the copies took.
+//! from the merges, and the upstream commits the copies took. The trailer
+//! of a catch-up merge, which takes the integration branch into an update,
+//! lives here as well.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
@@ -15,6 +17,9 @@ pub const TARGET_TRAILER: &str = "Intake-Target";
 pub const TAG_TRAILER: &str = "Intake-Tag";
 /// Names the upstream commit a copy took.
 pub const TAKEN_TRAILER: &str = "Intake-Taken";
+/// Marks a catch-up merge, naming the integration branch whose tip it took
+/// into the update.
+pub const CATCH_UP_TRAILER: &str = "Intake-Catch-Up";
 
 const FIELD: char = '\u{1f}';
 const RECORD: char = '\u{1e}';
@@ -46,6 +51,102 @@ pub fn message(
             "sync({name}): merge {source} at {short_target} ({tag})\n\n{UPSTREAM_TRAILER}: {name}\n{TARGET_TRAILER}: {target}\n{TAG_TRAILER}: {tag}\n"
         ),
     }
+}
+
+/// The commit message of a catch-up merge of the integration branch
+/// `integration` at `short_tip` into the update.
+pub fn catch_up_message(integration: &str, short_tip: &str) -> String {
+    format!(
+        "catch-up: merge {integration} at {short_tip} into the update\n\n{CATCH_UP_TRAILER}: {integration}\n"
+    )
+}
+
+/// The integration branch a catch-up merge names in its trailer, or `None`
+/// when `commit` is not one.
+pub fn catch_up_of(git: &Git, commit: &str) -> Result<Option<String>> {
+    let out = git.run(&[
+        "log",
+        "-1",
+        &format!("--format=%(trailers:key={CATCH_UP_TRAILER},valueonly,separator=%x2C)"),
+        commit,
+        "--",
+    ])?;
+    Ok(Some(first_value(out.trim()).to_string()).filter(|v| !v.is_empty()))
+}
+
+/// Those of `commits` that carry the catch-up trailer.
+pub fn catch_ups<'a>(
+    git: &Git,
+    commits: impl IntoIterator<Item = &'a str>,
+) -> Result<HashSet<String>> {
+    let input: String = commits.into_iter().map(|c| format!("{c}\n")).collect();
+    if input.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let out = git.run_with_input(
+        &[
+            "log".to_string(),
+            "--no-walk=unsorted".into(),
+            "--stdin".into(),
+            "--fixed-strings".into(),
+            format!("--grep={CATCH_UP_TRAILER}: "),
+            format!(
+                "--format=%H%x1f%(trailers:key={CATCH_UP_TRAILER},valueonly,separator=%x2C)%x1e"
+            ),
+            "--".into(),
+        ],
+        input,
+    )?;
+    Ok(out
+        .split(RECORD)
+        .filter_map(|entry| {
+            let mut fields = entry.trim_matches(['\n', '\r']).split(FIELD);
+            let commit = fields.next()?.trim();
+            let value = first_value(fields.next()?);
+            (!commit.is_empty() && !value.is_empty()).then(|| commit.to_string())
+        })
+        .collect())
+}
+
+/// The commits of `rev` that `base` lacks, without those of the configured
+/// upstreams' fetched branches, that carry a sync record or a copy's
+/// trailers, each with the upstreams they name, newest first.
+pub fn naming_upstreams(
+    git: &Git,
+    rev: &str,
+    base: &str,
+    upstream_tips: &[String],
+) -> Result<Vec<(String, Vec<String>)>> {
+    let mut args = log_args(
+        upstream_tips,
+        &[format!(
+            "--format=%H%x1f%(trailers:key={UPSTREAM_TRAILER},valueonly,separator=%x2C)%x1e"
+        )],
+        UPSTREAM_TRAILER,
+        rev,
+    );
+    // `--not` already ends the positive revisions when there are tips.
+    let at = args.len() - 1;
+    if upstream_tips.is_empty() {
+        args.insert(at, format!("^{base}"));
+    } else {
+        args.insert(at, base.to_string());
+    }
+    let out = git.run(&args)?;
+    Ok(out
+        .split(RECORD)
+        .filter_map(|entry| {
+            let mut fields = entry.trim_matches(['\n', '\r']).split(FIELD);
+            let commit = fields.next()?.trim().to_string();
+            let names: Vec<String> = fields
+                .next()?
+                .split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect();
+            (!commit.is_empty() && !names.is_empty()).then_some((commit, names))
+        })
+        .collect())
 }
 
 /// The trailers a copy of `taken` from upstream `name` carries, as

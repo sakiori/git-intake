@@ -13,7 +13,7 @@ use crate::git::{Git, abbrev, branch_ref, lines};
 use crate::output::{Render, emit};
 use crate::port::{self, Standing};
 use crate::repo::{MainWorktree, Repo};
-use crate::state::{UPDATE_BRANCH, UpstreamStep, Work};
+use crate::state::{CatchUpStep, UPDATE_BRANCH, UpstreamStep, Work};
 use crate::sync_record::{self, Record};
 use crate::upstreams::{self, Fetches, REFS_PREFIX};
 
@@ -609,8 +609,11 @@ fn state_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
         );
         return Ok(());
     };
-    if let Some(mr) = &state.merge_request {
-        // The worktree was removed when the merge request branch was pushed.
+    // The worktree was removed when the merge request branch was pushed,
+    // unless the update catches up with the integration branch meanwhile.
+    if let Some(mr) = &state.merge_request
+        && !(registered && state.worktree.exists())
+    {
         let detail = if state.finishing.is_some() {
             format!(
                 "`finish` is completing the update merged through '{}'; run `git intake finish`",
@@ -637,18 +640,25 @@ fn state_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
     }
     if problems.is_empty() {
         let wt = Git::worktree(&state.worktree);
+        // A catch-up merge is built on the integration tip, checked out
+        // detached, with the update head merged into it.
+        let catching_up = state.catching_up();
         let head_branch = wt.raw(&["symbolic-ref", "--short", "-q", "HEAD"])?;
-        if head_branch.stdout.trim() != UPDATE_BRANCH {
+        if head_branch.stdout.trim() != UPDATE_BRANCH && catching_up.is_none() {
             problems.push(format!("the update worktree is not on '{UPDATE_BRANCH}'"));
         }
         // A copy stops without a merge in progress; only a merge leaves one.
         let merging = state
             .upstreams
             .iter()
-            .any(|u| u.step == UpstreamStep::Conflict && u.follow().is_some());
-        if wt.merge_in_progress()? != merging {
+            .any(|u| u.step == UpstreamStep::Conflict && u.follow().is_some())
+            || catching_up.is_some_and(|c| c.step == CatchUpStep::Conflict);
+        let in_progress = wt.merge_in_progress()?;
+        let interrupted = catching_up.is_some_and(|c| c.step == CatchUpStep::Merging);
+        if in_progress != merging && !interrupted {
             problems.push(if merging {
-                "an upstream is recorded in conflict but no merge is in progress in the update worktree".to_string()
+                "an upstream or a catch-up merge is recorded in conflict but no merge is in progress in the update worktree"
+                    .to_string()
             } else {
                 "a merge is in progress in the update worktree that the update state does not record".to_string()
             });

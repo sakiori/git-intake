@@ -20,7 +20,7 @@ const ENV_PREFIX: &str = "GIT_INTAKE_";
 
 pub fn run(repo: &Repo) -> Result<Exit> {
     let mut state = repo.require_state()?;
-    require_merging(&state)?;
+    require_merging(repo, &state)?;
     require_worktree(repo, &state)?;
     let open: Vec<String> = state
         .unmerged()
@@ -32,6 +32,13 @@ pub fn run(repo: &Repo) -> Result<Exit> {
             "cannot verify before every queued upstream is merged or its plan carried out; \
              these still need `git intake continue`:\n{}",
             bullet(&open)
+        );
+    }
+    if let Some(c) = state.catching_up() {
+        bail!(
+            "the catch-up merge with '{}' at {} is not concluded; run `git intake continue` before verifying",
+            state.config.integration,
+            abbrev(&c.tip)
         );
     }
     let wt = Git::worktree(&state.worktree);
@@ -50,7 +57,23 @@ pub fn run(repo: &Repo) -> Result<Exit> {
         );
     }
     let head = wt.line(&["rev-parse", "HEAD"])?;
+    if verify_head(repo, &mut state, &head)? {
+        println!("verified {}; next: git intake finish", abbrev(&head));
+        Ok(Exit::Success)
+    } else {
+        println!(
+            "verification failed; fix it on the update branch in {}, commit, and run `git intake verify` again",
+            state.worktree.display()
+        );
+        Ok(Exit::Negative)
+    }
+}
 
+/// Runs the install command and the checks on `head`, the commit the update
+/// worktree is at, records the verification in the state, and returns
+/// whether it passed. `finish` runs it on a catch-up merge it made.
+pub fn verify_head(repo: &Repo, state: &mut UpdateState, head: &str) -> Result<bool> {
+    let wt = Git::worktree(&state.worktree);
     let logs = &repo.paths.logs;
     if logs.exists() {
         fs::remove_dir_all(logs).with_context(|| format!("cannot clear {}", logs.display()))?;
@@ -65,15 +88,11 @@ pub fn run(repo: &Repo) -> Result<Exit> {
         commands.push(("check", check));
     }
 
-    println!(
-        "verifying {} in {}",
-        abbrev(&head),
-        state.worktree.display()
-    );
-    let environment = check_environment(&state, &head);
+    println!("verifying {} in {}", abbrev(head), state.worktree.display());
+    let environment = check_environment(state, head);
     let mut results = Vec::new();
     let mut problems = Vec::new();
-    if let Err(why) = merged_config_problem(&wt, &head, &state.config.integration)? {
+    if let Err(why) = merged_config_problem(&wt, head, &state.config.integration)? {
         println!("FAILED   {why}");
         problems.push(why);
     }
@@ -133,22 +152,13 @@ pub fn run(repo: &Repo) -> Result<Exit> {
     let passed = problems.is_empty() && results.iter().all(|r| r.outcome == CheckOutcome::Passed);
 
     state.verification = Some(Verification {
-        commit: head.clone(),
+        commit: head.to_string(),
         passed,
         results,
         problems,
     });
-    repo.save_state(&state)?;
-    if passed {
-        println!("verified {}; next: git intake finish", abbrev(&head));
-        Ok(Exit::Success)
-    } else {
-        println!(
-            "verification failed; fix it on the update branch in {}, commit, and run `git intake verify` again",
-            state.worktree.display()
-        );
-        Ok(Exit::Negative)
-    }
+    repo.save_state(state)?;
+    Ok(passed)
 }
 
 /// Checks the configuration as it will be committed on the integration branch
@@ -176,10 +186,12 @@ fn merged_config_problem(
 }
 
 /// The environment that describes the update to the install command and the
-/// checks, as full commit ids. Every commit named stays in the repository
-/// while they run: the base and the head are on the update branch, and each
-/// upstream's commits are in the history of the reference the update holds
-/// for it.
+/// checks, as full commit ids. The base is the integration tip the update
+/// lands on: the tip it started from, or the one it last caught up with; a
+/// catch-up changes none of the upstreams' variables. Every commit named
+/// stays in the repository while they run: the base and the head are on the
+/// update branch, and each upstream's commits are in the history of the
+/// reference the update holds for it.
 fn check_environment(state: &UpdateState, head: &str) -> Vec<(String, String)> {
     let mut vars = vec![
         (format!("{ENV_PREFIX}BASE"), state.base.clone()),

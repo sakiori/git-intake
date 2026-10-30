@@ -264,3 +264,35 @@ fn upstream_names_that_share_variables_are_refused() {
         .stdout(predicates::str::contains(clash));
     m.env.assert_no_update(&m.down);
 }
+
+#[test]
+fn a_catch_up_names_the_tip_it_caught_up_with_as_the_base() {
+    let f = Fork::with_checks(&[&dump("check-env"), REACHABLE]);
+    let env = &f.env;
+    env.push_upstream(&f.up, &[("new.txt", "x\n")], "upstream: new");
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    let before = dumped(env, "check-env");
+    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
+
+    f.tool(&["finish"]).success();
+    let merge = env.rev(&f.down, "main");
+    let after = dumped(env, "check-env");
+    assert!(
+        after.contains(&format!("GIT_INTAKE_BASE={local}")),
+        "{after:?}"
+    );
+    assert!(
+        after.contains(&format!("GIT_INTAKE_HEAD={merge}")),
+        "{after:?}"
+    );
+    // Every other variable is as before the catch-up.
+    let rest = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| !l.starts_with("GIT_INTAKE_BASE=") && !l.starts_with("GIT_INTAKE_HEAD="))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(rest(&after), rest(&before));
+}

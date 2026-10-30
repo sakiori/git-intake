@@ -11,18 +11,31 @@ use crate::output::{Render, emit};
 use crate::port::{Verb, Verdict};
 use crate::repo::Repo;
 use crate::state::{
-    self, ConflictFile, CopyStep, FollowMerge, MergeKind, PortPlan, Resolution, UpdateState,
-    UpstreamStep, Work,
+    self, CatchUpStep, ConflictFile, CopyStep, FollowMerge, MergeKind, PortPlan, Resolution,
+    UpdateState, UpstreamStep, Work,
 };
 
 #[derive(Serialize)]
 pub struct ReportDoc {
     pub in_progress: bool,
     pub integration: String,
+    /// The integration tip the update started from, which upstream ranges
+    /// and the repository's own changes are measured from.
     pub base: String,
     /// Branches `finish --no-publish` advanced locally without publishing.
     pub unpublished: Vec<String>,
     pub upstreams: Vec<UpstreamReport>,
+    /// The catch-up merges with the integration branch, oldest first.
+    pub catch_ups: Vec<CatchUpReport>,
+}
+
+#[derive(Serialize)]
+pub struct CatchUpReport {
+    /// The integration tip taken in.
+    pub tip: String,
+    /// The catch-up merge; `null` while it is in progress.
+    pub merge_commit: Option<String>,
+    pub conflicts: Vec<ConflictFile>,
 }
 
 #[derive(Serialize)]
@@ -133,10 +146,12 @@ pub fn run(repo: &Repo, json: bool) -> Result<Exit> {
 
 fn build(git: &Git, state: &UpdateState, in_progress: bool) -> Result<ReportDoc> {
     let wt = Git::worktree(&state.worktree);
-    let stopped = state
-        .upstreams
-        .iter()
-        .any(|q| q.step == UpstreamStep::Conflict);
+    let catching_up = state.catching_up().is_some();
+    let stopped = catching_up
+        || state
+            .upstreams
+            .iter()
+            .any(|q| q.step == UpstreamStep::Conflict);
     let live_unmerged = if in_progress && stopped && state.worktree.exists() {
         Some(wt.unmerged_files()?)
     } else {
@@ -182,16 +197,30 @@ fn build(git: &Git, state: &UpdateState, in_progress: bool) -> Result<ReportDoc>
         }
         upstreams.push(report);
     }
+    let catch_ups = state
+        .catch_ups
+        .iter()
+        .map(|c| CatchUpReport {
+            tip: c.tip.clone(),
+            merge_commit: c.merge_commit.clone(),
+            conflicts: live(
+                &c.conflicts,
+                c.step == CatchUpStep::Conflict,
+                &live_unmerged,
+            ),
+        })
+        .collect();
     Ok(ReportDoc {
         in_progress,
         integration: state.config.integration.clone(),
-        base: state.base.clone(),
+        base: state.start_base().to_string(),
         unpublished: state
             .finishing
             .as_ref()
             .map(|f| f.unpublished.clone())
             .unwrap_or_default(),
         upstreams,
+        catch_ups,
     })
 }
 
@@ -222,19 +251,22 @@ fn follow_report(
     live_unmerged: &Option<Vec<String>>,
     report: &mut UpstreamReport,
 ) -> Result<()> {
+    // Measured from the base the update started from, which the merges were
+    // made on, whatever the update caught up with since.
+    let base = state.start_base();
     let range_start = match f.kind {
         MergeKind::Import => None,
         _ => match &f.previous {
             Some(p) => Some(p.clone()),
-            None => git.merge_base(&state.base, &f.target)?,
+            None => git.merge_base(base, &f.target)?,
         },
     };
     report.own_changes_before = match (&range_start, f.kind) {
-        (Some(start), MergeKind::Root) => Some(diff_stat(git, start, &state.base)?),
+        (Some(start), MergeKind::Root) => Some(diff_stat(git, start, base)?),
         (Some(start), MergeKind::Subtree) => Some(diff_stat(
             git,
             start,
-            &format!("{}:{}", state.base, path.unwrap_or_default()),
+            &format!("{base}:{}", path.unwrap_or_default()),
         )?),
         _ => None,
     };
@@ -400,6 +432,18 @@ impl Render for ReportDoc {
                 Some(p) => render_port(u, p, &mut out),
                 None => render_follow(u, &mut out),
             }
+        }
+        for c in &self.catch_ups {
+            out.push_str(&format!(
+                "\ncaught up with {} at {}{}\n",
+                self.integration,
+                abbrev(&c.tip),
+                match &c.merge_commit {
+                    Some(m) => format!(" as {}", abbrev(m)),
+                    None => " (in progress)".to_string(),
+                }
+            ));
+            render_conflicts(&c.conflicts, "  ", &mut out);
         }
         out
     }

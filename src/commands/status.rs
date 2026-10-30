@@ -128,7 +128,11 @@ pub struct OffLineView {
 #[derive(Serialize)]
 pub struct UpdateView {
     pub step: String,
+    /// The integration tip the update lands on: the tip at `start`, or the
+    /// one it last caught up with.
     pub base: String,
+    /// The integration tip at `start`.
+    pub start_base: String,
     pub branch: String,
     pub worktree: PathBuf,
     pub upstreams: Vec<QueuedView>,
@@ -137,7 +141,20 @@ pub struct UpdateView {
     pub publish_error: Option<String>,
     /// The merge request the update waits for, in merge-request mode.
     pub merge_request: Option<MergeRequestView>,
+    /// The catch-up merge of the steps `catch_up_conflict` and `catch_up`.
+    pub catch_up: Option<CatchUpView>,
     pub next: String,
+}
+
+#[derive(Serialize)]
+pub struct CatchUpView {
+    /// The integration tip caught up with.
+    pub tip: String,
+    /// The update branch head the catch-up merges into it.
+    pub head_before: String,
+    /// The catch-up merge, once committed.
+    pub merge_commit: Option<String>,
+    pub conflicts: Vec<ConflictFile>,
 }
 
 #[derive(Serialize)]
@@ -427,9 +444,11 @@ fn predicted(
 
 pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
     let wt = Git::worktree(&state.worktree);
+    let step = step_name(state, &wt)?;
     Ok(UpdateView {
-        step: step_name(state, &wt)?.to_string(),
+        step: step.to_string(),
         base: state.base.clone(),
+        start_base: state.start_base().to_string(),
         branch: state.branch.clone(),
         worktree: state.worktree.clone(),
         upstreams: state
@@ -496,6 +515,16 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
             commit: mr.commit.clone(),
             requested: mr.requested,
         }),
+        catch_up: state
+            .catch_ups
+            .last()
+            .filter(|_| step.starts_with("catch_up"))
+            .map(|c| CatchUpView {
+                tip: c.tip.clone(),
+                head_before: c.head_before.clone(),
+                merge_commit: c.merge_commit.clone(),
+                conflicts: c.conflicts.clone(),
+            }),
         next: next_step(state, &wt)?,
     })
 }
@@ -658,7 +687,15 @@ pub fn render_update(u: &UpdateView) -> String {
         "update in progress: {}\n",
         u.step.replace('_', " ")
     ));
-    out.push_str(&format!("  base: {}\n", abbrev(&u.base)));
+    if u.start_base == u.base {
+        out.push_str(&format!("  base: {}\n", abbrev(&u.base)));
+    } else {
+        out.push_str(&format!(
+            "  base: {}, caught up from {}\n",
+            abbrev(&u.base),
+            abbrev(&u.start_base)
+        ));
+    }
     out.push_str(&format!("  branch: {}\n", u.branch));
     match &u.merge_request {
         // The worktree is removed once the merge request branch is pushed.
@@ -732,6 +769,20 @@ pub fn render_update(u: &UpdateView) -> String {
             for c in &q.conflicts {
                 out.push_str(&format!("    {}  ({})\n", c.path, c.resolution.describe()));
             }
+        }
+    }
+    if let Some(c) = &u.catch_up {
+        let merge = c
+            .merge_commit
+            .as_deref()
+            .map(|m| format!(" as {}", abbrev(m)))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "  catching up with the integration tip {}{merge}\n",
+            abbrev(&c.tip)
+        ));
+        for f in &c.conflicts {
+            out.push_str(&format!("    {}  ({})\n", f.path, f.resolution.describe()));
         }
     }
     if let Some(v) = &u.verified_commit {
