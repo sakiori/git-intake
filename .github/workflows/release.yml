@@ -9,8 +9,13 @@
 # publishes the GitHub Release. RELEASING.md describes the setup and recovery.
 #
 # Pinned versions bumped by hand (Dependabot updates only the actions):
-# - release-plz 0.3.174 (the release-plz action's `version` input)
-# The Rust toolchain is the current stable release.
+# - release-plz 0.3.174, with the SHA-256 of its release archive
+#   (.github/scripts/install-release-plz.sh)
+# The Rust toolchain is the current stable release. Both jobs hold the GitHub
+# App's token, and the release job the OIDC token crates.io accepts, so they
+# run release-plz's own binary, installed from its checksum-verified release
+# archive, rather than the release-plz action, which installs further tools
+# without verifying them.
 name: Release
 
 on:
@@ -66,12 +71,20 @@ jobs:
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write
-      - uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
-        with:
-          command: release-pr
-          version: 0.3.174
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      - run: .github/scripts/install-release-plz.sh "$RUNNER_TEMP/release-plz"
+      # The release pull request's commit is made as the App's bot user.
+      - env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          id=$(gh api "users/$APP_SLUG%5Bbot%5D" --jq .id)
+          git config --global user.name "${APP_SLUG}[bot]"
+          git config --global user.email "${id}+${APP_SLUG}[bot]@users.noreply.github.com"
+      - env:
+          GIT_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          release-plz release-pr --forge github \
+            --repo-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --output json
 
   release:
     if: github.repository_owner == 'sakiori'
@@ -125,6 +138,14 @@ jobs:
             echo "::notice::$GITHUB_SHA is not the merge of a release pull request"
             exit 0
           fi
+          # release-plz releases the pull request's last commit only when the
+          # merge kept it; a squash or rebase merge would release a commit
+          # whose release builds never ran.
+          read -r _ first second extra <<< "$(git rev-list --parents -n 1 "$GITHUB_SHA")" || true
+          if [ -z "$first" ] || [ "$second" != "$head" ] || [ -n "${extra:-}" ]; then
+            echo "::error::$GITHUB_SHA does not merge the release pull request's last commit $head with a merge commit; merge release pull requests with a merge commit. Nothing was published."
+            exit 1
+          fi
           runs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$head/check-runs?per_page=100" --jq '.check_runs[]' | jq -s .)
           failed=0
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin; do
@@ -148,12 +169,13 @@ jobs:
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: read
+      - run: .github/scripts/install-release-plz.sh "$RUNNER_TEMP/release-plz"
       # Without CARGO_REGISTRY_TOKEN, release-plz obtains a short-lived token
-      # through crates.io's Trusted Publishing with the job's OIDC token. It
-      # creates the tag through GitHub's API with GITHUB_TOKEN.
-      - uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
-        with:
-          command: release
-          version: 0.3.174
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      # through crates.io's Trusted Publishing with the job's OIDC token. After
+      # the crate is published, it creates the tag through GitHub's API with
+      # GIT_TOKEN.
+      - env:
+          GIT_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          release-plz release --forge github \
+            --repo-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --output json

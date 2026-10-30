@@ -6,8 +6,8 @@ This is the maintainers' runbook for releases on GitHub: how a release runs, the
 
 1. Every push to `main` runs the `release-pr` job of `.github/workflows/release.yml`. release-plz opens or updates the release pull request from a branch `release-plz-*`: it raises the version in `Cargo.toml` and `Cargo.lock` and adds the release's entry to `CHANGELOG.md`, computed from the Conventional Commits since the last release (see [CONTRIBUTING.md](CONTRIBUTING.md#commits)).
 2. CI runs on the release pull request like on any other, including `release-build (<target>)` for each release target: it builds, packs and checks the release archive exactly as a release does, the third-party notices included, and publishes nothing.
-3. Merging the release pull request with a merge commit starts the `release` job. It first requires that every `release-build` check passed on the pull request's last commit, since a crate version, once published, cannot be replaced. release-plz then publishes the crate to crates.io through Trusted Publishing and creates the tag `vX.Y.Z` on that last commit, which is the commit release-plz releases.
-4. The tag starts `.github/workflows/binaries.yml`, in a run whose commit is the tag's. It checks the tag, that its commit is on `main`, that `Cargo.toml` holds its version and that the version is on crates.io; builds the archive of every target; attests each archive's build provenance and verifies that the attestation names this repository, `binaries.yml`, the tag and its commit; creates the draft GitHub Release with the changelog entry, attaches the archives and their `.sha256` files, and publishes the release, marked as the latest unless a newer release exists.
+3. Merging the release pull request with a merge commit starts the `release` job. It first requires that the merge commit's second parent is the pull request's last commit, refusing a squash or rebase merge, and that every `release-build` check passed on that commit, since a crate version, once published, cannot be replaced. It runs release-plz's own binary, installed from its release archive after checking the archive's SHA-256 (`.github/scripts/install-release-plz.sh`). release-plz then publishes the crate to crates.io through Trusted Publishing and creates the tag `vX.Y.Z` on that last commit, which is the commit release-plz releases.
+4. The tag starts `.github/workflows/binaries.yml`, in a run whose commit is the tag's. It checks the tag, that its commit is on `main` and that `Cargo.toml` holds its version, and it downloads the published crate, checks it against the checksum in crates.io's index and requires its `.cargo_vcs_info.json` to record a clean tree at the tag's commit; builds the archive of every target; attests each archive's build provenance and verifies that the attestation names this repository, `binaries.yml`, the tag and its commit; creates the draft GitHub Release with the changelog entry, attaches the archives and their `.sha256` files, and publishes the release, marked as the latest unless a newer release exists.
 
 Runs of `binaries.yml` for one tag never overlap, and only one run at a time attaches files to or publishes any release; queued runs wait instead of being cancelled. A run never replaces a file of a published release.
 
@@ -97,19 +97,23 @@ A run of `binaries.yml` failed, or the tag was created by a token whose events s
 gh workflow run binaries.yml --ref vX.Y.Z
 ```
 
-It builds, attests and attaches every archive again, replacing the files of the draft release, and publishes it; it creates the draft when it is missing. A run on any ref other than a release tag, or on a tag whose commit is not the run's, is refused. A release that is published already is left as it is: if a published release ever lacks a file, investigate before changing it by hand rather than replacing its files.
+It builds, attests and attaches every archive again, replacing the files of the draft release, and publishes it; it creates the draft when it is missing. A run on any ref other than a release tag, on a tag whose commit is not the run's, or on a tag whose commit is not the one the published crate records, is refused; a tag created by hand must be on that commit. A release that is published already is left as it is: if a published release ever lacks a file, investigate before changing it by hand rather than replacing its files.
 
 ## Checking a release
 
-Anyone can check that an archive was built by this repository's release workflow from the tag's commit:
+Anyone can check that an archive was built by this repository's release workflow from the tag's commit. In a clone of `https://github.com/sakiori/git-intake`, the trusted repository, never of a fork or mirror whose tags may differ:
 
 ```sh
+git fetch origin tag vX.Y.Z
 gh attestation verify git-intake-vX.Y.Z-<target>.tar.gz \
   --repo sakiori/git-intake \
   --signer-workflow sakiori/git-intake/.github/workflows/binaries.yml \
-  --source-ref refs/tags/vX.Y.Z
+  --source-ref refs/tags/vX.Y.Z \
+  --source-digest "$(git rev-parse 'vX.Y.Z^{commit}')"
 ```
+
+`--source-digest` ties the archive to the commit the tag names, not only to a ref called `vX.Y.Z`.
 
 ## Pinned versions
 
-The workflows pin some tools by hand; Dependabot updates only the actions. Each workflow's header lists its pins: release-plz in `release.yml`; zig, cargo-zigbuild and cargo-about in `ci.yml` and `binaries.yml`, and cargo-about also in `xtask/src/main.rs`, which refuses to generate the notices with another release; cargo-deny in `ci.yml`.
+The workflows pin some tools by hand; Dependabot updates only the actions. Each workflow's header lists its pins: release-plz in `release.yml`; zig, cargo-zigbuild and cargo-about in `ci.yml` and `binaries.yml`, and cargo-about also in `xtask/src/main.rs`, which refuses to generate the notices with another release; cargo-deny in `ci.yml`; release-plz, with its archive's checksum, in `.github/scripts/install-release-plz.sh`.

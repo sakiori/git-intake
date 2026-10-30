@@ -7,9 +7,11 @@
 # Either way the run's commit (github.sha) is the tag's commit, which is the
 # commit the binaries are built from and the one their provenance names. The
 # run refuses any other ref, a tag that has moved, a commit not on main, and a
-# version that is not on crates.io. Each archive git-intake-vX.Y.Z-<target>.tar.gz
-# holds the binary, LICENSE, THIRD-PARTY-NOTICES.txt and the manual pages under
-# man/man1/ (see .github/scripts/build-archive.sh), with a .sha256 next to it.
+# version whose crate on crates.io was not packaged from a clean tree at that
+# commit. Each archive git-intake-vX.Y.Z-<target>.tar.gz holds the binary,
+# LICENSE, THIRD-PARTY-NOTICES.txt, RUST-LIBRARY-COPYRIGHT.html and the manual
+# pages under man/man1/ (see .github/scripts/build-archive.sh), with a .sha256
+# next to it.
 # The release stays a draft until every archive, its checksum and its
 # attestation are in place; a release that is already published is left
 # alone. RELEASING.md describes the setup and recovery.
@@ -39,8 +41,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Checks the tag and that its version is on crates.io, and tells whether the
-  # release is published already.
+  # Checks the tag and that the crate published for its version came from its
+  # commit, and tells whether the release is published already.
   check:
     if: github.repository_owner == 'sakiori'
     runs-on: ubuntu-latest
@@ -82,11 +84,33 @@ jobs:
             echo "::error::Cargo.toml at $TAG holds version $committed, not $version"
             exit 1
           fi
-          published=$(curl --fail --silent --show-error --location \
-            --user-agent "git-intake release workflow (https://github.com/$GITHUB_REPOSITORY)" \
-            "https://crates.io/api/v1/crates/git-intake/$version" | jq -r '.version.num' || true)
-          if [ "$published" != "$version" ]; then
+          # The binaries are built from the commit the published crate came
+          # from: the crate's checksum must match crates.io's index, and its
+          # .cargo_vcs_info.json must record a clean tree at this commit.
+          agent="git-intake release workflow (https://github.com/$GITHUB_REPOSITORY)"
+          if ! index=$(curl --fail --silent --show-error --location --user-agent "$agent" \
+            https://index.crates.io/gi/t-/git-intake); then
+            index=
+          fi
+          entry=$(jq -c --arg v "$version" 'select(.vers == $v)' <<< "$index")
+          if [ -z "$entry" ]; then
             echo "::error::git-intake $version is not on crates.io; publish it before its binaries"
+            exit 1
+          fi
+          if [ "$(jq -r .yanked <<< "$entry")" = true ]; then
+            echo "::error::git-intake $version is yanked on crates.io"
+            exit 1
+          fi
+          crate="$RUNNER_TEMP/git-intake-$version.crate"
+          curl --fail --silent --show-error --location --user-agent "$agent" --output "$crate" \
+            "https://static.crates.io/crates/git-intake/git-intake-$version.crate"
+          echo "$(jq -r .cksum <<< "$entry")  $crate" | sha256sum --check --strict -
+          vcs=$(tar -xzOf "$crate" "git-intake-$version/.cargo_vcs_info.json")
+          echo "$vcs"
+          if [ "$(jq -r '.git.sha1 // ""' <<< "$vcs")" != "$GITHUB_SHA" ] \
+            || [ "$(jq -r '.git.dirty // false' <<< "$vcs")" != false ] \
+            || [ "$(jq -r '.path_in_vcs // ""' <<< "$vcs")" != "" ]; then
+            echo "::error::the published crate git-intake $version was not packaged from a clean tree at $GITHUB_SHA"
             exit 1
           fi
       # A first look, so that a published release builds nothing; the finish
@@ -140,7 +164,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - run: |
-          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup toolchain install stable --profile minimal --component rust-src --target "$TARGET"
           rustup default stable
       - if: matrix.build-tool == 'cargo-zigbuild'
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -256,7 +280,12 @@ jobs:
       # A release of an older tag is not marked as the latest.
       - if: steps.state.outputs.state != 'published'
         run: |
-          newest=$( { gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 1000 \
-            --json tagName --jq '.[].tagName'; echo "$TAG"; } | grep -Ex 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n 1)
+          # A failure to list the releases stops the run before it publishes.
+          if ! released=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 1000 \
+            --json tagName --jq '.[].tagName'); then
+            echo "::error::cannot list the published releases; $TAG stays a draft"
+            exit 1
+          fi
+          newest=$(printf '%s\n%s\n' "$released" "$TAG" | grep -Ex 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n 1)
           if [ "$newest" = "$TAG" ]; then latest=true; else latest=false; fi
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$latest"

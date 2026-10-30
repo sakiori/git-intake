@@ -195,11 +195,15 @@ jobs:
       TARGET: ${{ matrix.target }}
       BUILD_TOOL: ${{ matrix.build-tool }}
     steps:
+      # A pull request's own last commit, not the merge with its base that a
+      # pull_request run checks out by default: the release job requires these
+      # checks on exactly that commit, which release-plz then releases.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - run: |
-          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup toolchain install stable --profile minimal --component rust-src --target "$TARGET"
           rustup default stable
       - if: matrix.build-tool == 'cargo-zigbuild'
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
