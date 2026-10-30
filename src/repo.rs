@@ -381,20 +381,19 @@ fn locate_main_worktree(
     if top.success() {
         return Ok(MainWorktree::At(canonical(Path::new(top.stdout.trim()))));
     }
-    // The usual layout: the git directory is `.git` at the top of the main
-    // worktree.
-    if common.file_name().is_some_and(|n| n == ".git")
-        && let Some(parent) = common.parent()
-        && is_main_worktree(parent, common)?
-    {
-        return Ok(MainWorktree::At(parent.to_path_buf()));
-    }
-    // A git directory placed elsewhere names its main worktree nowhere: the
-    // tool was started in it, or the update in progress recorded it.
+    // A git directory that does not name its main worktree: the tool was
+    // started in it, or the update in progress recorded it. Both come before
+    // the guess below, which a separate git directory that is itself named
+    // `.git` would mislead.
     if let Some(top) = started_in {
         return Ok(MainWorktree::At(top.to_path_buf()));
     }
-    // An unreadable state is reported by the command that needs it.
+    // An unreadable state, or one of another format, gives no record and is
+    // not reported here. `continue`, `verify`, `finish` and `abort` read the
+    // state before they need the main worktree and stop on its error; `start`
+    // refuses on it as well. Read-only commands carry on: run outside the
+    // main worktree of such a layout, they find it from the guess below or
+    // say that it cannot be located, and `doctor` also reports the state.
     let recorded = state::load(&paths.state)
         .ok()
         .flatten()
@@ -403,6 +402,14 @@ fn locate_main_worktree(
         && is_main_worktree(&dir, common)?
     {
         return Ok(MainWorktree::At(dir));
+    }
+    // The usual layout: the git directory is `.git` at the top of the main
+    // worktree.
+    if common.file_name().is_some_and(|n| n == ".git")
+        && let Some(parent) = common.parent()
+        && is_main_worktree(parent, common)?
+    {
+        return Ok(MainWorktree::At(parent.to_path_buf()));
     }
     Ok(MainWorktree::Unknown)
 }

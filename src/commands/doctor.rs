@@ -267,12 +267,14 @@ fn checkout_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
     let main = match repo.main_worktree() {
         MainWorktree::Bare => return Ok(()),
         MainWorktree::At(main) => main.clone(),
+        // Nothing is wrong with the repository; the checks need to run in
+        // the main worktree.
         MainWorktree::Unknown => {
             checks.add(
                 "main_checkout_clean",
                 None,
-                CheckStatus::Fail,
-                repo.unknown_main_worktree(),
+                CheckStatus::Warn,
+                format!("not checked: {}", repo.unknown_main_worktree()),
             );
             return Ok(());
         }

@@ -301,16 +301,17 @@ fn submodule_downstream_resolves_relative_urls_from_its_checkout() {
     env.tool(&sub, &["doctor"]).success();
 }
 
-/// A downstream whose git directory lies outside its checkout, with its
-/// upstream reached by a URL relative to the checkout. Returns the
-/// environment, the upstream, the checkout and the git directory.
-fn separate_git_dir_downstream() -> (Env, Upstream, PathBuf, PathBuf) {
+/// A downstream whose git directory lies outside its checkout, at `git_dir`
+/// in the environment, with its upstream reached by a URL relative to the
+/// checkout. Returns the environment, the upstream, the checkout and the git
+/// directory.
+fn separate_git_dir_downstream(git_dir: &str) -> (Env, Upstream, PathBuf, PathBuf) {
     let env = Env::new();
     let up = env.upstream("upstream", &[(FORK_FILE, "one\n")]);
     let down = env.path("down");
-    // `down` reaches the upstream at `../upstream.git`; the git directory
-    // one level deeper does not.
-    let git_dir = env.path("git-dirs").join("down.git");
+    // `down` reaches the upstream at `../upstream.git`; a git directory one
+    // level deeper, or the directory holding it, does not.
+    let git_dir = env.path(git_dir);
     fs::create_dir_all(git_dir.parent().unwrap()).unwrap();
     env.git(
         &env.path(""),
@@ -333,15 +334,15 @@ fn separate_git_dir_downstream() -> (Env, Upstream, PathBuf, PathBuf) {
     (env, up, down, git_dir)
 }
 
-#[test]
-fn separate_git_dir_downstream_updates_from_its_checkout_and_update_worktree() {
-    let (env, up, down, git_dir) = separate_git_dir_downstream();
-    env.push_upstream(&up, &[("n.txt", "n\n")], "upstream: n");
-    env.tool(&down, &["start"])
+/// Starts an update in the checkout `down`, then fetches, verifies and
+/// finishes it from the update worktree.
+fn update_from_checkout_and_update_worktree(env: &Env, up: &Upstream, down: &Path, git_dir: &Path) {
+    env.push_upstream(up, &[("n.txt", "n\n")], "upstream: n");
+    env.tool(down, &["start"])
         .success()
         .stdout(contains("upstream: queued"));
-    let wt = update_worktree_in(&git_dir);
-    env.push_upstream(&up, &[("m.txt", "m\n")], "upstream: m");
+    let wt = update_worktree_in(git_dir);
+    env.push_upstream(up, &[("m.txt", "m\n")], "upstream: m");
     env.tool(&wt, &["fetch"])
         .success()
         .stdout(contains("upstream: fetched"));
@@ -350,28 +351,68 @@ fn separate_git_dir_downstream_updates_from_its_checkout_and_update_worktree() {
     env.tool(&wt, &["finish"])
         .success()
         .stderr(contains(LEFT_REMOVED_DIRECTORY));
-    assert_eq!(env.rev(&down, "main"), verified);
+    assert_eq!(env.rev(down, "main"), verified);
     assert!(down.join("n.txt").exists(), "the checkout did not follow");
-    assert!(env.git(&down, &["status", "--porcelain"]).is_empty());
-    env.tool(&down, &["doctor"]).success();
+    assert!(env.git(down, &["status", "--porcelain"]).is_empty());
+    env.tool(down, &["doctor"]).success();
+}
+
+#[test]
+fn separate_git_dir_downstream_updates_from_its_checkout_and_update_worktree() {
+    let (env, up, down, git_dir) = separate_git_dir_downstream("git-dirs/down.git");
+    update_from_checkout_and_update_worktree(&env, &up, &down, &git_dir);
+}
+
+#[test]
+fn separate_git_dir_named_dot_git_is_not_taken_for_its_parent() {
+    let (env, up, down, git_dir) = separate_git_dir_downstream("store/down/.git");
+    update_from_checkout_and_update_worktree(&env, &up, &down, &git_dir);
+    let beside: Vec<_> = fs::read_dir(git_dir.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        beside,
+        [".git"],
+        "files were written beside the git directory"
+    );
+}
+
+#[test]
+fn unreadable_state_stops_finish_from_the_update_worktree() {
+    let (env, up, down, git_dir) = separate_git_dir_downstream("git-dirs/down.git");
+    env.push_upstream(&up, &[("n.txt", "n\n")], "upstream: n");
+    env.tool(&down, &["start"]).success();
+    env.tool(&down, &["verify"]).success();
+    let main = env.rev(&down, "main");
+    fs::write(git_dir.join("git-intake").join("state.json"), "{").unwrap();
+    let finish = env.tool(&update_worktree_in(&git_dir), &["finish"]).code(2);
+    assert!(
+        stderr(&finish).contains("is unreadable"),
+        "{}",
+        stderr(&finish)
+    );
+    assert_eq!(env.rev(&down, "main"), main);
 }
 
 #[test]
 fn separate_git_dir_main_worktree_unknown_from_a_linked_worktree_is_named() {
-    let (env, up, down, _) = separate_git_dir_downstream();
+    let (env, up, down, _) = separate_git_dir_downstream("git-dirs/down.git");
     env.push_upstream(&up, &[("n.txt", "n\n")], "upstream: n");
+    env.tool(&down, &["fetch"]).success();
     let linked = env.path("side");
     add_worktree(&env, &down, "side", &linked);
-    let refusal = "the main worktree cannot be located from here";
+    let reason = "the main worktree cannot be located from here";
     let start = env.tool(&linked, &["start"]).code(2);
-    assert!(stderr(&start).contains(refusal), "{}", stderr(&start));
-    let doctor = env.tool_json(&linked, &["doctor", "--json"], 1);
+    assert!(stderr(&start).contains(reason), "{}", stderr(&start));
+    // Nothing is wrong with the repository, so doctor only warns.
+    let doctor = env.tool_json(&linked, &["doctor", "--json"], 0);
     let check = doctor["checks"]
         .as_array()
         .unwrap()
         .iter()
         .find(|c| c["check"] == "main_checkout_clean")
         .expect("main checkout check");
-    assert_eq!(check["status"], "fail");
-    assert!(check["detail"].as_str().unwrap().contains(refusal));
+    assert_eq!(check["status"], "warn");
+    assert!(check["detail"].as_str().unwrap().contains(reason));
 }
