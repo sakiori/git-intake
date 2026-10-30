@@ -11,7 +11,12 @@ use crate::commands::update::{require_merging, require_worktree};
 use crate::config;
 use crate::git::{Git, abbrev};
 use crate::repo::{Repo, bullet};
-use crate::state::{CheckOutcome, CheckResult, Verification};
+use crate::state::{CheckOutcome, CheckResult, UpdateState, Verification, Work};
+
+/// Prefix of the environment variables the install command and the checks
+/// receive. Variables with this prefix inherited from the caller are not
+/// passed on, so a command sees only those of the update it verifies.
+const ENV_PREFIX: &str = "GIT_INTAKE_";
 
 pub fn run(repo: &Repo) -> Result<Exit> {
     let mut state = repo.require_state()?;
@@ -65,6 +70,7 @@ pub fn run(repo: &Repo) -> Result<Exit> {
         abbrev(&head),
         state.worktree.display()
     );
+    let environment = check_environment(&state, &head);
     let mut results = Vec::new();
     let mut problems = Vec::new();
     if let Err(why) = merged_config_problem(&wt, &head, &state.config.integration)? {
@@ -86,7 +92,7 @@ pub fn run(repo: &Repo) -> Result<Exit> {
             });
             continue;
         }
-        let code = run_logged(command, &state.worktree, &log)?;
+        let code = run_logged(command, &state.worktree, &log, &environment)?;
         let outcome = if code == Some(0) {
             println!("passed   {command}  (log: {})", log.display());
             CheckOutcome::Passed
@@ -169,8 +175,60 @@ fn merged_config_problem(
     })
 }
 
-/// Runs a shell command in `dir`, writing its output to `log`.
-fn run_logged(command: &str, dir: &Path, log: &Path) -> Result<Option<i32>> {
+/// The environment that describes the update to the install command and the
+/// checks, as full commit ids. Every commit named stays in the repository
+/// while they run: the base and the head are on the update branch, and each
+/// upstream's commits are in the history of the reference the update holds
+/// for it.
+fn check_environment(state: &UpdateState, head: &str) -> Vec<(String, String)> {
+    let mut vars = vec![
+        (format!("{ENV_PREFIX}BASE"), state.base.clone()),
+        (format!("{ENV_PREFIX}HEAD"), head.to_string()),
+        (
+            format!("{ENV_PREFIX}INTEGRATION"),
+            state.config.integration.clone(),
+        ),
+        (
+            format!("{ENV_PREFIX}UPSTREAMS"),
+            state
+                .upstreams
+                .iter()
+                .map(|q| q.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    ];
+    for q in &state.upstreams {
+        let prefix = format!("{ENV_PREFIX}UPSTREAM_{}_", config::env_name(&q.name));
+        let (mode, target, previous) = match &q.work {
+            Work::Follow(f) => (config::Mode::Follow, Some(&f.target), f.previous.as_ref()),
+            // The newest commit of the plan: after the update, each upstream
+            // commit up to it is taken, decided, or left pending by the plan.
+            Work::Port(p) => (
+                config::Mode::Port,
+                p.commits.last().map(|c| &c.commit),
+                None,
+            ),
+        };
+        vars.push((format!("{prefix}MODE"), mode.as_str().to_string()));
+        if let Some(target) = target {
+            vars.push((format!("{prefix}TARGET"), target.clone()));
+        }
+        if let Some(previous) = previous {
+            vars.push((format!("{prefix}PREVIOUS"), previous.clone()));
+        }
+    }
+    vars
+}
+
+/// Runs a shell command in `dir` with the variables of `environment`,
+/// writing its output to `log`.
+fn run_logged(
+    command: &str,
+    dir: &Path,
+    log: &Path,
+    environment: &[(String, String)],
+) -> Result<Option<i32>> {
     let file = File::create(log).with_context(|| format!("cannot create {}", log.display()))?;
     let err = file.try_clone()?;
     let mut cmd = Command::new("sh");
@@ -189,6 +247,12 @@ fn run_logged(command: &str, dir: &Path, log: &Path) -> Result<Option<i32>> {
     ] {
         cmd.env_remove(var);
     }
+    for (var, _) in std::env::vars_os() {
+        if var.to_str().is_some_and(|v| v.starts_with(ENV_PREFIX)) {
+            cmd.env_remove(var);
+        }
+    }
+    cmd.envs(environment.iter().map(|(k, v)| (k, v)));
     let status = cmd
         .status()
         .with_context(|| format!("cannot run `{command}`"))?;

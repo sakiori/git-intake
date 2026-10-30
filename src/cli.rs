@@ -56,6 +56,16 @@ pub enum Command {
     /// remote; the merge request itself is closed on the forge.
     Abort,
     /// Run the install command and checks on the update
+    ///
+    /// Each command runs through `sh -c` in the update worktree with variables that describe
+    /// the update, as full commit ids: `GIT_INTAKE_BASE`, the integration tip the update started
+    /// from; `GIT_INTAKE_HEAD`, the commit being verified; `GIT_INTAKE_INTEGRATION`, the
+    /// integration branch; `GIT_INTAKE_UPSTREAMS`, the names of the upstreams the update takes,
+    /// separated by spaces. For each of them, `GIT_INTAKE_UPSTREAM_<NAME>_MODE` is `follow` or
+    /// `port`, and `GIT_INTAKE_UPSTREAM_<NAME>_TARGET` is the target merged, or for a port the
+    /// newest commit of the plan; a follow upstream with a last synced commit before the update
+    /// also gets it as `GIT_INTAKE_UPSTREAM_<NAME>_PREVIOUS`. `<NAME>` is the upstream's name in
+    /// upper case with every character other than a letter or a digit replaced by `_`.
     Verify,
     /// Publish the verified update by push or merge request, and complete it
     ///
