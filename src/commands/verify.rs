@@ -24,14 +24,12 @@ pub const ENV_PREFIX: &str = "GIT_INTAKE_";
 pub fn run(repo: &Repo, only: &[String], skip: &[String]) -> Result<Exit> {
     // A refused selection changes nothing: it is checked before the release
     // warning is recorded and the update's references are restored.
-    if let Some(state) = repo.state()? {
-        select(&state.config.checks, only, skip)?;
-    }
-    let mut state = repo.require_state()?;
-    let selected: Vec<Check> = select(&state.config.checks, only, skip)?
-        .into_iter()
-        .cloned()
-        .collect();
+    let (mut state, selected) = repo.require_state_checked(|s| {
+        Ok(select(&s.config.checks, only, skip)?
+            .into_iter()
+            .cloned()
+            .collect::<Vec<Check>>())
+    })?;
     require_merging(repo, &state)?;
     require_worktree(repo, &state)?;
     let open: Vec<String> = state

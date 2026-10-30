@@ -165,15 +165,26 @@ impl Repo {
     /// The references the update holds are restored first where they are
     /// missing.
     pub fn require_state(&self) -> Result<UpdateState> {
+        Ok(self.require_state_checked(|_| Ok(()))?.0)
+    }
+
+    /// [`Self::require_state`] with `check` run on the update first, so
+    /// that a refusal of `check` changes nothing: no warning is recorded and
+    /// no reference is restored. Returns what `check` gives with the update.
+    pub fn require_state_checked<T>(
+        &self,
+        check: impl FnOnce(&UpdateState) -> Result<T>,
+    ) -> Result<(UpdateState, T)> {
         match self.state()? {
             Some(mut s) => {
+                let checked = check(&s)?;
                 if let Some(warning) = state::release_warning(&s) {
                     eprintln!("warning: {warning}");
                     s.release_warned = Some(state::RELEASE.to_string());
                     self.save_state(&s)?;
                 }
                 self.restore_held_references(&s)?;
-                Ok(s)
+                Ok((s, checked))
             }
             None => bail!("no update is in progress; run `git intake start` to begin one"),
         }
