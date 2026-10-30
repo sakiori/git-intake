@@ -455,6 +455,8 @@ pub struct Waiting {
     /// The publication setting the update recorded at `start`.
     pub publish: Option<Publish>,
     pub base: String,
+    /// The integration tip at `start`.
+    pub start_base: String,
     pub branch: String,
     pub worktree: PathBuf,
     pub main_worktree: Option<PathBuf>,
@@ -578,6 +580,14 @@ impl UpdateState {
         self.catch_ups
             .last()
             .filter(|c| c.step != CatchUpStep::Merged)
+    }
+
+    /// Whether a full run of the checks passed on `head`; a partial run
+    /// never counts.
+    pub fn verified_at(&self, head: &str) -> bool {
+        self.verification
+            .as_ref()
+            .is_some_and(|v| v.passed && v.commit == head)
     }
 
     /// Upstreams that are not merged, or whose plan is not carried out, yet.
@@ -705,6 +715,9 @@ pub fn recorded_main_worktree(path: &Path) -> Option<PathBuf> {
 struct RawWaiting {
     config: RawWaitingConfig,
     base: String,
+    /// Format 4 did not record it; its base, which never moved, stands in.
+    #[serde(default)]
+    start_base: Option<String>,
     branch: String,
     worktree: PathBuf,
     #[serde(default)]
@@ -737,6 +750,7 @@ impl RawWaiting {
         Waiting {
             integration: self.config.integration,
             publish: self.config.publish,
+            start_base: self.start_base.unwrap_or_else(|| self.base.clone()),
             base: self.base,
             branch: self.branch,
             worktree: self.worktree,
@@ -1098,6 +1112,10 @@ mod tests {
                 let object = value.as_object_mut().unwrap();
                 object.remove("start_base");
                 object.remove("catch_ups");
+            } else {
+                // Format 5 records the base it started from beside the one a
+                // catch-up moved it to.
+                value["start_base"] = "d".repeat(40).into();
             }
             value["merge_request"] = serde_json::json!({
                 "remote": "origin",
@@ -1116,6 +1134,9 @@ mod tests {
             assert_eq!(w.merge_request.branch, "git-intake/update-bbbbbbbbbbbb");
             assert_eq!(w.merge_request.number, None);
             assert!(!w.catching_up);
+            assert_eq!(w.base, "b".repeat(40));
+            let started = if version == 4 { 'b' } else { 'd' };
+            assert_eq!(w.start_base, started.to_string().repeat(40));
             assert!(w.refusal().contains("as an earlier release left it"));
             // Every command that carries an update on refuses it.
             let err = format!("{:#}", load_update(&path).unwrap_err());

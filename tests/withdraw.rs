@@ -211,9 +211,23 @@ fn finish_hands_a_waiting_update_over_to_its_open_merge_request() {
     );
     assert_eq!(n, 1);
 
+    // A catch-up of the earlier release moved its base from the one it
+    // started from.
+    let path = env.intake_dir(&f.down).join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let base = state["base"].as_str().unwrap().to_string();
+    let started = env.rev(&f.down, "main~1");
+    state["start_base"] = started.clone().into();
+    fs::write(&path, state.to_string()).unwrap();
+
     // Other commands show it as left by an earlier release and name finish.
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["update"]["step"], "waiting_for_merge_request");
+    assert_eq!(status["update"]["base"], base.as_str());
+    assert_eq!(status["update"]["start_base"], started.as_str());
+    // The earlier release's queued upstreams are not read.
+    assert_eq!(status["update"]["upstreams"], json!([]));
     assert!(
         status["update"]["next"]
             .as_str()

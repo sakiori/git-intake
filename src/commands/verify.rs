@@ -22,6 +22,11 @@ use crate::state::{
 pub const ENV_PREFIX: &str = "GIT_INTAKE_";
 
 pub fn run(repo: &Repo, only: &[String], skip: &[String]) -> Result<Exit> {
+    // A refused selection changes nothing: it is checked before the release
+    // warning is recorded and the update's references are restored.
+    if let Some(state) = repo.state()? {
+        select(&state.config.checks, only, skip)?;
+    }
     let mut state = repo.require_state()?;
     let selected: Vec<Check> = select(&state.config.checks, only, skip)?
         .into_iter()
@@ -81,12 +86,9 @@ pub fn run(repo: &Repo, only: &[String], skip: &[String]) -> Result<Exit> {
 
 /// The checks a run takes, in the order of the update's checks: those
 /// `only` names, or all but those `skip` names. A name given twice counts
-/// once. Refuses a name that is not one of the update's checks, and both
-/// selections at once.
+/// once. Refuses a name that is not one of the update's checks; the command
+/// line refuses both selections at once.
 fn select<'a>(checks: &'a [Check], only: &[String], skip: &[String]) -> Result<Vec<&'a Check>> {
-    if !only.is_empty() && !skip.is_empty() {
-        bail!("`--only` and `--skip` cannot be given together; nothing was run");
-    }
     let mut unknown: Vec<&str> = Vec::new();
     for name in only.iter().chain(skip).map(String::as_str) {
         if !checks.iter().any(|c| c.name == name) && !unknown.contains(&name) {
@@ -107,7 +109,8 @@ fn select<'a>(checks: &'a [Check], only: &[String], skip: &[String]) -> Result<V
             )
         };
         bail!(
-            "unknown check {}; {known}. Nothing was run",
+            "unknown check{} {}; {known}. Nothing was run",
+            if unknown.len() == 1 { "" } else { "s" },
             unknown
                 .iter()
                 .map(|n| format!("'{n}'"))
@@ -163,10 +166,7 @@ fn partial_run(
     let passed = run.passed;
     state.partial_run = Some(PartialRun { run, left_out });
     repo.save_state(state)?;
-    let verified = state
-        .verification
-        .as_ref()
-        .is_some_and(|v| v.passed && v.commit == head);
+    let verified = state.verified_at(head);
     let outcome = if passed { "passed" } else { "failed" };
     let standing = if verified {
         format!(
@@ -523,7 +523,9 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("unknown check 'x', 'y'; the update's checks are 'lint', 'test', 'audit'"),
+            err.contains(
+                "unknown checks 'x', 'y'; the update's checks are 'lint', 'test', 'audit'"
+            ),
             "{err}"
         );
         // Names are matched exactly.
@@ -531,10 +533,9 @@ mod tests {
         let err = select(&[], &strings(&["lint"]), &[])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("the update has no checks"), "{err}");
-        let err = select(&checks, &strings(&["lint"]), &strings(&["test"]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("cannot be given together"), "{err}");
+        assert!(
+            err.contains("unknown check 'lint'; the update has no checks"),
+            "{err}"
+        );
     }
 }

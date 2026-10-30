@@ -610,8 +610,5 @@ pub fn unverified_head(state: &UpdateState, head: &str) -> bool {
         .catch_ups
         .last()
         .is_some_and(|c| c.step == CatchUpStep::Merged && c.merge_commit.as_deref() == Some(head))
-        && !state
-            .verification
-            .as_ref()
-            .is_some_and(|v| v.passed && v.commit == head)
+        && !state.verified_at(head)
 }

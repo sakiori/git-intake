@@ -406,3 +406,50 @@ fn a_check_added_by_a_catch_up_is_selected_and_finish_runs_every_check() {
     assert_eq!(env.rev(&f.publish, "main"), merge);
     env.assert_no_update(&f.down);
 }
+
+#[test]
+fn a_failed_full_run_is_reported_beside_a_partial_run_on_the_same_head() {
+    let f = started();
+    fail(&f, "test");
+    f.tool(&["verify"]).code(1);
+    f.tool(&["verify", "--only", "lint"]).success();
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(
+        err.contains(&format!("verification of {} failed", &head(&f)[..12])),
+        "{err}"
+    );
+    assert!(!err.contains("only a partial run"), "{err}");
+}
+
+#[test]
+fn a_refused_selection_writes_no_warning_and_restores_no_reference() {
+    let f = started();
+    let env = &f.env;
+    // Another release started the update, and its upstream reference is
+    // missing: carrying the update on would warn and restore it.
+    let path = env.intake_dir(&f.down).join("state.json");
+    let mut state: serde_json::Value = serde_json::from_str(&state_text(&f)).unwrap();
+    state["release"] = "0.0.1".into();
+    fs::write(&path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    env.git(
+        &f.down,
+        &["update-ref", "-d", "refs/git-intake/upstreams/upstream"],
+    );
+    let before = state_text(&f);
+
+    let err = stderr(&f.tool(&["verify", "--only", "tests"]).code(2));
+    assert!(err.contains("unknown check 'tests'"), "{err}");
+    assert!(!err.contains("warning:"), "{err}");
+    assert!(!err.contains("restored"), "{err}");
+    assert_eq!(state_text(&f), before);
+    assert!(env.intake_refs(&f.down).is_empty());
+    assert!(ran(&f).is_empty());
+
+    // A valid selection carries the update on as usual.
+    let err = stderr(&f.tool(&["verify", "--only", "lint"]).success());
+    assert!(
+        err.contains("warning: the update was started by git-intake 0.0.1"),
+        "{err}"
+    );
+    assert!(err.contains("restored the update's reference"), "{err}");
+}

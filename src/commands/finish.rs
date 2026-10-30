@@ -300,10 +300,7 @@ fn close_locally(
     let Some(head) = head.filter(|h| *h != planned.new) else {
         return Ok(f);
     };
-    let verified = state
-        .verification
-        .as_ref()
-        .is_some_and(|v| v.passed && v.commit == head);
+    let verified = state.verified_at(&head);
     if !verified {
         // Dropped with the update branch: named, so that they can still be
         // found until git prunes unreachable commits.
@@ -388,14 +385,8 @@ pub fn prepare(
 ) -> Result<Ready> {
     let mut head = require_finishable(state)?;
     let wt = Git::worktree(&state.worktree);
-    let verified = |state: &UpdateState, head: &str| {
-        state
-            .verification
-            .as_ref()
-            .is_some_and(|v| v.passed && v.commit == head)
-    };
     let git = &repo.git;
-    if verified(state, &head) && git.is_ancestor(&head, tip)? {
+    if state.verified_at(&head) && git.is_ancestor(&head, tip)? {
         println!(
             "'{}' at {} already contains the verified commit {}",
             state.config.integration,
@@ -404,7 +395,7 @@ pub fn prepare(
         );
         return Ok(Ready::Holds(head));
     }
-    let mut verify = !verified(state, &head);
+    let mut verify = !state.verified_at(&head);
     let moved_on = if run.remote_tip {
         !git.is_ancestor(tip, &state.base)?
     } else {
@@ -473,10 +464,7 @@ pub fn require_finishable(state: &UpdateState) -> Result<String> {
         );
     }
     let head = clean_head(state, &Git::worktree(&state.worktree))?;
-    let verified = state
-        .verification
-        .as_ref()
-        .is_some_and(|v| v.passed && v.commit == head);
+    let verified = state.verified_at(&head);
     if !verified && !catch_up::unverified_head(state, &head) {
         require_verified(state, &head)?;
     }
@@ -496,13 +484,16 @@ fn clean_head(state: &UpdateState, wt: &Git) -> Result<String> {
 }
 
 /// Refuses an update head that is not the verified commit. A partial run
-/// on the head does not count; the refusal names the checks it left out.
+/// on the head does not count: without a full run there, the refusal names
+/// the checks it left out, and a failed full run there is reported as such.
 fn require_verified(state: &UpdateState, head: &str) -> Result<()> {
-    let verified = state
+    let full_run_at_head = state
         .verification
         .as_ref()
-        .is_some_and(|v| v.passed && v.commit == head);
-    if !verified && let Some(p) = state.partial_run.as_ref().filter(|p| p.run.commit == head) {
+        .is_some_and(|v| v.commit == head);
+    if !full_run_at_head
+        && let Some(p) = state.partial_run.as_ref().filter(|p| p.run.commit == head)
+    {
         bail!(
             "the update head {} has only a partial run, which left out {} and does not verify the update; \
              run `git intake verify` without `--only` or `--skip` to run every check",

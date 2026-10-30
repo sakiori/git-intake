@@ -657,12 +657,14 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
 }
 
 /// An update of an earlier release that waits for its merge request, as far
-/// as this release reads it.
+/// as this release reads it. Its queued upstreams are not shown: their
+/// targets and steps are the earlier release's, which this release does not
+/// read.
 fn waiting_view(w: &Waiting) -> UpdateView {
     UpdateView {
         step: "waiting_for_merge_request".to_string(),
         base: w.base.clone(),
-        start_base: w.base.clone(),
+        start_base: w.start_base.clone(),
         branch: w.branch.clone(),
         worktree: w.worktree.clone(),
         upstreams: Vec::new(),

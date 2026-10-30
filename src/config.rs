@@ -358,6 +358,9 @@ fn parse_checks(value: toml::Value, problems: &mut Vec<String>) -> Vec<Check> {
         return Vec::new();
     }
     let mut checks = Vec::new();
+    // Every name given, valid or not, so that a repeated name is reported
+    // with the other problems of its checks.
+    let mut names: Vec<&str> = Vec::new();
     for (i, entry) in entries.iter().enumerate() {
         let table = match entry {
             toml::Value::Table(table) => table,
@@ -377,6 +380,7 @@ fn parse_checks(value: toml::Value, problems: &mut Vec<String>) -> Vec<Check> {
             }
         };
         let name = table.get("name").and_then(toml::Value::as_str);
+        names.extend(name.filter(|n| !n.is_empty()));
         let label = match name {
             Some(name) if !name.is_empty() => format!("check '{name}'"),
             _ => format!("checks[{i}]"),
@@ -430,11 +434,11 @@ fn parse_checks(value: toml::Value, problems: &mut Vec<String>) -> Vec<Check> {
         }
     }
     let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
-    for check in &checks {
-        let key = check.name.to_ascii_lowercase();
+    for name in names {
+        let key = name.to_ascii_lowercase();
         match groups.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, names)) => names.push(&check.name),
-            None => groups.push((key, vec![&check.name])),
+            Some((_, same)) => same.push(name),
+            None => groups.push((key, vec![name])),
         }
     }
     for (_, names) in groups.into_iter().filter(|(_, n)| n.len() > 1) {
@@ -1062,6 +1066,14 @@ via = "merge-request"
             "{e}"
         );
         assert!(!e.contains("'lint'"), "{e}");
+        // A repeated name is reported together with the other problems of
+        // the checks that carry it.
+        let e = err(&format!(
+            "integration = \"main\"\nchecks = [{{ name = \"test\", run = \" \" }}, {{ name = \"Test\", cmd = \"c\" }}]\n{UP_A}"
+        ));
+        assert!(e.contains("check 'test': the command is empty"), "{e}");
+        assert!(e.contains("check 'Test': unknown key `cmd`"), "{e}");
+        assert!(e.contains("checks 'test' and 'Test' share a name"), "{e}");
     }
 
     #[test]
