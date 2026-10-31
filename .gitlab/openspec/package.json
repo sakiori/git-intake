@@ -1,0 +1,9 @@
+{
+  "name": "git-intake-openspec",
+  "private": true,
+  "description": "The OpenSpec CLI that checks the specification under openspec/, pinned with its whole dependency tree by package-lock.json",
+  "license": "MIT",
+  "dependencies": {
+    "@fission-ai/openspec": "1.14.3"
+  }
+}

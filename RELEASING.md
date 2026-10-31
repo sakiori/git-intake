@@ -1,126 +1,263 @@
 # Releasing
 
-This is the maintainers' runbook for releases on GitHub: how a release runs, the repository settings it relies on, the first release after the move to GitHub, and how to finish a release that stopped halfway.
+This is the maintainers' runbook for releases on GitLab.com: how a release runs, the group and project settings it relies on, the macOS runner, the first release, how to finish a release that stopped halfway, and the later move to crates.io.
 
 ## How a release runs
 
-1. Every push to `main` runs the `release-pr` job of `.github/workflows/release.yml`. release-plz opens or updates the release pull request from a branch `release-plz-*`: it raises the version in `Cargo.toml` and `Cargo.lock` and adds the release's entry to `CHANGELOG.md`, computed from the Conventional Commits since the last release (see [CONTRIBUTING.md](CONTRIBUTING.md#commits)). release-plz makes the pull request's single commit through GitHub's API, so the commit is signed by GitHub ("Verified") and names the App's bot user (see *The GitHub App*).
-2. CI runs on the release pull request like on any other, on the pull request's own last commit for these checks:
-   - `package` packages the crate as `cargo publish` does and builds the packaged crate. The release job publishes with `publish_no_verify` (`release-plz.toml`), so the crate, with the build scripts and procedural macros of its dependencies, is never built in the job that holds the App's token and the OIDC token crates.io accepts.
-   - `release-build (<target>)`, for each release target, builds, packs and checks the release archive exactly as a release does, and publishes nothing. The build remaps the build host's paths out of the binary (`--remap-path-prefix` for the workspace, CARGO_HOME and the toolchain's sysroot, since Cargo's `trim-paths` is not stable), and the archive is packed deterministically: GNU tar's gnu format without PAX records, sorted names, owner and group 0 without names, every time the commit's time (`SOURCE_DATE_EPOCH`), modes 0755 and 0644, no extended attributes, and `gzip -n`. `xtask check-archive` reads the raw headers back and scans every file, the binary included, for absolute paths of the build host. The third-party notices are generated for the target.
-   - `deny` first runs `cargo update --dry-run`, which fetches cargo's index entries of every locked crate without changing `Cargo.lock`, since cargo-deny tells yanked versions only from those entries.
-3. Merging the release pull request with a merge commit starts the `release` job. It first works out the commit release-plz will release: release-plz 0.3.174 lists the pull request's commits with one request, which returns at most the first 30, and releases the last one returned, so the job refuses publication unless that commit is the pull request's head, on which the release builds ran. Keep a release pull request to release-plz's own commit: never push further commits onto it, let alone many. The job then requires that the merge commit's second parent is the pull request's last commit, refusing a squash or rebase merge, and that the `package` check and every `release-build` check passed on that commit, since a crate version, once published, cannot be replaced. It runs release-plz's own binary, installed from its release archive after checking the archive's SHA-256 (`.github/scripts/install-release-plz.sh`). release-plz then publishes the crate to crates.io through Trusted Publishing and creates the tag `vX.Y.Z` on that last commit, which is the commit release-plz releases.
-4. The tag starts `.github/workflows/binaries.yml`, in a run whose commit is the tag's. It checks the tag, that its commit is on `main` and that `Cargo.toml` holds its version, and it downloads the published crate, checks it against the checksum in crates.io's index and requires its `.cargo_vcs_info.json` to record a clean tree at the tag's commit; builds the archive of every target; attests each archive's build provenance and verifies that the attestation names this repository, `binaries.yml`, the tag and its commit; creates the draft GitHub Release with the changelog entry, attaches the archives and their `.sha256` files, and publishes the release, marked as the latest unless a newer release exists.
+1. Every push to `main` runs the jobs `release-plz-release` and then `release-plz-pr` of `.gitlab-ci.yml`, with release-plz 0.4.2 installed from its release archive after checking the archive's SHA-256 (`.gitlab/scripts/install-tools.sh`). `release-plz-pr` opens or updates the release merge request from a branch `release-plz-*`: it raises the version in `Cargo.toml` and `Cargo.lock` and adds the release's entry to `CHANGELOG.md`, computed from the Conventional Commits since the last release tag (see [CONTRIBUTING.md](CONTRIBUTING.md#commits)). Its commit is authored and committed as `Sakiori <oss@sakiori.app>` and pushed by the release bot user with its token in `RELEASE_PLZ_TOKEN`, which also opens the merge request (see *The release token*).
+2. The release merge request's pipeline runs like any other: the checks, and `check-build-linux`, which builds, packs and checks the release archive of each Linux target exactly as a release does and publishes nothing. The macOS targets are not built before the release tag (see *The macOS runner*).
+3. Merging the release merge request releases. In the push pipeline of `main`, `release-plz-release` finds that `Cargo.toml` holds a version `X.Y.Z` without a tag `vX.Y.Z` and creates that tag on the merged commit with the token; `release-plz.toml` sets `git_only`, so the release tags, not a registry, tell which versions are released. Any commit that sets an untagged version releases the same way, so only the release merge request changes the version.
+4. The tag starts the tag pipeline:
+   - `release-guard` refuses a tag that is not a protected tag `vX.Y.Z`, does not point at the pipeline's commit, whose commit is not on `main` or whose `Cargo.toml` holds another version, a version without a `CHANGELOG.md` entry, and a tag whose GitLab Release exists already. Nothing is built before it passes.
+   - `release-build-linux` builds the archives of the two Linux targets on GitLab.com's shared runners, from the tag's commit alone, without a cache, and `release-build-macos` those of the two macOS targets on the project's macOS runner.
+   - `sign` waits for all four archives, then writes `SHA256SUMS` over the archives and signs every archive and `SHA256SUMS` with cosign, keyless: the job's GitLab ID token (audience `sigstore`) obtains a short-lived Sigstore certificate whose identity is `https://gitlab.com/sakiori-oss/git-intake//.gitlab-ci.yml@refs/tags/vX.Y.Z`, and each signature is recorded in Sigstore's transparency log. It writes `<file>.sigstore.json` beside each file and verifies every bundle against that identity. It is the only job that holds an ID token.
+   - `publish` uploads every file to the generic package registry, package `git-intake`, version `vX.Y.Z`, and then creates the GitLab Release with the changelog entry and a link to every file. Each link is named exactly as its file, which mise's GitLab backend matches, and has the direct asset path `/binaries/<file>`, which gives the file the permanent URL `https://gitlab.com/sakiori-oss/git-intake/-/releases/vX.Y.Z/downloads/binaries/<file>` that cargo-binstall and the README use. The release is created last, so it never lists a file that is missing. One `publish` job runs at a time.
 
-Runs of `binaries.yml` for one tag never overlap, and only one run at a time attaches files to or publishes any release; queued runs wait instead of being cancelled. A run never replaces a file of a published release.
+The Linux targets are built on GitLab.com's x86_64 Linux runners with cargo-zigbuild, which links them statically with zig 0.17.0 against the musl zig ships. The macOS targets are built natively with Cargo and the Xcode Command Line Tools in a fresh macOS virtual machine on the project's macOS runner, for macOS 11 or later (`MACOSX_DEPLOYMENT_TARGET`), linked against the system's Security and CoreFoundation frameworks; Apple's SDK license permits building against the SDK only on Apple hardware, so they are not cross-compiled. Every target is built with the Rust release that `RUST_VERSION` names. The build remaps the build host's paths out of the binary (`--remap-path-prefix` for the workspace, `CARGO_HOME` and the toolchain's sysroot, since Cargo's `trim-paths` is not stable; for macOS also from the object paths that Apple's linker hashes into the binary's UUID, with `-oso_prefix`, so that the same commit gives the same binary in any directory), and `xtask pack` packs the archive deterministically: GNU tar headers without PAX records, sorted names, owner and group 0 without names, every time the commit's time, modes 0755 and 0644, no extended attributes, and gzip without a file name or time. `xtask check-archive` reads the raw headers back and scans every file, the binary included, for absolute paths of the build host, the Xcode tools' on macOS included. The third-party notices are generated for the target. The `x86_64-unknown-linux-musl`, `aarch64-apple-darwin` and `x86_64-apple-darwin` binaries are run once to check that they report the release's version, the last through Rosetta; the `aarch64-unknown-linux-musl` binary is not run in CI, and the tests run on Linux only.
 
-## Repository setup
+The crate is not published to crates.io yet; see *Publishing on crates.io*.
 
-### The GitHub App
+## Group and project settings
 
-release-plz opens the release pull request and creates the tag with a GitHub App's installation token rather than the workflow's own `GITHUB_TOKEN`: the runs of a pull request that `GITHUB_TOKEN` opens or updates wait until someone with write access approves them, and its pushes, tags included, start no workflow, so the tag would not start `binaries.yml`.
+### The group `sakiori-oss`
 
-- Create the App in the `sakiori` organisation with the name `sakiori-release` and the display name *Sakiori Release*, with no webhook, and install it on the `git-intake` repository only. Its bot user is `sakiori-release[bot]`, whose commits carry GitHub's numeric noreply address for it, `<id>+sakiori-release[bot]@users.noreply.github.com`. That bot user is the only identity besides `Sakiori <oss@sakiori.app>` that the release automation uses: it authors the release pull requests' commits and creates the release tags.
-- Repository permissions: *Contents: Read and write* (release branch, tag), *Pull requests: Read and write* (release pull request) and *Metadata: Read*. No other permission, in particular not *Workflows*: a release pull request never changes `.github/workflows/`.
-- Keep the App's client id and one private key; store them in the environments below, not as repository or organisation secrets.
+- Public, with at least two owners, so that the project never depends on one account.
+- *Settings > Packages and registries > Duplicate packages*: in the *Generic* row, turn off *Allow duplicates*, so that no file of a published package can be uploaded again under the same name.
 
-### Environments
+### The project `sakiori-oss/git-intake`
 
-| Environment | Deployment branches and tags | Variables | Secrets | Used by |
-| --- | --- | --- | --- | --- |
-| `release-pr` | Selected branches: `main` | `RELEASE_APP_CLIENT_ID` | `RELEASE_APP_PRIVATE_KEY` | `release.yml`, job `release-pr` |
-| `release` | Selected branches: `main` | `RELEASE_APP_CLIENT_ID` | `RELEASE_APP_PRIVATE_KEY` | `release.yml`, job `release` (crates.io Trusted Publishing) |
-| `release-binaries` | Selected tags: `v*` | none | none | `binaries.yml`, job `finish` |
+- *Settings > General > Visibility*: public, with the package registry visible to everyone, so that the release links download without a token.
+- *Settings > Repository > Protected branches*: `main`, *Allowed to merge*: Maintainers, *Allowed to push and merge*: No one, force push off. Until the first push of `main`, *Allowed to push and merge* is Maintainers (see *The first release*).
+- *Settings > Repository > Protected tags*: `v*`, *Allowed to create*: Maintainers. The release bot user has the Maintainer role and creates every release tag. A tag, once created, is never moved or deleted.
+- *Settings > Merge requests*: merge method *Fast-forward merge* or *Merge commit with semi-linear history*, so that the commit on `main` holds the tree the merge request pipeline tested, and *Pipelines must succeed*.
+- *Settings > CI/CD > Variables*: keep *Allow merge request pipelines to access protected variables and runners* off, and set *Minimum role to use pipeline variables* to *No one allowed*, so that no pipeline variable can override the predefined variables the release jobs and the macOS runner check, such as `CI_COMMIT_REF_PROTECTED`.
+- *Settings > CI/CD > Auto DevOps*: off, so that a commit without `.gitlab-ci.yml` starts no pipeline.
+- *Build > Pipeline schedules*: a weekly schedule on `main`, which runs `deny`, so that a new RustSec advisory fails without a change.
+- Issues stay enabled; SECURITY.md asks for vulnerability reports as confidential issues, which every tier has.
 
-Turn off *Allow administrators to bypass configured protection rules* for each of them. The App's private key is the credential that can create release tags, so it is held only by environments that admit `main` alone; a pull request's workflow, which runs on another ref, cannot read it.
+GitLab's protected environments need the Premium tier, so the release token is kept from other jobs by a protected variable with an environment scope instead (below). GitLab.com's Free tier includes 400 compute minutes a month for the group; the Linux builds are the most expensive jobs, and merge request pipelines run `check-build-linux` only when a change can affect the build.
 
-### crates.io Trusted Publishing
+### The release token
 
-In the crate's settings on crates.io, under *Trusted Publishing*, add a GitHub publisher:
+release-plz pushes the release branch and the release tag and opens the release merge request as the group's release bot user. The job token would not do: its pushes start no pipeline, so the tag would not start the release, and it cannot create merge requests. Project access tokens, which come with a bot user of their own, need the Premium tier on GitLab.com.
 
-| Field | Value |
-| --- | --- |
-| Repository owner | `sakiori` |
-| Repository name | `git-intake` |
-| Workflow filename | `release.yml` |
-| Environment | `release` |
+- A GitLab user account that exists only for the releases, with two-factor authentication, a member of the group `sakiori-oss` with the Maintainer role, so that the same user releases every project of the group, and used for nothing else. Its token therefore reaches every project of the group; the variable that holds it is protected and limited to the release-plz jobs (below). Every project of the group that releases with this user keeps its token under the same protections, since a token that leaks from any of them can release this project.
+- The bot user's identity verification completed. The pipelines of the release branch and the tag it pushes are its pipelines, and on GitLab.com's Free tier a user's jobs on GitLab-hosted runners fail with `Identity verification is required in order to run CI jobs` until the user completes [identity verification](https://docs.gitlab.com/security/identity_verification/), which can ask for a phone number or a payment method ([debugging pipelines](https://docs.gitlab.com/ci/debugging/#error-identity-verification-is-required-in-order-to-run-ci-jobs)).
+- Its personal access token named `release-plz`, with the scopes `api` and `write_repository` and an expiry of at most a year. Note the expiry date and replace the token before then.
+- *Settings > CI/CD > Variables* of the project, not of the group: `RELEASE_PLZ_TOKEN` with that token, *Protect variable* on, visibility *Masked and hidden*, environment scope `release-plz`. Only the two release-plz jobs name that environment, and a protected variable reaches only pipelines of `main` and the protected tags.
 
-Trusted Publishing applies only to a crate that exists, so the first version is published with an API token (see *The cutover*); revoke that token once the publisher is in place. Keep no `CARGO_REGISTRY_TOKEN` secret anywhere: release-plz uses Trusted Publishing only when none is set.
+The bot user creates the release merge request and the release tag. The release merge request's commit is authored and committed as `Sakiori <oss@sakiori.app>`, which the jobs set with `git config`.
 
-### Security settings
+### Dependency updates
 
-Under *Settings > Code security*, enable *Private vulnerability reporting*: SECURITY.md sends reports there.
+No bot proposes dependency updates. Renovate is GitLab's counterpart of Dependabot; running it needs its own bot account and token, as a hosted app or a scheduled pipeline, so it is an owner's decision. Until then, update `Cargo.lock` by hand (`cargo update`), committed as `fix(deps): ...`, since it changes the shipped binary; the weekly `deny` job reports advisories in the meantime.
 
-### Rulesets
+## The macOS runner
 
-**Branch ruleset for `main`** (target: the default branch):
+The macOS targets are built by a runner of the project's own on an Apple silicon Mac. `release-build-macos` runs the code of the release tag's commit and of every dependency's build script, so each job runs in a fresh macOS virtual machine that [Tart](https://tart.run/) clones from the image `MACOS_IMAGE` names and deletes after the job: nothing a build runs persists on the host or reaches a later build, and the virtual machine cannot reach the host's local network. The license of macOS 26 permits up to two additional instances of macOS in virtual machines on an Apple computer that already runs macOS, for software development among other purposes. The image is Cirrus Labs' base image, which has the Xcode Command Line Tools, gitlab-runner, which uploads the job's artifacts, and Rosetta; the job installs its own Rust toolchain with the pinned rustup-init and needs nothing else.
 
-- Restrict deletions; block force pushes.
-- Require a pull request before merging, with merge commits allowed: a release pull request is merged with a merge commit, so that the commit release-plz tags is the one CI checked.
-- Require status checks to pass, with *Require branches to be up to date before merging*: `fmt`, `clippy`, `test (ubuntu-latest)`, `test (macos-latest)`, `test (git 2.43.0)`, `test (git 2.47.3)`, `msrv`, `deny`, `package`, and `release-build (x86_64-unknown-linux-musl)`, `release-build (aarch64-unknown-linux-musl)`, `release-build (aarch64-apple-darwin)`, `release-build (x86_64-apple-darwin)`.
+- *Settings > CI/CD > Runners > New project runner* in `sakiori-oss/git-intake`, or the API's `POST /user/runners` with `runner_type=project_type`: tag `git-intake-macos`, *Run untagged jobs* off, *Protected* on, so that it takes jobs only from protected branches and tags, *Lock to current projects* on, and a maximum job timeout of one hour. Only `release-build-macos` names the tag, and only for a protected tag `vX.Y.Z`; merge request pipelines never reach the runner.
+- The Mac runs macOS 26 or later, which Softnet requires, and a macOS release at least as new as the image's, since a host cannot run a newer macOS in a virtual machine; a new `MACOS_IMAGE` may need the host updated first.
+- Softnet passes the virtual machine's traffic to globally routable addresses and to the host's vmnet gateway, which is the host itself. The `tart` the wrapper puts first on the executor's `PATH` blocks every connection to the gateway (`--net-softnet-block='out @host'`), and the wrapper allows DNS to it alone (`out proto udp @host port 53`), so that no service of the host is reachable from a build. A host whose resolver answers with addresses outside the globally routable space, as a proxy's fake-IP mode does, lists those CIDRs, comma-separated, in `/usr/local/etc/git-intake-tart-executor/softnet-allow`, owned by root, and the wrapper allows them too. That file holds only such a range, never one with the local network's addresses in it; an address of the host's own within the range, such as the proxy's interface address, goes into `/usr/local/etc/git-intake-tart-executor/softnet-block` beside it, and the `tart` below blocks it, since Softnet prefers the longest prefix. Once set up, check it in a virtual machine of the image started as the executor starts it, `tart run --net-softnet --net-softnet-allow='out proto udp @host port 53,<CIDRs of the allow file>' --net-softnet-block='out @host,<CIDRs of the block file>'`, without the lists the host has no file for: `nslookup gitlab.com` and `curl -I https://gitlab.com` succeed, and `nc -z -G2 <gateway> 22` and every other port of the host's services fail, at the gateway and at every address the block file lists.
+- An administrator installs Tart, [Softnet](https://github.com/openai/softnet), with the SUID bit its README asks for, and Cirrus Labs' [gitlab-tart-executor](https://github.com/cirruslabs/gitlab-tart-executor), and allows connections to the virtual machines' private addresses without the *Local Network* prompt, as the executor's README describes. Tart is source-available under the Functional Source License (FSL-1.1-ALv2), which permits any use but a competing product or service and grants the Apache License 2.0 two years after each release.
+- GitLab Runner runs as the launch agent of a user signed in on the Mac, as GitLab Runner does on macOS, in a session that stays signed in; after a restart, sign the user in again. The runner is registered there with `gitlab-runner register --url https://gitlab.com --token <runner authentication token> --executor custom` and joins that user's `~/.gitlab-runner/config.toml` with the section below, with `limit = 1` and `concurrent` large enough for every runner there. The jobs run only in the virtual machines; on the host, the runner runs only the wrapper below. Every other runner of that user, and every job it takes, can rewrite that file, read the runner's token and change the cached image, so the user runs no other runner, or only runners whose jobs are trusted as much as the release builds; a dedicated standard user account that runs this runner alone is the safe choice.
+- As the runner's user, `tart pull` the image `MACOS_IMAGE` names before the first release and after every change of it. The executor does not pull it for each job; a job that finds no cached copy pulls it in its prepare stage, tens of gigabytes that can exceed the job's timeout.
+- The executor is the wrapper below, `/usr/local/libexec/git-intake-tart-executor`, with the `tart` below as `/usr/local/libexec/git-intake-tart/tart`, both owned by root and not writable by the runner's user, for all four stages. Before any virtual machine starts, it refuses every job but one of `sakiori-oss/git-intake` for a protected tag `vX.Y.Z`, and a job that sets a variable of gitlab-tart-executor's, which reads its settings from the job's variables. It turns Softnet on with the allowances above, leaves the cached image unpulled, and gives the virtual machine half of the host's CPUs and memory.
+- The runner's section of `~/.gitlab-runner/config.toml` is the one below, with no `--builds-dir` or `--cache-dir`, so that no host directory is mounted into the virtual machine, and `TART_EXECUTOR_HOST_DIR` off, as the wrapper keeps it.
 
-**Tag ruleset for `v*`** (target: tags matching `v*`):
+```sh
+#!/bin/sh
+# The executor of the macOS runner of sakiori-oss/git-intake: the
+# gitlab-tart-executor stage the runner calls, with the runner's arguments,
+# for a release build of the project only and with fixed settings.
+# gitlab-tart-executor reads its settings from the job's variables
+# (CUSTOM_ENV_TART_EXECUTOR_*) in every stage, so a job that sets one is
+# refused, and the settings below are set here. A refusal fails the job
+# before a virtual machine is started.
+#
+# usage: git-intake-tart-executor config|prepare|cleanup
+#        git-intake-tart-executor run <script> <sub-stage>
+set -eu
 
-- Restrict creations, updates and deletions.
-- Bypass list: the GitHub App, which creates every release tag, and the *Repository admin* role, for the recovery below. A tag, once created, is never moved or deleted.
+# The tart beside this wrapper first, then Homebrew's.
+PATH=/usr/local/libexec/git-intake-tart:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
 
-## The cutover
+refuse() {
+  echo "this runner builds only the protected release tags of sakiori-oss/git-intake: $1" >&2
+  exit "${BUILD_FAILURE_EXIT_CODE:-1}"
+}
 
-Until the move to GitHub releases, `Cargo.toml` holds the placeholder version `0.0.0`, and both jobs of `release.yml` refuse to run. The first GitHub release is made by hand:
+[ "${CUSTOM_ENV_CI_PROJECT_PATH:-}" = sakiori-oss/git-intake ] \
+  || refuse "the project is '${CUSTOM_ENV_CI_PROJECT_PATH:-}'"
+[ "${CUSTOM_ENV_CI_COMMIT_REF_PROTECTED:-}" = true ] \
+  || refuse "the ref is not protected"
+tag=${CUSTOM_ENV_CI_COMMIT_TAG:-}
+# Only v, digits and dots, so that grep's line matching sees the whole tag.
+case "$tag" in
+  *[!v0-9.]* | "") refuse "'$tag' is not a release tag vX.Y.Z" ;;
+esac
+printf '%s\n' "$tag" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+' \
+  || refuse "'$tag' is not a release tag vX.Y.Z"
+if env | grep -q '^CUSTOM_ENV_TART_EXECUTOR_'; then
+  refuse "the job sets a TART_EXECUTOR_ variable"
+fi
 
-1. On a branch, make the cutover commit: it sets the next unreleased version `X.Y.Z` in `Cargo.toml` and `Cargo.lock` and seeds `CHANGELOG.md`. Let CI pass on its pull request, `release-build` included.
-2. From a clean checkout of exactly that commit, publish the crate with an API token: `cargo publish --locked`, never `--allow-dirty`, so that the published crate records the commit it came from.
-3. Create the annotated tag `vX.Y.Z` on that commit and push it, before the commit reaches `main`: `git tag -a vX.Y.Z -m vX.Y.Z <commit>` and `git push origin refs/tags/vX.Y.Z`. With the tag and the crates.io version in place, release-plz treats `X.Y.Z` as released when the commit reaches `main` and does not try to publish it again. The run of `binaries.yml` that the tag starts stops, because the commit is not on `main` yet; that is expected.
-4. Merge the pull request with a merge commit, so that the tagged commit itself is on `main`.
-5. Finish the release: `gh workflow run binaries.yml --ref vX.Y.Z`.
-6. Add the Trusted Publisher on crates.io and revoke the API token.
+# Softnet: the virtual machine reaches globally routable addresses and the
+# host's vmnet gateway, the host itself, not the host's local network. The
+# tart beside this wrapper blocks the gateway, and only DNS to it is allowed
+# here, with the CIDRs a host lists in the file below, for a resolver that
+# answers with addresses outside the globally routable space.
+CUSTOM_ENV_TART_EXECUTOR_SOFTNET=true
+allow='out proto udp @host port 53'
+extra=/usr/local/etc/git-intake-tart-executor/softnet-allow
+if [ -f "$extra" ]; then
+  cidrs=$(tr -d ' \t\n' < "$extra")
+  case "$cidrs" in
+    *[!0-9./,]*)
+      echo "$extra holds something other than comma-separated CIDRs" >&2
+      exit "${SYSTEM_FAILURE_EXIT_CODE:-1}"
+      ;;
+  esac
+  [ -z "$cidrs" ] || allow="$allow,$cidrs"
+fi
+CUSTOM_ENV_TART_EXECUTOR_SOFTNET_ALLOW=$allow
+# The image is pinned by digest and pulled ahead, so it is not pulled for
+# every job; without a cached copy, tart clone pulls it within the job.
+CUSTOM_ENV_TART_EXECUTOR_ALWAYS_PULL=false
+export CUSTOM_ENV_TART_EXECUTOR_SOFTNET CUSTOM_ENV_TART_EXECUTOR_SOFTNET_ALLOW
+export CUSTOM_ENV_TART_EXECUTOR_ALWAYS_PULL
+
+case "${1:-}" in
+  config | run | cleanup)
+    exec gitlab-tart-executor "$@"
+    ;;
+  prepare)
+    shift
+    # Half of the host's CPUs and memory, which leaves the host usable; the
+    # runner runs one job at a time. Only a Cirrus Labs base image pinned by
+    # digest is cloned.
+    exec gitlab-tart-executor prepare --concurrency 2 --cpu auto --memory auto \
+      --allow-image 'ghcr.io/cirruslabs/macos-*-base@sha256:*' "$@"
+    ;;
+  *)
+    echo "usage: git-intake-tart-executor config|prepare|run|cleanup [<argument>...]" >&2
+    exit "${SYSTEM_FAILURE_EXIT_CODE:-1}"
+    ;;
+esac
+```
+
+```sh
+#!/bin/sh
+# tart for the macOS runner of sakiori-oss/git-intake, first on the PATH that
+# git-intake-tart-executor gives gitlab-tart-executor: a virtual machine it
+# runs cannot open a connection to the host's vmnet gateway, the host itself,
+# beyond what the executor's Softnet allowance permits, DNS.
+set -eu
+PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+# A host that allows CIDRs holding addresses of its own, such as a proxy's
+# fake-IP range with the proxy's interface address in it, lists those
+# addresses, comma-separated, in the file below, and they are blocked too.
+if [ "${1:-}" = run ]; then
+  shift
+  block='out @host'
+  extra=/usr/local/etc/git-intake-tart-executor/softnet-block
+  if [ -f "$extra" ]; then
+    cidrs=$(tr -d ' \t\n' < "$extra")
+    case "$cidrs" in
+      *[!0-9./,]*)
+        echo "$extra holds something other than comma-separated CIDRs" >&2
+        exit 1
+        ;;
+    esac
+    [ -z "$cidrs" ] || block="$block,$cidrs"
+  fi
+  exec tart run --net-softnet-block="$block" "$@"
+fi
+exec tart "$@"
+```
+
+```toml
+[[runners]]
+  name = "git-intake-macos"
+  url = "https://gitlab.com"
+  token = "<runner authentication token>"
+  executor = "custom"
+  limit = 1
+  [runners.feature_flags]
+    FF_RESOLVE_FULL_TLS_CHAIN = false
+  [runners.custom]
+    config_exec = "/usr/local/libexec/git-intake-tart-executor"
+    config_args = ["config"]
+    prepare_exec = "/usr/local/libexec/git-intake-tart-executor"
+    prepare_args = ["prepare"]
+    run_exec = "/usr/local/libexec/git-intake-tart-executor"
+    run_args = ["run"]
+    cleanup_exec = "/usr/local/libexec/git-intake-tart-executor"
+    cleanup_args = ["cleanup"]
+```
+
+While the runner is offline, `release-build-macos` waits, and `sign` and `publish` with it; GitLab fails a job that no runner picks up, after an hour when no runner for it is online and after a day otherwise; then bring the runner online and retry the job, as *The tag pipeline failed* describes, and `sign` and `publish` follow. The runner's authentication token has the rights of the runner only; if it leaks, delete the runner in the project and register a new one.
+
+## The first release
+
+The project starts empty and receives the repository's history as it is published. The push of `main` releases v0.4.0 at once, so everything the release needs is ready before it.
+
+1. Make the settings above, with one exception: protect `main` with *Allowed to push and merge*: Maintainers for now, so that the history can be pushed. Create the release bot user and its token, complete the bot user's identity verification, and confirm that it can run a pipeline before `main` is pushed: signed in as the bot user, create a private project of its own whose `.gitlab-ci.yml` holds one job (`check: { script: [echo ok] }`), see that job pass on a GitLab-hosted runner, and delete the project. Bring the macOS runner online.
+2. Push the earlier release tags, each by name and never with `--tags`, with CI skipped: `git push -o ci.skip origin v0.1.0 v0.2.0 v0.2.1 v0.2.2 v0.3.0 v0.3.1 v0.3.2 v0.3.3 v0.3.4 v0.3.5 v0.3.6 v0.3.7`. Their commits hold no `.gitlab-ci.yml`, so with Auto DevOps off they would start no pipeline anyway; they are tags only.
+3. Push `main`: `git push origin main`. Its push pipeline runs `release-plz-release`, which tags `v0.4.0`, the version `Cargo.toml` holds, and the tag's pipeline publishes the release. `release-plz-pr` then finds no commit since the tag that asks for a release.
+4. Set *Allowed to push and merge* of `main` to No one, as the settings above ask; from now on `main` changes only through merge requests.
+5. Check the release as under *Checking a release*, and install it once through each way the README describes.
 
 ## Recovery
 
-### The crate is published, but the tag is missing
+### The tag pipeline failed
 
-The `release` job failed after `cargo publish` and before the tag. Running it again does not help: release-plz skips a version that crates.io already has. Create the tag by hand on the commit the crate was published from, which the published crate records:
+Retry the failed job. A macOS build that failed because the runner was offline is retried once the runner is back. A retried `publish` job uploads only the files the package lacks, skips those it holds with the same SHA-256 and refuses one it holds with other content, so retrying it after an upload failed is safe; retried after it created the release, it succeeds when the release links exactly the release's files, and fails otherwise. A new pipeline for the tag (*Build > Pipelines > New pipeline* on the tag) builds and signs again, while no release of the tag exists; its signatures, and possibly its archives, differ from those of an earlier run, so if that run uploaded files, delete the package version `git-intake` `vX.Y.Z` under *Deploy > Package registry* first. Once the release exists, the guard refuses every new pipeline of the tag.
 
-```sh
-version=X.Y.Z
-curl --fail --location --silent "https://static.crates.io/crates/git-intake/git-intake-$version.crate" \
-  | tar -xzO "git-intake-$version/.cargo_vcs_info.json"
-```
+### The tag is missing
 
-Check that the commit in `git.sha1` is the last commit of the merged release pull request and is on `main`, then, with the *Repository admin* bypass of the tag ruleset:
+`release-plz-release` failed or did not run. Run the pipeline of `main` again, or create the tag by hand on the commit of `main` that set the version:
 
 ```sh
-git tag -a "v$version" -m "v$version" <commit>
-git push origin "refs/tags/v$version"
+git tag -a vX.Y.Z -m vX.Y.Z <commit>
+git push origin refs/tags/vX.Y.Z
 ```
 
-A tag pushed by a person starts `binaries.yml`, which finishes the release.
+### A published release is wrong
 
-### The tag exists, but the release is unfinished
-
-A run of `binaries.yml` failed, or the tag was created by a token whose events start no workflow. Run the workflow on the tag:
-
-```sh
-gh workflow run binaries.yml --ref vX.Y.Z
-```
-
-It builds, attests and attaches every archive again, replacing the files of the draft release, and publishes it; it creates the draft when it is missing. A run on any ref other than a release tag, on a tag whose commit is not the run's, or on a tag whose commit is not the one the published crate records, is refused; a tag created by hand must be on that commit. A release that is published already is left as it is: if a published release ever lacks a file, investigate before changing it by hand rather than replacing its files.
+A published release and its files are never replaced. Fix forward: revert or fix on `main` and release the next version.
 
 ## Checking a release
 
-Anyone can check that an archive was built by this repository's release workflow from the tag's commit. In a clone of `https://github.com/sakiori/git-intake`, the trusted repository, never of a fork or mirror whose tags may differ:
+Anyone can check that an archive was signed by this project's pipeline for its tag, as the README's *Verifying the signature* shows:
+
+```sh
+cosign verify-blob --bundle git-intake-vX.Y.Z-<target>.tar.gz.sigstore.json \
+  --certificate-identity "https://gitlab.com/sakiori-oss/git-intake//.gitlab-ci.yml@refs/tags/vX.Y.Z" \
+  --certificate-oidc-issuer https://gitlab.com \
+  git-intake-vX.Y.Z-<target>.tar.gz
+```
+
+The certificate also records the commit the pipeline ran on, in Sigstore's *Source Repository Digest* extension (OID 1.3.6.1.4.1.57264.1.13). To tie the archive to the commit the tag names, compare the two, in a clone of `https://gitlab.com/sakiori-oss/git-intake`, never of a fork or mirror whose tags may differ:
 
 ```sh
 git fetch origin tag vX.Y.Z
-gh attestation verify git-intake-vX.Y.Z-<target>.tar.gz \
-  --repo sakiori/git-intake \
-  --signer-workflow sakiori/git-intake/.github/workflows/binaries.yml \
-  --source-ref refs/tags/vX.Y.Z \
-  --source-digest "$(git rev-parse 'vX.Y.Z^{commit}')"
+git rev-parse 'vX.Y.Z^{commit}'
+jq -r '.verificationMaterial.certificate.rawBytes' git-intake-vX.Y.Z-<target>.tar.gz.sigstore.json \
+  | base64 -d | openssl x509 -inform DER -noout -text | grep -A1 '1.3.6.1.4.1.57264.1.13:'
 ```
-
-`--source-digest` ties the archive to the commit the tag names, not only to a ref called `vX.Y.Z`.
 
 ## Pinned versions
 
-The workflows pin some tools by hand; Dependabot updates only the actions. Each workflow's header lists its pins: release-plz in `release.yml`; zig, cargo-zigbuild and cargo-about in `ci.yml` and `binaries.yml`, and cargo-about also in `xtask/src/main.rs`, which refuses to generate the notices with another release; cargo-deny in `ci.yml`; release-plz, with its archive's checksum, in `.github/scripts/install-release-plz.sh`.
+Nothing updates the pins automatically. The images are pinned by digest in `.gitlab-ci.yml`: `RUST_IMAGE`, `NODE_IMAGE`, and `MACOS_IMAGE`, the macOS virtual machine image of the macOS builds, which the runner pulls ahead (*The macOS runner*). The OpenSpec CLI is pinned in `.gitlab/openspec/package.json`, and its whole dependency tree, with every package's integrity hash, in `.gitlab/openspec/package-lock.json`, which `npm ci --ignore-scripts` installs; update both with `npm install --ignore-scripts --prefix .gitlab/openspec @fission-ai/openspec@<version> --save-exact` in `NODE_IMAGE`. The oldest git the tests run with, with its source archive's SHA-256, in the `test-git` job. `RUST_VERSION` names the Rust release of `RUST_IMAGE`, which the macOS builds install, and the Linux builds fail when the two differ, so a new Rust release changes both. Every other tool is pinned by version and SHA-256 in `.gitlab/scripts/install-tools.sh`: for x86_64 Linux zig, cargo-zigbuild, cargo-about, cargo-deny, release-plz, cosign, jq and shellcheck, and for Apple silicon macOS rustup-init and cargo-about. The Xcode Command Line Tools are those of `MACOS_IMAGE`, so a new image may bring new ones; the macOS binaries record the SDK version they were built with. cargo-about is pinned also in `xtask/src/main.rs`, which refuses to generate the notices with another release.
+
+## Publishing on crates.io
+
+The crate is not on crates.io yet. Its publication there takes these steps, in this order:
+
+1. Publish the first version by hand with an API token: from a clean checkout of the commit of a release tag, `cargo publish --locked`, never `--allow-dirty`, so that the published crate records the commit it came from.
+2. In the crate's settings on crates.io, under *Trusted Publishing*, add a GitLab publisher: namespace `sakiori-oss`, project `git-intake`, workflow filepath `.gitlab-ci.yml`. Trusted Publishing applies only to a crate that exists, hence the first publication by token.
+3. Turn `git_only` off in `release-plz.toml` and add a publish job to the release: it obtains a short-lived token by exchanging a GitLab ID token with audience `crates.io` at crates.io's Trusted Publishing endpoint, and runs `release-plz release` with it as `CARGO_REGISTRY_TOKEN`; release-plz obtains Trusted Publishing tokens by itself only in GitHub Actions. release-plz then publishes the crate before it creates the tag, so the binaries are built from the commit the crate came from.
+4. Enable *Trusted Publishing only* for the crate, so that no API token can publish it, and revoke the token of the first publication.

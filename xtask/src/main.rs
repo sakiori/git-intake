@@ -8,9 +8,15 @@
 //! third-party notices of the release binary for `<target>` into `<dir>`:
 //! `THIRD-PARTY-NOTICES.txt`, with the notices of the crates it is built from
 //! (cargo-about, `about.toml` and the template `about.hbs`), of the Rust
-//! toolchain's compiler-builtins and, for a musl target, of musl libc, and
+//! toolchain's compiler-builtins and, for a Linux (musl) target, of the Zig
+//! distribution that links it and of musl libc, and
 //! `RUST-LIBRARY-COPYRIGHT.html`, the toolchain's notices of the Rust standard
 //! library.
+//!
+//! `cargo run --locked -p xtask -- pack <dir> <archive> <epoch>` packs the
+//! files under `<dir>` as the gzip-compressed tar archive `<archive>`,
+//! deterministically, with every modification time `<epoch>`; `check-archive
+//! <archive> <epoch> [<host path>...]` checks such an archive.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -36,6 +42,13 @@ fn main() -> Result<()> {
     match args.as_slice() {
         [task, dir] if task == "man" => man(Path::new(dir)),
         [task, dir, target] if task == "notices" => notices(Path::new(dir), target),
+        [task, dir, archive, epoch] if task == "pack" => pack(
+            Path::new(dir),
+            Path::new(archive),
+            epoch
+                .parse()
+                .context("the epoch is not a number of seconds")?,
+        ),
         [task, archive, epoch, forbidden @ ..] if task == "check-archive" => check_archive(
             Path::new(archive),
             epoch
@@ -45,7 +58,7 @@ fn main() -> Result<()> {
         ),
         _ => bail!(
             "usage: cargo run -p xtask -- man <dir> | notices <dir> <target> | \
-             check-archive <archive> <epoch> [<host path>...]"
+             pack <dir> <archive> <epoch> | check-archive <archive> <epoch> [<host path>...]"
         ),
     }
 }
@@ -216,8 +229,11 @@ const RUST_LIBRARY_COPYRIGHT: &str = "RUST-LIBRARY-COPYRIGHT.html";
 ///   links into every binary, from the toolchain's rust-src component, and a
 ///   copy of the toolchain's COPYRIGHT-library.html, the notices of the
 ///   standard library and the crates it is built from;
-/// - for a musl target, musl's COPYRIGHT, from the zig installation whose
-///   musl cargo-zigbuild links statically.
+/// - for a Linux (musl) target, the license of the Zig distribution that
+///   cargo-zigbuild links the binary with and musl's COPYRIGHT, from that zig
+///   installation. Apple's toolchain links a macOS target against the
+///   system's libraries, which the binary does not carry, so a macOS target
+///   needs neither a Zig notice nor a zig installation.
 ///
 /// Fails when a crate's license cannot be read or is not accepted, on any
 /// warning of cargo-about, such as a clarification in `about.toml` whose file
@@ -303,9 +319,7 @@ fn notices(dir: &Path, target: &str) -> Result<()> {
 
     let sysroot = rust_sysroot()?;
     text.push_str(&rust_notices(&sysroot)?);
-    if target.ends_with("-linux-musl") {
-        text.push_str(&musl_notices()?);
-    }
+    text.push_str(&zig_notices(target)?);
 
     fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
     write(&dir.join(NOTICES), text.as_bytes())?;
@@ -653,16 +667,20 @@ fn rust_notices(sysroot: &Path) -> Result<String> {
     ))
 }
 
-/// musl's COPYRIGHT and the Zig distribution's LICENSE, from the zig
-/// installation that cargo-zigbuild links the static Linux binaries with:
-/// cargo-zigbuild leaves out the toolchain's own musl, and zig links the musl
-/// it ships, its own libc (libzigc) and its compiler_rt.
-fn musl_notices() -> Result<String> {
+/// For a Linux (musl) target, musl's COPYRIGHT and the Zig distribution's
+/// LICENSE, from the zig installation that cargo-zigbuild links the binary
+/// with: cargo-zigbuild leaves out the toolchain's own musl, and zig links the
+/// musl it ships, its own libc (libzigc) and its compiler_rt statically. For
+/// any other target, which zig does not link, nothing, without running zig.
+fn zig_notices(target: &str) -> Result<String> {
+    if !target.ends_with("-linux-musl") {
+        return Ok(String::new());
+    }
     let zig = std::env::var_os("CARGO_ZIGBUILD_ZIG_PATH").unwrap_or_else(|| "zig".into());
     let out = Process::new(&zig)
         .arg("env")
         .output()
-        .context("cannot run zig, whose musl the static Linux binaries link")?;
+        .context("cannot run zig, which links the release binaries")?;
     if !out.status.success() {
         bail!("zig env failed with {}", out.status);
     }
@@ -675,6 +693,17 @@ fn musl_notices() -> Result<String> {
             .with_context(|| format!("zig env names no {name}"))
     };
     let lib_dir = PathBuf::from(field("lib_dir")?);
+    let zig_version = field("version")?;
+    // Zig's own libc and compiler_rt, which it builds from its lib directory,
+    // are under the license of the Zig distribution, at the root of the
+    // installation.
+    let zig_license = lib_dir
+        .parent()
+        .map(|root| root.join("LICENSE"))
+        .context("zig's lib directory has no parent")?;
+    let zig_license = fs::read_to_string(&zig_license)
+        .with_context(|| format!("cannot read zig's license {}", zig_license.display()))?;
+    let rule = "-".repeat(80);
     let musl = lib_dir.join("libc/musl");
     let header = fs::read_to_string(musl.join("src/internal/version.h"))
         .with_context(|| format!("cannot read musl's version in {}", musl.display()))?;
@@ -685,22 +714,11 @@ fn musl_notices() -> Result<String> {
         .context("musl's version.h names no version")?;
     let copyright = fs::read_to_string(musl.join("COPYRIGHT"))
         .with_context(|| format!("cannot read musl's COPYRIGHT in {}", musl.display()))?;
-    // Zig's own libc (libzigc) and compiler_rt, which it builds from its lib
-    // directory and links statically, are under the license of the Zig
-    // distribution, at the root of the installation.
-    let zig_license = lib_dir
-        .parent()
-        .map(|root| root.join("LICENSE"))
-        .context("zig's lib directory has no parent")?;
-    let zig_license = fs::read_to_string(&zig_license)
-        .with_context(|| format!("cannot read zig's license {}", zig_license.display()))?;
-    let zig_version = field("version")?;
     Ok(format!(
         "\n{rule}\nmusl libc {version} (linked statically, as Zig {zig_version} ships it)\n\n{}\n\
          \n{rule}\nZig {zig_version} (its libc and compiler_rt, linked statically)\n\n{}\n",
         copyright.trim_end(),
         zig_license.trim_end(),
-        rule = "-".repeat(80),
     ))
 }
 
@@ -717,6 +735,119 @@ fn notice_files(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+/// Packs the files and directories under `dir` as the gzip-compressed tar
+/// archive `archive`, deterministically, so that it carries nothing of the
+/// build host and the same files give the same bytes on every host:
+///
+/// - GNU tar headers without PAX or GNU extension records, a directory's
+///   name ending with `/`;
+/// - the entries in the order of their names, every directory before its
+///   contents and the contents of each directory sorted by name, as GNU tar's
+///   `--sort=name` orders them;
+/// - owner and group 0 without names, every modification time `epoch`, mode
+///   0755 for directories and for files that any execute bit marks
+///   executable, and 0644 for other files, and no extended attributes;
+/// - gzip at the best compression, without a file name and with time 0.
+///
+/// Fails on anything but files and directories, such as a symbolic link, and
+/// on a name too long for a plain header. It writes `<archive>.part` and
+/// renames it, so that a failure leaves no archive behind. [`check_archive`]
+/// checks the result.
+fn pack(dir: &Path, archive: &Path, epoch: u64) -> Result<()> {
+    let mut entries = Vec::new();
+    tree(dir, "", &mut entries)?;
+    if entries.is_empty() {
+        bail!("{} holds nothing to pack", dir.display());
+    }
+    let mut part = archive.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let written = (|| -> Result<()> {
+        let file =
+            fs::File::create(&part).with_context(|| format!("cannot create {}", part.display()))?;
+        let gzip = flate2::GzBuilder::new()
+            .mtime(0)
+            .operating_system(3)
+            .write(std::io::BufWriter::new(file), flate2::Compression::best());
+        let mut tar = tar::Builder::new(gzip);
+        for (name, path, kind) in &entries {
+            let mut header = tar::Header::new_gnu();
+            header
+                .set_path(name)
+                .with_context(|| format!("cannot name {name} in a tar header"))?;
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mtime(epoch);
+            let data = match kind {
+                Kind::Directory => {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_mode(0o755);
+                    Vec::new()
+                }
+                Kind::File { executable } => {
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_mode(if *executable { 0o755 } else { 0o644 });
+                    fs::read(path).with_context(|| format!("cannot read {}", path.display()))?
+                }
+            };
+            header.set_size(u64::try_from(data.len())?);
+            header.set_cksum();
+            tar.append(&header, &data[..])
+                .with_context(|| format!("cannot pack {name}"))?;
+        }
+        let file = tar.into_inner()?.finish()?;
+        file.into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?
+            .sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = written {
+        let _ = fs::remove_file(&part);
+        return Err(err.context(format!("cannot write {}", part.display())));
+    }
+    fs::rename(&part, archive).with_context(|| format!("cannot write {}", archive.display()))?;
+    println!("wrote {}", archive.display());
+    Ok(())
+}
+
+/// An entry of an archive that [`pack`] writes.
+enum Kind {
+    Directory,
+    File { executable: bool },
+}
+
+/// Appends the entries under `dir` to `entries`, each with its name in the
+/// archive, `prefix` followed by its path under `dir`, in the order [`pack`]
+/// writes them.
+fn tree(dir: &Path, prefix: &str, entries: &mut Vec<(String, PathBuf, Kind)>) -> Result<()> {
+    let mut children = fs::read_dir(dir)
+        .with_context(|| format!("cannot list {}", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("cannot list {}", dir.display()))?;
+    children.sort_by_key(|e| e.file_name());
+    for child in children {
+        let path = child.path();
+        let file_name = child.file_name();
+        let file_name = file_name
+            .to_str()
+            .with_context(|| format!("{} is not named in UTF-8", path.display()))?;
+        let name = format!("{prefix}{file_name}");
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        if metadata.is_dir() {
+            entries.push((format!("{name}/"), path.clone(), Kind::Directory));
+            tree(&path, &format!("{name}/"), entries)?;
+        } else if metadata.is_file() {
+            use std::os::unix::fs::PermissionsExt;
+            let executable = metadata.permissions().mode() & 0o111 != 0;
+            entries.push((name, path, Kind::File { executable }));
+        } else {
+            bail!("{} is neither a file nor a directory", path.display());
+        }
+    }
+    Ok(())
 }
 
 /// Prefixes of absolute paths of a build host that no file of a release
@@ -902,6 +1033,86 @@ fn text_around(data: &[u8], at: usize, len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A packed archive passes `check-archive`, lists its entries in the
+    /// order of their names with every directory before its contents, keeps
+    /// the execute bit as mode 0755, and is the same bytes when packed again.
+    #[test]
+    fn pack_writes_a_deterministic_archive_that_check_archive_accepts() {
+        let root = std::env::temp_dir().join(format!("xtask-pack-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let stage = root.join("stage");
+        fs::create_dir_all(stage.join("man/man1")).unwrap();
+        fs::write(stage.join("git-intake"), "binary").unwrap();
+        fs::write(stage.join("LICENSE"), "license").unwrap();
+        fs::write(stage.join("man/man1/git-intake.1"), "page").unwrap();
+        fs::write(stage.join("a.txt"), "").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(stage.join("git-intake"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            fs::set_permissions(stage.join("LICENSE"), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let epoch = 1_700_000_000;
+        let first = root.join("first.tar.gz");
+        let second = root.join("second.tar.gz");
+        pack(&stage, &first, epoch).unwrap();
+        pack(&stage, &second, epoch).unwrap();
+        check_archive(&first, epoch, &[]).unwrap();
+        let bytes = fs::read(&first).unwrap();
+        assert_eq!(bytes, fs::read(&second).unwrap());
+
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
+        let listing: Vec<(String, u32)> = archive
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let name = String::from_utf8(e.path_bytes().into_owned()).unwrap();
+                (name, e.header().mode().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            listing,
+            [
+                ("LICENSE".to_string(), 0o644),
+                ("a.txt".to_string(), 0o644),
+                ("git-intake".to_string(), 0o755),
+                ("man/".to_string(), 0o755),
+                ("man/man1/".to_string(), 0o755),
+                ("man/man1/git-intake.1".to_string(), 0o644),
+            ]
+        );
+        assert!(!root.join("first.tar.gz.part").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A symbolic link is not packed, and the failure leaves no archive.
+    #[test]
+    fn pack_refuses_a_symbolic_link() {
+        let root = std::env::temp_dir().join(format!("xtask-pack-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let stage = root.join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        std::os::unix::fs::symlink("elsewhere", stage.join("link")).unwrap();
+        let archive = root.join("out.tar.gz");
+        let err = pack(&stage, &archive, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("neither a file nor a directory"),
+            "{err:#}"
+        );
+        assert!(!archive.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Only the Linux (musl) targets are linked by zig; the notices of a
+    /// macOS target are made without running zig at all.
+    #[test]
+    fn zig_notices_are_only_for_the_musl_targets() {
+        for target in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+            assert_eq!(zig_notices(target).unwrap(), "", "{target}");
+        }
+    }
 
     #[test]
     fn copyright_lines_are_recognised_in_every_common_form() {

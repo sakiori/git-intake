@@ -1,6 +1,6 @@
 [package]
 name = "git-intake"
-version = "0.0.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -14,9 +14,10 @@ include = ["/src/", "/Cargo.lock", "/LICENSE", "/README.md"]
 
 # cargo-binstall downloads the release archive of the target instead of
 # building the crate: git-intake-vX.Y.Z-<target>.tar.gz with the binary at its
-# root (see .github/scripts/build-archive.sh).
+# root (see .gitlab/scripts/build-archive.sh), through the permanent URL of
+# the GitLab Release's link to it.
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+pkg-url = "{ repo }/-/releases/v{ version }/downloads/binaries/{ name }-v{ version }-{ target }.tar.gz"
 bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
@@ -31,7 +32,7 @@ members = ["xtask"]
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-repository = "https://github.com/sakiori/git-intake"
+repository = "https://gitlab.com/sakiori-oss/git-intake"
 
 [dependencies]
 anyhow = "1.0.104"

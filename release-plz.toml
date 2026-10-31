@@ -1,27 +1,23 @@
-# release-plz configuration; .github/workflows/release.yml runs it.
+# release-plz configuration; the release-plz jobs of .gitlab-ci.yml run it on
+# every push to the default branch.
 
 [workspace]
-# Only a commit that asks for a release opens or updates the release pull
+# Only a commit that asks for a release opens or updates the release merge
 # request: a feature, fix, performance change or revert (git's own `Revert "`
 # subject included), or a breaking change of any type (`!` after the type or a
 # BREAKING CHANGE footer). The regex is matched against each commit's whole
 # message.
 release_commits = '(?m)\A(feat|fix|perf|revert)(\([^)]*\))?!?:|\ARevert "|\A[a-z]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:'
-# Release only from the merge commit of a release pull request, so that a
-# release holds exactly the commits its changelog lists.
-release_always = false
-# release-plz publishes the crate and creates the tag; binaries.yml, which the
-# tag starts, creates the GitHub Release with the changelog entry and publishes
-# it once every archive, its checksum and its attestation are in place.
+# The crate is not on crates.io yet: the release tags tell the released
+# versions, and nothing is published to a registry. `release-plz release`
+# tags vX.Y.Z when Cargo.toml holds a version X.Y.Z that has no tag, which the
+# merge of the release merge request brings.
+git_only = true
+# The tag's pipeline creates the GitLab Release, once every archive, its
+# checksum and its signature are uploaded.
 git_release_enable = false
 # A binary has no library API for cargo-semver-checks to compare.
 semver_check = false
-# cargo publish does not build the packaged crate, and with it the build
-# scripts and procedural macros of its dependencies, in the job that holds the
-# GitHub App's token and the OIDC token crates.io accepts. CI's package job
-# builds the packaged crate instead, and the release job requires it on the
-# release pull request's last commit.
-publish_no_verify = true
 
 [[package]]
 name = "git-intake"

@@ -10,7 +10,7 @@ It covers three cases:
 
 The tool runs the installed `git` for every repository operation. Each repository describes itself in a committed `.git-intake.toml`. Upstreams are fetched by their URL; the repository keeps no remote, remote-tracking branch or other branch of an upstream.
 
-**Contents:** [How it differs from other tools](#how-it-differs-from-other-tools) · [Installation](#installation) · [Quickstart](#quickstart) · [Releasing](#releasing) · [Configuration](#configuration) · [The update cycle](#the-update-cycle) · [The sync record](#the-sync-record) · [Commands](#commands) · [Exit status](#exit-status) · [Running in CI](#running-in-ci) · [Moving from upstream remotes and mirror branches](#moving-from-upstream-remotes-and-mirror-branches) · [Monorepo migration](#monorepo-migration) · [Safety properties](#safety-properties) · [License](#license)
+**Contents:** [How it differs from other tools](#how-it-differs-from-other-tools) · [Installation](#installation) · [Quickstart](#quickstart) · [Releases](#releases) · [Configuration](#configuration) · [The update cycle](#the-update-cycle) · [The sync record](#the-sync-record) · [Commands](#commands) · [Exit status](#exit-status) · [Running in CI](#running-in-ci) · [Moving from upstream remotes and mirror branches](#moving-from-upstream-remotes-and-mirror-branches) · [Monorepo migration](#monorepo-migration) · [Safety properties](#safety-properties) · [License](#license)
 
 ## How it differs from other tools
 
@@ -26,21 +26,30 @@ Requires Git 2.43 or later (`git merge-tree -X` is used for conflict prediction)
 
 The tool runs on Linux and macOS; Windows is not supported. While the version is `0.x`, the formats of `.git-intake.toml` and of the update state may change between releases; a release that changes them says how to move to it, as *The update state* and *Upgrading to named checks* do for the current ones.
 
-Releases provide prebuilt binaries for the targets `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. They are statically linked and run on any Linux distribution and in minimal CI images. On macOS, install from source (below): the tool verifies the forge's TLS certificate against the keychain through the system's Security framework, so its macOS binary is built on macOS.
+Releases provide prebuilt binaries for the targets `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin` and `x86_64-apple-darwin`. The Linux binaries are statically linked and run on any Linux distribution and in minimal CI images. The macOS binaries need macOS 11 or later and verify the forge's TLS certificate against the keychain through the system's Security framework. Release archives start with 0.4.0; earlier versions are tags only.
 
 ### With mise
 
 Pin the version in the repository's tool configuration, so that an update of the tool is a reviewed change:
 
 ```sh
-mise use gitlab:sakiori-oss/git-intake@0.1.0
+mise use gitlab:sakiori-oss/git-intake@X.Y.Z
 ```
 
-mise's GitLab backend picks the release asset for the running platform by its target triple and finds the binary at the archive root without further options. The manual pages come with it; *Help and the manual page* below says how `man` finds them.
+mise's GitLab backend picks the release archive for the running platform by its target triple and finds the binary at the archive root without further options. The manual pages come with it; *Help and the manual page* below says how `man` finds them. The project is public, so no token is needed.
+
+### With cargo
+
+```sh
+cargo binstall --git https://gitlab.com/sakiori-oss/git-intake git-intake
+cargo install --locked --git https://gitlab.com/sakiori-oss/git-intake --tag vX.Y.Z git-intake
+```
+
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall) reads the package manifest from the repository's default branch, whose version is the latest release, and downloads that release's archive for the running platform instead of building. Between the merge of a release merge request and the end of its release pipeline, the default branch already names the new version while its archive is not yet published, and cargo-binstall then builds that version from source instead. `cargo install` builds the tagged release from source and needs Rust 1.88 or later. Both install the binary alone, without the manual pages; *Help and the manual page* below says where to get them. The crate is not on crates.io yet; once it is, `cargo install git-intake` and `cargo binstall git-intake` will install from there.
 
 ### Direct download
 
-Each release lists its archives, `git-intake-vX.Y.Z-<target>.tar.gz`, with a `.sha256` checksum next to each. The binary sits at the archive root with its license and the notices of the third-party code it links, and the manual pages under `man/man1/`:
+Each [release](https://gitlab.com/sakiori-oss/git-intake/-/releases) lists its archives, `git-intake-vX.Y.Z-<target>.tar.gz`, each with a `.sha256` checksum and a `.sigstore.json` signature bundle, and `SHA256SUMS` over all archives with its own bundle. The binary sits at the archive root with its license and the notices of the third-party code it links, and the manual pages under `man/man1/`:
 
 ```
 git-intake
@@ -51,7 +60,7 @@ man/man1/git-intake.1
 man/man1/git-intake-<command>.1
 ```
 
-To download an archive and its checksum directly:
+The same commands install the tool on a workstation and in a CI job of any forge; they need no token:
 
 ```sh
 tag=vX.Y.Z  # the release to install
@@ -60,21 +69,29 @@ file="git-intake-$tag-$target.tar.gz"
 base="https://gitlab.com/sakiori-oss/git-intake/-/releases/$tag/downloads/binaries"
 curl --fail --location --remote-name "$base/$file"
 curl --fail --location --remote-name "$base/$file.sha256"
-sha256sum -c "$file.sha256"
+sha256sum -c "$file.sha256"   # on macOS: shasum -a 256 -c "$file.sha256"
 tar -xzf "$file" -C /usr/local/bin git-intake
 ```
 
 To install the manual pages as well, extract them into a manual directory, for example `tar -xzf "$file" -C /usr/local/share man`.
 
-### From source
+### Verifying the signature
 
-Contributors with a Rust toolchain can build any revision:
+The release pipeline signs every archive and `SHA256SUMS` with [Sigstore](https://www.sigstore.dev/)'s keyless signing: the signing certificate names this project's pipeline configuration and the release tag, and the signature is recorded in Sigstore's public transparency log. With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/), check that an archive was signed by the pipeline of its tag:
 
 ```sh
-cargo install --locked --git https://gitlab.com/sakiori-oss/git-intake.git --tag v0.1.0
+curl --fail --location --remote-name "$base/$file.sigstore.json"
+cosign verify-blob --bundle "$file.sigstore.json" \
+  --certificate-identity "https://gitlab.com/sakiori-oss/git-intake//.gitlab-ci.yml@refs/tags/$tag" \
+  --certificate-oidc-issuer https://gitlab.com \
+  "$file"
 ```
 
-From a checkout, `cargo install --locked --path .` installs the working tree. `cargo run --locked -p xtask -- man <dir>` writes the manual pages into `<dir>`. A build from source reports the version `0.0.0`: only a release build carries its tag's version.
+The double slash belongs to the identity: it separates the project from the path of its CI configuration. `SHA256SUMS` and `SHA256SUMS.sigstore.json` are checked the same way, and `sha256sum -c SHA256SUMS --ignore-missing` then checks any archive of the release.
+
+### From source
+
+Contributors with a Rust toolchain can build any revision from a checkout: `cargo install --locked --path .` installs the working tree. `cargo run --locked -p xtask -- man <dir>` writes the manual pages into `<dir>`.
 
 ### Help and the manual page
 
@@ -177,15 +194,11 @@ The steps below make a fork in throwaway repositories, so they can be run as the
 
 [The update cycle](#the-update-cycle) describes each step in full, and [Running in CI](#running-in-ci) the same cycle run by a scheduled job.
 
-## Releasing
+## Releases
 
-A release is the pipeline of a protected tag `vX.Y.Z` on a commit of `main`; nothing else publishes. The tag, the release guard, the version a pipeline builds and the GitLab Release come from shared release components, which `.gitlab-ci.yml` includes at a pinned commit.
+Each release is a [GitLab release](https://gitlab.com/sakiori-oss/git-intake/-/releases) with the archives described under *Installation*, their `.sha256` checksums, `SHA256SUMS` and the Sigstore bundles of their signatures. [CHANGELOG.md](CHANGELOG.md) lists the changes of every release.
 
-- A daily pipeline schedule on `main` cuts the tag. Its pipeline holds only the tagging job, which tags the tip of `main` with the next version unless a release tag already points at it. git-cliff computes the version from the Conventional Commits since the last release: in `0.x` a breaking change raises the minor version and a feature, fix, performance change or revert the patch version; other commits, such as documentation, ask for no release. Nobody picks a version or pushes a release tag by hand.
-- An off-cycle release is the same schedule run by hand; it cuts the next version by the same rules.
-- The tag's pipeline starts with the guard, which every build waits for. It refuses a tag that is malformed, does not point at a commit of `main`, does not sort after every other release, or whose release is published completely. After it the `release-version` job hands the tag's version to the builds, which stamp it into `Cargo.toml` and `Cargo.lock` in the job's working tree only, so the binaries and their manual pages report it; the committed version stays `0.0.0`. The publish job uploads the archives and their `.sha256` files to the generic package registry, package `git-intake`, version `vX.Y.Z`, and last a `SHA256SUMS` over the archives, which marks the release complete. The GitLab Release follows, with notes git-cliff writes from the commits since the previous release and links to the archives.
-- A failed release is finished, not cut again: retry its failed jobs, or run its tag's pipeline again while nothing of it is published completely and no newer release exists; after that the guard refuses a new pipeline, so only the failed jobs are retried. The schedule cuts no second tag for a commit that already has one. Rollback is forward, by a revert and an off-cycle release.
-- A pipeline started by hand on `main` (`glab ci run --branch main`) is a rehearsal: it builds every target as a release does and publishes nothing. Its builds carry the version `<x.y.z>-rehearsal.<YYYYMMDD>`: the version the next release would take, or the latest release's when no commit since asks for one, and the pipeline's UTC day. A prerelease, it is a version no release tag can name. Rehearse after a change to the build before the next scheduled release; merge request pipelines also build when a change can affect the build.
+Versions and changelog entries are computed from the [Conventional Commits](https://www.conventionalcommits.org/) since the last release: in `0.x` a breaking change raises the minor version and a feature, fix, performance change or revert the patch version; other commits, such as documentation, ask for no release. [release-plz](https://release-plz.dev/) keeps a release merge request open with the next version and its changelog entry; merging it tags the release, and the tag's pipeline builds, signs and publishes it. [RELEASING.md](RELEASING.md) is the maintainers' runbook.
 
 ## Configuration
 

@@ -6,6 +6,9 @@ mod common;
 use common::{Fork, MERGE_REQUEST_BRANCH, Mono, mono_config, stderr, stdout};
 use predicates::str::contains;
 
+/// The release of the binary under test.
+const RELEASE: &str = env!("CARGO_PKG_VERSION");
+
 #[test]
 fn status_shows_configuration_values() {
     let f = Fork::new();
@@ -688,10 +691,10 @@ fn state_files_of_another_format_are_named_or_ignored() {
     ] {
         let err = stderr(&f.tool(&args).code(2));
         assert!(
-            err.contains(
+            err.contains(&format!(
                 "the update in progress was started by a release that keeps its state in format 2; \
-                 this release (git-intake 0.0.0) understands format 6. Finish or abort the update with a release that keeps format 2 (git-intake v0.2.0 to v0.2.2), then start it again with this release"
-            ),
+                 this release (git-intake {RELEASE}) understands format 6. Finish or abort the update with a release that keeps format 2 (git-intake v0.2.0 to v0.2.2), then start it again with this release"
+            )),
             "{args:?}: {err}"
         );
     }
@@ -745,7 +748,7 @@ fn state_of_an_earlier_release_that_does_not_wait_is_refused() {
             assert!(
                 err.contains(&format!(
                     "the update in progress was started by a release (git-intake 0.3.6) that keeps its state in \
-                     format {version}; this release (git-intake 0.0.0) understands format 6. {advice}"
+                     format {version}; this release (git-intake {RELEASE}) understands format 6. {advice}"
                 )),
                 "{version} {args:?}: {err}"
             );
@@ -782,10 +785,10 @@ fn state_of_a_newer_or_unknown_format_is_refused() {
     for args in &commands {
         let err = stderr(&f.tool(args).code(2));
         assert!(
-            err.contains(
+            err.contains(&format!(
                 "the update in progress was started by a release (git-intake 9.9.9) that keeps its state in format 99; \
-                 this release (git-intake 0.0.0) understands format 6, an older one"
-            ),
+                 this release (git-intake {RELEASE}) understands format 6, an older one"
+            )),
             "{args:?}: {err}"
         );
         assert!(
@@ -801,9 +804,9 @@ fn state_of_a_newer_or_unknown_format_is_refused() {
     for args in &commands {
         let err = stderr(&f.tool(args).code(2));
         assert!(
-            err.contains(
-                "names no state format; this release (git-intake 0.0.0) understands format 6"
-            ),
+            err.contains(&format!(
+                "names no state format; this release (git-intake {RELEASE}) understands format 6"
+            )),
             "{args:?}: {err}"
         );
     }
@@ -820,8 +823,10 @@ fn edit_state(f: &Fork, edit: impl FnOnce(&mut serde_json::Value)) -> serde_json
     state
 }
 
-const OTHER_RELEASE: &str =
-    "warning: the update was started by git-intake 0.0.1 and is carried on by git-intake 0.0.0";
+const OTHER_RELEASE: &str = concat!(
+    "warning: the update was started by git-intake 0.0.1 and is carried on by git-intake ",
+    env!("CARGO_PKG_VERSION")
+);
 
 #[test]
 fn another_release_of_the_same_format_continues_with_a_warning_once() {
@@ -831,7 +836,7 @@ fn another_release_of_the_same_format_continues_with_a_warning_once() {
     f.tool(&["start"]).success();
     // The state records the release that started the update.
     let state = edit_state(&f, |_| {});
-    assert_eq!(state["release"], "0.0.0");
+    assert_eq!(state["release"], RELEASE);
 
     // The same release carries on silently.
     let verified = f.tool(&["verify"]).success();
@@ -850,7 +855,7 @@ fn another_release_of_the_same_format_continues_with_a_warning_once() {
         first.contains("run `git intake abort` and start the update again"),
         "{first}"
     );
-    assert_eq!(edit_state(&f, |_| {})["release_warned"], "0.0.0");
+    assert_eq!(edit_state(&f, |_| {})["release_warned"], RELEASE);
     let again = stderr(&f.tool(&["verify"]).success());
     assert!(!again.contains("warning:"), "{again}");
     let finished = stderr(&f.tool(&["finish"]).success());

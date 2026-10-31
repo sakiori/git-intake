@@ -28,8 +28,7 @@ const STATE_VERSION: u32 = 6;
 /// merge request, only to hand it over or abort it; see [`Waiting`].
 const WAITING_FORMATS: [u32; 2] = [4, 5];
 
-/// The release of this binary, as recorded in the states it starts. A build
-/// from source reports `0.0.0`.
+/// The release of this binary, as recorded in the states it starts.
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
 
 /// The releases that keep the update state in each format, so that a

@@ -6,20 +6,23 @@ Security fixes are made on `main` and ship in the next release. Only the latest 
 
 ## Reporting a vulnerability
 
-Report a vulnerability privately through GitHub's private vulnerability reporting: open the repository's **Security** tab and choose **Report a vulnerability**, or go to <https://github.com/sakiori/git-intake/security/advisories/new>. If you cannot use GitHub, write to <oss@sakiori.app>.
+Report a vulnerability privately as a confidential issue: open a [new issue](https://gitlab.com/sakiori-oss/git-intake/-/issues/new) and select **This issue is confidential** before you create it. A confidential issue is visible only to you and the members of the project. If you cannot use GitLab, write to <oss@sakiori.app>.
 
-Please do not open a public issue or pull request for a vulnerability before a fix is released. Include the release (`git intake --version`), the git version, the platform, and the steps or a repository that shows the problem.
+Please do not open a public issue or merge request for a vulnerability before a fix is released. Include the release (`git intake --version`), the git version, the platform, and the steps or a repository that shows the problem.
 
 ## Verifying a release
 
-Every archive of a release has a `.sha256` file next to it and a build provenance attestation made by the release workflow. Check both before installing:
+Every archive of a release has a `.sha256` file and a Sigstore signature bundle, `.sigstore.json`, next to it, signed keylessly by the release pipeline of its tag. Check both before installing:
 
 ```sh
 sha256sum -c git-intake-vX.Y.Z-<target>.tar.gz.sha256
-gh attestation verify git-intake-vX.Y.Z-<target>.tar.gz --repo sakiori/git-intake
+cosign verify-blob --bundle git-intake-vX.Y.Z-<target>.tar.gz.sigstore.json \
+  --certificate-identity "https://gitlab.com/sakiori-oss/git-intake//.gitlab-ci.yml@refs/tags/vX.Y.Z" \
+  --certificate-oidc-issuer https://gitlab.com \
+  git-intake-vX.Y.Z-<target>.tar.gz
 ```
 
-The second command needs the GitHub CLI; it confirms that the archive was built by this repository's workflows. [RELEASING.md](RELEASING.md#checking-a-release) shows how to tie it to the tag's commit as well.
+The second command needs [cosign](https://docs.sigstore.dev/cosign/system_config/installation/); it confirms that the archive was signed by this project's pipeline for the tag `vX.Y.Z`. [RELEASING.md](RELEASING.md#checking-a-release) shows how to tie it to the tag's commit as well.
 
 ## Threat model
 

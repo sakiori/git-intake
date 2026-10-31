@@ -1,0 +1,430 @@
+# The pipeline of git-intake on GitLab.com.
+#
+# - A merge request pipeline checks the change: formatting, Clippy, the tests
+#   with the image's git and with the oldest supported git, the minimum
+#   supported Rust version, cargo-deny, the OpenSpec specification, the crate's
+#   package, shellcheck, and, when the change can affect the build, the
+#   release archive of every Linux target, packed and checked as a release
+#   does.
+# - A push to the default branch runs release-plz (release-plz.toml): it tags
+#   vX.Y.Z when Cargo.toml holds a version without a tag, which the merge of
+#   the release merge request brings, and opens or updates the release merge
+#   request with the next version and its CHANGELOG.md entry.
+# - The pipeline of a protected tag vX.Y.Z releases: the guard checks the tag,
+#   every target is built, the macOS targets on the project's own macOS
+#   runner, cosign signs the archives and SHA256SUMS keylessly
+#   with the job's GitLab ID token, the files go to the generic package
+#   registry, and the GitLab Release is created last, with the changelog entry
+#   and a link to every file.
+# - The weekly schedule runs cargo-deny, so that a new RustSec advisory fails
+#   without a change. A pipeline started by hand runs the merge request
+#   pipeline's checks and builds every Linux target, publishing nothing.
+#
+# RELEASING.md describes the project settings this relies on and the
+# recovery of a release that stopped. The images are pinned by digest, the
+# tools by version and checksum in .gitlab/scripts/install-tools.sh, and the
+# OpenSpec CLI with its dependencies in .gitlab/openspec. Every job but the
+# macOS builds runs on GitLab.com's x86_64 Linux runners. Apple's SDK license
+# permits building against the SDK only on Apple hardware, so the macOS
+# targets are built natively, with the Xcode Command Line Tools, on the
+# project's own Apple silicon runner, which takes only jobs tagged
+# git-intake-macos, runs them only for protected release tags, and runs each
+# in a fresh macOS virtual machine that is deleted after the job. Every tag
+# pipeline's release job runs only in this project: forks release nothing.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(push|schedule)$/
+    - if: $CI_COMMIT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(web|api)$/
+  auto_cancel:
+    on_new_commit: interruptible
+
+stages:
+  - check
+  - build
+  - sign
+  - publish
+  - release
+
+variables:
+  # Rust 1.99.1 on Debian 13, whose git is the newest the tests run with.
+  RUST_IMAGE: rust:1.99.1-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137
+  # The Rust release of RUST_IMAGE, which the macOS builds install; the two
+  # must name the same release, so that every target is built with the same
+  # toolchain, and the Linux builds fail when they do not.
+  RUST_VERSION: "1.99.1"
+  # The macOS virtual machine image of the macOS builds, Cirrus Labs' base
+  # image of macOS 26, with the Xcode Command Line Tools, gitlab-runner and
+  # Rosetta.
+  MACOS_IMAGE: ghcr.io/cirruslabs/macos-tahoe-base@sha256:4aaa751fa7538902d73c767f27a066fc87e83f183069da4e4b5022863abd4c77
+  NODE_IMAGE: node:24.22.2-trixie-slim@sha256:54f84b4cf8432b21aaffd5d3ce8d41e12cea0d10d33c09d2f3c9879d49d6b446
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  TOOLS: $CI_PROJECT_DIR/.tools
+
+default:
+  image: $RUST_IMAGE
+  interruptible: true
+
+# The jobs that check a change: in merge request pipelines and pipelines
+# started by hand.
+.check:
+  stage: check
+  needs: []
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(merge_request_event|web|api)$/
+  cache:
+    key:
+      files:
+        - Cargo.lock
+      prefix: $CI_JOB_NAME_SLUG
+    paths:
+      - .cargo/registry/index
+      - .cargo/registry/cache
+      - target/
+
+fmt:
+  extends: .check
+  cache: []
+  script:
+    - rustup component add rustfmt
+    - cargo fmt --all --check
+
+clippy:
+  extends: .check
+  script:
+    - rustup component add clippy
+    - cargo clippy --workspace --all-targets --locked -- -D warnings
+
+test:
+  extends: .check
+  script:
+    - git --version
+    - cargo test --workspace --locked
+
+# The tests against the oldest git the README supports, built from source.
+test-git:
+  extends: .check
+  variables:
+    GIT_VERSION: 2.43.0
+    GIT_SHA256: 5446603e73d911781d259e565750dcd277a42836c8e392cac91cf137aa9b76ec
+  cache:
+    - key: git-$GIT_VERSION-$RUST_IMAGE
+      paths:
+        - .git-build/
+    - key:
+        files:
+          - Cargo.lock
+        prefix: test
+      paths:
+        - .cargo/registry/index
+        - .cargo/registry/cache
+        - target/
+      policy: pull
+  script:
+    - |
+      prefix="$CI_PROJECT_DIR/.git-build/git-$GIT_VERSION"
+      if [ ! -x "$prefix/bin/git" ]; then
+        src=$(mktemp -d)
+        curl --fail --silent --show-error --location --proto '=https' --output "$src/git.tar.xz" \
+          "https://mirrors.edge.kernel.org/pub/software/scm/git/git-$GIT_VERSION.tar.xz"
+        echo "$GIT_SHA256  $src/git.tar.xz" | sha256sum --check --strict -
+        tar -C "$src" -xJf "$src/git.tar.xz"
+        make -C "$src/git-$GIT_VERSION" -j"$(nproc)" prefix="$prefix" \
+          NO_GETTEXT=YesPlease NO_TCLTK=YesPlease NO_PERL=YesPlease NO_PYTHON=YesPlease install > /dev/null
+      fi
+      export PATH="$prefix/bin:$PATH"
+      git --version | grep -Fqx "git version $GIT_VERSION"
+    - cargo test --workspace --locked
+
+# Builds the workspace with the toolchain that rust-version in Cargo.toml
+# names, the minimum supported Rust version.
+msrv:
+  extends: .check
+  script:
+    - version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+    - rustup toolchain install "$version" --profile minimal
+    - cargo "+$version" build --workspace --all-targets --locked
+
+# Advisories (the RustSec database), licenses, bans and sources, as deny.toml
+# configures them; also weekly, on the schedule.
+deny:
+  extends: .check
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(merge_request_event|web|api|schedule)$/
+  cache: []
+  script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" cargo-deny
+    # cargo-deny tells a yanked version only from cargo's cached index
+    # entries, which a fresh runner lacks; a dry-run update fetches the
+    # current entry of every locked crate without changing Cargo.lock.
+    - cargo update --dry-run
+    - '"$TOOLS/bin/cargo-deny" --locked check'
+
+# Packages the crate as cargo publish does and builds the packaged crate.
+package:
+  extends: .check
+  script:
+    - cargo package --locked
+
+# The OpenSpec CLI and its whole dependency tree, as
+# .gitlab/openspec/package-lock.json pins them with their integrity hashes;
+# none of them needs an install script.
+openspec:
+  extends: .check
+  image: $NODE_IMAGE
+  cache: []
+  variables:
+    # The CLI reports usage to its authors unless told not to.
+    OPENSPEC_TELEMETRY: "0"
+  script:
+    - npm ci --prefix .gitlab/openspec --ignore-scripts --no-audit --no-fund
+    - .gitlab/openspec/node_modules/.bin/openspec validate --all --strict --no-interactive
+
+shellcheck:
+  extends: .check
+  cache: []
+  script:
+    # The pipeline runs the scripts directly, so git must record them as
+    # executable.
+    - |
+      modes=$(git ls-files -s -- '.gitlab/scripts/*.sh')
+      [ -n "$modes" ] || { echo "git lists no script under .gitlab/scripts" >&2; exit 1; }
+      plain=$(printf '%s\n' "$modes" | grep -v '^100755 ' || true)
+      [ -z "$plain" ] || { printf 'not executable in git (git update-index --chmod=+x):\n%s\n' "$plain" >&2; exit 1; }
+    - .gitlab/scripts/install-tools.sh "$TOOLS" shellcheck
+    - '"$TOOLS/bin/shellcheck" .gitlab/scripts/*.sh'
+
+# Build, pack and check the release archive of every target with
+# .gitlab/scripts/build-archive.sh. The Linux targets are built by
+# check-build-linux for a merge request that can change the build and for a
+# pipeline started by hand, so that a release never meets a broken build for
+# the first time, and by release-build-linux for a release tag, after the
+# guard; the macOS targets only for a release tag, by release-build-macos on
+# the project's macOS runner, so that it never runs the code of a merge
+# request.
+.build-linux:
+  stage: build
+  parallel:
+    matrix:
+      - TARGET:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+  script:
+    - |
+      case "$(rustc --version)" in
+        "rustc $RUST_VERSION "*) ;;
+        *) echo "RUST_IMAGE has $(rustc --version), not RUST_VERSION $RUST_VERSION" >&2; exit 1 ;;
+      esac
+    - rustup target add "$TARGET"
+    - rustup component add rust-src
+    - .gitlab/scripts/install-tools.sh "$TOOLS" zig cargo-zigbuild cargo-about
+    - export PATH="$TOOLS/bin:$PATH"
+    - .gitlab/scripts/build-archive.sh "$TARGET"
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 30 days
+
+# The cache speeds up the builds that check a change; a merge request
+# pipeline compares the changes with the merge request's target branch.
+check-build-linux:
+  extends: .build-linux
+  needs: []
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths:
+          - Cargo.toml
+          - Cargo.lock
+          - about.toml
+          - about.hbs
+          - LICENSE
+          - src/**/*
+          - xtask/**/*
+          - .gitlab/scripts/**/*
+          - .gitlab-ci.yml
+  cache:
+    key:
+      files:
+        - Cargo.lock
+      prefix: build-$TARGET
+    paths:
+      - .cargo/registry/index
+      - .cargo/registry/cache
+      - target/
+
+# A release binary depends on nothing but the tag's commit and the pinned
+# image and tools, so the release build restores no cache.
+release-build-linux:
+  extends: .build-linux
+  needs:
+    - job: release-guard
+      artifacts: false
+  interruptible: false
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/git-intake"
+  cache: []
+
+# Each job runs in a virtual machine cloned from MACOS_IMAGE and deleted
+# after it, so nothing a build runs outlives the job. It uses nothing of the
+# image but the shell, git, curl, the Xcode Command Line Tools and Rosetta,
+# with which build-archive.sh runs the x86_64 binary: the pinned rustup-init
+# installs the Rust toolchain into the job's own RUSTUP_HOME and CARGO_HOME.
+# It caches nothing.
+release-build-macos:
+  stage: build
+  image: $MACOS_IMAGE
+  tags:
+    - git-intake-macos
+  needs:
+    - job: release-guard
+      artifacts: false
+  interruptible: false
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/git-intake"
+  timeout: 1h
+  parallel:
+    matrix:
+      - TARGET:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+  cache: []
+  variables:
+    GIT_STRATEGY: clone
+    RUSTUP_HOME: $CI_PROJECT_DIR/.rustup
+  script:
+    # The runner refuses any other job before it starts a virtual machine;
+    # the job refuses it again.
+    - |
+      [ "${CI_COMMIT_REF_PROTECTED:-}" = true ] || { echo "the macOS builds run only for a protected tag" >&2; exit 1; }
+      printf '%s\n' "${CI_COMMIT_TAG:-}" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+' \
+        || { echo "the macOS builds run only for a release tag vX.Y.Z, not '${CI_COMMIT_TAG:-}'" >&2; exit 1; }
+    - .gitlab/scripts/install-tools.sh "$TOOLS" rustup cargo-about
+    - '"$TOOLS/bin/rustup-init" --profile minimal --default-toolchain "$RUST_VERSION" --no-modify-path -y'
+    - export PATH="$CARGO_HOME/bin:$TOOLS/bin:$PATH"
+    - rustup target add aarch64-apple-darwin x86_64-apple-darwin
+    - rustup component add rust-src
+    - .gitlab/scripts/build-archive.sh "$TARGET"
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 30 days
+
+release-guard:
+  stage: check
+  needs: []
+  interruptible: false
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/git-intake"
+  variables:
+    GIT_DEPTH: 0
+  script:
+    - .gitlab/scripts/release-guard.sh
+  artifacts:
+    paths:
+      - release-notes.md
+    expire_in: 30 days
+
+# The only job that holds an ID token for Sigstore; it runs no code of the
+# build.
+sign:
+  stage: sign
+  interruptible: false
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/git-intake"
+  needs:
+    - job: release-build-linux
+      artifacts: true
+    - job: release-build-macos
+      artifacts: true
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" cosign
+    - export PATH="$TOOLS/bin:$PATH"
+    - .gitlab/scripts/sign.sh
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 30 days
+
+# One release publishes at a time.
+publish:
+  stage: publish
+  interruptible: false
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PROJECT_PATH == "sakiori-oss/git-intake"
+  needs:
+    - job: release-guard
+      artifacts: true
+    - job: sign
+      artifacts: true
+  resource_group: release-publish
+  script:
+    - .gitlab/scripts/install-tools.sh "$TOOLS" jq
+    - export PATH="$TOOLS/bin:$PATH"
+    - .gitlab/scripts/publish.sh
+
+# release-plz on the default branch. RELEASE_PLZ_TOKEN, the personal access
+# token of the release bot user of the group sakiori-oss, a Maintainer of the
+# group, with the api and write_repository scopes, is a protected, masked and
+# hidden variable of the project scoped to the environment release-plz, so
+# that only these jobs receive it. The bot user pushes the release branch
+# and the tag, whose pipeline then releases, and opens the release merge
+# request; the release merge request's commit is authored and committed as
+# Sakiori <oss@sakiori.app>.
+.release-plz:
+  stage: release
+  needs: []
+  interruptible: false
+  rules:
+    # Forks release nothing.
+    - if: $CI_PROJECT_PATH == "sakiori-oss/git-intake" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+  environment:
+    name: release-plz
+    action: prepare
+  resource_group: release-plz
+  variables:
+    GIT_DEPTH: 0
+    GIT_STRATEGY: clone
+  before_script:
+    - '[ -n "${RELEASE_PLZ_TOKEN:-}" ] || { echo "RELEASE_PLZ_TOKEN is not set; RELEASING.md describes it" >&2; exit 1; }'
+    - .gitlab/scripts/install-tools.sh "$TOOLS" release-plz
+    - export PATH="$TOOLS/bin:$PATH"
+    # release-plz works on the branch; a newer push leaves this pipeline
+    # behind, and the newer pipeline releases instead.
+    - git checkout -B "$CI_COMMIT_BRANCH" "$CI_COMMIT_SHA"
+    - git fetch --quiet --tags origin
+    - |
+      if [ "$(git ls-remote origin "refs/heads/$CI_COMMIT_BRANCH" | cut -f1)" != "$CI_COMMIT_SHA" ]; then
+        echo "$CI_COMMIT_BRANCH moved on from $CI_COMMIT_SHA; its newer pipeline runs release-plz"
+        exit 0
+      fi
+    - git config user.name Sakiori
+    - git config user.email oss@sakiori.app
+    # git pushes with the token, which stays in the environment.
+    - git config credential.helper '!f() { echo username=release-plz; echo "password=$RELEASE_PLZ_TOKEN"; }; f'
+    - git remote set-url origin "$CI_PROJECT_URL.git"
+    - export GIT_TOKEN="$RELEASE_PLZ_TOKEN"
+
+release-plz-release:
+  extends: .release-plz
+  script:
+    - release-plz release --forge gitlab --repo-url "$CI_PROJECT_URL" --output json
+
+release-plz-pr:
+  extends: .release-plz
+  needs:
+    - release-plz-release
+  script:
+    - release-plz release-pr --forge gitlab --repo-url "$CI_PROJECT_URL" --output json
