@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://gitlab.com/sakiori-oss/git-intake/compare/v0.4.0...v0.4.1) - 2026-11-01
+
+### Added
+
+- `git intake release next`, `tag`, `check`, `version` and `notes` cut, check, version and describe a downstream's own releases, configured by an optional `[release]` table. A release is `v<base>-<label>.<YYYYMMDD>.<n>`, whose base is the next patch version after the newest upstream release the integration tip contains, and its pipeline creates the forge release from the notes. `status` reports the release state
+
+### Changed
+
+- Fetches of the publish remote no longer apply the remote's configured refspecs, so no command moves the repository's own branches or tags
+
 ## [0.4.0](https://gitlab.com/sakiori-oss/git-intake/-/compare/v0.3.7...v0.4.0)
 
 ### Added
