@@ -412,8 +412,12 @@ publish:
       fi
     - git config user.name Sakiori
     - git config user.email oss@sakiori.app
-    # git pushes with the token, which stays in the environment.
-    - git config credential.helper '!f() { echo username=release-plz; echo "password=$RELEASE_PLZ_TOKEN"; }; f'
+    # git pushes with the token, which stays in the environment. The runner's
+    # git configuration, which git reads before these lines, gives the server
+    # a credential helper with the job token, which may not push; the empty
+    # helper clears every helper configured before it.
+    - git config --add credential.helper ''
+    - git config --add credential.helper '!f() { echo username=release-plz; echo "password=$RELEASE_PLZ_TOKEN"; }; f'
     - git remote set-url origin "$CI_PROJECT_URL.git"
     - export GIT_TOKEN="$RELEASE_PLZ_TOKEN"
 
