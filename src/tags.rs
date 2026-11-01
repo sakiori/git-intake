@@ -61,7 +61,7 @@ impl TagPattern {
 
     /// The version of a tag that names a release: a version without a
     /// prerelease part or build metadata.
-    fn release_version(&self, tag: &str) -> Option<Version> {
+    pub fn release_version(&self, tag: &str) -> Option<Version> {
         self.version(tag)
             .filter(|v| v.pre.is_empty() && v.build.is_empty())
     }

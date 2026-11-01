@@ -21,6 +21,16 @@ struct RawConfig {
     checks: Option<toml::Value>,
     #[serde(default, rename = "upstream")]
     upstreams: Vec<RawUpstream>,
+    /// Read as a value first so that its problems are named with its keys.
+    release: Option<toml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRelease {
+    upstream: String,
+    tags: Option<String>,
+    labels: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,7 +134,32 @@ pub struct Config {
     pub install: Option<String>,
     pub checks: Vec<Check>,
     pub upstreams: Vec<Upstream>,
+    /// The releases of the integration branch, when it is releasable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<Release>,
 }
+
+/// The `[release]` table: the upstream whose version the releases carry, the
+/// pattern of its release tags, and the labels of the downstream's releases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release {
+    pub upstream: String,
+    /// The pattern of `[release]`, or else the upstream's own `tags`.
+    pub tags: String,
+    /// The label of new releases first, then the labels earlier releases
+    /// took.
+    pub labels: Vec<String>,
+}
+
+impl Release {
+    /// The label of new releases.
+    pub fn label(&self) -> &str {
+        &self.labels[0]
+    }
+}
+
+/// The label of releases when `[release]` sets no `labels`.
+pub const DEFAULT_LABEL: &str = "custom";
 
 /// One check: a name, unique ignoring letter case, and the command it runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +356,10 @@ pub fn parse(text: &str) -> Result<Config> {
     }
 
     check_layout(&integration, &upstreams, &mut problems);
+    let release = match raw.release {
+        None => None,
+        Some(value) => parse_release(value, &upstreams, publish.is_some(), &mut problems),
+    };
 
     if !problems.is_empty() {
         bail!(
@@ -338,7 +377,126 @@ pub fn parse(text: &str) -> Result<Config> {
         install: raw.install,
         checks,
         upstreams,
+        release,
     })
+}
+
+/// Reads the `[release]` table against the upstreams it may name.
+fn parse_release(
+    value: toml::Value,
+    upstreams: &[Upstream],
+    publish: bool,
+    problems: &mut Vec<String>,
+) -> Option<Release> {
+    let raw: RawRelease = match value.try_into() {
+        Ok(raw) => raw,
+        Err(e) => {
+            let e: toml::de::Error = e;
+            problems.push(format!("release: {}", e.message()));
+            return None;
+        }
+    };
+    let mut valid = true;
+    if !publish {
+        problems.push(
+            "release: releases are cut on the publish remote's integration branch; configure the publish \
+             remote in a [publish] table"
+                .to_string(),
+        );
+        valid = false;
+    }
+    let upstream = upstreams.iter().find(|u| u.name == raw.upstream);
+    match upstream {
+        None => {
+            let known: Vec<&str> = upstreams.iter().map(|u| u.name.as_str()).collect();
+            problems.push(format!(
+                "release.upstream: no upstream is named '{}'; configured upstreams: {}",
+                raw.upstream,
+                known.join(", ")
+            ));
+            valid = false;
+        }
+        Some(up) if up.mode != Mode::Follow => {
+            problems.push(format!(
+                "release.upstream: upstream '{}' is in `{}` mode; releases take their version from an upstream \
+                 in `follow` mode",
+                up.name,
+                up.mode.as_str()
+            ));
+            valid = false;
+        }
+        Some(_) => {}
+    }
+    let tags = match (raw.tags, upstream) {
+        (Some(tags), _) => match crate::tags::TagPattern::parse(&tags) {
+            Ok(_) => Some(tags),
+            Err(why) => {
+                problems.push(format!("release.tags '{tags}': {why}"));
+                None
+            }
+        },
+        (None, Some(up)) if up.tags.is_some() => up.tags.clone(),
+        (None, Some(up)) => {
+            problems.push(format!(
+                "release.tags: upstream '{}' has no `tags` pattern; set `tags` in [release] to the glob of its \
+                 release tags, such as \"v*\"",
+                up.name
+            ));
+            None
+        }
+        (None, None) => None,
+    };
+    let labels = raw
+        .labels
+        .unwrap_or_else(|| vec![DEFAULT_LABEL.to_string()]);
+    let mut labels_valid = true;
+    if labels.is_empty() {
+        problems.push(
+            "release.labels: the list is empty; name at least the label of new releases"
+                .to_string(),
+        );
+        labels_valid = false;
+    }
+    for label in &labels {
+        if let Err(why) = check_label(label) {
+            problems.push(format!("release.labels: {why}"));
+            labels_valid = false;
+        }
+    }
+    for (i, label) in labels.iter().enumerate() {
+        if labels[..i].contains(label) {
+            problems.push(format!(
+                "release.labels: '{label}' is listed more than once"
+            ));
+            labels_valid = false;
+        }
+    }
+    if !valid || !labels_valid {
+        return None;
+    }
+    Some(Release {
+        upstream: raw.upstream,
+        tags: tags?,
+        labels,
+    })
+}
+
+/// The rule for a release label, a SemVer prerelease identifier that is not
+/// a number.
+fn check_label(label: &str) -> std::result::Result<(), String> {
+    if label.is_empty() {
+        Err("a label is empty".to_string())
+    } else if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        Err(format!(
+            "'{label}' is not a valid label: it may contain only ASCII letters, digits and '-'"
+        ))
+    } else if label.chars().all(|c| c.is_ascii_digit()) {
+        Err(format!(
+            "'{label}' is not a valid label: a label of digits alone would read as a number in the version"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Reads the list of checks, each a table with exactly the keys `name` and
@@ -899,6 +1057,86 @@ via = "merge-request"
             e.contains("upstream 'a': `tags` selects the target of a follow upstream"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn the_release_table_takes_its_defaults_from_the_upstream() {
+        let up = UP_A.replace("branch", "tags = \"v*\"\nbranch");
+        let cfg = parse(&format!(
+            "integration = \"main\"\n{up}[publish]\nremote = \"origin\"\n[release]\nupstream = \"a\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.release,
+            Some(Release {
+                upstream: "a".into(),
+                tags: "v*".into(),
+                labels: vec!["custom".into()],
+            })
+        );
+        let cfg = parse(&format!(
+            "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\n[release]\nupstream = \"a\"\n\
+             tags = \"expo@*\"\nlabels = [\"nightly\", \"custom-2\"]\n"
+        ))
+        .unwrap();
+        let release = cfg.release.unwrap();
+        assert_eq!(release.tags, "expo@*");
+        assert_eq!(release.label(), "nightly");
+        // The upstream's own `tags` stays unset: updates take its branch tip.
+        assert_eq!(cfg.upstreams[0].tags, None);
+    }
+
+    #[test]
+    fn rejects_invalid_release_tables() {
+        let publish = "[publish]\nremote = \"origin\"\n";
+        let port = "[[upstream]]\nname = \"p\"\nurl = \"u\"\nbranch = \"main\"\nmode = \"port\"\n";
+        let e = err(&format!(
+            "integration = \"main\"\n{port}{publish}[release]\nupstream = \"p\"\ntags = \"v*\"\n"
+        ));
+        assert!(
+            e.contains("release.upstream: upstream 'p' is in `port` mode"),
+            "{e}"
+        );
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}{publish}[release]\nupstream = \"x\"\ntags = \"v*\"\n"
+        ));
+        assert!(
+            e.contains("release.upstream: no upstream is named 'x'"),
+            "{e}"
+        );
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}{publish}[release]\nupstream = \"a\"\n"
+        ));
+        assert!(
+            e.contains("release.tags: upstream 'a' has no `tags` pattern"),
+            "{e}"
+        );
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}{publish}[release]\nupstream = \"a\"\ntags = \"refs/tags/v*\"\n"
+        ));
+        assert!(e.contains("release.tags 'refs/tags/v*'"), "{e}");
+        for (labels, why) in [
+            ("[\"2024\"]", "'2024' is not a valid label"),
+            ("[]", "the list is empty"),
+            ("[\"a.b\"]", "'a.b' is not a valid label"),
+            ("[\"x\", \"x\"]", "'x' is listed more than once"),
+        ] {
+            let e = err(&format!(
+                "integration = \"main\"\n{UP_A}{publish}[release]\nupstream = \"a\"\ntags = \"v*\"\nlabels = {labels}\n"
+            ));
+            assert!(e.contains(&format!("release.labels: {why}")), "{e}");
+        }
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}[release]\nupstream = \"a\"\ntags = \"v*\"\n"
+        ));
+        assert!(
+            e.contains("release: releases are cut on the publish remote"),
+            "{e}"
+        );
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}{publish}[release]\nupstream = \"a\"\nlabel = \"x\"\n"
+        ));
+        assert!(e.contains("release: unknown field `label`"), "{e}");
     }
 
     #[test]

@@ -64,7 +64,7 @@ fn main() -> Result<()> {
 }
 
 /// Writes `git-intake.1`, and one page per command such as
-/// `git-intake-finish.1`, into `dir`.
+/// `git-intake-finish.1` or `git-intake-release-next.1`, into `dir`.
 fn man(dir: &Path) -> Result<()> {
     let manifest: toml::Table = toml::from_str(MANIFEST).context("cannot parse Cargo.toml")?;
     let version = manifest
@@ -102,20 +102,33 @@ fn man(dir: &Path) -> Result<()> {
     write(&dir.join(man.get_filename()), &page)?;
 
     for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
-        let man = Man::new(sub.clone()).source(format!("git-intake {version}"));
-        let mut page = Vec::new();
-        man.render_title(&mut page)?;
-        man.render_name_section(&mut page)?;
-        synopsis(sub).to_writer(&mut page)?;
-        man.render_description_section(&mut page)?;
-        man.render_options_section(&mut page)?;
-        if sub.get_after_long_help().is_some() || sub.get_after_help().is_some() {
-            man.render_extra_section(&mut page)?;
-        }
-        if sub.get_version().is_some() || sub.get_long_version().is_some() {
-            man.render_version_section(&mut page)?;
-        }
-        write(&dir.join(man.get_filename()), &page)?;
+        command_pages(dir, sub, version)?;
+    }
+    Ok(())
+}
+
+/// Writes the page of a command, such as `git-intake-release.1`, and one
+/// page per command of a group, such as `git-intake-release-next.1`.
+fn command_pages(dir: &Path, cmd: &Command, version: &str) -> Result<()> {
+    let man = Man::new(cmd.clone()).source(format!("git-intake {version}"));
+    let mut page = Vec::new();
+    man.render_title(&mut page)?;
+    man.render_name_section(&mut page)?;
+    synopsis(cmd).to_writer(&mut page)?;
+    man.render_description_section(&mut page)?;
+    man.render_options_section(&mut page)?;
+    if cmd.has_subcommands() {
+        man.render_subcommands_section(&mut page)?;
+    }
+    if cmd.get_after_long_help().is_some() || cmd.get_after_help().is_some() {
+        man.render_extra_section(&mut page)?;
+    }
+    if cmd.get_version().is_some() || cmd.get_long_version().is_some() {
+        man.render_version_section(&mut page)?;
+    }
+    write(&dir.join(man.get_filename()), &page)?;
+    for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
+        command_pages(dir, sub, version)?;
     }
     Ok(())
 }

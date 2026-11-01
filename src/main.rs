@@ -13,6 +13,7 @@ mod integration_line;
 mod output;
 mod port;
 mod redact;
+mod release;
 mod repo;
 mod state;
 mod sync_record;
@@ -25,7 +26,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, ReleaseCommand};
 
 /// The outcome of a command that ran to completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +72,15 @@ fn run(command: Command) -> anyhow::Result<Exit> {
         Command::Contribute { upstream, branch } => {
             commands::contribute::run(&repo, &upstream, &branch)
         }
+        Command::Release { command } => match command {
+            ReleaseCommand::Next { json } => commands::release::next(&repo, json),
+            ReleaseCommand::Tag => commands::release::tag(&repo),
+            ReleaseCommand::Check { tag } => commands::release::check(&repo, tag.as_deref()),
+            ReleaseCommand::Version { tag, json, dotenv } => {
+                commands::release::version(&repo, tag.as_deref(), json, dotenv)
+            }
+            ReleaseCommand::Notes { tag } => commands::release::notes(&repo, tag.as_deref()),
+        },
     };
     repo.note_removed_directory();
     result

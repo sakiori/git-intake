@@ -1,6 +1,6 @@
 # git-intake
 
-`git intake` keeps a downstream repository current with one or more upstreams. It takes upstream changes by merge commits or by copying chosen upstream commits, never rewrites history and never force-pushes. The work happens in a separate worktree. A conflict is resolved once, and the repository's own checks run on exactly the tree that gets published: `verify` runs them before an update is pushed, and a merge request's pipeline runs them on an update published for review, on a forge whose settings merge only a tree that pipeline tested. The integration branch moves only by fast-forward. `git intake sync` carries the whole cycle out unattended, as a scheduled CI job.
+`git intake` keeps a downstream repository current with one or more upstreams, and releases it. It takes upstream changes by merge commits or by copying chosen upstream commits, never rewrites history and never force-pushes. The work happens in a separate worktree. A conflict is resolved once, and the repository's own checks run on exactly the tree that gets published: `verify` runs them before an update is pushed, and a merge request's pipeline runs them on an update published for review, on a forge whose settings merge only a tree that pipeline tested. The integration branch moves only by fast-forward. `git intake sync` carries the whole cycle out unattended, as a scheduled CI job. `git intake release` cuts, checks and versions releases of the downstream whose versions name the upstream release they carry.
 
 It covers three cases:
 
@@ -10,7 +10,7 @@ It covers three cases:
 
 The tool runs the installed `git` for every repository operation. Each repository describes itself in a committed `.git-intake.toml`. Upstreams are fetched by their URL; the repository keeps no remote, remote-tracking branch or other branch of an upstream.
 
-**Contents:** [How it differs from other tools](#how-it-differs-from-other-tools) · [Installation](#installation) · [Quickstart](#quickstart) · [Releases](#releases) · [Configuration](#configuration) · [The update cycle](#the-update-cycle) · [The sync record](#the-sync-record) · [Commands](#commands) · [Exit status](#exit-status) · [Running in CI](#running-in-ci) · [Moving from upstream remotes and mirror branches](#moving-from-upstream-remotes-and-mirror-branches) · [Monorepo migration](#monorepo-migration) · [Safety properties](#safety-properties) · [License](#license)
+**Contents:** [How it differs from other tools](#how-it-differs-from-other-tools) · [Installation](#installation) · [Quickstart](#quickstart) · [Releases](#releases) · [Configuration](#configuration) · [The update cycle](#the-update-cycle) · [The sync record](#the-sync-record) · [Downstream releases](#downstream-releases) · [Commands](#commands) · [Exit status](#exit-status) · [Running in CI](#running-in-ci) · [Moving from upstream remotes and mirror branches](#moving-from-upstream-remotes-and-mirror-branches) · [Monorepo migration](#monorepo-migration) · [Safety properties](#safety-properties) · [License](#license)
 
 ## How it differs from other tools
 
@@ -202,7 +202,7 @@ Versions and changelog entries are computed from the [Conventional Commits](http
 
 ## Configuration
 
-`.git-intake.toml` lives at the repository root and is committed on the integration branch. The tool always reads the version committed at the integration branch tip. An uncommitted edit in the working copy is ignored, and the tool prints a note that the working copy differs. The tool finds the integration branch from the configuration committed at `HEAD`, or from the update in progress, so run it from a checkout of the integration branch or of a branch that carries the configuration.
+`.git-intake.toml` lives at the repository root and is committed on the integration branch. The tool always reads the version committed at the integration branch tip, except where the release commands read it at the publish remote's tip or at the checked-out commit (see *Release commands*). An uncommitted edit in the working copy is ignored, and the tool prints a note that the working copy differs. The tool finds the integration branch from the configuration committed at `HEAD`, or from the update in progress, so run it from a checkout of the integration branch or of a branch that carries the configuration.
 
 ```toml
 integration = "main"                  # the branch that receives the upstream changes
@@ -216,7 +216,7 @@ checks = [                            # run in order by verify, each named
 remote = "origin"                     # the publish remote, a git remote of the repository
 via = "push"                          # optional: "push" (default) or "merge-request"
 # forge = "gitlab"                    # optional: "gitlab" or "github", when the URL does not tell; in push mode it names the CI files
-# api = "https://gitlab.example.com/api/v4"  # optional, merge-request mode: the forge's REST API on the remote's host
+# api = "https://gitlab.example.com/api/v4"  # optional, merge-request mode or [release]: the forge's REST API on the remote's host
 
 [[upstream]]
 name = "app-a"                        # unique; used on the command line, in sync records, trailers and check variables
@@ -225,6 +225,11 @@ branch = "main"                       # the upstream branch to take from
 mode = "follow"                       # optional: "follow" (default) or "port"
 path = "apps/app-a"                   # optional, follow mode only: merge under this path; absent = repository root
 tags = "v*"                           # optional, follow mode only: take the newest release tag matching this pattern instead of the branch tip
+
+[release]                             # optional: make the integration branch releasable (see Downstream releases)
+upstream = "app-a"                    # the follow upstream whose version the releases carry
+tags = "v*"                           # optional: the glob of its release tags; default: the upstream's own `tags`
+labels = ["custom"]                   # optional: the label of new releases first, then labels earlier releases took
 ```
 
 Validation rules. The tool refuses to run when any of them is broken, and it names the entries involved:
@@ -239,6 +244,7 @@ Validation rules. The tool refuses to run when any of them is broken, and it nam
 - `tags` belongs to an upstream in `follow` mode. It is a glob over tag names (`*`, `?` and `[...]`, matched against the whole name), written without `refs/tags/`, such as `v*` or `release-[0-9]*`.
 - Each check is a table with exactly the keys `name` and `run`, the command, which may not be empty. A check's name may contain only ASCII letters, digits, `-`, `_` and `.`, and may not start with `-` or `.`; no two checks may have names that differ only in letter case. The name selects the check for `verify --only` and `--skip`, names it in the output and the merge request's description, and names its log. The list of plain command strings of earlier releases, `checks = ["pnpm lint"]`, is rejected with the table form to write instead.
 - `publish` is a table: `remote` is required, `via` is `push` or `merge-request`, `forge` is `gitlab` or `github`, and `api` is an `https` URL with a host and without credentials, query or fragment (see *The forge*). Write it as the `[publish]` section shown above, after the top-level keys (a section header ends the top level, so keys written below it belong to the section), or inline as `publish = { remote = "origin", via = "merge-request" }`. The string form `publish = "origin"` is rejected with the form to write instead.
+- `release` is a table with exactly the keys `upstream`, `tags` and `labels`, and needs `[publish]`. `upstream` names an upstream in `follow` mode; `tags` is a pattern as for an upstream's `tags`, and without it the upstream must have one; `labels` is a non-empty list of distinct labels of ASCII letters, digits and `-`, none of digits alone (see *Downstream releases*).
 - The publish remote may not be fetched from or pushed to (its `url` or any `pushurl`) a URL that names an upstream's repository, because the tool never pushes to an upstream. URLs are compared both as configured and as git resolves them, after its `url.<base>.insteadOf` and `url.<base>.pushInsteadOf` rewriting, and two URLs name the same repository when:
   - both are local paths or `file://` URLs, whatever host a `file://` URL names, that resolve against the main worktree to the same repository as git reports it, made canonical, for the path or the path with `.git` appended: `../up`, `../up.git/`, the absolute path, `file://localhost/` with that path, a symbolic link to the repository and a linked worktree of it all match;
   - or both are hosted URLs, with the scp-like form `user@host:path` read as `ssh://user@host/path` and `<transport>::<address>` as its address, with the same host and path, whatever their scheme, user, password and the case of the path: the host is compared in lower case without a trailing `.`, a default port such as `:22` or `:443` is dropped, and the path is compared without doubled or trailing `/`, a `.git` suffix in any case and a leading `~/`. An `ssh` URL also matches by the host and port `ssh -G` resolves for its host, so an SSH host alias names the host it stands for.
@@ -451,7 +457,7 @@ tags = "v*"
 - have neither a prerelease part nor build metadata, so `v1.0.0-rc.1` and `v1.0.0+build.5` never count, whatever the pattern,
 - and point at a commit of the fetched upstream branch, so a release made on another branch, such as a maintenance branch the upstream never merged, never counts;
 
-the one with the highest version by semantic versioning precedence: `v0.10.0` is newer than `v0.9.0`, whatever their order on the branch. Tags whose names are not versions in this sense are ignored. To take a prerelease, or any other commit, name it: `start upstream=v1.0.0-rc.1`. No tag is fetched; a release's commit is on the fetched branch, which `refs/git-intake/upstreams/<name>` holds while the update runs, so the repository's `refs/tags` never change.
+the one with the highest version by semantic versioning precedence: `v0.10.0` is newer than `v0.9.0`, whatever their order on the branch. Tags whose names are not versions in this sense are ignored. To take a prerelease, or any other commit, name it: `start upstream=v1.0.0-rc.1`. No tag is fetched; a release's commit is on the fetched branch, which `refs/git-intake/upstreams/<name>` holds while the update runs, so an update never changes the repository's `refs/tags`.
 
 The release is the target, and the usual rules apply to it (see *Choosing a target*). When the integration branch already contains it, `start` reports the upstream as current, even when an earlier update took a later, unreleased commit by naming it. When the branch has no release, `start` refuses and says to name the target; `status` shows the state `no release`, and `status --check` fails.
 
@@ -576,7 +582,7 @@ The token comes from the environment only, under the names the forges' own comma
 | github.com and `ghe.com` hosts | `GH_TOKEN`, `GITHUB_TOKEN` | `Authorization: Bearer` |
 | GitHub Enterprise Server | `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`; in an Actions job of that server also `GH_TOKEN`, `GITHUB_TOKEN` | `Authorization: Bearer` |
 
-A github.com token is never sent to an Enterprise Server, except the token an Actions job of that server is given. Without a token, `start`, `finish` and `sync` refuse before they push anything and name the variables. The tool never prints, stores or logs the token, and sends it only to the API's host.
+A github.com token is never sent to an Enterprise Server, except the token an Actions job of that server is given. The release commands, which only read releases, also take a GitLab CI job's `CI_JOB_TOKEN`, sent as a `JOB-TOKEN` header, and ask without a token when none is set (see *Publication*). Without a token, `start`, `finish` and `sync` refuse before they push anything and name the variables. The tool never prints, stores or logs the token, and sends it only to the API's host.
 
 The token must be able to open merge requests:
 
@@ -741,6 +747,142 @@ The tool reads its own history along the **integration line**: the first-parent 
 
 A follow upstream's **last synced commit** is the target of its newest sync record on the integration line whose target no other of its records' targets contains, so a branch carrying an older record that is merged after a newer one never moves the upstream back. It is not stored anywhere else. An upstream without a record has its last synced commit taken from the history instead, and the decision depends only on the integration branch and that upstream's own branch, never on other upstreams or on which of them are fetched. For a root upstream, such as a fork created by cloning, it is the newest upstream commit the integration branch contains. For a path upstream, it is the second parent of the newest merge on the integration line whose second parent belongs to the upstream's branch and which changes the upstream's path. That is the merge `git subtree add` or `git subtree pull` leaves, so ancestry shared through a template does not count, and the import still counts when another upstream later merges this one's history. `status` says so in text, and `status --json` marks the source as `history` instead of `record`. The first update writes a record. Only this repository's own records count. Records inside a configured upstream's fetched branch are skipped; this happens, for example, when a stacked branch starts from another fork's integration branch that carries that fork's records. If a follow upstream's branch no longer contains its last synced commit, the upstream was rewritten: `status` reports it and `start` refuses to update it.
 
+## Downstream releases
+
+A downstream that git intake keeps current is usually released as well, and its version has to say which upstream it carries. A downstream that follows its upstream's branch ships code newer than the upstream's last release, so a version taken from a manifest the upstream commits may lag several releases behind, and `<release>-<label>` sorts before the release it already contains. git intake knows which upstream releases the integration branch contains, and versions the downstream's releases from that.
+
+### Release configuration
+
+```toml
+[release]
+upstream = "app"         # the follow upstream whose version the releases carry
+tags = "v*"              # optional: the glob of its release tags; default: the upstream's own `tags`
+labels = ["custom"]      # optional, default ["custom"]: the label of new releases, then labels earlier releases took
+```
+
+`tags` under `[release]` is separate from the upstream's own `tags`, which also makes updates take only releases: a downstream that follows the upstream's branch sets the pattern under `[release]` only, and updates keep taking the branch tip. A pattern selects an upstream release as for *Release tags*: a tag of the upstream's repository that matches it and is a semantic version without a prerelease part or build metadata once the pattern's literal prefix, and one `v` or `V` after it, are removed, so `expo-device-hub@0.19.1` is version 0.19.1 under `expo-device-hub@*`, and the upstream's own builds, such as `v0.1.7-nightly.20261031.3991`, never count. The tags are listed from the upstream's URL and never fetched.
+
+Releases before this one refuse a configuration that contains `[release]`, as an unknown key. Upgrade every place that runs git intake on the repository, CI jobs included, before committing it.
+
+### Release versions
+
+A release is the tag `v<base>-<label>.<YYYYMMDD>.<n>`, and its version is the name without the `v`:
+
+- `<base>` is the **release base** of the tagged commit: the version of the newest upstream release the commit contains, by semantic versioning precedence, with its patch number raised by one. An integration branch that contains `v0.11.0` and twelve later upstream commits, or took the upstream at `v0.11.0` and carries its own commits on top, has the base `0.11.1`: after the release it contains, and before the next one of any kind. An upstream release the commit does not contain, such as a `v0.12.0` not yet taken, does not count. A commit that contains no upstream release has no base, and the commands refuse it, naming the upstream, its URL and the pattern.
+- `<label>` is the first of `labels`.
+- `<YYYYMMDD>` is the UTC day the tag is cut.
+- `<n>` is one past the highest number any tag of release form of the publish remote took that day, whatever its base or label and wherever it points, or else 1, up to 99. A tag of release form off the downstream's line is no release, but its number is never taken again.
+
+Every release must sort after every other release by semantic versioning, so that tools that pick the newest version, Renovate and package managers among them, see it as newer; and `YYYYMMDD * 100 + n` must grow with every release, so that it serves as a monotonic build number, such as an Android version code. The tool refuses to cut a release that breaks either order, naming the release it would not come after: a base older than an earlier release's, a label changed to one that sorts before the label of an earlier release with the same base, or a day's hundredth release.
+
+Releases count only on the **downstream's line**: the first-parent commits of the publish remote's integration branch that the last synced commit of no upstream contains (see *The sync record*). A tag of release form of the publish remote, with one of `labels`, peeled through an annotated tag, is a release when it points at a commit of that line, and no release otherwise. So the upstream's own tags of the same form on the upstream history below the downstream's first commit, and tags on commits a merge brought in through its second parent, never count. Release tags an earlier tool cut in this form remain releases: list their label in `labels` after the current one.
+
+### Publication
+
+A release is **published** when the forge of the publish remote has a release for its tag. The project's release pipeline creates that forge release as its last step, after everything it publishes, with GitLab's `release` keyword, `glab release create` or `gh release create`; a forge release created earlier would mark the release published before its artifacts exist. git intake only reads forge releases.
+
+The release commands reach the forge of the publish remote in either publication mode, found as in *The forge* (the settings `forge` and `api` apply), and only read the project's releases. On GitLab they send `GITLAB_TOKEN`, or else, in a GitLab CI job whose `CI_SERVER_URL` is on the remote's host, `CI_JOB_TOKEN` as a job token, so a tag pipeline needs no other credential. On GitHub they send the variables of *Tokens*. Without a token they ask without credentials, which a public project answers. A forge that does not show the project's releases is never taken for one without the release: the commands refuse and name the token variables.
+
+### Release commands
+
+The release commands fetch the publish remote's integration branch and its tags into references of their own, applying none of the remote's configured fetch refspecs, and remove them before they exit. They need no local integration branch, run in a CI clone with `HEAD` detached at a tag, and change no local branch or tag except the tag `release tag` creates. Like every command, they refuse a shallow clone.
+
+| Command | Purpose |
+| --- | --- |
+| `release next [--json]` | Shows, for the publish remote's integration tip, its release base and the upstream release it comes from, and either the release at the tip and whether it is published, or the release a tag cut now would take, with the newest release below the tip when that one is not published. Changes nothing. A forge that cannot be read leaves publication unknown. |
+| `release tag` | Cuts a release on the publish remote's integration tip. Without a release at the tip, it creates the next release as an annotated tag on the tip, with the message `Release <version>` and git's configured identity, and pushes only that tag to the publish remote, whatever `push.followTags` or other push settings say, creating it only where the remote lacks it; when the newest release below the tip is not published, it warns and names it. With a published release at the tip, it says so and does nothing. With a release at the tip that is not published, it creates nothing and exits with status 1: that release's pipeline is still running or failed, and a failed release is completed by running its pipeline's failed jobs again. |
+| `release check [TAG]` | Guards a tag pipeline: checks TAG, or else `CI_COMMIT_TAG`, against the publish remote. It reports every problem: the tag is not of release form with the current label, the remote has no such tag, the tag does not point at the checked-out commit, that commit is not on the downstream's line, the tag's base is not that commit's release base, or the tag does not sort after every other release by version and by day and number. Only when it finds none does it ask whether the release is published, which is a problem too: a published release is never written again. Exits with status 1 on a problem. |
+| `release version [--tag TAG] [--json \| --dotenv]` | Prints the version a build makes. For a release tag, named by `--tag` or `CI_COMMIT_TAG`, it is the tag's version, once the tag has the current label and the base of the tagged commit; otherwise it refuses. Without one, it is the rehearsal version `<base>-<label>.<YYYYMMDD>.0` of the checked-out commit, with the UTC day of `CI_PIPELINE_CREATED_AT`, or else of now, which no release takes. `--dotenv` writes `RELEASE_VERSION=<version>` and, for a release tag, `RELEASE_TAG=<tag>`; `--json` an object with `version`, `tag` (null for a rehearsal) and `rehearsal`. |
+| `release notes [TAG]` | Writes the Markdown release notes of TAG, or else `CI_COMMIT_TAG`, to standard output: newest first, the subject of each of the downstream's own commits since the previous release, the newest release before the tag, and each update of an upstream by its name and the upstream tag it took, or else the target's abbreviated commit. The upstream's own commits are not listed. The first release says so, and a release with nothing to list names the previous one. |
+
+`release next`, `release tag` and `status` read the configuration committed at the publish remote's integration tip, which they act on. `release check`, `release version` and `release notes` read it at the checked-out commit, so a tag pipeline run again later behaves as it did, whatever changed on the branch since.
+
+Two runs that compute the same next release race on the push: the tag is created only where the remote lacks it, so the run that pushes second fails without effect, exits with status 2 and says to run it again. Pushing a release tag obeys the rule that pushes never reach an upstream (see *Safety properties*). Pushing it needs a credential whose pushes start the forge's pipeline, as `sync` does.
+
+### Releasing from CI
+
+A scheduled job cuts the release tag; the tag's pipeline checks it, builds with its version and creates the forge release last. On GitLab, protect the release tags (`v*`) so that the tag pipeline gets the protected variables it publishes with, and let the user of the scheduled job's token create them:
+
+```yaml
+variables:
+  GIT_DEPTH: "0"        # the full history; git intake refuses a shallow clone
+
+stages: [check, build, release]
+
+release-tag:
+  stage: release
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - git config user.name "Sakiori"
+    - git config user.email "oss@sakiori.app"
+    # Push with the access token in GITLAB_TOKEN instead of the job token,
+    # whose pushes start no pipeline.
+    - git remote set-url origin "$CI_SERVER_URL/$CI_PROJECT_PATH.git"
+    - git config credential.helper '!f() { echo username=oauth2; echo "password=$GITLAB_TOKEN"; }; f'
+    - git intake release tag
+
+release-check:
+  stage: check
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - git intake release check
+
+# In a tag pipeline, nothing is versioned or built before the check passes.
+version:
+  stage: build
+  needs:
+    - job: release-check
+      optional: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "schedule"
+  script:
+    - git intake release version --dotenv > release.env
+  artifacts:
+    reports:
+      dotenv: release.env
+
+build:
+  stage: build
+  needs:
+    - job: release-check
+      optional: true
+    - version
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "schedule"
+  script:
+    - ./scripts/build.sh "$RELEASE_VERSION"
+
+release-notes:
+  stage: build
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - git intake release notes > release-notes.md
+  artifacts:
+    paths: [release-notes.md]
+
+# The last job: the release is published once the forge release exists.
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/cli:<version>
+  rules:
+    - if: $CI_COMMIT_TAG
+  needs: [release-check, build, release-notes]
+  script:
+    - echo "releasing $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    description: release-notes.md
+```
+
+The tag pipeline needs only `CI_JOB_TOKEN` to read the forge. A branch pipeline gets a rehearsal version from `version`, so every build is versioned the same way. Where the job image has `glab`, `glab release create "$CI_COMMIT_TAG" --notes-file release-notes.md` replaces the `release` keyword. When `release-tag` fails because the release at the tip is not published, run the failed jobs of that release's tag pipeline again; the next scheduled run then finds it published. Once the tip has moved on, `release-tag` cuts the next release and warns about the unpublished one below it, which `release next` and `status` keep naming.
+
+On GitHub Actions, a scheduled workflow runs `git intake release tag` with a GitHub App installation token with *Contents: write*, passed to `actions/checkout` and as `GH_TOKEN`: a tag pushed with the workflow's `GITHUB_TOKEN` starts no workflow. A workflow `on: push: tags: ["v*"]` with `fetch-depth: 0` then runs `git intake release check "$GITHUB_REF_NAME"` with `GH_TOKEN: ${{ github.token }}`, without which a private repository's releases read as hidden and the check refuses, `git intake release version --tag "$GITHUB_REF_NAME" --dotenv >> "$GITHUB_ENV"`, the build, and last `git intake release notes "$GITHUB_REF_NAME" > notes.md` and `gh release create "$GITHUB_REF_NAME" --verify-tag --notes-file notes.md` with `GH_TOKEN: ${{ github.token }}` and `permissions: contents: write`.
+
+`status` shows the release state of the integration tip below the upstreams, as `release next` does, when the configuration carries `[release]`.
+
 ## Commands
 
 | Command | Purpose |
@@ -758,6 +900,7 @@ A follow upstream's **last synced commit** is the target of its newest sync reco
 | `branches [UPSTREAM...] [--json]` | Fetches every branch of the selected upstreams for the command and lists every branch that holds commits the integration branch does not contain, with their number; for a port upstream, commits a copy names as taken do not count. |
 | `doctor [--json]` | Checks the repository and reports each check as pass, fail or warn, changing nothing (see [doctor](#doctor)). |
 | `contribute UPSTREAM[=REV] BRANCH` | Creates the local branch BRANCH at the upstream's fetched tip, or at the commit REV names on its branch, for a contribution to the upstream (see *Contributing to an upstream*). Never pushes. |
+| `release next\|tag\|check\|version\|notes` | Shows, cuts, checks, versions and describes the releases of the integration branch (see *Release commands*). |
 
 `status --check` additionally predicts, with `git merge-tree`, the files a merge of each behind follow upstream's tip, or newest release with `tags`, would conflict in. It creates no worktree, branch or state, and fails unless every upstream is current, so a port upstream with pending commits fails it too. It can run on a schedule and gate a cutover or a port review.
 
@@ -770,6 +913,8 @@ A port upstream shows its journal's base and its numbers of taken, decided and p
 `unavailable` means the upstream could not be fetched, its branch is missing, the tags of an upstream with `tags` could not be listed, or, for a port upstream, its journal is invalid; any upstream that cannot be fetched makes `status` exit with status 1. `path removed` means a synced path upstream, from a record or from history, whose path no longer exists on the integration branch; `start` refuses it and `status --check` counts it as drift. When several states apply, `unavailable` comes first, then `rewritten`, then `path removed`. A path upstream is `not imported` until a sync record for it exists or, without one, while its path is absent or holds content that no merge of the upstream brought in; a root upstream is `not imported` while it shares no history with the integration branch.
 
 In merge-request mode it shows the update's open merge request with its number, address and head and whether the head contains the integration tip, naming `sync` when it does not, and the newest merge request of the update merged without its history; when it cannot read the forge, it says why and keeps its exit status.
+
+With `[release]` it shows what `release next` shows for the publish remote's integration tip; when it cannot read the forge, or the release state at all, it says why and keeps its exit status.
 
 While an update is in progress it also shows the step reached, the base and the base the update started from when a catch-up moved it, the worktree, each queued upstream's target or plan and step, a catch-up merge in conflict or awaiting verification with the tip it catches up with, the update's checks by name, the verified commit, the partial run with its commit, the outcome of each command it ran and the checks it left out, and the next command.
 
@@ -799,7 +944,7 @@ It warns about upstreams that still have sync records but were dropped from the 
 
 ### JSON output
 
-`status`, `report`, `log`, `branches`, `doctor` and `env` accept `--json`. They then write one JSON document to standard output, with the same facts as the text form under stable snake_case field names, and exit with the same status. A URL in the output, as in every message, carries no credentials: a password is never shown, nor the user of an `http` or `https` URL, where a token is usually written; the user of an SSH URL stays. No message shows a token the tool reads, even where a forge's message quotes it. Notes and errors go to standard error. `env --json` prints one object whose keys are the variable names, and `{}` for a commit that carries no update.
+`status`, `report`, `log`, `branches`, `doctor`, `env`, `release next` and `release version` accept `--json`. They then write one JSON document to standard output, with the same facts as the text form under stable snake_case field names, and exit with the same status. A URL in the output, as in every message, carries no credentials: a password is never shown, nor the user of an `http` or `https` URL, where a token is usually written; the user of an SSH URL stays. No message shows a token the tool reads, even where a forge's message quotes it. Notes and errors go to standard error. `env --json` prints one object whose keys are the variable names, and `{}` for a commit that carries no update.
 
 #### status --json
 
@@ -813,6 +958,12 @@ The update's `step` is `plan` while a plan waits to be edited, `commit_failed` w
 
 `base` is the integration tip the update lands on and `start_base` the one it started from. `checks` lists the names of the update's checks, `verified_commit` is the commit a full run verified, or null, and `partial_run` is the update's partial run, or null: its `commit`, `install`, the install command's outcome or null when no install command is configured, `checks`, each check it ran with `name` and `outcome`, `left_out`, the names of the checks it left out, and `passed`. An outcome is `passed`, `failed`, or `skipped` when the install command failed; a check left out appears only in `left_out`.
 
+With `[release]`, `status --json` carries `release`, the object `release next --json` writes, and `release_error`, why the release state could not be read, or null; without it both are null.
+
+#### release next --json
+
+One object: `tip`, the publish remote's integration tip; `base`, its release base; `upstream_release`, the tag of the upstream release the base comes from; `release`, the release at the tip, or null; `published`, whether that release is published, or null without one or when the forge cannot be read; `next`, the release a tag cut now would take, or null when the tip carries one; `unpublished_previous`, when the tip carries no release, the newest release below it if it is not published, or null; and `forge_error`, why the forge could not be read, or null.
+
 #### report --json, log --json and branches --json
 
 `report --json` carries `base`, the integration tip the update started from or was carried on at, `carried_from`, the address of the merge request an update was carried on from, or null, and `catch_ups`, each with `tip`, `merge_commit` and `conflicts`. Each entry of `report --json` `upstreams` carries `mode` and `rev`; a follow upstream fills `kind`, `range_start`, `target`, `tag`, `commits`, `merge_commit`, `conflicts` and the diff sizes, and a port upstream fills `port` with `taken` (each with `commit`, `subject`, `copy`, `copied`, `conflicts`, `left_out` and `earlier_pending`), `unchanged` (each with `commit`, `subject` and `left_out`), `decisions` (each with `commit`, `subject`, `verdict` and `note`), `left_pending` and `journal_commit`. Each entry of `log --json` and `branches --json` carries `mode`; a follow upstream's entry of `log --json` adds `release` and `release_tag`, null without `tags`.
@@ -822,14 +973,14 @@ The update's `step` is `plan` while a plan waits to be edited, `commit_failed` w
 | Status | Meaning |
 | --- | --- |
 | 0 | Success. |
-| 1 | A negative result: `status --check` found drift or pending port commits, an upstream could not be fetched by `status`, `log` or `branches`, a `doctor` check failed, `verify` failed, a partial run included, or `start`/`continue` stopped on conflicts or on the failed commit of a copy. `finish` stopped on the conflicts or the failed checks of a catch-up merge, or because the integration branch moved again while it made or verified one. `sync` stopped on a conflict or on failed checks, or left out a follow upstream it could not take. An open merge request is not a negative result. |
-| 2 | An error: invalid configuration, a refused command (for example `start` with an upstream that cannot be fetched, `continue` with an invalid plan, `verify` with a check name the update does not have, `finish` on an unverified update in push mode, a head with only a partial run included, on a forge whose merge settings do not qualify or without a token, `sync` on a rewritten merge request or a declined branch, or any command in a shallow clone), a forge that rejected the token or a request, a push of the update's branch rejected because another run pushed it first, a catch-up refused because the integration branch was rewritten or its new commits change what the update means, a git failure (including a push rejected by the publish remote, after which `finish` retries the push, catching up first when the remote moved, and `finish --no-publish` closes the update locally), or invalid usage. |
+| 1 | A negative result: `status --check` found drift or pending port commits, an upstream could not be fetched by `status`, `log` or `branches`, a `doctor` check failed, `verify` failed, a partial run included, or `start`/`continue` stopped on conflicts or on the failed commit of a copy. `finish` stopped on the conflicts or the failed checks of a catch-up merge, or because the integration branch moved again while it made or verified one. `sync` stopped on a conflict or on failed checks, or left out a follow upstream it could not take. `release tag` found an unpublished release at the integration tip, or `release check` found a problem. An open merge request is not a negative result. |
+| 2 | An error: invalid configuration, a refused command (for example `start` with an upstream that cannot be fetched, `continue` with an invalid plan, `verify` with a check name the update does not have, `finish` on an unverified update in push mode, a head with only a partial run included, on a forge whose merge settings do not qualify or without a token, `sync` on a rewritten merge request or a declined branch, or any command in a shallow clone), a forge that rejected the token or a request, a push of the update's branch, or of a release tag, rejected because another run pushed it first, a release that breaks the order of releases or whose name the remote already has, a forge whose releases cannot be read by `release tag` or `release check`, or that hides them from `release next`, a catch-up refused because the integration branch was rewritten or its new commits change what the update means, a git failure (including a push rejected by the publish remote, after which `finish` retries the push, catching up first when the remote moved, and `finish --no-publish` closes the update locally), or invalid usage. |
 
 `env -- <command>` exits with the command's status, or with status 2 without running it when it cannot read the variables.
 
 ## Running in CI
 
-A scheduled job runs `git intake sync`; the merge request's own pipeline runs the repository's checks on the update, with the variables `git intake env` gives them. Every command refuses a shallow clone, because a shallow history cuts the integration line off: an upstream's last sync record may lie below the cut, and the tool would plan from the wrong commit without noticing. CI systems clone shallow by default, so set the job to fetch the full history. Install the binary in the job first, as under *Installation*.
+A scheduled job runs `git intake sync`; the merge request's own pipeline runs the repository's checks on the update, with the variables `git intake env` gives them. Releasing from CI is described under *Releasing from CI*. Every command refuses a shallow clone, because a shallow history cuts the integration line off: an upstream's last sync record may lie below the cut, and the tool would plan from the wrong commit without noticing. CI systems clone shallow by default, so set the job to fetch the full history. Install the binary in the job first, as under *Installation*.
 
 The job's clone must push with a credential whose pushes start the forge's pipeline, and the token in the environment must be able to open merge requests (see *Tokens*). The tool commits merges, so the job also sets git's `user.name` and `user.email`.
 
@@ -970,13 +1121,14 @@ Earlier releases kept a git remote per upstream, its remote-tracking branches, a
 ## Safety properties
 
 - The tool never rewrites history and never force-pushes. Local branches only fast-forward, and so does the update branch, through catch-up merges.
+- Updates never change the repository's tags. The release commands create release tags and never move, replace or delete a tag, locally or on the remote: `release tag` pushes only the tag it creates, and only where the remote lacks it.
 - It never pushes to an upstream. The publish remote may not be fetched from or pushed to an upstream's URL, and the tool keeps no remote for an upstream: a reference to an upstream exists only while a command or an update needs it.
 - No file of the main checkout is changed, beyond the fast-forward of a checkout of the integration branch, which never follows a tree that puts anything at the place of the update worktree. The tool removes only the update worktree git registers at its place, reached through directories alone, and leaves anything else there. The update lives in its own worktree, `.worktrees/git-intake/update` in the main worktree (in the git directory of a bare repository), on `git-intake/update`, with its state and plan in `<git-common-dir>/git-intake/`, which every worktree shares and no commit can carry.
 - Each target is fixed when the update starts, and an update keeps the references that hold its targets and planned commits until it ends. What is merged or copied, verified and published is the same commit.
 - In push mode, `finish` moves no ref unless the verified commit is the worktree head, the base is still the integration tip, and the move is a fast-forward. When the integration branch moved, the update first takes the new tip in by a catch-up merge, which is verified before anything moves to it. It validates the move before making it, and it can be resumed.
 - Publication by push pushes exactly the planned commit. Nothing unverified is ever published by a retry, and `finish --no-publish` closes an update that cannot be published.
 - In push mode, only a commit `verify` passed reaches the integration branch. In merge-request mode, only a tree the forge's required pipeline tested can be merged, by anyone the forge's rules bind: the tool publishes only to a forge whose settings guarantee it, read before every push. The update's branch only moves forward, and a branch the tool did not leave is never deleted or overwritten; deletions go under a lease on the commit read.
-- The forge's token is read from the environment only, sent only to the API of the publish remote's own host, and never printed or stored; the publication setting is read from the integration tip, never from an update's head.
+- The forge's token is read from the environment only, sent only to the API of the publish remote's own host, and never printed or stored; the publication setting is read from the integration tip, never from an update's head. The release commands only read the forge.
 - The tool never adds or changes a git remote, and never fetches an upstream through one.
 - A rewritten upstream is detected from the sync record or the port journal and copies, and is not taken.
 - The configuration and a port's journal are read from the committed integration tip, never from a working copy or from the tree being taken in.

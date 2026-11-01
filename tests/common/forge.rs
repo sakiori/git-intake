@@ -105,6 +105,10 @@ pub struct World {
     /// GitHub: the repository's name as GitHub reports it, which differs
     /// from the remote's path once the repository was renamed.
     pub full_name: String,
+    /// The tags that have a release on the forge.
+    pub releases: Vec<String>,
+    /// Whether the project is shown only to a request with a credential.
+    pub private: bool,
     clock: u64,
 }
 
@@ -175,6 +179,8 @@ impl FakeForge {
             stale_lists: 0,
             merge_when: None,
             full_name: format!("{OWNER}/{REPO}"),
+            releases: Vec::new(),
+            private: false,
             clock: 0,
         }));
         let mut mocks = Vec::new();
@@ -381,6 +387,12 @@ impl FakeForge {
         mr.ended = Some(clock);
     }
 
+    /// Creates the forge release of `tag`, as a release pipeline's last job
+    /// does.
+    pub fn publish_release(&self, tag: &str) {
+        self.world().releases.push(tag.to_string());
+    }
+
     /// Sets the description of a merge request, as a person edits it.
     pub fn describe(&self, number: u64, description: &str) {
         let mut w = self.world();
@@ -498,6 +510,13 @@ fn answer(kind: Kind, w: &mut World, req: &Request, bare: &Path, host: &str) -> 
         return reply(*status, json!({ "message": message }));
     }
     let body: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let credential = req
+        .headers()
+        .iter()
+        .any(|(n, _)| ["private-token", "job-token", "authorization"].contains(&n.as_str()));
+    if w.private && !credential {
+        return reply(404, json!({"message": "404 Project Not Found"}));
+    }
     match kind {
         Kind::GitLab => gitlab(w, &method, path, &q, &body, bare, host),
         Kind::GitHub => github(w, &method, path, &q, &body, bare, host),
@@ -547,6 +566,14 @@ fn gitlab(
     let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
     match (method, parts.as_slice()) {
         ("GET", []) => reply(200, w.project.clone()),
+        ("GET", ["releases"]) => reply(
+            200,
+            Value::Array(w.releases.iter().map(|t| json!({"tag_name": t})).collect()),
+        ),
+        ("GET", ["releases", tag]) => match w.releases.iter().find(|t| t.as_str() == *tag) {
+            Some(t) => reply(200, json!({"tag_name": t})),
+            None => reply(404, json!({"message": "404 Not found"})),
+        },
         ("GET", ["merge_requests"]) => {
             if w.stale_lists > 0 {
                 w.stale_lists -= 1;
@@ -680,6 +707,16 @@ fn github(
     let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
     match (method, parts.as_slice()) {
         ("GET", []) => reply(200, w.project.clone()),
+        ("GET", ["releases"]) => reply(
+            200,
+            Value::Array(w.releases.iter().map(|t| json!({"tag_name": t})).collect()),
+        ),
+        ("GET", ["releases", "tags", tag]) => {
+            match w.releases.iter().find(|t| t.as_str() == *tag) {
+                Some(t) => reply(200, json!({"tag_name": t})),
+                None => reply(404, json!({"message": "Not Found"})),
+            }
+        }
         ("GET", ["rules", "branches", _]) => reply(200, w.rules.clone()),
         ("GET", ["branches", b]) => reply(200, json!({"name": b, "protected": w.protected})),
         ("GET", ["branches", _, "protection"]) => match &w.protection {

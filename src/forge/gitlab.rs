@@ -11,7 +11,9 @@ use serde_json::{Value, json};
 use url::Url;
 
 use super::http::{Auth, Client, Method};
-use super::{Forge, Kind, Location, MergeRequest, Review, State, endpoint, instant, text};
+use super::{
+    Forge, Kind, Location, MergeRequest, ReleaseLookup, Review, State, endpoint, instant, text,
+};
 
 /// The longest description GitLab takes.
 const DESCRIPTION_LIMIT: usize = 1_048_576;
@@ -26,10 +28,14 @@ pub struct GitLab {
 
 impl GitLab {
     pub fn new(location: Location) -> Self {
+        let auth = match &location.credential {
+            Some(c) if c.job => Auth::JobToken,
+            _ => Auth::PrivateToken,
+        };
         let client = Client::new(
             location.api.clone(),
-            location.token.clone(),
-            Auth::PrivateToken,
+            location.credential.as_ref().map(|c| c.secret.clone()),
+            auth,
             vec![("Accept", "application/json")],
             "GitLab",
         );
@@ -185,6 +191,24 @@ impl Forge for GitLab {
 
     fn description_limit(&self) -> usize {
         DESCRIPTION_LIMIT
+    }
+
+    // The releases API, unlike the project itself, takes a CI job token.
+    fn release(&self, tag: &str) -> Result<ReleaseLookup> {
+        let list = self.url(&["releases"], &[("per_page", "1")]);
+        let reply = self.client.send(Method::Get, &list, None)?;
+        match reply.status {
+            404 => return Ok(ReleaseLookup::Hidden),
+            _ if reply.success() => {}
+            _ => anyhow::bail!("{}", self.client.refusal(Method::Get, &list, &reply)),
+        }
+        let one = self.url(&["releases", tag], &[]);
+        let reply = self.client.send(Method::Get, &one, None)?;
+        match reply.status {
+            404 => Ok(ReleaseLookup::Unpublished),
+            _ if reply.success() => Ok(ReleaseLookup::Published),
+            _ => anyhow::bail!("{}", self.client.refusal(Method::Get, &one, &reply)),
+        }
     }
 }
 

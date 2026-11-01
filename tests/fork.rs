@@ -906,3 +906,44 @@ fn finish_by_push_names_no_change_when_the_checks_stay() {
     let out = stdout(&f.tool(&["finish"]).success());
     assert!(!out.contains("changes its own checks"), "{out}");
 }
+
+/// Gives the fork's publish remote fetch refspecs that map onto the
+/// repository's own tags and branches, as a mirror clone has; returns the
+/// commit a remote-only branch and tag point at.
+fn mirror_refspecs(f: &Fork) -> String {
+    let env = &f.env;
+    let dir = common::forge(env, &f.publish);
+    let other = env.commit(&dir, &[("other.txt", "o\n")], "other: elsewhere");
+    env.git(
+        &dir,
+        &[
+            "push",
+            "-q",
+            "origin",
+            "HEAD:refs/heads/side",
+            "HEAD:refs/tags/own",
+        ],
+    );
+    env.git(&f.down, &["branch", "side", "main"]);
+    env.git(&f.down, &["tag", "own", "main"]);
+    for spec in [
+        "+refs/tags/*:refs/tags/*",
+        "+refs/heads/side:refs/heads/side",
+        "+refs/heads/*:refs/heads/mirror/*",
+    ] {
+        env.git(&f.down, &["config", "--add", "remote.origin.fetch", spec]);
+    }
+    other
+}
+
+#[test]
+fn fetching_the_publish_remote_leaves_the_repository_s_tags_and_branches() {
+    let f = Fork::new();
+    let local = f.env.rev(&f.down, "main");
+    let other = mirror_refspecs(&f);
+    f.tool(&["start"]).success();
+    assert_eq!(f.env.rev(&f.down, "own^{commit}"), local);
+    assert_eq!(f.env.rev(&f.down, "side"), local);
+    assert!(!f.env.has_rev(&f.down, "refs/heads/mirror/main"));
+    assert_ne!(local, other);
+}

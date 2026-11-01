@@ -15,7 +15,9 @@ use serde_json::{Value, json};
 use url::Url;
 
 use super::http::{Auth, Client, Method};
-use super::{Forge, Kind, Location, MergeRequest, Review, State, endpoint, instant, text};
+use super::{
+    Forge, Kind, Location, MergeRequest, ReleaseLookup, Review, State, endpoint, instant, text,
+};
 
 /// The API version every request asks for.
 pub const API_VERSION: &str = "2022-11-28";
@@ -37,7 +39,7 @@ impl GitHub {
     pub fn new(location: Location) -> Self {
         let client = Client::new(
             location.api.clone(),
-            location.token.clone(),
+            location.credential.as_ref().map(|c| c.secret.clone()),
             Auth::Bearer,
             vec![
                 ("Accept", "application/vnd.github+json"),
@@ -231,6 +233,23 @@ impl Forge for GitHub {
 
     fn description_limit(&self) -> usize {
         DESCRIPTION_LIMIT
+    }
+
+    fn release(&self, tag: &str) -> Result<ReleaseLookup> {
+        let list = self.url(&["releases"], &[("per_page", "1")]);
+        let reply = self.client.send(Method::Get, &list, None)?;
+        match reply.status {
+            404 => return Ok(ReleaseLookup::Hidden),
+            _ if reply.success() => {}
+            _ => anyhow::bail!("{}", self.client.refusal(Method::Get, &list, &reply)),
+        }
+        let one = self.url(&["releases", "tags", tag], &[]);
+        let reply = self.client.send(Method::Get, &one, None)?;
+        match reply.status {
+            404 => Ok(ReleaseLookup::Unpublished),
+            _ if reply.success() => Ok(ReleaseLookup::Published),
+            _ => anyhow::bail!("{}", self.client.refusal(Method::Get, &one, &reply)),
+        }
     }
 }
 

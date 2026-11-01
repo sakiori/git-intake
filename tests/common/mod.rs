@@ -38,6 +38,9 @@ const TOOL_CLEARED: &[&str] = &[
     "GITHUB_TOKEN",
     "GH_ENTERPRISE_TOKEN",
     "GITHUB_ENTERPRISE_TOKEN",
+    "CI_JOB_TOKEN",
+    "CI_COMMIT_TAG",
+    "CI_PIPELINE_CREATED_AT",
     "ALL_PROXY",
     "HTTPS_PROXY",
     "HTTP_PROXY",
@@ -508,6 +511,12 @@ impl Fork {
             "follow",
             Some(forge::Kind::GitLab),
         )
+    }
+
+    /// A fork that publishes by push to a GitLab project, reached as from
+    /// one of its CI jobs.
+    pub fn push_gitlab() -> Self {
+        Self::build(&[FORK_CHECK], "push", "follow", Some(forge::Kind::GitLab))
     }
 
     /// A fork that publishes through pull requests on a GitHub whose

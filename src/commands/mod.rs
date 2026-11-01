@@ -9,6 +9,7 @@ pub mod finish;
 pub mod log;
 pub mod merge_request;
 pub mod port_plan;
+pub mod release;
 pub mod report;
 pub mod status;
 pub mod sync;

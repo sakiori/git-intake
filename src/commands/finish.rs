@@ -567,7 +567,8 @@ fn local_tip(git: &Git, integration: &str) -> Result<String> {
         .with_context(|| format!("the integration branch '{integration}' does not exist"))
 }
 
-/// Fetches the publish remote, refusing with git's reason when it fails.
+/// Fetches the publish remote's branches into its tracking refs, refusing
+/// with git's reason when it fails.
 fn fetch(git: &Git, remote: &str) -> Result<()> {
     if git.remote_url(remote)?.is_none() {
         bail!("the publish remote '{remote}' does not exist");
@@ -575,7 +576,16 @@ fn fetch(git: &Git, remote: &str) -> Result<()> {
     // Read where the remote is fetched from, as every other comparison with
     // its tracking refs is. If the push side is ahead, the push, never
     // forced, is rejected instead.
-    let out = git.raw(&["fetch", "--quiet", "--no-tags", remote])?;
+    // `--refmap=` keeps git from also applying the remote's configured
+    // refspecs, which may map onto local branches and tags.
+    let out = git.raw(&[
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--refmap=",
+        remote,
+        &format!("+refs/heads/*:refs/remotes/{remote}/*"),
+    ])?;
     if !out.success() {
         bail!(
             "cannot fetch the publish remote '{remote}': {}; no branch moved",

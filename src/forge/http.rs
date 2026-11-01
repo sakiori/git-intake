@@ -50,6 +50,8 @@ pub enum Auth {
     PrivateToken,
     /// `Authorization: Bearer <token>`.
     Bearer,
+    /// `JOB-TOKEN: <token>`, as GitLab takes a CI job's token.
+    JobToken,
 }
 
 /// A request method the forge clients use.
@@ -136,7 +138,8 @@ pub struct Client {
     agent: ureq::Agent,
     /// The API base; requests for its host carry the token.
     base: Url,
-    token: Secret,
+    /// `None` asks without credentials.
+    token: Option<Secret>,
     auth: Auth,
     /// Headers every request carries, such as GitHub's API version.
     headers: Vec<(&'static str, &'static str)>,
@@ -147,7 +150,7 @@ pub struct Client {
 impl Client {
     pub fn new(
         base: Url,
-        token: Secret,
+        token: Option<Secret>,
         auth: Auth,
         headers: Vec<(&'static str, &'static str)>,
         forge: &'static str,
@@ -281,11 +284,12 @@ impl Client {
         for (name, value) in &self.headers {
             builder = builder.header(*name, *value);
         }
-        if self.trusted(url) {
+        if let Some(token) = self.token.as_ref().filter(|_| self.trusted(url)) {
             builder = match self.auth {
-                Auth::PrivateToken => builder.header("PRIVATE-TOKEN", self.token.expose()),
+                Auth::PrivateToken => builder.header("PRIVATE-TOKEN", token.expose()),
+                Auth::JobToken => builder.header("JOB-TOKEN", token.expose()),
                 Auth::Bearer => {
-                    builder.header("Authorization", format!("Bearer {}", self.token.expose()))
+                    builder.header("Authorization", format!("Bearer {}", token.expose()))
                 }
             };
         }
@@ -375,7 +379,7 @@ mod tests {
     fn only_the_api_host_is_trusted_with_the_token() {
         let client = Client::new(
             Url::parse("https://gitlab.example.com/api/v4").unwrap(),
-            Secret::new("t".into()),
+            Some(Secret::new("t".into())),
             Auth::PrivateToken,
             Vec::new(),
             "GitLab",

@@ -101,9 +101,40 @@ pub struct Location {
     pub api: Url,
     /// The project's path on the forge, such as `group/sub/app`.
     pub project: String,
-    pub token: Secret,
-    /// The variable the token was read from.
-    pub token_variable: String,
+    /// The token requests carry; `None` asks without credentials.
+    pub credential: Option<Credential>,
+    /// The variables a token for this forge is read from, as messages name
+    /// them.
+    pub token_variables: String,
+}
+
+impl Location {
+    /// The variable the token was read from, or `none`.
+    pub fn token_variable(&self) -> &str {
+        self.credential
+            .as_ref()
+            .map_or("none", |c| c.variable.as_str())
+    }
+}
+
+/// A token read from the environment.
+#[derive(Debug, Clone)]
+pub struct Credential {
+    /// The variable it was read from.
+    pub variable: String,
+    pub secret: Secret,
+    /// Whether it is a GitLab CI job token, sent as one.
+    pub job: bool,
+}
+
+/// What the tool reaches the forge for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Opening, changing and reading merge requests: a token is required.
+    MergeRequests,
+    /// Reading the project's releases: a GitLab CI job token serves, and
+    /// without any token the forge is asked without credentials.
+    Releases,
 }
 
 /// What the location needs from outside: the environment, and the host an
@@ -174,6 +205,7 @@ pub fn locate(
     publish: &Publish,
     url: Option<&str>,
     around: &Surroundings,
+    access: Access,
 ) -> std::result::Result<Location, String> {
     let remote = &publish.remote;
     let Some(url) = url else {
@@ -184,7 +216,11 @@ pub fn locate(
     let Some(parsed) = parse_remote_url(url) else {
         return Err(format!(
             "the URL of the publish remote '{remote}' names no host, so the tool cannot tell its forge; \
-             publication through a merge request needs a remote on GitLab or GitHub"
+             {} needs a remote on GitLab or GitHub",
+            match access {
+                Access::MergeRequests => "publication through a merge request",
+                Access::Releases => "reading the releases of the forge",
+            }
         ));
     };
     let host = parsed.host.clone();
@@ -255,13 +291,39 @@ pub fn locate(
              `<owner>/<repository>`; {SETTINGS_HINT}"
         ));
     }
-    let (token_variable, token) = token(kind, &host, &api, in_job, around)?;
+    let names = token_names(kind, &host, &api, in_job);
+    let mut token_variables = listed(&names);
+    let mut credential = names.iter().find_map(|name| {
+        around.var(name).map(|value| Credential {
+            variable: name.to_string(),
+            secret: Secret::new(value.trim().to_string()),
+            job: false,
+        })
+    });
+    if access == Access::Releases && kind == Kind::GitLab {
+        token_variables.push_str(&format!(
+            ", or {JOB_TOKEN} in a GitLab CI job of the remote's own host"
+        ));
+        if credential.is_none() && in_job {
+            credential = around.var(JOB_TOKEN).map(|value| Credential {
+                variable: JOB_TOKEN.to_string(),
+                secret: Secret::new(value.trim().to_string()),
+                job: true,
+            });
+        }
+    }
+    if credential.is_none() && access == Access::MergeRequests {
+        return Err(format!(
+            "no token for the {} API at {api} is set; set {token_variables} in the environment",
+            kind.name(),
+        ));
+    }
     Ok(Location {
         kind,
         api,
         project,
-        token: Secret::new(token),
-        token_variable,
+        credential,
+        token_variables,
     })
 }
 
@@ -322,6 +384,9 @@ fn project_path(path: &str, api: &Url) -> String {
     }
 }
 
+/// The token of a GitLab CI job.
+const JOB_TOKEN: &str = "CI_JOB_TOKEN";
+
 /// Every variable a token is read from.
 pub const TOKEN_VARIABLES: &[&str] = &[
     "GITLAB_TOKEN",
@@ -329,19 +394,14 @@ pub const TOKEN_VARIABLES: &[&str] = &[
     "GITHUB_TOKEN",
     "GH_ENTERPRISE_TOKEN",
     "GITHUB_ENTERPRISE_TOKEN",
+    JOB_TOKEN,
 ];
 
-/// The token for the forge, from the variables its own command-line tools
-/// read; each is one of [`TOKEN_VARIABLES`].
-fn token(
-    kind: Kind,
-    host: &str,
-    api: &Url,
-    in_job: bool,
-    around: &Surroundings,
-) -> std::result::Result<(String, String), String> {
+/// The variables the token for the forge is read from, in order: those its
+/// own command-line tools read; each is one of [`TOKEN_VARIABLES`].
+fn token_names(kind: Kind, host: &str, api: &Url, in_job: bool) -> Vec<&'static str> {
     let api_host = api.host_str().unwrap_or_default();
-    let names: Vec<&str> = match kind {
+    match kind {
         Kind::GitLab => vec!["GITLAB_TOKEN"],
         Kind::GitHub
             if host == "github.com"
@@ -360,21 +420,16 @@ fn token(
             "GITHUB_TOKEN",
         ],
         Kind::GitHub => vec!["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"],
-    };
-    for name in &names {
-        if let Some(value) = around.var(name) {
-            return Ok((name.to_string(), value.trim().to_string()));
-        }
     }
-    Err(format!(
-        "no token for the {} API at {api} is set; set {} in the environment",
-        kind.name(),
-        match names.as_slice() {
-            [one] => one.to_string(),
-            [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
-            [] => String::new(),
-        }
-    ))
+}
+
+/// Names as a message lists them: `A`, `A, or B`, `A, B, or C`.
+fn listed(names: &[&str]) -> String {
+    match names {
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
+        [] => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -411,6 +466,7 @@ mod tests {
                 env: &env,
                 ssh_host: &ssh,
             },
+            Access::MergeRequests,
         )
     }
 
@@ -448,7 +504,7 @@ mod tests {
         assert_eq!(l.kind, Kind::GitHub);
         assert_eq!(l.project, "team/app");
         assert_eq!(l.api.as_str(), "https://api.github.com/");
-        assert_eq!(l.token_variable, "GH_TOKEN");
+        assert_eq!(l.token_variable(), "GH_TOKEN");
         let l = located(
             &publish(None, None),
             "https://gitlab.com/group/sub/app.git",
@@ -600,6 +656,49 @@ mod tests {
         assert!(located(&p, "git@github.com:team/app.git", &[("GH_TOKEN", "t")]).is_ok());
     }
 
+    fn located_for_releases(url: &str, vars: &[(&str, &str)]) -> Location {
+        let vars: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let env = move |name: &str| vars.get(name).cloned();
+        let ssh = |_: &str| None;
+        locate(
+            &publish(None, None),
+            Some(url),
+            &Surroundings {
+                env: &env,
+                ssh_host: &ssh,
+            },
+            Access::Releases,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn releases_are_read_with_a_job_token_or_without_one() {
+        let job = [
+            ("GITLAB_CI", "true"),
+            ("CI_SERVER_URL", "https://gitlab.example.com"),
+            ("CI_JOB_TOKEN", "job-token"),
+        ];
+        let l = located_for_releases("https://gitlab.example.com/g/app.git", &job);
+        let c = l.credential.unwrap();
+        assert_eq!((c.variable.as_str(), c.job), ("CI_JOB_TOKEN", true));
+        assert!(l.token_variables.contains("GITLAB_TOKEN, or CI_JOB_TOKEN"));
+        // GITLAB_TOKEN comes first.
+        let mut vars = job.to_vec();
+        vars.push(("GITLAB_TOKEN", "t"));
+        let l = located_for_releases("https://gitlab.example.com/g/app.git", &vars);
+        assert_eq!(l.token_variable(), "GITLAB_TOKEN");
+        // A job of another instance gives no token.
+        let l = located_for_releases("https://gitlab.com/g/app.git", &job);
+        assert!(l.credential.is_none());
+        let l = located_for_releases("git@github.com:team/app.git", &[]);
+        assert!(l.credential.is_none());
+        assert_eq!(l.token_variables, "GH_TOKEN, or GITHUB_TOKEN");
+    }
+
     #[test]
     fn tokens_come_from_the_forge_s_variables() {
         let e = located(
@@ -615,7 +714,7 @@ mod tests {
             &[("GITHUB_TOKEN", "b"), ("GH_TOKEN", "")],
         )
         .unwrap();
-        assert_eq!(l.token_variable, "GITHUB_TOKEN");
+        assert_eq!(l.token_variable(), "GITHUB_TOKEN");
         // A GitHub Enterprise Server gets no github.com token outside its
         // own Actions jobs.
         let p = publish(Some(ForgeKind::Github), None);
@@ -642,7 +741,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(l.kind, Kind::GitHub);
-        assert_eq!(l.token_variable, "GITHUB_TOKEN");
+        assert_eq!(l.token_variable(), "GITHUB_TOKEN");
         assert_eq!(l.api.as_str(), "https://github.example.com/api/v3");
     }
 }

@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use crate::Exit;
 use crate::commands::merge_request;
+use crate::commands::release::{self, ReleaseState};
 use crate::commands::update::{
     blocking_prefix, described, next_step, no_release, plural, step_name, unrelated_content,
 };
@@ -52,6 +53,12 @@ pub struct StatusDoc {
     #[serde(skip)]
     pub term: &'static str,
     pub update: Option<UpdateView>,
+    /// With `[release]`: the release state of the publish remote's
+    /// integration tip, as `release next --json` writes it, or `null`.
+    pub release: Option<ReleaseState>,
+    /// With `[release]`: why the release state could not be read, or
+    /// `null`.
+    pub release_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -317,6 +324,17 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
         fetched.push(result);
         tag_lists.push(tags);
     }
+    let mut known = crate::release::Known::default();
+    for ((up, f), tags) in config.upstreams.iter().zip(&fetched).zip(&tag_lists) {
+        if let Ok(tip) = f {
+            known
+                .tips
+                .insert((up.url.clone(), up.branch.clone()), tip.clone());
+        }
+        if let Some(tags) = tags {
+            known.tags.insert(up.url.clone(), tags.clone());
+        }
+    }
     let fetch_failed = fetched.iter().any(|f| f.is_err());
     let tips: Vec<String> = fetched.iter().filter_map(|f| f.clone().ok()).collect();
     let latest = sync_record::latest(git, &sync_record::records(git, &tip, &tips)?)?;
@@ -368,6 +386,14 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
             Err(err) => forge_error = Some(format!("{err:#}")),
         }
     }
+    let (release, release_error) = if config.release.is_some() {
+        match release::state(repo, config, &known, false) {
+            Ok(state) => (Some(state), None),
+            Err(err) => (None, Some(format!("{err:#}"))),
+        }
+    } else {
+        (None, None)
+    };
     let update = match repo.stored()? {
         Some(Stored::Update(state)) => {
             repo.restore_held_references(&state)?;
@@ -395,6 +421,8 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
         forge_error,
         term,
         update,
+        release,
+        release_error,
     };
     emit(&doc, json)?;
     Ok(if fetch_failed || (check && !all_current) {
@@ -858,6 +886,13 @@ impl Render for StatusDoc {
         }
         if let Some(why) = &self.forge_error {
             out.push_str(&format!("\ncannot read the forge: {why}\n"));
+        }
+        if let Some(release) = &self.release {
+            out.push('\n');
+            out.push_str(&release.render());
+        }
+        if let Some(why) = &self.release_error {
+            out.push_str(&format!("\ncannot read the release state: {why}\n"));
         }
         if let Some(update) = &self.update {
             out.push('\n');

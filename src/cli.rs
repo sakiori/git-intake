@@ -9,22 +9,25 @@ use clap::{Parser, Subcommand};
     name = "git-intake",
     bin_name = "git intake",
     version,
-    about = "Verified, resumable updates of a repository from its upstreams",
-    long_about = "Verified, resumable updates of a repository from its upstreams.\n\n\
+    about = "Verified, resumable updates of a repository from its upstreams, and its releases",
+    long_about = "Verified, resumable updates of a repository from its upstreams, and its releases.\n\n\
         Each upstream is fetched by its URL, with no remote kept for it, and taken in one of two modes. \
         In follow mode an update merges it at the repository root or under its own path, with a sync \
         record in the merge commit. In port mode an update copies the upstream commits a plan takes, \
         and a journal on the integration branch records the commits skipped or already present. The \
         work happens in a separate worktree, the repository's own checks run on exactly the tree that \
-        gets published, and the integration branch moves only by fast-forward. The repository \
-        describes itself in a .git-intake.toml committed on its integration branch.",
+        gets published, and the integration branch moves only by fast-forward. With a [release] \
+        table, the release commands cut, check and version releases of the integration branch \
+        whose versions name the upstream release they carry. The repository describes itself in a \
+        .git-intake.toml committed on its integration branch.",
     after_long_help = "Exit status: 0 on success; 1 on a negative result (drift found by status --check, \
         a failed doctor check, a failed verify, an upstream that status, log or branches could not \
         fetch, a stop on conflicts or on the failed commit of a copy, failed checks in finish or \
         sync, an integration branch that moved again while finish made or verified a catch-up \
-        merge, or an upstream sync left out); 2 on an error (invalid configuration, a refused \
-        command, such as start with an upstream that cannot be fetched, a git or forge failure, or \
-        invalid usage). env -- <command> exits with the command's status."
+        merge, an upstream sync left out, a release at the integration tip that release tag finds \
+        unpublished, or a problem release check finds); 2 on an error (invalid configuration, a refused \
+        command, such as start with an upstream that cannot be fetched, a git or forge failure, a \
+        release tag another run pushed first, or invalid usage). env -- <command> exits with the command's status."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -231,6 +234,102 @@ pub enum Command {
         upstream: UpstreamTarget,
         /// The new local branch
         branch: String,
+    },
+    /// Cut, check and version the releases of the integration branch
+    ///
+    /// With a `[release]` table in the configuration, the integration branch is released as
+    /// `v<base>-<label>.<YYYYMMDD>.<n>`. `<base>` is the next patch version after the newest
+    /// release of the release upstream that the commit contains: a tag of that upstream matching
+    /// the release `tags` pattern whose name, after the pattern's literal prefix and an optional
+    /// `v` or `V`, is a semantic version without a prerelease part or build metadata. `<label>`
+    /// is the first of `labels`, `<YYYYMMDD>` the UTC day, and `<n>` one past the highest number
+    /// any tag of release form of that day took, from 1 to 99. Every release sorts after the earlier ones,
+    /// and `YYYYMMDD * 100 + n` grows with every release.
+    ///
+    /// Releases count only on the downstream's line: the first-parent commits of the publish
+    /// remote's integration branch that the last synced commit of no upstream contains. A
+    /// release is published when the forge of the publish remote has a release for its tag,
+    /// which the project's pipeline creates as its last step. The commands read the forge with
+    /// `GITLAB_TOKEN`, or in a GitLab CI job of the remote's own host with `CI_JOB_TOKEN`, and on
+    /// GitHub with the variables `finish` reads; without a token they ask without credentials.
+    ///
+    /// The commands fetch the publish remote's integration branch and tags into references of
+    /// their own; they need no local integration branch and change no local branch or tag, except
+    /// the tag `release tag` creates.
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
+    },
+}
+
+/// The commands of `release`.
+#[derive(Subcommand)]
+pub enum ReleaseCommand {
+    /// Show the release at the publish remote's integration tip, or the release a tag would take
+    ///
+    /// Reads the configuration at the publish remote's integration tip. Shows the tip's release
+    /// base and the upstream release it comes from, and either the release at the tip and whether
+    /// it is published, or the next release and, when the newest release below the tip is not
+    /// published, that release. Changes nothing.
+    Next {
+        /// Write one JSON object to standard output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cut the next release tag on the publish remote's integration tip
+    ///
+    /// Reads the configuration at the publish remote's integration tip. When no release points
+    /// at the tip, creates the next release as an annotated tag `Release <version>` with git's
+    /// identity and pushes only that tag to the publish remote, creating it only where the remote
+    /// lacks it, with a warning when the newest release below the tip is not published. When a
+    /// published release points at the tip, does nothing. When a release that is
+    /// not published points at the tip, creates nothing and exits with status 1: its pipeline is
+    /// still running or failed, and a failed release is completed by running its pipeline's
+    /// failed jobs again. Never moves, replaces or deletes a tag.
+    Tag,
+    /// Check a release tag in its pipeline before anything is built
+    ///
+    /// Reads the configuration at the checked-out commit and checks TAG, or else
+    /// `CI_COMMIT_TAG`: it is of release form with the current label, the publish remote has it,
+    /// it points at the checked-out commit, that commit is on the downstream's line, the tag's
+    /// base is the commit's release base, and it sorts after every other release, by version
+    /// and by day and number. Only then does it ask the forge whether the release is published
+    /// already, which is a problem as well. Exits with status 1 when it finds a problem.
+    Check {
+        /// The release tag; `CI_COMMIT_TAG` when none is given
+        #[arg(value_name = "TAG")]
+        tag: Option<String>,
+    },
+    /// Print the version a build makes
+    ///
+    /// Reads the configuration at the checked-out commit. For a release tag, named by `--tag` or
+    /// `CI_COMMIT_TAG`, prints the tag's version, refusing a tag that is not of release form with
+    /// the current label or whose base is not the release base of the tagged commit. Without one,
+    /// prints the rehearsal version `<base>-<label>.<YYYYMMDD>.0` of the checked-out commit, with
+    /// the UTC day of `CI_PIPELINE_CREATED_AT`, or else of now, which no release ever takes.
+    Version {
+        /// The release tag; `CI_COMMIT_TAG` when none is given
+        #[arg(long, value_name = "TAG")]
+        tag: Option<String>,
+        /// Write one JSON object to standard output
+        #[arg(long, conflicts_with = "dotenv")]
+        json: bool,
+        /// Print `RELEASE_VERSION=<version>` and, for a release tag, `RELEASE_TAG=<tag>`, for a
+        /// GitLab dotenv report or GitHub's environment file
+        #[arg(long)]
+        dotenv: bool,
+    },
+    /// Write the Markdown release notes of a release tag
+    ///
+    /// Reads the configuration at the checked-out commit. For TAG, or else `CI_COMMIT_TAG`,
+    /// lists, newest first, the downstream's own changes since the previous release on the
+    /// integration line: each commit's subject, and each update of an upstream by its name and
+    /// the upstream tag it took, or else the target's abbreviated commit. The first release says
+    /// so instead.
+    Notes {
+        /// The release tag; `CI_COMMIT_TAG` when none is given
+        #[arg(value_name = "TAG")]
+        tag: Option<String>,
     },
 }
 

@@ -476,7 +476,7 @@ fn forge_checks(repo: &Repo, config: &Config, checks: &mut Checks) {
             forge.kind().name(),
             location.project,
             location.api,
-            location.token_variable
+            location.token_variable()
         ),
     );
     if let Err(err) = forge.check_access() {

@@ -111,6 +111,10 @@ pub fn existing(git: &Git) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
+/// The tip of the publish remote's integration branch, and each of its tags
+/// with the commit it points at.
+pub type ReleaseRefs = (String, Vec<(String, String)>);
+
 /// The fetches of one command, into a namespace under
 /// `refs/git-intake/read/` that no other command uses. The namespace is
 /// removed when this is dropped, whatever the command's outcome.
@@ -189,6 +193,59 @@ impl<'r> Fetches<'r> {
         })
     }
 
+    /// Fetches branch `integration` and the tags whose names start with `v`
+    /// of the git remote `remote`, as the release commands read them.
+    /// Returns the branch's tip and each tag with the commit it points at,
+    /// peeled through an annotated tag, or git's error.
+    pub fn release_refs(
+        &mut self,
+        remote: &str,
+        integration: &str,
+    ) -> Result<std::result::Result<ReleaseRefs, String>> {
+        let head = format!("{}release/{remote}/head", self.namespace);
+        let tags = format!("{}release/{remote}/tags/", self.namespace);
+        let out = self.git.raw(&[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--refmap=",
+            "--end-of-options",
+            remote,
+            &format!("+refs/heads/{integration}:{head}"),
+            &format!("+refs/tags/v*:{tags}v*"),
+        ])?;
+        if !out.success() {
+            return Ok(Err(out.into_error().to_string()));
+        }
+        let Some(tip) = self.git.commit(&head)? else {
+            return Ok(Err(format!(
+                "fetching branch '{integration}' from '{remote}' left no commit"
+            )));
+        };
+        let listing = self.git.run(&[
+            "for-each-ref",
+            "--format=%(refname)%09%(objecttype)%09%(objectname)%09%(*objecttype)%09%(*objectname)",
+            &tags,
+        ])?;
+        let mut found = Vec::new();
+        for line in lines(&listing) {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let [name, kind, oid, peeled_kind, peeled] = fields.as_slice() else {
+                continue;
+            };
+            let commit = match (*kind, *peeled_kind) {
+                ("commit", _) => oid,
+                ("tag", "commit") => peeled,
+                _ => continue,
+            };
+            if let Some(name) = name.strip_prefix(&tags) {
+                found.push((name.to_string(), commit.to_string()));
+            }
+        }
+        Ok(Ok((tip, found)))
+    }
+
     fn fetch(&self, up: &Upstream, refspec: &str) -> Result<std::result::Result<(), String>> {
         self.fetch_from(&up.url, refspec)
     }
@@ -199,6 +256,9 @@ impl<'r> Fetches<'r> {
             "--quiet",
             "--no-tags",
             "--no-write-fetch-head",
+            // A git remote's configured refspecs may map onto local branches
+            // and tags; only the refspec given is applied.
+            "--refmap=",
             "--end-of-options",
             source,
             refspec,

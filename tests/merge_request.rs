@@ -939,3 +939,35 @@ fn checks_only_reordered_are_named_as_such() {
         "{description}"
     );
 }
+
+#[test]
+fn reading_the_publish_remote_leaves_the_repository_s_tags_and_branches() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    let local = env.rev(&f.down, "main");
+    let dir = common::forge(env, &f.publish);
+    env.commit(&dir, &[("other.txt", "o\n")], "other: elsewhere");
+    env.git(
+        &dir,
+        &[
+            "push",
+            "-q",
+            "origin",
+            "HEAD:refs/heads/side",
+            "HEAD:refs/tags/own",
+        ],
+    );
+    env.git(&f.down, &["branch", "side", "main"]);
+    env.git(&f.down, &["tag", "own", "main"]);
+    for spec in [
+        "+refs/tags/*:refs/tags/*",
+        "+refs/heads/side:refs/heads/side",
+        "+refs/heads/*:refs/heads/mirror/*",
+    ] {
+        env.git(&f.down, &["config", "--add", "remote.origin.fetch", spec]);
+    }
+    f.tool(&["status"]).success();
+    assert_eq!(env.rev(&f.down, "own^{commit}"), local);
+    assert_eq!(env.rev(&f.down, "side"), local);
+    assert!(!env.has_rev(&f.down, "refs/heads/mirror/main"));
+}

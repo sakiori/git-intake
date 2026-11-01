@@ -3,8 +3,9 @@
 //!
 //! Every command uses the [`Forge`] interface only: it finds the update's
 //! merge requests, opens one, rewrites its title and description, closes
-//! it, and reads whether the project merges only a tree its required
-//! pipeline tested. [`gitlab`] and [`github`] implement it over [`http`].
+//! it, reads whether the project merges only a tree its required pipeline
+//! tested, and reads whether a release exists for a tag. [`gitlab`] and
+//! [`github`] implement it over [`http`].
 
 pub mod github;
 pub mod gitlab;
@@ -17,7 +18,7 @@ use url::Url;
 use crate::config::Publish;
 use crate::git::Git;
 
-pub use locate::{Location, TOKEN_VARIABLES};
+pub use locate::{Access, Location, TOKEN_VARIABLES};
 
 /// A kind of forge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +115,16 @@ pub struct Review {
     pub ci_paths: Vec<String>,
 }
 
+/// Whether the forge has a release for a tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseLookup {
+    Published,
+    Unpublished,
+    /// The forge does not show the project to the credential sent, so its
+    /// releases cannot be read.
+    Hidden,
+}
+
 /// The requests the tool makes of a forge.
 pub trait Forge {
     fn kind(&self) -> Kind;
@@ -157,18 +168,24 @@ pub trait Forge {
 
     /// The longest description the forge takes, in characters.
     fn description_limit(&self) -> usize;
+
+    /// Whether the project has a release for `tag`. The project's list of
+    /// releases is read first, so that a project the forge hides is never
+    /// taken for one without the release.
+    fn release(&self, tag: &str) -> Result<ReleaseLookup>;
 }
 
 /// Reaches the forge of the publish remote that `publish` names, refusing
-/// before anything is pushed when it cannot be located or no token is set.
-pub fn connect(git: &Git, publish: &Publish) -> Result<Box<dyn Forge>> {
+/// before anything is pushed when it cannot be located, or, for merge
+/// requests, no token is set.
+pub fn connect(git: &Git, publish: &Publish, access: Access) -> Result<Box<dyn Forge>> {
     let url = fetch_url(git, &publish.remote)?;
     let env = |name: &str| std::env::var(name).ok();
     let around = locate::Surroundings {
         env: &env,
         ssh_host: &ssh_host,
     };
-    let location = match locate::locate(publish, url.as_deref(), &around) {
+    let location = match locate::locate(publish, url.as_deref(), &around, access) {
         Ok(location) => location,
         Err(why) => bail!("{why}"),
     };

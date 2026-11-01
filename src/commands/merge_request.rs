@@ -45,7 +45,7 @@ fn is_update_branch(branch: &str) -> bool {
 
 /// Reaches the forge of the publish remote, refusing when it cannot.
 pub fn connect(repo: &Repo, publish: &Publish) -> Result<Box<dyn Forge>> {
-    forge::connect(&repo.git, publish)
+    forge::connect(&repo.git, publish, forge::Access::MergeRequests)
 }
 
 /// The update's merge requests as the forge lists them.
@@ -1280,6 +1280,7 @@ pub fn fetch_integration(git: &Git, remote: &str, integration: &str) -> Result<S
         "fetch",
         "--quiet",
         "--no-tags",
+        "--refmap=",
         remote,
         &format!(
             "+{}:{}",
@@ -1429,6 +1430,7 @@ mod tests {
                 })
                 .collect(),
             upstreams: Vec::new(),
+            release: None,
         }
     }
 
