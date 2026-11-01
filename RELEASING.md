@@ -29,7 +29,10 @@ The crate is not published to crates.io yet; see *Publishing on crates.io*.
 - *Settings > General > Visibility*: public, with the package registry visible to everyone, so that the release links download without a token.
 - *Settings > Repository > Protected branches*: `main`, *Allowed to merge*: Maintainers, *Allowed to push and merge*: No one, force push off. Until the first push of `main`, *Allowed to push and merge* is Maintainers (see *The first release*).
 - *Settings > Repository > Protected tags*: `v*`, *Allowed to create*: Maintainers. The release bot user has the Maintainer role and creates every release tag. A tag, once created, is never moved or deleted.
-- *Settings > Merge requests*: merge method *Fast-forward merge* or *Merge commit with semi-linear history*, so that the commit on `main` holds the tree the merge request pipeline tested, and *Pipelines must succeed*.
+- *Settings > Merge requests*:
+  - merge method *Fast-forward merge*, so that the commit on `main` holds the tree the merge request pipeline tested and no merge commit lands beside it;
+  - *Squash commits when merging*: *Require*, so that every merge request, the release merge request included, lands as one commit whose message release-plz reads (see [CONTRIBUTING.md](CONTRIBUTING.md#commits));
+  - *Pipelines must succeed*.
 - *Settings > CI/CD > Variables*: keep *Allow merge request pipelines to access protected variables and runners* off, and set *Minimum role to use pipeline variables* to *No one allowed*, so that no pipeline variable can override the predefined variables the release jobs and the macOS runner check, such as `CI_COMMIT_REF_PROTECTED`.
 - *Settings > CI/CD > Auto DevOps*: off, so that a commit without `.gitlab-ci.yml` starts no pipeline.
 - *Build > Pipeline schedules*: a weekly schedule on `main`, which runs `deny`, so that a new RustSec advisory fails without a change.

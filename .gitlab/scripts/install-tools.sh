@@ -92,9 +92,13 @@ for tool in "$@"; do
       ;;
     release-plz)
       [ "$host" = Linux-x86_64 ] || unpinned
+      # The glibc build, which the release-plz jobs' Debian image runs. In
+      # the musl build, the stack guard of the template parser behind the
+      # changelog reads the main thread's stack as only its mapped part and
+      # refuses every changelog with "stack limit reached".
       version=0.4.2
-      unpack "https://github.com/release-plz/release-plz/releases/download/release-plz-v$version/release-plz-x86_64-unknown-linux-musl.tar.gz" \
-        b13410802d13fc8ecc73120ec370447b21b4ec093c6a722d5a4109bec9ea4920 \
+      unpack "https://github.com/release-plz/release-plz/releases/download/release-plz-v$version/release-plz-x86_64-unknown-linux-gnu.tar.gz" \
+        bd7c3adc1a4ed3831e6bfde51b92b168f32ab6d15cd210ed88044e7f858f0cae \
         release-plz
       ;;
     cosign)

@@ -42,7 +42,7 @@ openspec validate git-intake --type spec --strict
 
 ## Commits
 
-Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `test:`, `ci:`, `chore:` and so on, with `!` for a breaking change). Release versions and the changelog are computed from them, so the type matters: in `0.x` a breaking change raises the minor version, and a feature, fix, performance change or revert (`revert:`, or the `Revert "..."` subject `git revert` writes) the patch version. Other types, such as `docs`, `test`, `ci` or `chore`, ask for no release. Dependency updates follow the same rule: a cargo dependency update changes the shipped binary and is committed as `fix(deps)`, an update of the pipeline's pinned images or tools as `ci`.
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `test:`, `ci:`, `chore:` and so on, with `!` for a breaking change). Release versions and the changelog are computed from them, so the type matters: in `0.x` a breaking change raises the minor version, and a feature, fix, performance change or revert (`revert:`, or the `Revert "..."` subject `git revert` writes) the patch version. Other types, such as `docs`, `test`, `ci` or `chore`, ask for no release. Dependency updates follow the same rule: a cargo dependency update changes the shipped binary and is committed as `fix(deps)`, an update of the pipeline's pinned images or tools as `ci`. A merge request lands on `main` as one squashed commit, and release-plz reads only that commit's message: give the merge request a Conventional Commit title, which GitLab takes as the squash commit message by default, and check the message before merging.
 
 ## Releases
 
