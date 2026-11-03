@@ -376,10 +376,10 @@ publish:
     - .gitlab/scripts/publish.sh
 
 # release-plz on the default branch. RELEASE_PLZ_TOKEN, the personal access
-# token of the release bot user of the group sakiori-oss, a Maintainer of the
-# group, with the api and write_repository scopes, is a protected, masked and
-# hidden variable of the project scoped to the environment release-plz, so
-# that only these jobs receive it. The bot user pushes the release branch
+# token of the release service account of the group sakiori-oss, a Maintainer
+# of the group, with the api and write_repository scopes, is a protected, masked
+# and hidden variable of the project scoped to the environment release-plz, so
+# that only these jobs receive it. The account pushes the release branch
 # and the tag, whose pipeline then releases, and opens the release merge
 # request; the release merge request's commit is authored and committed as
 # Sakiori <oss@sakiori.app>.
