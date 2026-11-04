@@ -2,8 +2,8 @@
 # Installs pinned tools into <dir> after verifying the SHA-256 checksum of
 # each download; there is no fallback to another source or to a build. The
 # executables go to <dir>/bin, zig's distribution beside them. Two hosts run
-# the pipeline's jobs: x86_64 Linux, GitLab.com's shared runners, which run
-# every job but the macOS builds and need every tool but rustup, and arm64
+# the pipeline's jobs: x86_64 Linux, the group's runner, which runs every
+# job but the macOS builds and needs every tool but rustup, and arm64
 # macOS, the project's own runner, which builds the macOS targets and needs
 # only rustup and cargo-about; a tool not pinned for the host is refused. A
 # new version of a tool needs both its version and its checksums below; a

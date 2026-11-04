@@ -24,18 +24,23 @@
 # recovery of a release that stopped. The images are pinned by digest, the
 # tools by version and checksum in .gitlab/scripts/install-tools.sh, and the
 # OpenSpec CLI with its dependencies in .gitlab/openspec. Every job but the
-# macOS builds runs on GitLab.com's x86_64 Linux runners. Apple's SDK license
-# permits building against the SDK only on Apple hardware, so the macOS
-# targets are built natively, with the Xcode Command Line Tools, on the
-# project's own Apple silicon runner, which takes only jobs tagged
-# git-intake-macos, runs them only for protected release tags, and runs each
-# in a fresh macOS virtual machine that is deleted after the job. Every tag
-# pipeline's release job runs only in this project: forks release nothing.
+# macOS builds runs on the group's x86_64 Linux runner, tagged
+# sakiori-oss-linux. Apple's SDK license permits building against the SDK
+# only on Apple hardware, so the macOS targets are built natively, with the
+# Xcode Command Line Tools, on the project's own Apple silicon runner, which
+# takes only jobs tagged git-intake-macos, runs them only for protected release
+# tags, and runs each in a fresh macOS virtual machine that is deleted after the
+# job. Every tag pipeline's release job runs only in this project: forks release
+# nothing.
 
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # The Linux runner keeps a working copy that merge request jobs also use,
+    # so a release clones.
     - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+      variables:
+        GIT_STRATEGY: clone
     - if: $CI_COMMIT_TAG
       when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(push|schedule)$/
@@ -69,6 +74,8 @@ variables:
 
 default:
   image: $RUST_IMAGE
+  tags:
+    - sakiori-oss-linux
   interruptible: true
 
 # The jobs that check a change: in merge request pipelines and pipelines
@@ -77,6 +84,10 @@ default:
   stage: check
   needs: []
   rules:
+    # A new pipeline for a release tag runs the release's jobs alone; these restore
+    # caches that merge request jobs write.
+    - if: $CI_COMMIT_TAG
+      when: never
     - if: $CI_PIPELINE_SOURCE =~ /^(merge_request_event|web|api)$/
   cache:
     key:
@@ -156,6 +167,8 @@ msrv:
 deny:
   extends: .check
   rules:
+    - if: $CI_COMMIT_TAG
+      when: never
     - if: $CI_PIPELINE_SOURCE =~ /^(merge_request_event|web|api|schedule)$/
   cache: []
   script:
@@ -397,12 +410,6 @@ publish:
   variables:
     GIT_DEPTH: 0
     GIT_STRATEGY: clone
-    # Without this flag the runner rewrites every URL of the server, through
-    # an insteadOf rule, to one that carries the job token, which may not
-    # push, and git then never asks for the release token. With it the
-    # runner keeps tokens out of URLs and offers the job token through a
-    # credential helper instead, which the job replaces below.
-    FF_GIT_URLS_WITHOUT_TOKENS: "true"
   before_script:
     - '[ -n "${RELEASE_PLZ_TOKEN:-}" ] || { echo "RELEASE_PLZ_TOKEN is not set; RELEASING.md describes it" >&2; exit 1; }'
     - .gitlab/scripts/install-tools.sh "$TOOLS" release-plz
@@ -418,19 +425,23 @@ publish:
       fi
     - git config user.name Sakiori
     - git config user.email oss@sakiori.app
-    # git pushes with the token, which stays in the environment. The runner's
-    # git configuration, which git reads before these lines, gives the server
-    # a credential helper with the job token; the empty helper clears every
-    # helper configured before it.
+    - git remote set-url origin "$CI_PROJECT_URL.git"
+    # The runner's own git configuration, included from the clone's and from the
+    # global one, carries the job token, which may not push: a rewrite of the
+    # server's URLs into ones with the token, and a credential helper. The job
+    # drops both and answers with the release token alone, which stays in the
+    # environment.
+    - export GIT_CONFIG_GLOBAL="$(mktemp)"
+    - git config --local --unset-all include.path || true
+    - git config --unset-all credential.helper || true
     - git config --add credential.helper ''
     - git config --add credential.helper '!f() { echo username=release-plz; echo "password=$RELEASE_PLZ_TOKEN"; }; f'
-    - git remote set-url origin "$CI_PROJECT_URL.git"
-    # A URL that git rewrites to carry credentials would push without the
-    # release token; the URL itself is not printed.
     - |
       case "$(git remote get-url --push origin)" in
         *@*) echo "git rewrites the push URL to carry credentials; it must reach the server without them" >&2; exit 1 ;;
       esac
+      answer=$(printf 'url=%s\n\n' "$CI_PROJECT_URL.git" | GIT_TERMINAL_PROMPT=0 git credential fill | sed -n 's/^password=//p')
+      [ "$answer" = "$RELEASE_PLZ_TOKEN" ] || { echo "git answers the server with a credential other than RELEASE_PLZ_TOKEN" >&2; exit 1; }
     - export GIT_TOKEN="$RELEASE_PLZ_TOKEN"
 
 release-plz-release:
