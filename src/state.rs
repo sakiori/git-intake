@@ -291,6 +291,10 @@ pub struct FollowMerge {
     /// another tag of the target.
     #[serde(default)]
     pub tag: Option<String>,
+    /// The rule by which the tool chose the target, which the sync record
+    /// names; `None` for a revision a person named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen: Option<crate::sync_record::Chosen>,
     /// The last synced commit before this update, if any.
     pub previous: Option<String>,
     /// Upstream commits the base did not contain.
@@ -989,6 +993,7 @@ mod tests {
             work: Work::Follow(FollowMerge {
                 target: "a".repeat(40),
                 tag: Some("v1.0".into()),
+                chosen: None,
                 previous: None,
                 commits: 3,
                 kind: MergeKind::Root,
@@ -1128,6 +1133,7 @@ mod tests {
                 work: Work::Follow(FollowMerge {
                     target: "a".repeat(40),
                     tag: None,
+                    chosen: None,
                     previous: None,
                     commits: 1,
                     kind: MergeKind::Root,
@@ -1178,6 +1184,7 @@ mod tests {
                 work: Work::Follow(FollowMerge {
                     target: "a".repeat(40),
                     tag: None,
+                    chosen: None,
                     previous: None,
                     commits: 1,
                     kind: MergeKind::Root,
@@ -1193,6 +1200,7 @@ mod tests {
             forge: None,
             api: None,
             queue: None,
+            replace_after: None,
         });
         state.release = Some("0.3.5".into());
         for version in [4, 5] {

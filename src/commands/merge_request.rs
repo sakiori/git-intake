@@ -252,6 +252,9 @@ pub struct Publication<'a> {
     /// The merge request merged without its history whose targets the
     /// update proposes again.
     pub retry_of: Option<&'a MergeRequest>,
+    /// The merge request the update replaces, and the releases that caused
+    /// the replacement.
+    pub replaces: Option<description::Replaces>,
 }
 
 /// How [`publish`] ended.
@@ -277,16 +280,7 @@ pub fn publish(
     let kind = forge.kind();
     let term = kind.term();
     let integration = state.config.integration.clone();
-    let review = forge.review(&integration)?;
-    if !review.refusals.is_empty() {
-        bail!(
-            "the {} project '{}' does not guarantee that only a tree its required pipeline tested is merged, \
-             so the update is not published as a {term}. Nothing was pushed. Change these settings:\n{}",
-            kind.name(),
-            forge.location().project,
-            bullet(&review.refusals)
-        );
-    }
+    let review = require_mergeable(forge, &integration)?;
     let changes = check_changes(&repo.git, state, head, &review.ci_paths)?;
     if !changes.is_empty() {
         say!(
@@ -304,6 +298,7 @@ pub fn publish(
         retry_of: p
             .retry_of
             .map(|m| format!("{} ({})", kind.reference(m.number), m.url)),
+        replaces: p.replaces,
         targets: follow_targets(state),
     };
     let body = description::render(&content, forge.description_limit());
@@ -378,6 +373,25 @@ pub fn publish(
         say!("rewrote the title and description of {}", named(kind, &mr));
     }
     Ok(Published::Done(mr))
+}
+
+/// Reads the forge's settings for merge requests into `integration`,
+/// refusing, before anything is pushed, when they do not guarantee that only
+/// a tree the required pipeline tested is merged.
+pub fn require_mergeable(forge: &dyn Forge, integration: &str) -> Result<forge::Review> {
+    let kind = forge.kind();
+    let review = forge.review(integration)?;
+    if !review.refusals.is_empty() {
+        bail!(
+            "the {} project '{}' does not guarantee that only a tree its required pipeline tested is merged, \
+             so the update is not published as a {}. Nothing was pushed. Change these settings:\n{}",
+            kind.name(),
+            forge.location().project,
+            kind.term(),
+            bullet(&review.refusals)
+        );
+    }
+    Ok(review)
 }
 
 /// Reads the merge request's state and head and the remote's integration
@@ -929,7 +943,7 @@ pub fn withdraw(
     let mut branches: Vec<String> = vec![UPDATE_BRANCH.to_string()];
     branches.extend(also);
     if let Some(open) = &reqs.open {
-        forge.close(open.number)?;
+        forge.close(open.number, None)?;
         say!("closed {}", named(kind, open));
         done = true;
         delete_branch(&repo.git, remote, &open.source, &open.head, upstreams)?;
@@ -1225,6 +1239,7 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
         branch: &branch,
         open: open.as_ref(),
         retry_of: None,
+        replaces: None,
     };
     let published = match &open {
         Some(open) => {

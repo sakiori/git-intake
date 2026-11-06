@@ -447,6 +447,7 @@ mod tests {
             forge,
             api: api.map(str::to_string),
             queue: None,
+            replace_after: None,
         }
     }
 

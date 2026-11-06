@@ -13,7 +13,7 @@ use url::Url;
 use super::http::{Auth, Client, Method};
 use super::{
     Account, Failure, Forge, Kind, Location, Merge, MergeRequest, Pipeline, Queued, ReleaseLookup,
-    Review, State, assigns, endpoint, instant, pipeline_state, text,
+    Review, Signal, State, assigns, endpoint, instant, pipeline_state, signal, text,
 };
 
 /// The merge statuses of a merge request whose mergeability GitLab is still
@@ -138,7 +138,30 @@ fn merge_request(v: &Value) -> Result<MergeRequest> {
         source: text(v, "source_branch"),
         target: text(v, "target_branch"),
         description: text(v, "description"),
+        created_at: instant(v, "created_at"),
         ended_at,
+        // `work_in_progress` is what instances before `draft` answer.
+        draft: v
+            .get("draft")
+            .or_else(|| v.get("work_in_progress"))
+            .and_then(Value::as_bool),
+        assigned: match (v.get("assignees"), v.get("assignee")) {
+            (Some(Value::Array(list)), _) => Some(!list.is_empty()),
+            (_, Some(one)) => Some(!one.is_null()),
+            _ => None,
+        },
+        // GitLab reports every auto-merge, "merge when checks pass"
+        // included, as `merge_when_pipeline_succeeds`.
+        auto_merge: v
+            .get("merge_when_pipeline_succeeds")
+            .and_then(Value::as_bool),
+        review_requested: match v.get("reviewers") {
+            Some(Value::Array(list)) => Some(!list.is_empty()),
+            _ => None,
+        },
+        locked: v.get("state").and_then(Value::as_str) == Some("locked"),
+        // Absent on instances without the feature, which nobody set then.
+        merge_scheduled: v.get("merge_after").is_some_and(|a| !a.is_null()),
     })
 }
 
@@ -229,9 +252,76 @@ impl Forge for GitLab {
         )?)
     }
 
-    fn close(&self, number: u64) -> Result<MergeRequest> {
+    fn close(&self, number: u64, description: Option<&str>) -> Result<MergeRequest> {
         let n = number.to_string();
-        let body = json!({ "state_event": "close" });
+        let mut body = json!({ "state_event": "close" });
+        if let Some(description) = description {
+            body["description"] = description.into();
+        }
+        merge_request(&self.client.json(
+            Method::Put,
+            &self.url(&["merge_requests", &n], &[]),
+            Some(&body),
+        )?)
+    }
+
+    // Every tier answers `approved_by`, which lists each approval whether
+    // or not a rule requires it.
+    fn reviewed(&self, number: u64) -> Result<Signal> {
+        let n = number.to_string();
+        let url = self.url(&["merge_requests", &n, "approvals"], &[]);
+        signal(|| {
+            match self
+                .client
+                .json(Method::Get, &url, None)?
+                .get("approved_by")
+            {
+                Some(Value::Array(list)) => Ok(!list.is_empty()),
+                _ => anyhow::bail!(
+                    "GitLab answered the approvals of merge request !{number} without `approved_by`"
+                ),
+            }
+        })
+    }
+
+    // System notes record pushes, description changes and other events;
+    // every other note, on the diff as well, is someone's comment.
+    fn commented(&self, number: u64) -> Result<Signal> {
+        let n = number.to_string();
+        let url = self.url(
+            &["merge_requests", &n, "notes"],
+            &[("sort", "asc"), ("order_by", "created_at")],
+        );
+        signal(|| {
+            let mut found = false;
+            self.client.pages(&url, "notes", |page| {
+                found = page
+                    .iter()
+                    .any(|note| note.get("system").and_then(Value::as_bool) != Some(true));
+                !found
+            })?;
+            Ok(found)
+        })
+    }
+
+    // Award emoji on the merge request itself; those on its notes belong
+    // to the notes.
+    fn reacted(&self, number: u64) -> Result<Signal> {
+        let n = number.to_string();
+        let url = self.url(&["merge_requests", &n, "award_emoji"], &[]);
+        signal(|| {
+            let mut found = false;
+            self.client.pages(&url, "award emoji", |page| {
+                found = !page.is_empty();
+                false
+            })?;
+            Ok(found)
+        })
+    }
+
+    fn set_description(&self, number: u64, description: &str) -> Result<MergeRequest> {
+        let n = number.to_string();
+        let body = json!({ "description": description });
         merge_request(&self.client.json(
             Method::Put,
             &self.url(&["merge_requests", &n], &[]),
@@ -578,6 +668,30 @@ mod tests {
         assert_eq!(mr.state, State::Merged);
         assert_eq!(mr.ended_at, Some("2026-01-02T00:00:00Z".parse().unwrap()));
         assert_eq!(mr.description, "");
+        // Whatever the answer does not say stays unknown.
+        assert_eq!((mr.draft, mr.assigned, mr.auto_merge), (None, None, None));
+        let open = merge_request(&json!({
+            "iid": 8, "state": "opened", "created_at": "2026-01-01T10:00:00.000Z",
+            "draft": false, "assignees": [], "merge_when_pipeline_succeeds": false
+        }))
+        .unwrap();
+        assert_eq!(
+            open.created_at,
+            Some("2026-01-01T10:00:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            (open.draft, open.assigned, open.auto_merge),
+            (Some(false), Some(false), Some(false))
+        );
+        let touched = merge_request(&json!({
+            "iid": 9, "state": "opened", "work_in_progress": true,
+            "assignee": {"username": "someone"}, "merge_when_pipeline_succeeds": true
+        }))
+        .unwrap();
+        assert_eq!(
+            (touched.draft, touched.assigned, touched.auto_merge),
+            (Some(true), Some(true), Some(true))
+        );
         assert_eq!(
             merge_request(&json!({"iid": 1, "state": "locked"}))
                 .unwrap()

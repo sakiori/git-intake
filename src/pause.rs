@@ -260,15 +260,32 @@ pub fn described(remote: &str, pause: &Pause) -> String {
     )
 }
 
-/// Warns, without stopping anything, of a pause that stands.
-pub fn warn_if_on(repo: &Repo, publish: &Publish, upstreams: &[Upstream]) {
+/// Whether the publish remote records a pause of the merge queue, as far as
+/// its record could be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Paused {
+    No,
+    Recorded,
+    /// The record could not be read, which is never taken for no pause.
+    Unreadable,
+}
+
+/// Warns, without stopping anything, of a pause that stands, and says
+/// whether one does.
+pub fn warn_if_on(repo: &Repo, publish: &Publish, upstreams: &[Upstream]) -> Paused {
     match look(repo, publish, upstreams) {
-        Ok(None) => {}
-        Ok(Some(r)) => esay!("warning: {}", described(&publish.remote, &r.pause)),
-        Err(err) => esay!(
-            "warning: cannot tell whether the merge queue is paused: {}",
-            crate::redact::redacted(&format!("{err:#}"))
-        ),
+        Ok(None) => Paused::No,
+        Ok(Some(r)) => {
+            esay!("warning: {}", described(&publish.remote, &r.pause));
+            Paused::Recorded
+        }
+        Err(err) => {
+            esay!(
+                "warning: cannot tell whether the merge queue is paused: {}",
+                crate::redact::redacted(&format!("{err:#}"))
+            );
+            Paused::Unreadable
+        }
     }
 }
 

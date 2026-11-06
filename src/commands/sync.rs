@@ -4,17 +4,18 @@
 //!
 //! Each run derives everything from the publish remote, its forge and the
 //! upstreams. In merge-request mode, with the update's merge request open,
-//! it catches the merge request up when the integration branch moved past
-//! its head, and otherwise changes nothing. Without one, it plans an update
-//! of every follow upstream that is behind and publishes it as a merge
-//! request, unless the merge request closed or merged most recently was
-//! closed without merging and recorded every target it would merge. In push
-//! mode it starts, verifies and publishes in one run.
+//! it replaces an untouched merge request with an update at a newer release
+//! when `replace_after` lets it, catches the merge request up when the
+//! integration branch moved past its head, and otherwise changes nothing.
+//! Without one, it plans an update of every follow upstream that is behind
+//! and publishes it as a merge request, unless the merge request closed or
+//! merged most recently was closed without merging and recorded every target
+//! it would merge. In push mode it starts, verifies and publishes in one run.
 //!
-//! A conflict, or failed checks in push mode, stops it with the update in
-//! progress, for a person to resolve with `continue` and `finish`. Any
-//! other end leaves no update it created, so that the next run meets the
-//! same situation.
+//! A conflict, except in the merges of a replacement, which are discarded,
+//! or failed checks in push mode, stops it with the update in progress, for
+//! a person to resolve with `continue` and `finish`. Any other end leaves no
+//! update it created, so that the next run meets the same situation.
 
 use std::time::Duration;
 
@@ -28,16 +29,16 @@ use crate::commands::merge_request::{
     require_publishable, unknown_branch,
 };
 use crate::commands::update::{
-    self, Advanced, Fetched, Queued, advance, begin, plural, queue_follow, refuse_leftovers,
-    require_published, step_name,
+    self, Advanced, Fetched, OnConflict, Queued, advance, begin, plural, queue_follow,
+    refuse_leftovers, require_published, step_name,
 };
-use crate::commands::{env, finish, verify};
+use crate::commands::{env, finish, replace, verify};
 use crate::config::{Config, Mode, Publish, PublishVia};
 use crate::description::{self, Targets};
 use crate::forge::{Failure, Forge, MergeRequest, State, patiently};
 use crate::git::{Git, abbrev, branch_ref};
 use crate::output::{esay, say};
-use crate::pause;
+use crate::pause::{self, Paused};
 use crate::port::{self, Standing, Verb};
 use crate::repo::Repo;
 use crate::state::{
@@ -73,14 +74,17 @@ pub fn retry_gap() -> Duration {
 /// messages name it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Caller {
-    Sync,
+    /// `sync`, which read whether the publish remote records a pause of the
+    /// merge queue.
+    Sync(Paused),
+    /// `land`, which never replaces the merge request it lands.
     Land,
 }
 
 impl Caller {
     fn name(self) -> &'static str {
         match self {
-            Caller::Sync => "sync",
+            Caller::Sync(_) => "sync",
             Caller::Land => "land",
         }
     }
@@ -89,7 +93,7 @@ impl Caller {
     /// just before the push.
     fn after_a_change(self) -> &'static str {
         match self {
-            Caller::Sync => "Run the command again",
+            Caller::Sync(_) => "Run the command again",
             Caller::Land => "`git intake land` reads them again",
         }
     }
@@ -347,7 +351,7 @@ fn by_push(repo: &Repo, config: Config) -> Result<Exit> {
     drop(fetches);
     let mut announced = merge_request::Announced::default();
     let verified = (|| -> Result<Option<Exit>> {
-        match advance(repo, &mut state)? {
+        match advance(repo, &mut state, OnConflict::Resolve)? {
             Advanced::Merged => {}
             Advanced::Plan | Advanced::Stopped(_) => return Ok(Some(stopped_on_conflict())),
         }
@@ -394,7 +398,7 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
     let remote = setting.remote.clone();
     crate::forge::refuse_job_token_push(git, &remote)?;
     require_published(repo, &remote, &integration)?;
-    pause::warn_if_on(repo, &setting, &config.upstreams);
+    let paused = pause::warn_if_on(repo, &setting, &config.upstreams);
     let forge = connect(repo, &setting)?;
     let kind = forge.kind();
     let term = kind.term();
@@ -413,7 +417,7 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
             open,
             &tip,
             &mut fetches,
-            Caller::Sync,
+            Caller::Sync(paused),
         );
     }
     let plan = plan(repo, &config, &tip, &mut fetches, true)?;
@@ -461,6 +465,16 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
                     "the branch '{UPDATE_BRANCH}' on '{remote}' at {} holds an update no {term} carries; carrying it on",
                     abbrev(&at)
                 );
+                let replaces = replaced_before(
+                    git,
+                    &config,
+                    kind,
+                    &reqs,
+                    history
+                        .follows
+                        .iter()
+                        .map(|f| (f.name.as_str(), f.target.as_str(), f.tag.as_deref())),
+                )?;
                 let exit = carry_and_publish(
                     repo,
                     config,
@@ -470,7 +484,8 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
                     &history,
                     &tip,
                     None,
-                    Caller::Sync,
+                    replaces,
+                    Caller::Sync(paused),
                 )?;
                 return Ok(worse(exit, plan.exit()));
             }
@@ -513,12 +528,22 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
         retry_of = Some(merged.clone());
     }
     let exit = plan.exit();
+    let replaces = replaced_before(
+        git,
+        &config,
+        kind,
+        &reqs,
+        plan.queue.iter().filter_map(|q| {
+            q.follow()
+                .map(|f| (q.name.as_str(), f.target.as_str(), f.tag.as_deref()))
+        }),
+    )?;
     let worktree = repo.place_update_worktree()?;
     refuse_leftovers(repo, &worktree)?;
     let mut state = begin(repo, config, &tip, worktree, plan.queue)?;
     drop(fetches);
     let published = (|| -> Result<Exit> {
-        match advance(repo, &mut state)? {
+        match advance(repo, &mut state, OnConflict::Resolve)? {
             Advanced::Merged => {}
             Advanced::Plan | Advanced::Stopped(_) => return Ok(stopped_on_conflict()),
         }
@@ -529,6 +554,7 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
             branch: UPDATE_BRANCH,
             open: None,
             retry_of: retry_of.as_ref(),
+            replaces,
         };
         let outcome = publish(repo, &mut state, &head, publication, None)?;
         conclude(repo, &state, outcome)
@@ -541,6 +567,48 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
         Ok(Exit::Success) => Ok(exit),
         Ok(other) => Ok(other),
     }
+}
+
+/// What the description of an update published without an open merge
+/// request says of the merge request a replacement closed, when that is the
+/// one closed or merged most recently: a run that closed it and failed, or
+/// was killed, before it opened the new one. The releases are the targets of
+/// upstreams with `tags` among `targets`, each as name, target and tag, that
+/// the closed merge request's head lacks.
+fn replaced_before<'a>(
+    git: &Git,
+    config: &Config,
+    kind: crate::forge::Kind,
+    reqs: &merge_request::Requests,
+    targets: impl Iterator<Item = (&'a str, &'a str, Option<&'a str>)>,
+) -> Result<Option<description::Replaces>> {
+    let Some(closed) = reqs
+        .latest_ended()
+        .filter(|m| m.state == State::Closed && description::is_replaced(&m.description))
+    else {
+        return Ok(None);
+    };
+    // The closed merge request's head is in the clone when its branch was
+    // fetched; without it, every release counts.
+    let head = match closed.head.as_str() {
+        "" => None,
+        head => git.commit(head)?,
+    };
+    let mut releases = Vec::new();
+    for (name, target, tag) in targets {
+        let tagged = config.upstream(name).is_some_and(|u| u.tags.is_some());
+        let lacks = match &head {
+            Some(head) => !git.is_ancestor(target, head)?,
+            None => true,
+        };
+        if let (true, Some(tag), true) = (tagged, tag, lacks) {
+            releases.push(format!("`{name}` {tag}"));
+        }
+    }
+    Ok(Some(description::Replaces {
+        merge_request: format!("{} ({})", kind.reference(closed.number), closed.url),
+        releases,
+    }))
 }
 
 /// The worse of two exit statuses.
@@ -608,7 +676,57 @@ pub fn sync_open(
             caller.name()
         );
     }
-    if git.is_ancestor(tip, &head)? {
+    // With `replace_after`, the checks that ask nothing of the forge come
+    // first; when none keeps the merge request, `sync` plans the update it
+    // would start from the integration tip, within the conflict limit, and
+    // only then reads the merge request's activity.
+    let mut exit = Exit::Success;
+    let mut planned = None;
+    if let Caller::Sync(paused) = caller
+        && let Some(after) = config
+            .publish
+            .as_ref()
+            .and_then(|p| p.replace_after.clone())
+    {
+        let open_mr = replace::Open {
+            mr: &open,
+            head: &head,
+            history: &history,
+        };
+        let held = replace::screen(git, &config, &open_mr, &after, paused)?;
+        // Nothing starts while the merge request is held, so no target is
+        // worth a prediction per tag.
+        let plan = plan(repo, &config, tip, fetches, held.is_none())?;
+        let decision = replace::decide(
+            git,
+            &config,
+            forge,
+            &open_mr,
+            &plan.queue,
+            !plan.left_out.is_empty(),
+            held,
+            &after,
+        )?;
+        if let replace::Decision::Replace(releases) = decision {
+            match replace_merge_request(
+                repo,
+                config.clone(),
+                forge,
+                remote,
+                &open,
+                &head,
+                tip,
+                plan.queue.clone(),
+                &releases,
+            )? {
+                Replaced::Done(done) => return Ok(worse(done, plan.exit())),
+                Replaced::Conflicted => exit = Exit::Negative,
+            }
+        }
+        planned = Some(plan);
+    }
+    let waits = git.is_ancestor(tip, &head)?;
+    if waits {
         say!(
             "the update waits for the {} at {}, which contains '{}' at {}; nothing changed",
             named(kind, &open),
@@ -616,9 +734,22 @@ pub fn sync_open(
             config.integration,
             abbrev(tip)
         );
-        // Nothing starts, so no target is worth a prediction per tag.
-        let plan = plan(repo, &config, tip, fetches, false)?;
-        for q in &plan.queue {
+    }
+    // A merge request that waits gets the upstreams that moved on named,
+    // which takes a plan; a catch-up fetches no upstream unless a
+    // replacement was planned. Without a replacement to plan, nothing
+    // starts, so no target is worth a prediction per tag. `sync` counts the
+    // follow upstreams a plan left out in its status.
+    let plan = match planned {
+        Some(plan) => Some(plan),
+        None if waits => Some(plan(repo, &config, tip, fetches, false)?),
+        None => None,
+    };
+    if let (Some(plan), Caller::Sync(_)) = (&plan, caller) {
+        exit = worse(exit, plan.exit());
+    }
+    if waits {
+        for q in plan.iter().flat_map(|p| &p.queue) {
             if let Some(f) = q.follow()
                 && !git.is_ancestor(&f.target, &head)?
             {
@@ -629,9 +760,9 @@ pub fn sync_open(
                 );
             }
         }
-        return Ok(Exit::Success);
+        return Ok(exit);
     }
-    carry_and_publish(
+    let caught = carry_and_publish(
         repo,
         config,
         forge,
@@ -640,8 +771,152 @@ pub fn sync_open(
         &history,
         tip,
         Some(&open),
+        None,
         caller,
-    )
+    )?;
+    Ok(worse(caught, exit))
+}
+
+/// How a replacement of the update's merge request ended.
+enum Replaced {
+    /// It ran to an end with this exit status: replaced, or stopped by what
+    /// the forge showed just before the close.
+    Done(Exit),
+    /// Its merges conflicted; nothing was closed or pushed, and the merge
+    /// request stays as it was.
+    Conflicted,
+}
+
+/// Replaces the update's open merge request `open`, whose branch is at
+/// `head`, with an update of `queue` from the integration tip `tip`, which
+/// takes `releases`: merges it locally without the install command or the
+/// checks, reads the merge request and the integration branch again, closes
+/// the merge request with a description that records no targets, deletes
+/// its branch while it is at `head`, and publishes the update from
+/// `git-intake/update` as a new merge request.
+#[allow(clippy::too_many_arguments)]
+fn replace_merge_request(
+    repo: &Repo,
+    config: Config,
+    forge: &dyn Forge,
+    remote: &str,
+    open: &MergeRequest,
+    head: &str,
+    tip: &str,
+    queue: Vec<QueuedUpstream>,
+    releases: &[String],
+) -> Result<Replaced> {
+    let git = &repo.git;
+    let kind = forge.kind();
+    let term = kind.term();
+    let integration = config.integration.clone();
+    say!(
+        "replacing the {} with an update at {}: it is untouched and was opened at least `replace_after` ago",
+        named(kind, open),
+        releases.join(", ")
+    );
+    let worktree = repo.place_update_worktree()?;
+    refuse_leftovers(repo, &worktree)?;
+    let mut state = begin(repo, config, tip, worktree, queue)?;
+    let result = (|| -> Result<Replaced> {
+        match advance(repo, &mut state, OnConflict::Report)? {
+            Advanced::Merged => {}
+            Advanced::Plan | Advanced::Stopped(_) => {
+                let targets: Vec<String> = state
+                    .upstreams
+                    .iter()
+                    .filter_map(|q| {
+                        q.follow().map(|f| {
+                            format!(
+                                "{} at {}",
+                                q.name,
+                                update::described(&f.target, f.tag.as_deref())
+                            )
+                        })
+                    })
+                    .collect();
+                let files: Vec<String> = state
+                    .upstreams
+                    .iter()
+                    .flat_map(|q| q.conflicts().iter().map(|c| format!("`{}`", c.path)))
+                    .collect();
+                say!(
+                    "the replacement of the {} conflicts: merging {} into '{integration}' stopped on conflicts{}. \
+                     The replacement was discarded, nothing was closed or pushed, and the {term} is kept as it is; \
+                     merge it, or withdraw it with `git intake abort --merge-request`, and the next update takes \
+                     {}",
+                    named(kind, open),
+                    targets.join(", "),
+                    if files.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" in {}", files.join(", "))
+                    },
+                    releases.join(", ")
+                );
+                discard(repo, &state)?;
+                return Ok(Replaced::Conflicted);
+            }
+        }
+        let new_head = require_publishable(&state)?;
+        // Settings that refuse the publication refuse it before anything
+        // on the forge changes.
+        merge_request::require_mergeable(forge, &integration)?;
+        let now = match replace::recheck(repo, forge, remote, open, head, tip)? {
+            Ok(now) => now,
+            Err((exit, message)) => {
+                say!("{message}");
+                discard(repo, &state)?;
+                return Ok(Replaced::Done(exit));
+            }
+        };
+        let closed = match replace::close(forge, &now, &description::replaced(term, releases))? {
+            replace::Closed::Done(closed) => closed,
+            replace::Closed::Stopped(exit, message) => {
+                say!("{message}");
+                discard(repo, &state)?;
+                return Ok(Replaced::Done(exit));
+            }
+        };
+        say!(
+            "closed the {} without merging, replaced by the update at {}",
+            named(kind, &closed),
+            releases.join(", ")
+        );
+        let upstreams = crate::identity::Upstreams::new(git, &state.config.upstreams)?;
+        // A branch that remains may go with the next attempt, which finds the
+        // merge request closed and the branch at its head.
+        if delete_branch(git, remote, &open.source, head, &upstreams)? {
+            return Err(Failure::unanswered(format!(
+                "the branch '{}' of the closed {} remains on '{remote}', so the update that replaces it was not \
+                 pushed; run `git intake sync` again, which deletes the branch once it is at {} and opens the {term}",
+                open.source,
+                named(kind, &closed),
+                abbrev(head)
+            ))
+            .into());
+        }
+        let publication = Publication {
+            forge,
+            remote,
+            branch: UPDATE_BRANCH,
+            open: None,
+            retry_of: None,
+            replaces: Some(description::Replaces {
+                merge_request: format!("{} ({})", kind.reference(open.number), open.url),
+                releases: releases.to_vec(),
+            }),
+        };
+        let outcome = publish(repo, &mut state, &new_head, publication, None)?;
+        conclude(repo, &state, outcome).map(Replaced::Done)
+    })();
+    match result {
+        Err(err) => {
+            discard(repo, &state)?;
+            Err(err)
+        }
+        ok => ok,
+    }
 }
 
 /// Carries on the update the branch at `head` holds, catches it up with the
@@ -657,6 +932,7 @@ fn carry_and_publish(
     history: &History,
     tip: &str,
     open: Option<&MergeRequest>,
+    replaces: Option<description::Replaces>,
     caller: Caller,
 ) -> Result<Exit> {
     let git = &repo.git;
@@ -701,6 +977,7 @@ fn carry_and_publish(
             branch: &branch,
             open,
             retry_of: None,
+            replaces,
         };
         let outcome = match open {
             Some(open) => {
@@ -823,6 +1100,7 @@ fn queued(
                     commits: git.count(base, &f.target)?,
                     target: f.target.clone(),
                     tag: f.tag.clone(),
+                    chosen: None,
                     previous: d.previous.clone(),
                     kind,
                     head_before: None,

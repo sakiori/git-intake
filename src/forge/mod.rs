@@ -3,8 +3,9 @@
 //!
 //! Every command uses the [`Forge`] interface only: it finds the update's
 //! merge requests, opens one, rewrites its title and description, closes
-//! it, reads whether the project merges only a tree its required pipeline
-//! tested, reads whether a release exists for a tag, reads the pipeline of
+//! it, reads whether people approved, reviewed or commented on one, reads
+//! whether the project merges only a tree its required pipeline tested,
+//! reads whether a release exists for a tag, reads the pipeline of
 //! a merge request's head, merges it, and reads and changes the assignments
 //! a merge queue works by. [`gitlab`] and [`github`] implement it over
 //! [`http`].
@@ -91,9 +92,32 @@ pub struct MergeRequest {
     pub source: String,
     pub target: String,
     pub description: String,
+    /// When it was opened.
+    pub created_at: Option<jiff::Timestamp>,
     /// When it was merged or closed.
     pub ended_at: Option<jiff::Timestamp>,
+    /// Whether it is marked as a draft; `None` when the forge's answer does
+    /// not say.
+    pub draft: Option<bool>,
+    /// Whether someone is assigned to it; `None` when the forge's answer
+    /// does not say.
+    pub assigned: Option<bool>,
+    /// Whether it is set to merge automatically; `None` when the forge's
+    /// answer does not say.
+    pub auto_merge: Option<bool>,
+    /// Whether anyone is asked to review it, a person or a team; `None`
+    /// when the forge's answer does not say.
+    pub review_requested: Option<bool>,
+    /// GitLab: whether it is `locked`, the moment of its merge.
+    pub locked: bool,
+    /// GitLab: whether someone set a time after which it may be merged,
+    /// `merge_after`, which instances before the field never set.
+    pub merge_scheduled: bool,
 }
+
+/// Whether people left a trace of one kind on a merge request, or, as
+/// `Err`, why the forge did not let the token read it.
+pub type Signal = std::result::Result<bool, String>;
 
 /// A time the forge writes, in RFC 3339, as an instant; `None` when absent
 /// or unreadable.
@@ -225,7 +249,23 @@ pub trait Forge {
     /// again for squashing off.
     fn update(&self, number: u64, title: &str, description: &str) -> Result<MergeRequest>;
 
-    fn close(&self, number: u64) -> Result<MergeRequest>;
+    /// Closes a merge request without merging it, replacing its
+    /// description in the same request when `description` is given.
+    fn close(&self, number: u64, description: Option<&str>) -> Result<MergeRequest>;
+
+    /// Whether anyone approved the merge request, on GitLab, or reviewed
+    /// it in any state, on GitHub.
+    fn reviewed(&self, number: u64) -> Result<Signal>;
+
+    /// Whether the merge request has a comment other than the forge's own
+    /// system notes.
+    fn commented(&self, number: u64) -> Result<Signal>;
+
+    /// Whether anyone reacted to the merge request itself with an emoji.
+    fn reacted(&self, number: u64) -> Result<Signal>;
+
+    /// Replaces the description of a merge request, in any state.
+    fn set_description(&self, number: u64, description: &str) -> Result<MergeRequest>;
 
     /// Reads the settings that decide how a merge request into `target` is
     /// merged.
@@ -342,6 +382,17 @@ pub fn patiently<T>(
 /// no answer, or answered that it cannot serve it now.
 pub fn may_pass(err: &anyhow::Error) -> bool {
     failure(err).is_some_and(|f| matches!(f.status, None | Some(429 | 500..=599)))
+}
+
+/// Reads a signal of a merge request with `read`: what the forge refused, or
+/// answered with something unreadable, is a reason the signal could not be
+/// read, and only what may pass when asked again stays an error.
+fn signal(read: impl FnOnce() -> Result<bool>) -> Result<Signal> {
+    match read() {
+        Ok(found) => Ok(Ok(found)),
+        Err(err) if may_pass(&err) => Err(err),
+        Err(err) => Ok(Err(format!("{err:#}"))),
+    }
 }
 
 /// Whether an error is the forge answering that it has no such thing.
@@ -580,7 +631,14 @@ mod tests {
             source: String::new(),
             target: String::new(),
             description: String::new(),
+            created_at: None,
             ended_at: ended.map(|t| t.parse().unwrap()),
+            draft: None,
+            assigned: None,
+            auto_merge: None,
+            review_requested: None,
+            locked: false,
+            merge_scheduled: false,
         };
         // Across the change to summer time: 03:15+02:00 is 01:15Z, before
         // 01:30Z, though it sorts after it as text; and back to winter

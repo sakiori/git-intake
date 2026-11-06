@@ -17,7 +17,7 @@ use url::Url;
 use super::http::{Auth, Client, Method, PER_PAGE};
 use super::{
     Account, Failure, Forge, Kind, Location, Merge, MergeRequest, Pipeline, PipelineState, Queued,
-    ReleaseLookup, Review, State, endpoint, failure, instant, pipeline_state, text,
+    ReleaseLookup, Review, Signal, State, endpoint, failure, instant, pipeline_state, signal, text,
 };
 
 /// The API version every request asks for.
@@ -92,6 +92,16 @@ impl GitHub {
             .filter(|v| from_the_repository(v))
             .map(pull)
             .collect()
+    }
+
+    /// Whether the list at `url` has an item; its first page tells.
+    fn any(&self, url: &Url, what: &str) -> Result<bool> {
+        let mut found = false;
+        self.client.pages(url, what, |page| {
+            found = !page.is_empty();
+            false
+        })?;
+        Ok(found)
     }
 
     /// The active rules of repository and organisation rulesets for `target`.
@@ -241,10 +251,26 @@ fn pull(v: &Value) -> Result<MergeRequest> {
         source: side("head", "ref"),
         target: side("base", "ref"),
         description: text(v, "body"),
+        created_at: instant(v, "created_at"),
         ended_at: match state {
             State::Open => None,
             _ => instant(v, "closed_at").or(merged_at),
         },
+        draft: v.get("draft").and_then(Value::as_bool),
+        assigned: match v.get("assignees") {
+            Some(Value::Array(list)) => Some(!list.is_empty()),
+            _ => None,
+        },
+        // `auto_merge` is null unless automatic merge is set.
+        auto_merge: v.get("auto_merge").map(|a| !a.is_null()),
+        review_requested: match (v.get("requested_reviewers"), v.get("requested_teams")) {
+            (Some(Value::Array(people)), Some(Value::Array(teams))) => {
+                Some(!people.is_empty() || !teams.is_empty())
+            }
+            _ => None,
+        },
+        locked: false,
+        merge_scheduled: false,
     })
 }
 
@@ -308,8 +334,40 @@ impl Forge for GitHub {
         )?)
     }
 
-    fn close(&self, number: u64) -> Result<MergeRequest> {
-        let body = json!({ "state": "closed" });
+    fn close(&self, number: u64, description: Option<&str>) -> Result<MergeRequest> {
+        let mut body = json!({ "state": "closed" });
+        if let Some(description) = description {
+            body["body"] = description.into();
+        }
+        pull(&self.client.json(
+            Method::Patch,
+            &self.url(&["pulls", &number.to_string()], &[]),
+            Some(&body),
+        )?)
+    }
+
+    // A review in any state counts, a comment-only or pending one as well.
+    fn reviewed(&self, number: u64) -> Result<Signal> {
+        let n = number.to_string();
+        signal(|| self.any(&self.url(&["pulls", &n, "reviews"], &[]), "reviews"))
+    }
+
+    // The conversation of a pull request is its issue's comments; comments
+    // on its diff belong to a review.
+    fn commented(&self, number: u64) -> Result<Signal> {
+        let n = number.to_string();
+        signal(|| self.any(&self.url(&["issues", &n, "comments"], &[]), "comments"))
+    }
+
+    // Reactions on the pull request itself, which GitHub keeps on its
+    // issue; reading them takes *Issues: read*.
+    fn reacted(&self, number: u64) -> Result<Signal> {
+        let n = number.to_string();
+        signal(|| self.any(&self.url(&["issues", &n, "reactions"], &[]), "reactions"))
+    }
+
+    fn set_description(&self, number: u64, description: &str) -> Result<MergeRequest> {
+        let body = json!({ "body": description });
         pull(&self.client.json(
             Method::Patch,
             &self.url(&["pulls", &number.to_string()], &[]),
@@ -872,6 +930,29 @@ mod tests {
         .unwrap();
         assert_eq!(p.state, State::Merged);
         assert_eq!(p.head, "abc");
+        assert_eq!((p.draft, p.assigned, p.auto_merge), (None, None, None));
+        let open = pull(&json!({
+            "number": 5, "state": "open", "created_at": "2026-01-01T10:00:00Z",
+            "draft": false, "assignees": [], "auto_merge": null
+        }))
+        .unwrap();
+        assert_eq!(
+            open.created_at,
+            Some("2026-01-01T10:00:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            (open.draft, open.assigned, open.auto_merge),
+            (Some(false), Some(false), Some(false))
+        );
+        let touched = pull(&json!({
+            "number": 6, "state": "open", "draft": true,
+            "assignees": [{"login": "someone"}], "auto_merge": {"merge_method": "merge"}
+        }))
+        .unwrap();
+        assert_eq!(
+            (touched.draft, touched.assigned, touched.auto_merge),
+            (Some(true), Some(true), Some(true))
+        );
         assert_eq!(p.target, "main");
         assert_eq!(
             pull(&json!({"number": 4, "state": "closed"}))

@@ -23,12 +23,12 @@ use clap::{Parser, Subcommand};
     after_long_help = "Exit status: 0 on success; 1 on a negative result (drift found by status --check, \
         a failed doctor check, a failed verify, an upstream that status, log or branches could not \
         fetch, a stop on conflicts or on the failed commit of a copy, failed checks in finish or \
-        sync, an integration branch that moved again while finish made or verified a catch-up \
-        merge, an upstream sync left out, a failed or canceled pipeline or a catch-up conflict in \
-        land, a release at the integration tip that release tag finds unpublished, or a problem \
-        release check finds); 2 on an error (invalid configuration, a refused command, such as start \
-        with an upstream that cannot be fetched, a git or forge failure, a release tag another run \
-        pushed first, land after its timeout, or invalid usage). env -- <command> exits with the command's status."
+        sync, a replacement that sync found conflicting, an integration branch that moved again while \
+        finish made or verified a catch-up merge, an upstream sync left out, a failed or canceled pipeline \
+        or a catch-up conflict in land, a release at the integration tip that release tag finds \
+        unpublished, or a problem release check finds); 2 on an error (invalid configuration, a refused \
+        command, such as start with an upstream that cannot be fetched, a git or forge failure, a release \
+        tag another run pushed first, land after its timeout, or invalid usage). env -- <command> exits with the command's status."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -145,15 +145,17 @@ pub enum Command {
     /// Take the follow upstreams in without local state, as a scheduled CI job does
     ///
     /// Brings the local integration branch up to date with the publish remote's, creating it when
-    /// missing. In merge-request mode, with the update's merge request open, it catches the
-    /// merge request up with the integration branch when that moved, by a catch-up merge pushed
-    /// without force, and otherwise changes nothing. Without an open merge request it starts an
-    /// update of every follow upstream the integration branch lacks the target of and publishes
-    /// it as `finish` does, unless a person closed the last merge request of those very targets
-    /// without merging it. Merge-request mode runs no install command and no check. In push mode
-    /// it starts, verifies and publishes in one run. Upstreams it cannot take are left out and
-    /// named; port upstreams with pending commits are named, never taken. A conflict, or failed
-    /// checks in push mode, stop it with the update in progress, as `start` stops.
+    /// missing. In merge-request mode, with the update's merge request open, it catches the merge
+    /// request up with the integration branch when that moved, by a catch-up merge pushed without
+    /// force, and otherwise changes nothing; with `replace_after`, it replaces an untouched merge
+    /// request open that long with a new one when an upstream with `tags` published a newer release,
+    /// unless a pause of the merge queue is recorded. Without an open merge request it starts an update
+    /// of every follow upstream the integration branch lacks the target of and publishes it as `finish`
+    /// does, unless a person closed the last merge request of those very targets without merging it.
+    /// Merge-request mode runs no install command and no check. In push mode it starts, verifies and
+    /// publishes in one run. Upstreams it cannot take are left out and named; port upstreams with
+    /// pending commits are named, never taken. A conflict, or failed checks in push mode, stop it with
+    /// the update in progress, as `start` stops.
     Sync,
     /// Carry the update's open merge request to the integration branch
     ///

@@ -22,14 +22,15 @@ use crate::config::{Config, Mode};
 use crate::git::{Git, lines};
 use crate::port::{self, Decision};
 use crate::sync_record::{
-    self, CATCH_UP_TRAILER, TAG_TRAILER, TAKEN_TRAILER, TARGET_TRAILER, UPSTREAM_TRAILER,
+    self, CHOSEN_TRAILER, Chosen, TAG_TRAILER, TAKEN_TRAILER, TARGET_TRAILER, UPSTREAM_TRAILER,
 };
 
 const FIELD: char = '\u{1f}';
 const RECORD: char = '\u{1e}';
 
-/// The commits of the update line from `head` over `base`, head first.
-pub fn walk(git: &Git, head: &str, base: &str) -> Result<Vec<String>> {
+/// The commits of the update line from `head` over `base`, head first, and
+/// the catch-up merges among them.
+fn walk(git: &Git, head: &str, base: &str) -> Result<(Vec<String>, HashSet<String>)> {
     let listing = git.run(&["rev-list", "--parents", head, &format!("^{base}"), "--"])?;
     let parents: HashMap<String, Vec<String>> = listing
         .lines()
@@ -47,7 +48,9 @@ pub fn walk(git: &Git, head: &str, base: &str) -> Result<Vec<String>> {
         Some(p) if p.len() > 1 => sync_record::record_of(git, head)?.is_some(),
         _ => false,
     };
-    Ok(line(head, &parents, &catch_ups, head_record))
+    let line = line(head, &parents, &catch_ups, head_record);
+    let catch_ups = catch_ups.into_iter().filter(|c| line.contains(c)).collect();
+    Ok((line, catch_ups))
 }
 
 /// The line through `parents`, which holds the commits the base lacks.
@@ -110,11 +113,32 @@ pub struct PortTaken {
     pub journal_commit: Option<String>,
 }
 
+/// What one commit of the update line is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineCommit {
+    /// A sync merge of a follow upstream, with the upstream tag it names,
+    /// the rule by which the tool chose its target, when its record names
+    /// one, and its parents.
+    SyncMerge {
+        upstream: String,
+        tag: Option<String>,
+        chosen: Option<Chosen>,
+        parents: Vec<String>,
+    },
+    /// A catch-up merge, with its parents.
+    CatchUp { parents: Vec<String> },
+    /// Anything else: a commit someone pushed, a merge the forge's update
+    /// button made, a copy or a journal change of a port upstream.
+    Other,
+}
+
 /// What an update carries, read from its update line.
 #[derive(Debug, Clone, Default)]
 pub struct History {
     /// Head first.
     pub line: Vec<String>,
+    /// What each commit of `line` is, in its order.
+    pub kinds: Vec<LineCommit>,
     /// In configuration order.
     pub follows: Vec<FollowTaken>,
     /// In configuration order.
@@ -148,8 +172,33 @@ impl History {
 /// Reads what the update at `head` over `base` carries for the upstreams
 /// `config` lists.
 pub fn describe(git: &Git, config: &Config, head: &str, base: &str) -> Result<History> {
-    let line = walk(git, head, base)?;
+    let (line, catch_ups) = walk(git, head, base)?;
     let entries = read_trailers(git, &line)?;
+    let kinds = entries
+        .iter()
+        .map(|e| {
+            let follow = config
+                .upstream(&e.upstream)
+                .is_some_and(|u| u.mode == Mode::Follow);
+            if catch_ups.contains(&e.commit) {
+                LineCommit::CatchUp {
+                    parents: e.parents.clone(),
+                }
+            } else if follow
+                && !e.target.is_empty()
+                && sync_record::is_sync_merge(&e.parents, &e.target)
+            {
+                LineCommit::SyncMerge {
+                    upstream: e.upstream.clone(),
+                    tag: (!e.tag.is_empty()).then(|| e.tag.clone()),
+                    chosen: Chosen::parse(&e.chosen),
+                    parents: e.parents.clone(),
+                }
+            } else {
+                LineCommit::Other
+            }
+        })
+        .collect();
     let mut follows = Vec::new();
     let mut ports = Vec::new();
     for up in &config.upstreams {
@@ -221,6 +270,7 @@ pub fn describe(git: &Git, config: &Config, head: &str, base: &str) -> Result<Hi
     }
     Ok(History {
         line,
+        kinds,
         follows,
         ports,
     })
@@ -298,6 +348,7 @@ struct Entry {
     target: String,
     tag: String,
     taken: String,
+    chosen: String,
 }
 
 /// The trailers of the commits of the line, in its order.
@@ -313,7 +364,7 @@ fn read_trailers(git: &Git, line: &[String]) -> Result<Vec<Entry>> {
         trailer(TARGET_TRAILER),
         trailer(TAG_TRAILER),
         trailer(TAKEN_TRAILER),
-        trailer(CATCH_UP_TRAILER),
+        trailer(CHOSEN_TRAILER),
     );
     let out = git.run_with_input(
         &[
@@ -342,6 +393,7 @@ fn read_trailers(git: &Git, line: &[String]) -> Result<Vec<Entry>> {
                 target: first(f.next()?),
                 tag: first(f.next()?),
                 taken: first(f.next()?),
+                chosen: first(f.next()?),
             })
         })
         .collect())

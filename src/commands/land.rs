@@ -408,6 +408,15 @@ impl Lander<'_> {
                 say!("the {} is merged into '{}'", named(kind, &mr), mr.target);
                 return Ok(Some(Exit::Success));
             }
+            (State::Closed, _) if crate::description::is_replaced(&mr.description) => {
+                say!(
+                    "the {} was closed without merging: `git intake sync` replaced it with an update at a newer \
+                     release, in a new {}. Nothing was merged; `git intake land` lands the new one",
+                    named(kind, &mr),
+                    kind.term()
+                );
+                return Ok(Some(Exit::Success));
+            }
             (State::Closed, Some(_)) => bail!(
                 "{} took the {} to merge, and it was closed without merging",
                 kind.name(),

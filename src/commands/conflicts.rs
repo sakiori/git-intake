@@ -107,16 +107,54 @@ pub fn run(repo: &Repo, since: Option<&str>, globs: &[String], json: bool) -> Re
 /// The files a merge of `parents` conflicts in, sorted; none for the first
 /// import of a path upstream, whose histories share nothing.
 fn recomputed(git: &Git, parents: &[String], path: Option<&str>) -> Result<Vec<String>> {
+    Ok(merged(git, parents, path)?
+        .map(|m| m.conflicts)
+        .unwrap_or_default())
+}
+
+/// The clean merge of `parents`, recomputed, its conflicted files sorted;
+/// `None` for the first import of a path upstream, whose histories share
+/// nothing.
+fn merged(git: &Git, parents: &[String], path: Option<&str>) -> Result<Option<drift::MergeTree>> {
     let [first, second, ..] = parents else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     if git.merge_base(first, second)?.is_none() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-    let mut paths = drift::predict_conflicts(git, first, second, path)?;
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+    let mut merged = drift::merge_tree(git, first, second, path)?;
+    merged.conflicts.sort();
+    merged.conflicts.dedup();
+    Ok(Some(merged))
+}
+
+/// What a person did to a merge beyond merging its parents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ByHand {
+    /// Nothing: its tree is the clean merge of its parents.
+    Nothing,
+    /// It needed a resolution in these files.
+    Resolved(Vec<String>),
+    /// It merged cleanly, but its tree differs from that merge.
+    Changed,
+}
+
+/// What a person did to the merge `commit` of `parents`, recomputed as
+/// `conflicts` recomputes it. The first import of a path upstream counts as
+/// done by the tool.
+pub fn by_hand(git: &Git, commit: &str, parents: &[String], path: Option<&str>) -> Result<ByHand> {
+    let Some(merged) = merged(git, parents, path)? else {
+        return Ok(ByHand::Nothing);
+    };
+    if !merged.conflicts.is_empty() {
+        return Ok(ByHand::Resolved(merged.conflicts));
+    }
+    let tree = git.line(&["rev-parse", &format!("{commit}^{{tree}}")])?;
+    Ok(if tree == merged.tree {
+        ByHand::Nothing
+    } else {
+        ByHand::Changed
+    })
 }
 
 /// The configuration at the integration tip and that tip: the publish

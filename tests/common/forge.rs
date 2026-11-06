@@ -64,6 +64,27 @@ pub struct FakeMr {
     pub merge_error: Option<&'static str>,
     /// The ids of its assignees.
     pub assignees: Vec<u64>,
+    /// When it was opened, in RFC 3339.
+    pub created: String,
+    pub draft: bool,
+    /// Whether it is set to merge automatically.
+    pub auto_merge: bool,
+    /// GitLab: who approved it.
+    pub approvals: Vec<String>,
+    /// GitHub: the states of its reviews.
+    pub reviews: Vec<String>,
+    /// The ids of the people asked to review it.
+    pub reviewers: Vec<u64>,
+    /// GitHub: the teams asked to review it.
+    pub requested_teams: Vec<String>,
+    /// The emoji people reacted to it with.
+    pub reactions: Vec<String>,
+    /// GitLab: whether it is `locked`, the moment of its merge.
+    pub locked: bool,
+    /// GitLab: the time after which it may be merged, as `merge_after`
+    /// says; the key is left out without one, as instances before the
+    /// field answer.
+    pub merge_after: Option<String>,
 }
 
 /// One note on a merge request of the fake forge.
@@ -90,6 +111,14 @@ pub enum Action {
     Merge(u64),
     /// Assigns a merge request to an account, keeping its assignees.
     Assign(u64, u64),
+    /// Closes a merge request without merging it, replacing its description,
+    /// as another run of the tool does.
+    Close(u64, String),
+    /// Sets a merge request to merge automatically, as a person does.
+    AutoMerge(u64),
+    /// Makes actions happen when the next request with a method and a path
+    /// suffix arrives, before it is answered, as [`FakeForge::before_request`].
+    BeforeRequest(String, String, Vec<Action>),
     /// Answers the next requests whose path ends with a suffix with a
     /// failure: method, path suffix, status and how many.
     FailTimes(String, String, u16, usize),
@@ -204,6 +233,15 @@ pub struct World {
     /// A merge request the forge merges once this file exists, as a
     /// person does while the tool runs.
     pub merge_when: Option<(u64, PathBuf)>,
+    /// A merge request a person comments on once this file exists, as
+    /// while the tool runs.
+    pub comment_when: Option<(u64, PathBuf)>,
+    /// What happens once the next request with a method and a path suffix
+    /// arrives, before it is answered.
+    pub before: Vec<(String, String, Vec<Action>)>,
+    /// GitLab: whether a request that closes a merge request leaves its
+    /// description as it was, whatever the request asked.
+    pub close_keeps_description: bool,
     /// GitHub: the repository's name as GitHub reports it, which differs
     /// from the remote's path once the repository was renamed.
     pub full_name: String,
@@ -312,6 +350,9 @@ impl FakeForge {
             redirects: Vec::new(),
             stale_lists: 0,
             merge_when: None,
+            comment_when: None,
+            before: Vec::new(),
+            close_keeps_description: false,
             full_name: format!("{OWNER}/{REPO}"),
             releases: Vec::new(),
             private: false,
@@ -444,6 +485,15 @@ impl FakeForge {
         self.world().hidden = true;
     }
 
+    /// Makes `actions` happen when the next request with `method` whose path
+    /// ends with `suffix` arrives, before it is answered, as when another
+    /// party acts just before it.
+    pub fn before_request(&self, method: &str, suffix: &str, actions: Vec<Action>) {
+        self.world()
+            .before
+            .push((method.into(), suffix.into(), actions));
+    }
+
     /// Makes `actions` happen once the next request with `method` whose path
     /// ends with `suffix` has been answered.
     pub fn on_request(&self, method: &str, suffix: &str, actions: Vec<Action>) {
@@ -523,6 +573,16 @@ impl FakeForge {
             blocked: None,
             merge_error: None,
             assignees: Vec::new(),
+            created: jiff::Timestamp::now().to_string(),
+            draft: false,
+            auto_merge: false,
+            approvals: Vec::new(),
+            reviews: Vec::new(),
+            reviewers: Vec::new(),
+            requested_teams: Vec::new(),
+            reactions: Vec::new(),
+            locked: false,
+            merge_after: None,
         });
         number
     }
@@ -569,6 +629,12 @@ impl FakeForge {
     pub fn edit(&self, number: u64, change: impl FnOnce(&mut FakeMr)) {
         let mut w = self.world();
         change(w.mrs.iter_mut().find(|m| m.number == number).unwrap());
+    }
+
+    /// Makes a merge request `days` old.
+    pub fn age(&self, number: u64, days: i64) {
+        let created = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * days);
+        self.edit(number, |m| m.created = created.to_string());
     }
 
     /// Ends a merge request as `merged` or `closed`, keeping its head.
@@ -623,6 +689,27 @@ impl FakeForge {
             system: false,
             at,
         });
+    }
+
+    /// Adds a system note to merge request `number`, as the forge records an
+    /// event.
+    pub fn add_event(&self, number: u64, body: &str) {
+        let mut w = self.world();
+        w.clock += 1;
+        let at = w.clock;
+        w.notes.push(FakeNote {
+            number,
+            body: body.into(),
+            system: true,
+            at,
+        });
+    }
+
+    /// Removes the notes of merge request `number` that are no system notes.
+    pub fn remove_comments(&self, number: u64) {
+        self.world()
+            .notes
+            .retain(|n| n.number != number || n.system);
     }
 
     /// Scripts the pipeline of `commit`, read by read.
@@ -846,6 +933,29 @@ fn act(w: &mut World, bare: &Path, action: &Action) {
         Action::Merge(number) => {
             merge_mr(w, bare, *number, true);
         }
+        Action::Close(number, description) => {
+            w.clock += 1;
+            let clock = w.clock;
+            if let Some(mr) = w
+                .mrs
+                .iter_mut()
+                .find(|m| m.number == *number && m.state == "open")
+            {
+                mr.head = branch_tip(bare, &mr.source);
+                mr.state = "closed";
+                mr.ended = Some(clock);
+                mr.description = description.clone();
+            }
+        }
+        Action::AutoMerge(number) => {
+            if let Some(mr) = w.mrs.iter_mut().find(|m| m.number == *number) {
+                mr.auto_merge = true;
+            }
+        }
+        Action::BeforeRequest(method, suffix, actions) => {
+            w.before
+                .push((method.clone(), suffix.clone(), actions.clone()));
+        }
         Action::Assign(number, id) => {
             let mut assignees = w
                 .mrs
@@ -967,6 +1077,29 @@ fn answer(kind: Kind, w: &mut World, req: &Request, bare: &Path, host: &str) -> 
             mr.ended = Some(clock);
         }
     }
+    if let Some(at) = w
+        .before
+        .iter()
+        .position(|(m, s, _)| *m == method && path.ends_with(s.as_str()))
+    {
+        let (_, _, actions) = w.before.remove(at);
+        for action in &actions {
+            act(w, bare, action);
+        }
+    }
+    if let Some((number, file)) = w.comment_when.clone()
+        && file.exists()
+    {
+        w.comment_when = None;
+        w.clock += 1;
+        let at = w.clock;
+        w.notes.push(FakeNote {
+            number,
+            body: "Looks good, merging tomorrow".into(),
+            system: false,
+            at,
+        });
+    }
     let hidden = [
         format!("/api/v4/projects/{OWNER}%2F{REPO}"),
         format!("/api/v3/repos/{OWNER}/{REPO}"),
@@ -1037,10 +1170,14 @@ fn head_of(mr: &FakeMr, bare: &Path) -> String {
 }
 
 fn gitlab_mr(mr: &FakeMr, bare: &Path, host: &str) -> Value {
-    json!({
+    let mut v = json!({
         "iid": mr.number,
         "web_url": format!("{host}/{OWNER}/{REPO}/-/merge_requests/{}", mr.number),
-        "state": if mr.state == "open" { "opened" } else { mr.state },
+        "state": match (mr.state, mr.locked) {
+            ("open", true) => "locked",
+            ("open", false) => "opened",
+            (state, _) => state,
+        },
         "sha": head_of(mr, bare),
         "source_branch": mr.source,
         "source_project_id": if mr.fork { 2 } else { 1 },
@@ -1051,7 +1188,15 @@ fn gitlab_mr(mr: &FakeMr, bare: &Path, host: &str) -> Value {
         "merged_at": (mr.state == "merged").then(|| time(mr.ended.unwrap_or(0))),
         "closed_at": (mr.state == "closed").then(|| time(mr.ended.unwrap_or(0))),
         "assignees": mr.assignees.iter().map(|a| json!({"id": a})).collect::<Vec<_>>(),
-    })
+        "created_at": mr.created,
+        "draft": mr.draft,
+        "merge_when_pipeline_succeeds": mr.auto_merge,
+        "reviewers": mr.reviewers.iter().map(|a| json!({"id": a})).collect::<Vec<_>>(),
+    });
+    if let Some(at) = &mr.merge_after {
+        v["merge_after"] = json!(at);
+    }
+    v
 }
 
 /// A merge request as GitLab answers a request for it alone: with its
@@ -1184,6 +1329,30 @@ fn gitlab(
                 None => reply(404, json!({"message": "404 Not found"})),
             }
         }
+        ("GET", ["merge_requests", n, "award_emoji"]) => {
+            match w.mrs.iter().find(|m| m.number.to_string() == *n) {
+                Some(m) => {
+                    let emoji: Vec<Value> =
+                        m.reactions.iter().map(|e| json!({"name": e})).collect();
+                    reply(200, Value::Array(page(&emoji, q)))
+                }
+                None => reply(404, json!({"message": "404 Not found"})),
+            }
+        }
+        ("GET", ["merge_requests", n, "approvals"]) => {
+            match w.mrs.iter().find(|m| m.number.to_string() == *n) {
+                Some(m) => reply(
+                    200,
+                    json!({
+                        "approved": !m.approvals.is_empty(),
+                        "approved_by": m.approvals.iter()
+                            .map(|a| json!({"user": {"username": a}}))
+                            .collect::<Vec<_>>(),
+                    }),
+                ),
+                None => reply(404, json!({"message": "404 Not found"})),
+            }
+        }
         ("GET", ["merge_requests", n, "notes"]) => {
             let mut notes: Vec<&FakeNote> = w
                 .notes
@@ -1302,6 +1471,16 @@ fn gitlab(
                 blocked: None,
                 merge_error: None,
                 assignees: Vec::new(),
+                created: jiff::Timestamp::now().to_string(),
+                draft: false,
+                auto_merge: false,
+                approvals: Vec::new(),
+                reviews: Vec::new(),
+                reviewers: Vec::new(),
+                requested_teams: Vec::new(),
+                reactions: Vec::new(),
+                locked: false,
+                merge_after: None,
             };
             let json = gitlab_mr(&mr, bare, host);
             w.mrs.push(mr);
@@ -1310,13 +1489,18 @@ fn gitlab(
         ("PUT", ["merge_requests", n]) => {
             w.clock += 1;
             let clock = w.clock;
+            let keeps = w.close_keeps_description && body["state_event"] == "close";
             let Some(mr) = w.mrs.iter_mut().find(|m| m.number.to_string() == *n) else {
                 return reply(404, json!({"message": "404 Not found"}));
             };
             if let Some(t) = body["title"].as_str() {
                 mr.title = t.into();
             }
-            if let Some(d) = body["description"].as_str() {
+            let mut events = Vec::new();
+            if let Some(d) = body["description"].as_str().filter(|_| !keeps) {
+                if mr.description != d {
+                    events.push("changed the description");
+                }
                 mr.description = d.into();
             }
             if let Some(s) = body["squash"].as_bool() {
@@ -1326,8 +1510,20 @@ fn gitlab(
                 mr.head = branch_tip(bare, &mr.source);
                 mr.state = "closed";
                 mr.ended = Some(clock);
+                events.push("closed");
             }
             let number = mr.number;
+            // The forge's system notes of what changed.
+            for event in events {
+                w.clock += 1;
+                let at = w.clock;
+                w.notes.push(FakeNote {
+                    number,
+                    body: event.into(),
+                    system: true,
+                    at,
+                });
+            }
             if let Some(ids) = body["assignee_ids"].as_array() {
                 let ids = ids.iter().filter_map(Value::as_u64).collect();
                 set_assignees(w, number, ids);
@@ -1361,6 +1557,16 @@ fn github_pr(mr: &FakeMr, bare: &Path, host: &str, full_name: &str) -> Value {
         "base": {"ref": mr.target, "repo": repo},
         "title": mr.title,
         "body": mr.description,
+        "created_at": mr.created,
+        "draft": mr.draft,
+        "assignees": mr.assignees.iter().map(|a| json!({"id": a})).collect::<Vec<_>>(),
+        "requested_reviewers": mr.reviewers.iter().map(|a| json!({"id": a})).collect::<Vec<_>>(),
+        "requested_teams": mr.requested_teams.iter().map(|s| json!({"slug": s})).collect::<Vec<_>>(),
+        "auto_merge": if mr.auto_merge {
+            json!({"merge_method": "merge"})
+        } else {
+            Value::Null
+        },
     })
 }
 
@@ -1525,16 +1731,34 @@ fn github(
             }
             reply(200, json!({"merged": true, "sha": merged}))
         }
-        ("GET", ["issues", n, "comments"]) => reply(
-            200,
-            Value::Array(
-                w.notes
-                    .iter()
-                    .filter(|x| x.number.to_string() == *n)
-                    .map(|x| json!({"body": x.body, "created_at": time(x.at)}))
-                    .collect(),
-            ),
-        ),
+        ("GET", ["issues", n, "reactions"]) => {
+            match w.mrs.iter().find(|m| m.number.to_string() == *n) {
+                Some(m) => {
+                    let reactions: Vec<Value> =
+                        m.reactions.iter().map(|e| json!({"content": e})).collect();
+                    reply(200, Value::Array(page(&reactions, q)))
+                }
+                None => reply(404, json!({"message": "Not Found"})),
+            }
+        }
+        ("GET", ["pulls", n, "reviews"]) => match w.mrs.iter().find(|m| m.number.to_string() == *n)
+        {
+            Some(m) => {
+                let reviews: Vec<Value> = m.reviews.iter().map(|s| json!({"state": s})).collect();
+                reply(200, Value::Array(page(&reviews, q)))
+            }
+            None => reply(404, json!({"message": "Not Found"})),
+        },
+        // GitHub lists no events of the forge among the comments.
+        ("GET", ["issues", n, "comments"]) => {
+            let comments: Vec<Value> = w
+                .notes
+                .iter()
+                .filter(|x| x.number.to_string() == *n && !x.system)
+                .map(|x| json!({"body": x.body, "created_at": time(x.at)}))
+                .collect();
+            reply(200, Value::Array(page(&comments, q)))
+        }
         ("POST", ["issues", n, "comments"]) => {
             let Ok(number) = n.parse::<u64>() else {
                 return reply(404, json!({"message": "Not Found"}));
@@ -1582,6 +1806,16 @@ fn github(
                 blocked: None,
                 merge_error: None,
                 assignees: Vec::new(),
+                created: jiff::Timestamp::now().to_string(),
+                draft: false,
+                auto_merge: false,
+                approvals: Vec::new(),
+                reviews: Vec::new(),
+                reviewers: Vec::new(),
+                requested_teams: Vec::new(),
+                reactions: Vec::new(),
+                locked: false,
+                merge_after: None,
             };
             let json = github_pr(&mr, bare, host, &w.full_name);
             w.mrs.push(mr);

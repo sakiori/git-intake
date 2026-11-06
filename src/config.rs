@@ -63,6 +63,7 @@ struct RawPublish {
     forge: Option<String>,
     api: Option<String>,
     queue: Option<String>,
+    replace_after: Option<String>,
 }
 
 /// How an upstream is taken.
@@ -133,6 +134,78 @@ pub struct Publish {
     /// merge requests assigned to it, which `land` pauses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
+    /// Merge-request mode: how long the update's merge request stays open
+    /// at least before `sync` may replace it with a newer release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_after: Option<ReplaceAfter>,
+}
+
+/// The shortest time the update's merge request stays open before `sync`
+/// may replace it: a positive duration of whole weeks, days, hours and
+/// minutes, in which a day counts as 24 hours. It keeps the text it was
+/// written as, which messages and the update's state show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ReplaceAfter {
+    text: String,
+    duration: jiff::SignedDuration,
+}
+
+impl ReplaceAfter {
+    /// Reads a duration such as `7d`, `36h`, `2w` or `1d 12h`, refusing
+    /// years and months, which have no fixed length, seconds, and anything
+    /// that is not positive.
+    pub fn parse(text: &str) -> std::result::Result<Self, String> {
+        let refuse = || {
+            format!(
+                "publish replace_after: '{text}' is not a positive duration of weeks, days, hours and minutes; \
+                 write one such as `7d`, `36h`, `2w` or `1d 12h`, in which a day counts as 24 hours"
+            )
+        };
+        let trimmed = text.trim();
+        let span: jiff::Span = trimmed.parse().map_err(|_| refuse())?;
+        let calendar = span.get_years() != 0 || span.get_months() != 0;
+        let below_minutes = span.get_seconds() != 0
+            || span.get_milliseconds() != 0
+            || span.get_microseconds() != 0
+            || span.get_nanoseconds() != 0;
+        if calendar || below_minutes || !span.is_positive() {
+            return Err(refuse());
+        }
+        let duration = span
+            .to_duration(jiff::SpanRelativeTo::days_are_24_hours())
+            .map_err(|_| refuse())?;
+        if !duration.is_positive() {
+            return Err(refuse());
+        }
+        Ok(Self {
+            text: trimmed.to_string(),
+            duration,
+        })
+    }
+
+    /// The duration as it was written.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn duration(&self) -> jiff::SignedDuration {
+        self.duration
+    }
+}
+
+impl TryFrom<String> for ReplaceAfter {
+    type Error = String;
+
+    fn try_from(text: String) -> std::result::Result<Self, String> {
+        Self::parse(&text)
+    }
+}
+
+impl From<ReplaceAfter> for String {
+    fn from(value: ReplaceAfter) -> String {
+        value.text
+    }
 }
 
 /// A validated configuration.
@@ -398,6 +471,9 @@ pub fn parse(text: &str) -> Result<Config> {
     }
 
     check_layout(&integration, &upstreams, &mut problems);
+    if let Some(publish) = &publish {
+        check_replacement(publish, &upstreams, &mut problems);
+    }
     let release = match raw.release {
         None => None,
         Some(value) => parse_release(value, &upstreams, publish.is_some(), &mut problems),
@@ -723,12 +799,17 @@ fn parse_publish(value: toml::Value) -> std::result::Result<Publish, String> {
         }
         Some(account) => Some(check_account(account)?),
     };
+    let replace_after = match raw.replace_after.as_deref() {
+        None => None,
+        Some(text) => Some(ReplaceAfter::parse(text)?),
+    };
     Ok(Publish {
         remote: raw.remote,
         via: raw.via,
         forge,
         api,
         queue,
+        replace_after,
     })
 }
 
@@ -747,6 +828,32 @@ fn check_account(account: &str) -> std::result::Result<String, String> {
         ));
     }
     Ok(account.to_string())
+}
+
+/// Refuses `replace_after` where it would do nothing: in push mode, which
+/// opens no merge request, and without a follow upstream with `tags`, whose
+/// releases alone trigger a replacement.
+fn check_replacement(publish: &Publish, upstreams: &[Upstream], problems: &mut Vec<String>) {
+    let Some(after) = &publish.replace_after else {
+        return;
+    };
+    if publish.via != PublishVia::MergeRequest {
+        problems.push(format!(
+            "publish replace_after: '{}' replaces the update's merge request, which needs merge-request mode; \
+             set `via = \"merge-request\"` or remove `replace_after`",
+            after.text()
+        ));
+    }
+    if !upstreams
+        .iter()
+        .any(|u| u.mode == Mode::Follow && u.tags.is_some())
+    {
+        problems.push(format!(
+            "publish replace_after: '{}' does nothing here: only a newer release of a follow upstream with `tags` \
+             triggers a replacement, and no follow upstream has `tags`",
+            after.text()
+        ));
+    }
 }
 
 /// Validates the setting `api`: an `https` URL with a host, without
@@ -1011,6 +1118,7 @@ via = "merge-request"
                 forge: None,
                 api: None,
                 queue: None,
+                replace_after: None,
             })
         );
         assert_eq!(
@@ -1544,6 +1652,91 @@ via = "merge-request"
             e.contains("publish queue: 'merge bot' is not an account name"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn replace_after_reads_weeks_days_hours_and_minutes() {
+        for (text, hours) in [
+            ("7d", 168),
+            ("36h", 36),
+            ("2w", 336),
+            ("1d 12h", 36),
+            (" 3 days ", 72),
+            ("1w 1d", 192),
+        ] {
+            let after = ReplaceAfter::parse(text).unwrap();
+            assert_eq!(after.text(), text.trim());
+            assert_eq!(
+                after.duration(),
+                jiff::SignedDuration::from_hours(hours),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            ReplaceAfter::parse("90m").unwrap().duration(),
+            jiff::SignedDuration::from_mins(90)
+        );
+        for text in [
+            "0d", "-7d", "1 month", "1y", "soon", "", "7d ago", "30s", "1h 30s",
+        ] {
+            let e = ReplaceAfter::parse(text).unwrap_err();
+            assert!(
+                e.contains(&format!("publish replace_after: '{text}'")),
+                "{e}"
+            );
+            assert!(e.contains("`7d`, `36h`, `2w` or `1d 12h`"), "{e}");
+        }
+    }
+
+    #[test]
+    fn replace_after_needs_merge_requests_and_a_release_upstream() {
+        let tagged = "[[upstream]]\nname = \"a\"\nurl = \"https://example.com/a.git\"\nbranch = \"main\"\n\
+                      path = \"apps/a\"\ntags = \"v*\"\n";
+        let cfg = parse(&format!(
+            "integration = \"main\"\n{tagged}{UP_B}[publish]\nremote = \"origin\"\nvia = \"merge-request\"\n\
+             replace_after = \"7d\"\n"
+        ))
+        .unwrap();
+        let after = cfg.publish.unwrap().replace_after.unwrap();
+        assert_eq!(after.duration(), jiff::SignedDuration::from_hours(168));
+        // The update's state keeps it as written.
+        assert_eq!(serde_json::to_value(&after).unwrap(), "7d");
+        assert_eq!(
+            serde_json::from_value::<ReplaceAfter>("7d".into()).unwrap(),
+            after
+        );
+
+        let e = err(&format!(
+            "integration = \"main\"\n{tagged}[publish]\nremote = \"origin\"\nvia = \"push\"\n\
+             replace_after = \"7d\"\n"
+        ));
+        assert!(e.contains("publish replace_after: '7d'"), "{e}");
+        assert!(e.contains("needs merge-request mode"), "{e}");
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\n\
+             replace_after = \"7d\"\n"
+        ));
+        assert!(e.contains("needs merge-request mode"), "{e}");
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}{UP_B}[publish]\nremote = \"origin\"\nvia = \"merge-request\"\n\
+             replace_after = \"7d\"\n"
+        ));
+        assert!(e.contains("publish replace_after: '7d'"), "{e}");
+        assert!(
+            e.contains("only a newer release of a follow upstream with `tags`"),
+            "{e}"
+        );
+        for bad in ["0d", "-7d", "1 month", "soon"] {
+            let e = err(&format!(
+                "integration = \"main\"\n{tagged}[publish]\nremote = \"origin\"\nvia = \"merge-request\"\n\
+                 replace_after = \"{bad}\"\n"
+            ));
+            assert!(
+                e.contains(&format!("publish replace_after: '{bad}'")),
+                "{e}"
+            );
+            assert!(e.contains("`7d`, `36h`, `2w` or `1d 12h`"), "{e}");
+        }
     }
 
     #[test]

@@ -7,12 +7,17 @@
 //! merge request closed without merging to tell the targets a person
 //! declined, and from a merged one to tell whether the merge kept the
 //! update's history. A description without a readable block, as one written
-//! by an earlier release or edited by hand, records nothing.
+//! by an earlier release or edited by hand, or the note a replaced merge
+//! request gets, records nothing.
 
 use std::collections::BTreeMap;
 
 /// How the hidden block starts.
 const BLOCK_START: &str = "<!-- git-intake targets";
+
+/// The first line of the description of a merge request a replacement
+/// closed.
+const REPLACED: &str = "Upstream update by git intake, replaced.";
 /// How it ends.
 const BLOCK_END: &str = "-->";
 
@@ -34,7 +39,20 @@ pub struct Content {
     /// The merge request merged without its history whose targets this one
     /// proposes again, as `!5 (<address>)`.
     pub retry_of: Option<String>,
+    /// The merge request this one replaces, and the releases that caused
+    /// the replacement.
+    pub replaces: Option<Replaces>,
     pub targets: Targets,
+}
+
+/// What the description of a merge request that replaces another says of
+/// it.
+#[derive(Debug, Clone, Default)]
+pub struct Replaces {
+    /// The replaced merge request, as `!5 (<address>)`.
+    pub merge_request: String,
+    /// Each newer release, such as `` `app` v1.3.0 ``.
+    pub releases: Vec<String>,
 }
 
 /// The title of the merge request of an update of `names`.
@@ -72,6 +90,18 @@ pub fn render(content: &Content, limit: usize) -> String {
              sync records never landed; this {term} proposes the same targets again, and merging it records them.\n"
         ));
     }
+    if let Some(replaces) = &content.replaces {
+        body.push_str(&format!(
+            "\nThis {term} replaces the {term} {}, on which, as far as the forge reported, nobody had approved, \
+             reviewed, commented or otherwise acted: git intake closed it without merging when {} came out, so \
+             that the review starts from the newest release. Nothing of it was merged.\n",
+            replaces.merge_request,
+            match replaces.releases.is_empty() {
+                true => "newer releases".to_string(),
+                false => replaces.releases.join(", "),
+            }
+        ));
+    }
     let block = block(&content.targets);
     let total = body.chars().count() + 1 + block.chars().count();
     if total > limit {
@@ -82,6 +112,24 @@ pub fn render(content: &Content, limit: usize) -> String {
         body.push_str(NOTE);
     }
     format!("{body}\n{block}")
+}
+
+/// The description a merge request gets when `sync` closes it to replace it
+/// with an update at `releases`. It records no targets, so it declines
+/// nothing.
+pub fn replaced(term: &str, releases: &[String]) -> String {
+    format!(
+        "{REPLACED}\n\nThis {term} was untouched when {} came out, so git intake \
+         closed it without merging and proposed an update at the newer release{} in a new {term}. Nothing of it was \
+         merged; its changes are part of the new {term}, which is reviewed from scratch.\n",
+        releases.join(", "),
+        if releases.len() == 1 { "" } else { "s" }
+    )
+}
+
+/// Whether `description` is the one [`replaced`] writes.
+pub fn is_replaced(description: &str) -> bool {
+    description.starts_with(REPLACED)
 }
 
 /// The hidden block recording each follow target.
@@ -131,6 +179,7 @@ mod tests {
             integration: "main".into(),
             check_changes: vec!["`.github/workflows/ci.yml`".into()],
             retry_of: Some("#5 (https://github.com/team/app/pull/5)".into()),
+            replaces: None,
             targets,
         }
     }
@@ -185,6 +234,47 @@ mod tests {
         assert!(text.chars().count() <= 4000, "{}", text.chars().count());
         assert!(text.contains("The description was shortened"), "{text}");
         assert_eq!(targets(&text), Some(c.targets));
+    }
+
+    #[test]
+    fn a_replacement_names_the_replaced_merge_request_and_the_releases() {
+        let mut c = content();
+        c.retry_of = None;
+        c.replaces = Some(Replaces {
+            merge_request: "#5 (https://github.com/team/app/pull/5)".into(),
+            releases: vec!["`app-a` v1.3.0".into()],
+        });
+        let text = render(&c, 65_536);
+        assert!(
+            text.contains(
+                "This pull request replaces the pull request #5 (https://github.com/team/app/pull/5)"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("when `app-a` v1.3.0 came out"), "{text}");
+        assert_eq!(targets(&text), Some(c.targets));
+    }
+
+    #[test]
+    fn a_replaced_merge_request_records_no_targets() {
+        let text = replaced(
+            "merge request",
+            &["`app-a` v1.4.0".into(), "`app.b` v2.0.0".into()],
+        );
+        assert!(text.contains("closed it without merging"), "{text}");
+        assert!(text.contains("Nothing of it was merged"), "{text}");
+        assert!(
+            text.contains("`app-a` v1.4.0, `app.b` v2.0.0 came out"),
+            "{text}"
+        );
+        assert!(
+            text.contains("at the newer releases in a new merge request"),
+            "{text}"
+        );
+        assert!(!text.contains(BLOCK_START), "{text}");
+        assert_eq!(targets(&text), None);
+        assert!(is_replaced(&text));
+        assert!(!is_replaced(&render(&content(), 65_536)));
     }
 
     #[test]

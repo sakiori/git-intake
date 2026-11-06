@@ -233,6 +233,20 @@ pub fn predict_conflicts(
     tip: &str,
     path: Option<&str>,
 ) -> Result<Vec<String>> {
+    Ok(merge_tree(git, integration_tip, tip, path)?.conflicts)
+}
+
+/// What `git merge-tree` makes of a merge of `theirs` into `ours`.
+pub struct MergeTree {
+    /// The tree it wrote, with conflict markers where it conflicts.
+    pub tree: String,
+    /// The files it conflicts in.
+    pub conflicts: Vec<String>,
+}
+
+/// Merges `theirs` into `ours` with `git merge-tree`, under `path` as a
+/// subtree merge when given, without touching any ref, index or worktree.
+pub fn merge_tree(git: &Git, ours: &str, theirs: &str, path: Option<&str>) -> Result<MergeTree> {
     let mut args: Vec<String> = vec![
         "merge-tree".into(),
         "--write-tree".into(),
@@ -244,20 +258,25 @@ pub fn predict_conflicts(
         args.push("-X".into());
         args.push(format!("subtree={p}"));
     }
-    args.push(integration_tip.into());
-    args.push(tip.into());
+    args.push(ours.into());
+    args.push(theirs.into());
     let out = git.raw(&args)?;
+    // `<tree>\0<path>\0<path>\0\0`: the conflicted paths end at the first
+    // empty entry.
+    let mut fields = out.stdout.split('\0');
+    let tree = fields.next().unwrap_or_default().trim().to_string();
     match out.code {
-        Some(0) => Ok(Vec::new()),
-        // `<tree>\0<path>\0<path>\0\0`: the conflicted paths end at the
-        // first empty entry.
-        Some(1) => Ok(out
-            .stdout
-            .split('\0')
-            .skip(1)
-            .take_while(|p| !p.is_empty())
-            .map(str::to_string)
-            .collect()),
+        Some(0) => Ok(MergeTree {
+            tree,
+            conflicts: Vec::new(),
+        }),
+        Some(1) => Ok(MergeTree {
+            tree,
+            conflicts: fields
+                .take_while(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect(),
+        }),
         _ => Err(out.into_error().into()),
     }
 }

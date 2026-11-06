@@ -215,9 +215,11 @@ fn merge_log_configuration_does_not_break_the_record() {
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
     let msg = env.git(&f.down, &["log", "-1", "--format=%B", "main"]);
+    // The record's trailers end the message, with no shortlog after them.
     assert!(
-        msg.trim_end()
-            .ends_with(&format!("Intake-Target: {target}")),
+        msg.trim_end().ends_with(&format!(
+            "Intake-Target: {target}\nIntake-Chosen: branch-tip"
+        )),
         "{msg}"
     );
     let status = env.tool_json(&f.down, &["status", "--json"], 0);

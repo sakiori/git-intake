@@ -20,6 +20,45 @@ pub const TAKEN_TRAILER: &str = "Intake-Taken";
 /// Marks a catch-up merge, naming the integration branch whose tip it took
 /// into the update.
 pub const CATCH_UP_TRAILER: &str = "Intake-Catch-Up";
+/// Names the rule by which the tool chose the target of a sync merge; a
+/// merge without it took a revision a person named, or was made by an
+/// earlier release.
+pub const CHOSEN_TRAILER: &str = "Intake-Chosen";
+
+/// The rule by which the tool chose the target of a follow upstream when no
+/// revision was named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Chosen {
+    /// The newest release of an upstream with `tags`.
+    NewestRelease,
+    /// The tag `max_conflicts` selected.
+    ConflictLimit,
+    /// The fetched tip of an upstream without `tags`.
+    BranchTip,
+}
+
+impl Chosen {
+    /// The value of [`CHOSEN_TRAILER`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Chosen::NewestRelease => "newest-release",
+            Chosen::ConflictLimit => "conflict-limit",
+            Chosen::BranchTip => "branch-tip",
+        }
+    }
+
+    /// Reads a value of [`CHOSEN_TRAILER`].
+    pub fn parse(value: &str) -> Option<Self> {
+        [
+            Chosen::NewestRelease,
+            Chosen::ConflictLimit,
+            Chosen::BranchTip,
+        ]
+        .into_iter()
+        .find(|c| c.as_str() == value)
+    }
+}
 
 const FIELD: char = '\u{1f}';
 const RECORD: char = '\u{1e}';
@@ -35,22 +74,28 @@ pub struct Record {
 }
 
 /// The commit message of a sync merge, naming the upstream tag `tag` of the
-/// target when one points at it.
+/// target when one points at it, and the rule `chosen` by which the tool
+/// chose the target when no revision was named.
 pub fn message(
     name: &str,
     source: &str,
     short_target: &str,
     target: &str,
     tag: Option<&str>,
+    chosen: Option<Chosen>,
 ) -> String {
-    match tag {
+    let mut out = match tag {
         None => format!(
             "sync({name}): merge {source} at {short_target}\n\n{UPSTREAM_TRAILER}: {name}\n{TARGET_TRAILER}: {target}\n"
         ),
         Some(tag) => format!(
             "sync({name}): merge {source} at {short_target} ({tag})\n\n{UPSTREAM_TRAILER}: {name}\n{TARGET_TRAILER}: {target}\n{TAG_TRAILER}: {tag}\n"
         ),
+    };
+    if let Some(chosen) = chosen {
+        out.push_str(&format!("{CHOSEN_TRAILER}: {}\n", chosen.as_str()));
     }
+    out
 }
 
 /// The commit message of a catch-up merge of the integration branch
@@ -418,7 +463,7 @@ mod tests {
 
     #[test]
     fn message_has_subject_and_trailers() {
-        let m = message("app-a", "app-a/main", "abc1234", "abc1234ffff", None);
+        let m = message("app-a", "app-a/main", "abc1234", "abc1234ffff", None, None);
         assert_eq!(
             m,
             "sync(app-a): merge app-a/main at abc1234\n\nIntake-Upstream: app-a\nIntake-Target: abc1234ffff\n"
@@ -429,11 +474,14 @@ mod tests {
             "abc1234",
             "abc1234ffff",
             Some("v1.2.0"),
+            Some(Chosen::NewestRelease),
         );
         assert_eq!(
             m,
-            "sync(app-a): merge app-a/main at abc1234 (v1.2.0)\n\nIntake-Upstream: app-a\nIntake-Target: abc1234ffff\nIntake-Tag: v1.2.0\n"
+            "sync(app-a): merge app-a/main at abc1234 (v1.2.0)\n\nIntake-Upstream: app-a\nIntake-Target: abc1234ffff\nIntake-Tag: v1.2.0\nIntake-Chosen: newest-release\n"
         );
+        assert_eq!(Chosen::parse("conflict-limit"), Some(Chosen::ConflictLimit));
+        assert_eq!(Chosen::parse("v1.2.0"), None);
     }
 
     #[test]

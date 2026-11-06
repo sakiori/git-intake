@@ -152,6 +152,20 @@ fn an_unreachable_upstream_is_left_out_and_the_others_taken() {
     let fake = m.forge.as_ref().unwrap();
     assert_eq!(fake.mr(1).title, "Merge upstream update: app-a");
     env.assert_no_update(&m.down);
+
+    // While the merge request waits, the upstream is still left out.
+    fake.clear_requests();
+    let out = stdout(&m.tool(&["sync"]).code(1));
+    assert!(
+        out.contains("the update waits for the merge request !1"),
+        "{out}"
+    );
+    assert!(
+        out.contains("left out: upstream 'app-b' cannot be fetched"),
+        "{out}"
+    );
+    assert!(fake.changes().is_empty(), "{:?}", fake.changes());
+    env.assert_no_update(&m.down);
 }
 
 #[test]

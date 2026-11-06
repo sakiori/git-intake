@@ -34,6 +34,9 @@ pub struct StatusDoc {
     pub publish: Option<String>,
     /// `push` or `merge_request`; `null` without a publish remote.
     pub publish_via: Option<String>,
+    /// Merge-request mode: `replace_after` as the configuration writes it,
+    /// or `null`.
+    pub replace_after: Option<String>,
     pub install: Option<String>,
     /// The checks of the configuration at the integration tip, each with its
     /// `name` and the command it runs, `run`.
@@ -466,6 +469,11 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
             .publish
             .as_ref()
             .map(|p| p.via.as_str().replace('-', "_")),
+        replace_after: config
+            .publish
+            .as_ref()
+            .and_then(|p| p.replace_after.as_ref())
+            .map(|a| a.text().to_string()),
         install: config.install.clone(),
         checks: config.checks.clone(),
         config_working_copy_differs: loaded.working_copy_differs,
@@ -821,8 +829,12 @@ fn config_lines(doc: &StatusDoc, out: &mut String) {
     ));
     match (&doc.publish, &doc.publish_via) {
         (Some(remote), Some(via)) => out.push_str(&format!(
-            "publish: {remote} (via {})\n",
-            via.replace('_', " ")
+            "publish: {remote} (via {}{})\n",
+            via.replace('_', " "),
+            doc.replace_after
+                .as_deref()
+                .map(|a| format!(", replacing an untouched {} after {a}", doc.term))
+                .unwrap_or_default()
         )),
         _ => out.push_str("publish: none\n"),
     }

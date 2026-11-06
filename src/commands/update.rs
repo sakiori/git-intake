@@ -21,7 +21,7 @@ use crate::state::{
     CatchUpStep, ConflictFile, CopyStep, FollowMerge, MergeKind, PlannedCommit, PortPlan,
     QueuedUpstream, Resolution, Stored, UPDATE_BRANCH, UpdateState, UpstreamStep, Work,
 };
-use crate::sync_record::{self, Record};
+use crate::sync_record::{self, Chosen, Record};
 use crate::tags::{self, TagPattern, UpstreamTags};
 use crate::target;
 use crate::upstreams::{self, Fetches};
@@ -355,14 +355,14 @@ pub fn queue_follow(
         Ok(pattern) => pattern,
         Err(why) => bail!("upstream '{}' tags: {why}", up.name),
     };
-    let (target, tag) = match (&rev, &pattern) {
+    let (target, tag, chosen) = match (&rev, &pattern) {
         (Some(rev), _) => match target::resolve(git, &repo.here, up, tags, rev, tip)? {
             Ok(resolved) => {
                 let tag = resolved
                     .tag
                     .filter(|t| tags::recordable(t))
                     .or_else(|| tags.naming(pattern.as_ref(), &resolved.commit));
-                (resolved.commit, tag)
+                (resolved.commit, tag, None)
             }
             Err(why) => return Ok(Queued::Refused(why)),
         },
@@ -373,7 +373,11 @@ pub fn queue_follow(
         {
             Some(limited) => {
                 say!("{}", limited.describe(up));
-                (limited.release.commit, Some(limited.release.tag))
+                (
+                    limited.release.commit,
+                    Some(limited.release.tag),
+                    Some(Chosen::ConflictLimit),
+                )
             }
             None => match tags.release(git, pattern, up.prereleases, tip)? {
                 Some(release) => {
@@ -388,12 +392,20 @@ pub fn queue_follow(
                             described(&release.commit, Some(&release.tag))
                         )));
                     }
-                    (release.commit, Some(release.tag))
+                    (
+                        release.commit,
+                        Some(release.tag),
+                        Some(Chosen::NewestRelease),
+                    )
                 }
                 None => return Ok(Queued::Refused(no_release(up))),
             },
         },
-        (None, None) => (tip.to_string(), tags.naming(None, tip)),
+        (None, None) => (
+            tip.to_string(),
+            tags.naming(None, tip),
+            Some(Chosen::BranchTip),
+        ),
     };
     let named = tag.as_deref().or(rev.as_deref());
     if let Some(last) = &d.last_synced
@@ -440,6 +452,7 @@ pub fn queue_follow(
                 commits: git.count(base, &target)?,
                 target,
                 tag,
+                chosen,
                 previous: d.last_synced.clone(),
                 kind,
                 head_before: None,
@@ -655,9 +668,18 @@ pub enum Advanced {
     Stopped(Exit),
 }
 
+/// What a merge that stops on conflicts says beyond the conflicted files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnConflict {
+    /// How to resolve them and go on, for an update kept in progress.
+    Resolve,
+    /// Nothing more: the caller discards the update and says what follows.
+    Report,
+}
+
 /// Takes in every pending upstream in order, stopping at the first conflict
 /// or at a plan to edit.
-pub fn advance(repo: &Repo, state: &mut UpdateState) -> Result<Advanced> {
+pub fn advance(repo: &Repo, state: &mut UpdateState, on_conflict: OnConflict) -> Result<Advanced> {
     for i in 0..state.upstreams.len() {
         let stopped = match (state.upstreams[i].step, &state.upstreams[i].work) {
             (UpstreamStep::Merged, _) => None,
@@ -670,7 +692,7 @@ pub fn advance(repo: &Repo, state: &mut UpdateState) -> Result<Advanced> {
                 say!("mark each commit take, skip, have or later, then run `git intake continue`");
                 return Ok(Advanced::Plan);
             }
-            (_, Work::Follow(_)) => merge_follow(repo, state, i)?,
+            (_, Work::Follow(_)) => merge_follow(repo, state, i, on_conflict)?,
             (_, Work::Port(_)) => port_plan::carry_out(repo, state, i)?,
         };
         if let Some(exit) = stopped {
@@ -683,7 +705,7 @@ pub fn advance(repo: &Repo, state: &mut UpdateState) -> Result<Advanced> {
 /// [`advance`] as `start` and `continue` run it, naming the next command
 /// once every upstream is taken in.
 fn finish_advance(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
-    Ok(match advance(repo, state)? {
+    Ok(match advance(repo, state, OnConflict::Resolve)? {
         Advanced::Merged => {
             say!(
                 "every queued upstream is merged or its plan carried out; next: {}",
@@ -698,18 +720,23 @@ fn finish_advance(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
 
 /// Merges one pending follow upstream. Returns the exit status when the
 /// merge stopped on conflicts.
-fn merge_follow(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Option<Exit>> {
+fn merge_follow(
+    repo: &Repo,
+    state: &mut UpdateState,
+    i: usize,
+    on_conflict: OnConflict,
+) -> Result<Option<Exit>> {
     let wt = Git::worktree(&state.worktree);
     let up = upstream_of(state, i)?;
-    let (target, tag, kind) = {
+    let (target, tag, chosen, kind) = {
         let f = follow_of(state, i)?;
-        (f.target.clone(), f.tag.clone(), f.kind)
+        (f.target.clone(), f.tag.clone(), f.chosen, f.kind)
     };
     let tag = tag.as_deref();
 
     // A merge that completed before the state could be saved.
     if carries_record(&wt, &up, &target, tag)? {
-        let commit = confirm_merged(&wt, &up, &target, tag)?;
+        let commit = confirm_merged(&wt, &up, &target, tag, chosen)?;
         mark_merged(repo, state, i, commit)?;
         return Ok(None);
     }
@@ -722,12 +749,12 @@ fn merge_follow(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Option
             // labelled as resolved by a recorded resolution.
             follow_mut(state, i)?.head_before = Some(wt.line(&["rev-parse", "HEAD"])?);
             let output = fs::read_to_string(merge_output_path(repo, &up.name)).unwrap_or_default();
-            return stop_on_conflict(repo, state, i, &output).map(Some);
+            return stop_on_conflict(repo, state, i, &output, on_conflict).map(Some);
         }
         wt.run(&["merge", "--abort"])?;
     }
 
-    let msg = merge_message(&repo.git, &up, &target, tag)?;
+    let msg = merge_message(&repo.git, &up, &target, tag, chosen)?;
     let head_before = wt.line(&["rev-parse", "HEAD"])?;
     follow_mut(state, i)?.head_before = Some(head_before);
     repo.save_state(state)?;
@@ -765,7 +792,7 @@ fn merge_follow(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Option
 
     match failure {
         None => {
-            let commit = confirm_merged(&wt, &up, &target, tag)?;
+            let commit = confirm_merged(&wt, &up, &target, tag, chosen)?;
             mark_merged(repo, state, i, commit)?;
             Ok(None)
         }
@@ -775,7 +802,7 @@ fn merge_follow(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Option
                     .with_context(|| format!("merging upstream '{}' failed", up.name));
             }
             let output = format!("{}{}", out.stdout, out.stderr);
-            stop_on_conflict(repo, state, i, &output).map(Some)
+            stop_on_conflict(repo, state, i, &output, on_conflict).map(Some)
         }
     }
 }
@@ -835,13 +862,19 @@ pub fn settle(conflicts: &mut [ConflictFile]) {
 /// Records the conflicts of the merge stopped in the worktree and reports them.
 /// `output` is what the merge printed; rerere reports there the files it
 /// resolved from a recorded resolution.
-fn stop_on_conflict(repo: &Repo, state: &mut UpdateState, i: usize, output: &str) -> Result<Exit> {
+fn stop_on_conflict(
+    repo: &Repo,
+    state: &mut UpdateState,
+    i: usize,
+    output: &str,
+    on_conflict: OnConflict,
+) -> Result<Exit> {
     let wt = Git::worktree(&state.worktree);
     let conflicts = label_conflicts(&wt.unmerged_files()?, &rerere_resolved(output));
     follow_mut(state, i)?.conflicts = conflicts;
     state.upstreams[i].step = UpstreamStep::Conflict;
     repo.save_state(state)?;
-    print_conflict(state, i, output);
+    print_conflict(state, i, output, on_conflict);
     Ok(Exit::Negative)
 }
 
@@ -932,7 +965,13 @@ fn carries_record(wt: &Git, up: &Upstream, target: &str, tag: Option<&str>) -> R
 /// Checks that HEAD is a complete merge of the upstream before it is counted
 /// as merged: the sync record names the upstream and target, the target is
 /// merged, and a path upstream's path exists. Returns HEAD.
-fn confirm_merged(wt: &Git, up: &Upstream, target: &str, tag: Option<&str>) -> Result<String> {
+fn confirm_merged(
+    wt: &Git,
+    up: &Upstream,
+    target: &str,
+    tag: Option<&str>,
+    chosen: Option<Chosen>,
+) -> Result<String> {
     let head = wt.line(&["rev-parse", "HEAD"])?;
     let mut problems = Vec::new();
     if !carries_record(wt, up, target, tag)? {
@@ -959,7 +998,7 @@ fn confirm_merged(wt: &Git, up: &Upstream, target: &str, tag: Option<&str>) -> R
             abbrev(&head),
             wt.dir().display(),
             bullet(&problems),
-            sync_record::message(&up.name, &up.source(), abbrev(target), target, tag)
+            sync_record::message(&up.name, &up.source(), abbrev(target), target, tag, chosen)
         );
     }
     Ok(head)
@@ -974,7 +1013,13 @@ pub fn upstream_of(state: &UpdateState, i: usize) -> Result<Upstream> {
         .with_context(|| format!("the update state names unknown upstream '{name}'"))
 }
 
-fn merge_message(git: &Git, up: &Upstream, target: &str, tag: Option<&str>) -> Result<String> {
+fn merge_message(
+    git: &Git,
+    up: &Upstream,
+    target: &str,
+    tag: Option<&str>,
+    chosen: Option<Chosen>,
+) -> Result<String> {
     let short = git.short(target)?;
     Ok(sync_record::message(
         &up.name,
@@ -982,10 +1027,11 @@ fn merge_message(git: &Git, up: &Upstream, target: &str, tag: Option<&str>) -> R
         &short,
         target,
         tag,
+        chosen,
     ))
 }
 
-fn print_conflict(state: &UpdateState, i: usize, stderr: &str) {
+fn print_conflict(state: &UpdateState, i: usize, stderr: &str, on_conflict: OnConflict) {
     let q = &state.upstreams[i];
     let up = state.config.upstream(&q.name);
     let target = q.follow().map(|f| f.target.as_str()).unwrap_or_default();
@@ -1017,10 +1063,12 @@ fn print_conflict(state: &UpdateState, i: usize, stderr: &str) {
         .collect();
     say!("merged: {}", list_or_none(&merged));
     say!("pending: {}", list_or_none(&pending));
-    say!(
-        "resolve the conflicts in {}, stage them with `git add`, then run `git intake continue`",
-        state.worktree.display()
-    );
+    if on_conflict == OnConflict::Resolve {
+        say!(
+            "resolve the conflicts in {}, stage them with `git add`, then run `git intake continue`",
+            state.worktree.display()
+        );
+    }
 }
 
 /// Lists conflicted files with the source of their resolution.
@@ -1085,9 +1133,14 @@ pub fn resume(repo: &Repo) -> Result<Exit> {
 fn conclude_merge(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<()> {
     let wt = Git::worktree(&state.worktree);
     let up = upstream_of(state, i)?;
-    let (target, tag, head_before) = {
+    let (target, tag, chosen, head_before) = {
         let f = follow_of(state, i)?;
-        (f.target.clone(), f.tag.clone(), f.head_before.clone())
+        (
+            f.target.clone(),
+            f.tag.clone(),
+            f.chosen,
+            f.head_before.clone(),
+        )
     };
     let tag = tag.as_deref();
     if wt.merge_in_progress()? {
@@ -1107,7 +1160,7 @@ fn conclude_merge(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<()> 
                 bullet(&unmerged)
             );
         }
-        let msg = merge_message(&repo.git, &up, &target, tag)?;
+        let msg = merge_message(&repo.git, &up, &target, tag, chosen)?;
         wt.run(&["commit", "--no-edit", "-m", &msg])?;
     } else {
         let head = wt.line(&["rev-parse", "HEAD"])?;
@@ -1121,7 +1174,7 @@ fn conclude_merge(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<()> 
             );
         }
     }
-    let commit = confirm_merged(&wt, &up, &target, tag)?;
+    let commit = confirm_merged(&wt, &up, &target, tag, chosen)?;
     mark_merged(repo, state, i, commit)
 }
 

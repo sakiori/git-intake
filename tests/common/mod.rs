@@ -828,3 +828,77 @@ pub fn mono_config(a: &Upstream, b: &Upstream, extra: &str) -> String {
         b.url()
     )
 }
+
+/// The merge queue's account on the fake forge.
+pub const BOT: u64 = 42;
+
+/// The reference on the publish remote that records a pause.
+pub const PAUSE_REF: &str = "refs/git-intake/pause";
+
+/// A commit in the publish remote's repository that records a pause of
+/// `held` started for merge request `number`, reachable from no reference.
+pub fn record(f: &Fork, number: u64, held: &[u64], in_flight: &[u64]) -> String {
+    let held: Vec<serde_json::Value> = held
+        .iter()
+        .map(|n| serde_json::json!({"number": n, "others": []}))
+        .collect();
+    let body = serde_json::json!({
+        "account": {"id": BOT, "username": "merge-bot"},
+        "merge_request": {"number": number, "url": format!("https://forge.example/mr/{number}")},
+        "held": held,
+        "in_flight": in_flight,
+    });
+    let tree = f.env.git(
+        &f.publish,
+        &["hash-object", "-t", "tree", "-w", "/dev/null"],
+    );
+    f.env.git(
+        &f.publish,
+        &[
+            "commit-tree",
+            &tree,
+            "-m",
+            &format!("git intake: a pause of the merge queue\n\n{body}\n"),
+        ],
+    )
+}
+
+/// Records a pause of `held` as a run that died leaves it.
+pub fn dead_pause(f: &Fork, number: u64, held: &[u64]) {
+    dead_pause_in_flight(f, number, held, &[]);
+}
+
+pub fn dead_pause_in_flight(f: &Fork, number: u64, held: &[u64], in_flight: &[u64]) {
+    let oid = record(f, number, held, in_flight);
+    f.env.git(&f.publish, &["update-ref", PAUSE_REF, &oid]);
+}
+
+/// A request as a method and a path.
+pub type Request = (String, String);
+
+/// Runs a scenario once to list the distinct requests it makes of the forge,
+/// then once more with each of them answered once with 502, which must change
+/// nothing it checks. The scenario returns the requests it made.
+pub fn survives_each_failed_request(
+    scenario: impl Fn(Option<&Request>) -> Vec<forge::Recorded> + Sync,
+) {
+    let mut made: Vec<Request> = Vec::new();
+    for r in scenario(None) {
+        let path = r.path.split_once('?').map_or(r.path.as_str(), |(p, _)| p);
+        let request = (r.method, path.to_string());
+        if !made.contains(&request) {
+            made.push(request);
+        }
+    }
+    assert!(made.len() > 2, "{made:?}");
+    std::thread::scope(|s| {
+        for chunk in made.chunks(made.len().div_ceil(4)) {
+            let scenario = &scenario;
+            s.spawn(move || {
+                for request in chunk {
+                    scenario(Some(request));
+                }
+            });
+        }
+    });
+}
