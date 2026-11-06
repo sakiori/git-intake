@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://gitlab.com/sakiori-oss/git-intake/compare/v0.5.0...v0.5.1) - 2026-11-06
+
+### Added
+
+- replace an untouched update merge request with a newer release
+
 ## [0.5.0](https://gitlab.com/sakiori-oss/git-intake/compare/v0.4.1...v0.5.0) - 2026-11-06
 
 ### Added
