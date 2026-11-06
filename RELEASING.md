@@ -35,6 +35,7 @@ The crate is not published to crates.io yet; see *Publishing on crates.io*.
   - *Pipelines must succeed*.
 - *Settings > CI/CD > Variables*: keep *Allow merge request pipelines to access protected variables and runners* off, and set *Minimum role to use pipeline variables* to *No one allowed*, so that no pipeline variable can override the predefined variables the release jobs and the macOS runner check, such as `CI_COMMIT_REF_PROTECTED`.
 - *Settings > CI/CD > Auto DevOps*: off, so that a commit without `.gitlab-ci.yml` starts no pipeline.
+- The `sub` claim of the project's ID tokens names the project by its id, not its path: `ci_id_token_sub_claim_components` is `["project_id", "ref_type", "ref"]`, set through the API alone (`PUT /projects/:id`, with a JSON body). The path `sakiori-oss/git-intake` once belonged to another project, and GitLab refuses an ID token whose `sub` names such a path, which fails `sign` with `id_token_burned_project_path`. The Sigstore certificate's identity comes from the pipeline's configuration, not from `sub`, so the bundles verify as before.
 - *Build > Pipeline schedules*: a weekly schedule on `main`, which runs `deny`, so that a new RustSec advisory fails without a change.
 - Issues stay enabled; SECURITY.md asks for vulnerability reports as confidential issues, which every tier has.
 
