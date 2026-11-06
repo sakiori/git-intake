@@ -161,6 +161,21 @@ fn an_upstream_prerelease_is_no_upstream_release() {
     f.tool(&["sync"]).success();
     append_config(&f, RELEASE);
     assert_eq!(next_json(&f)["base"], "0.1.7");
+
+    // An upstream taken at its prereleases still releases from its releases.
+    let d = f
+        .env
+        .push_upstream(&f.up, &[("d.txt", "d\n")], "upstream: d");
+    upstream_tag(&f, "v0.1.8-nightly.20261101.4000", &d);
+    f.reconfigure(
+        "mode = \"follow\"\n",
+        "mode = \"follow\"\ntags = \"v*\"\nprereleases = true\n",
+    );
+    f.tool(&["sync"]).success();
+    assert_eq!(f.env.git(&f.publish, &["rev-parse", "main^2"]), d);
+    let doc = next_json(&f);
+    assert_eq!(doc["base"], "0.1.7");
+    assert_eq!(doc["upstream_release"], "v0.1.6");
 }
 
 #[test]

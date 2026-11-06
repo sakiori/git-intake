@@ -1192,6 +1192,7 @@ mod tests {
             via: crate::config::PublishVia::MergeRequest,
             forge: None,
             api: None,
+            queue: None,
         });
         state.release = Some("0.3.5".into());
         for version in [4, 5] {

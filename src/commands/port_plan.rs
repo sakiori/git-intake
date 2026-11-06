@@ -13,6 +13,7 @@ use crate::commands::update::{
     rerere_resolved, save_merge_output, settle,
 };
 use crate::git::{Git, abbrev, split_z};
+use crate::output::say;
 use crate::port::{self, Decision, Journal, Verb, Verdict};
 use crate::repo::{Repo, bullet};
 use crate::state::{CopyStep, PortPlan, UpdateState, UpstreamStep, Work};
@@ -80,7 +81,7 @@ pub fn carry_out(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Optio
         let head_before = wt.line(&["rev-parse", "HEAD"])?;
         plan_mut(state, i)?.commits[index].head_before = Some(head_before);
         repo.save_state(state)?;
-        println!(
+        say!(
             "{name}: copying {} {}",
             abbrev(&entry.commit),
             entry.subject
@@ -131,7 +132,7 @@ pub fn carry_out(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Optio
         .iter()
         .filter(|c| !c.overlaps.is_empty())
         .count() as u64;
-    println!(
+    say!(
         "{name}: plan carried out: {copied} commit{} copied{}",
         plural(copied),
         if empty > 0 {
@@ -141,7 +142,7 @@ pub fn carry_out(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Optio
         }
     );
     if overlapping > 0 {
-        println!(
+        say!(
             "{name}: {overlapping} taken commit{} change{} files that earlier pending commits change too; \
              `git intake report` names them",
             plural(overlapping),
@@ -222,7 +223,7 @@ fn leave_out_own_paths(repo: &Repo, state: &mut UpdateState, i: usize, index: us
     wt.run(&restore)?;
     let name = state.upstreams[i].name.clone();
     let entry = &mut plan_mut(state, i)?.commits[index];
-    println!(
+    say!(
         "{name}: left out of the copy of {}: {}; a copy never changes .git-intake.toml or .git-intake/",
         abbrev(&entry.commit),
         paths.join(", ")
@@ -261,7 +262,7 @@ fn finish_copy(
                 bullet(&unstaged)
             );
             stop_on_failed_commit(repo, state, i, index, &why)?;
-            println!(
+            say!(
                 "stage what belongs to the copy with `git add`, discard the rest, then run `git intake continue`"
             );
             return Ok(Some(Exit::Negative));
@@ -287,7 +288,7 @@ fn finish_copy(
     if !out.success() {
         let why = format!("{}{}", out.stdout, out.stderr).trim().to_string();
         stop_on_failed_commit(repo, state, i, index, &why)?;
-        println!(
+        say!(
             "the copy stays staged; fix the cause there, stage the result with `git add`, then run \
              `git intake continue`, which commits it as the copy with its author, message and trailers"
         );
@@ -324,7 +325,7 @@ fn stop_on_failed_commit(
     let (commit, subject) = (entry.commit.clone(), entry.subject.clone());
     state.upstreams[i].step = UpstreamStep::Conflict;
     repo.save_state(state)?;
-    println!(
+    say!(
         "{name}: the copy of {} {subject} could not be committed in {}:\n{why}",
         abbrev(&commit),
         state.worktree.display()
@@ -343,8 +344,8 @@ fn record_copy(
     let name = state.upstreams[i].name.clone();
     let entry = &mut plan_mut(state, i)?.commits[index];
     match &copied {
-        Some(c) => println!("{name}: copied {} as {}", abbrev(&entry.commit), abbrev(c)),
-        None => println!(
+        Some(c) => say!("{name}: copied {} as {}", abbrev(&entry.commit), abbrev(c)),
+        None => say!(
             "{name}: the copy of {} changes nothing; it is recorded as present",
             abbrev(&entry.commit)
         ),
@@ -379,7 +380,7 @@ fn stop_on_conflict(
 
     let plan = plan_of(state, i)?;
     let entry = &plan.commits[index];
-    println!(
+    say!(
         "{}: conflicts copying {} {} in {}",
         state.upstreams[i].name,
         abbrev(&entry.commit),
@@ -395,18 +396,18 @@ fn stop_on_conflict(
             .map(|c| abbrev(&c.commit))
             .collect()
     };
-    println!(
+    say!(
         "copied: {}",
         list_or_none(&listed(&|s| matches!(
             s,
             CopyStep::Copied | CopyStep::Empty
         )))
     );
-    println!(
+    say!(
         "still to copy: {}",
         list_or_none(&listed(&|s| s == CopyStep::None))
     );
-    println!(
+    say!(
         "resolve the conflicts in {}, stage them with `git add`, then run `git intake continue`",
         state.worktree.display()
     );
@@ -536,7 +537,7 @@ fn commit_journal(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<()> 
         &path,
     ])?;
     let commit = wt.line(&["rev-parse", "HEAD"])?;
-    println!(
+    say!(
         "{name}: recorded {} decision{} in {path} as {}",
         added.len(),
         plural(added.len() as u64),

@@ -13,7 +13,7 @@ use common::{FORK_CHECK, FORK_FILE, Fork, Mono, checks_line};
 /// cannot add lines.
 fn dump(file: &str) -> String {
     format!(
-        "awk 'BEGIN {{ for (k in ENVIRON) if (k ~ /^GIT_INTAKE_/) print k \"=\" ENVIRON[k] }}' \
+        "awk 'BEGIN {{ for (k in ENVIRON) if (k ~ /^GIT_INTAKE_/ && k !~ /^GIT_INTAKE_TEST_/) print k \"=\" ENVIRON[k] }}' \
          | LC_ALL=C sort > \"$HOME/{file}\""
     )
 }

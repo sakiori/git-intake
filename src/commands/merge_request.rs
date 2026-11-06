@@ -15,12 +15,13 @@ use anyhow::{Context, Result, bail};
 
 use crate::Exit;
 use crate::commands::update::{plural, require_worktree};
-use crate::commands::{catch_up, finish};
+use crate::commands::{catch_up, finish, sync};
 use crate::config::{self, Config, Publish};
 use crate::description::{self, Content, Targets};
-use crate::forge::{self, Forge, Kind, MergeRequest, State};
+use crate::forge::{self, Failure, Forge, Kind, MergeRequest, State, may_pass};
 use crate::git::{Git, abbrev, branch_ref, split_z, tracking_ref};
 use crate::identity;
+use crate::output::say;
 use crate::port::Verb;
 use crate::redact::redacted;
 use crate::repo::{Repo, bullet};
@@ -124,10 +125,11 @@ fn earlier_branches(git: &Git, remote: &str) -> Result<Vec<String>> {
     let pattern = format!("refs/heads/{EARLIER_BRANCH_PREFIX}*");
     let out = git.raw(&["ls-remote", "--heads", remote, &pattern])?;
     if !out.success() {
-        bail!(
+        return Err(Failure::unanswered(format!(
             "cannot list the branches of the publish remote '{remote}': {}",
             out.into_error()
-        );
+        ))
+        .into());
     }
     Ok(out
         .stdout
@@ -287,7 +289,7 @@ pub fn publish(
     }
     let changes = check_changes(&repo.git, state, head, &review.ci_paths)?;
     if !changes.is_empty() {
-        println!(
+        say!(
             "the update changes its own checks: {}; the pipeline that verifies it runs what the update brings",
             changes.join(", ")
         );
@@ -315,14 +317,14 @@ pub fn publish(
     let upstreams = identity::Upstreams::new(&repo.git, &state.config.upstreams)?;
     let pushed = push_branch(repo, p.remote, p.branch, head, term, &upstreams)?;
     if pushed {
-        println!(
+        say!(
             "pushed the update head {} to '{}' as branch '{}'",
             abbrev(head),
             p.remote,
             p.branch
         );
     } else {
-        println!(
+        say!(
             "'{}' on '{}' is already at the update head {}; nothing was pushed",
             p.branch,
             p.remote,
@@ -334,9 +336,18 @@ pub fn publish(
     {
         return Ok(Published::Stopped(stop));
     }
+    // Past the push a new run finds nothing to do, so what is left of the
+    // publication is tried again here.
     let (mr, created) = match p.open {
-        Some(open) => (forge.update(open.number, &title, &body)?, false),
-        None => match forge.open(p.branch, &integration, &title, &body)? {
+        Some(open) => (
+            forge::patiently(sync::ATTEMPTS, sync::retry_gap(), || {
+                forge.update(open.number, &title, &body)
+            })?,
+            false,
+        ),
+        None => match forge::patiently(sync::ATTEMPTS, sync::retry_gap(), || {
+            forge.open(p.branch, &integration, &title, &body)
+        })? {
             Some(mr) => (mr, true),
             // Opened meanwhile, by another run: that one carries the update.
             None => {
@@ -352,14 +363,19 @@ pub fn publish(
                             p.branch
                         )
                     })?;
-                (forge.update(open.number, &title, &body)?, false)
+                (
+                    forge::patiently(sync::ATTEMPTS, sync::retry_gap(), || {
+                        forge.update(open.number, &title, &body)
+                    })?,
+                    false,
+                )
             }
         },
     };
     if created {
-        println!("opened {}", named(kind, &mr));
+        say!("opened {}", named(kind, &mr));
     } else {
-        println!("rewrote the title and description of {}", named(kind, &mr));
+        say!("rewrote the title and description of {}", named(kind, &mr));
     }
     Ok(Published::Done(mr))
 }
@@ -367,6 +383,7 @@ pub fn publish(
 /// Reads the merge request's state and head and the remote's integration
 /// branch again just before the push, and the merge request's state right
 /// after it.
+#[allow(clippy::too_many_arguments)]
 pub fn guard<'a>(
     repo: &'a Repo,
     forge: &'a dyn Forge,
@@ -375,6 +392,7 @@ pub fn guard<'a>(
     head: &'a str,
     tip: &'a str,
     upstreams: &'a identity::Upstreams,
+    after_a_change: &'a str,
 ) -> impl FnMut(Stage) -> Result<Option<Stopped>> + 'a {
     let kind = forge.kind();
     move |stage| {
@@ -404,7 +422,7 @@ pub fn guard<'a>(
                     return Ok(Some(Stopped {
                         exit: Exit::Code(2),
                         message: format!(
-                            "the {} or '{remote}/{}' changed meanwhile; nothing was pushed. Run the command again",
+                            "the {} or '{remote}/{}' changed meanwhile; nothing was pushed. {after_a_change}",
                             named(kind, &now),
                             open.target
                         ),
@@ -470,7 +488,7 @@ fn announce_check_changes(repo: &Repo, state: &UpdateState, head: &str) -> Resul
     };
     let changes = check_changes(&repo.git, state, head, &ci_paths)?;
     if !changes.is_empty() {
-        println!(
+        say!(
             "the update changes its own checks: {}; the checks that verify it are the ones it brings",
             changes.join(", ")
         );
@@ -673,9 +691,15 @@ fn push_branch(
     upstreams.refuse_push(&repo.git, remote)?;
     let places = match pushed_branch(&repo.git, remote, branch) {
         Ok(places) => places,
-        Err(err) => bail!(
-            "cannot check where the branch '{branch}' is on '{remote}': {err:#}\nNothing was pushed"
-        ),
+        Err(err) => {
+            let why = format!(
+                "cannot check where the branch '{branch}' is on '{remote}': {err:#}\nNothing was pushed"
+            );
+            return Err(match may_pass(&err) {
+                true => Failure::unanswered(why).into(),
+                false => anyhow::anyhow!(why),
+            });
+        }
     };
     let targets = push_targets(remote, &places, |at| at != Some(head));
     for target in &targets {
@@ -700,13 +724,20 @@ fn push_branch(
             } else {
                 "Nothing was pushed".to_string()
             };
-            bail!(
+            // Rejected for what the branch holds is final: another run pushed
+            // first. Anything else may be the connection.
+            let final_ = out.stderr.contains("[rejected]");
+            let why = format!(
                 "pushing the update to the branch '{branch}' on '{}' was rejected: {}\n{moved}, and no {term} \
                  was opened or changed. The branch is never forced: when another run pushed it meanwhile, run the \
                  command again, which pushes only where the branch is not at the update head",
                 redacted(target),
                 out.into_error()
             );
+            return Err(match final_ {
+                true => anyhow::anyhow!(why),
+                false => Failure::unanswered(why).into(),
+            });
         }
         received.push(target);
     }
@@ -742,7 +773,10 @@ pub fn remote_branch(
     }
     match fetches.remote_branch(remote, branch)? {
         Ok(at) => Ok(Some(at)),
-        Err(why) => bail!("cannot fetch the branch '{branch}' from '{remote}': {why}"),
+        Err(why) => Err(Failure::unanswered(format!(
+            "cannot fetch the branch '{branch}' from '{remote}': {why}"
+        ))
+        .into()),
     }
 }
 
@@ -850,7 +884,7 @@ pub fn delete_branch(
         match (&before.at, &now.at) {
             (_, Some(c)) if c == lease => {
                 remains = true;
-                println!(
+                say!(
                     "could not delete the branch '{branch}' from {on}{}",
                     failed
                         .as_ref()
@@ -860,14 +894,14 @@ pub fn delete_branch(
             }
             (_, Some(c)) => {
                 remains = true;
-                println!(
+                say!(
                     "kept the branch '{branch}' on {on}: it is at {}, not at {} as read, so it may hold someone's work",
                     abbrev(c),
                     abbrev(lease)
                 );
             }
-            (Some(_), None) => println!("deleted the branch '{branch}' from {on}"),
-            (None, None) => println!("the branch '{branch}' is already gone from {on}"),
+            (Some(_), None) => say!("deleted the branch '{branch}' from {on}"),
+            (None, None) => say!("the branch '{branch}' is already gone from {on}"),
         }
     }
     Ok(remains)
@@ -896,7 +930,7 @@ pub fn withdraw(
     branches.extend(also);
     if let Some(open) = &reqs.open {
         forge.close(open.number)?;
-        println!("closed {}", named(kind, open));
+        say!("closed {}", named(kind, open));
         done = true;
         delete_branch(&repo.git, remote, &open.source, &open.head, upstreams)?;
         branches.retain(|b| *b != open.source);
@@ -910,12 +944,12 @@ pub fn withdraw(
         }
     }
     if !done {
-        println!(
+        say!(
             "no {term} of the update into '{integration}' is open, and its branch is not on '{remote}'; there is \
              nothing to withdraw"
         );
     } else {
-        println!(
+        say!(
             "withdrew the update's {term}; its targets count as declined, so `git intake sync` proposes them again \
              only once an upstream moves on, and `git intake start` with `git intake finish` publishes them by hand"
         );
@@ -994,12 +1028,12 @@ pub fn hand_over(repo: &Repo, waiting: &Waiting) -> Result<Exit> {
     let forge = connect(repo, &publish)?;
     let kind = forge.kind();
     match earlier_request(forge.as_ref(), mr, integration)? {
-        Some(found) => println!(
+        Some(found) => say!(
             "the update waited for {}, which is {}; it carries the update from now on",
             named(kind, &found),
             found.state.describe()
         ),
-        None => println!(
+        None => say!(
             "no {} from '{}' into '{integration}' was found on the forge",
             kind.term(),
             mr.branch
@@ -1009,7 +1043,7 @@ pub fn hand_over(repo: &Repo, waiting: &Waiting) -> Result<Exit> {
         let wt = Git::worktree(&waiting.worktree);
         if wt.merge_in_progress()? {
             wt.run(&["rerere"])?;
-            println!("recorded the resolutions made so far in the catch-up merge");
+            say!("recorded the resolutions made so far in the catch-up merge");
         }
     }
     let mut removed = repo.remove_update_artifacts()?;
@@ -1025,9 +1059,9 @@ pub fn hand_over(repo: &Repo, waiting: &Waiting) -> Result<Exit> {
     removed.extend(repo.remove_logs()?);
     repo.paths.remove(&repo.paths.state)?;
     for r in &removed {
-        println!("removed {r}");
+        say!("removed {r}");
     }
-    println!(
+    say!(
         "handed the update over to its {}; no update remains locally, the {} and its branch '{}' are unchanged, \
          and `git intake sync` carries it on",
         kind.term(),
@@ -1075,7 +1109,7 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     let mut head = require_publishable(&state)?;
     let tip = fetch_integration(&repo.git, &remote, &integration)?;
     if repo.git.is_ancestor(&head, &tip)? {
-        println!(
+        say!(
             "'{remote}/{integration}' at {} already contains the update head {}: the update already landed. \
              Nothing was pushed, and no {term} was opened",
             abbrev(&tip),
@@ -1147,7 +1181,7 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
         )? {
             Branch::Contained => {}
             Branch::Leftover => {
-                println!(
+                say!(
                     "the branch '{branch}' on '{remote}' holds nothing but what landed or a closed {term} held; \
                      deleting it"
                 );
@@ -1170,7 +1204,7 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     }
     if !repo.git.is_ancestor(&tip, &state.base)? {
         if caught {
-            println!(
+            say!(
                 "'{remote}/{integration}' moved to {} since the catch-up merge was made; nothing was pushed. Run \
                  `git intake finish` again to catch up with it",
                 abbrev(&tip)
@@ -1203,6 +1237,7 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
                 &read_head,
                 &tip,
                 &upstreams,
+                "Run the command again",
             );
             publish(repo, &mut state, &head, publication, Some(&mut guard))?
         }
@@ -1223,13 +1258,13 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
             recreated.describe()
         ),
         Published::Stopped(stop) => {
-            println!("{}", stop.message);
+            say!("{}", stop.message);
             return Ok(stop.exit);
         }
     };
     drop(fetches);
     let exit = finish::close(repo, state, Vec::new())?;
-    println!(
+    say!(
         "the {term} carries the update from now on: {}",
         named(kind, &mr)
     );
@@ -1289,10 +1324,11 @@ pub fn fetch_integration(git: &Git, remote: &str, integration: &str) -> Result<S
         ),
     ])?;
     if !out.success() {
-        bail!(
+        return Err(Failure::unanswered(format!(
             "cannot fetch '{integration}' from the publish remote '{remote}': {}",
             out.into_error()
-        );
+        ))
+        .into());
     }
     git.commit(&tracking_ref(remote, integration))?
         .with_context(|| format!("'{remote}' has no branch '{integration}'"))
@@ -1393,11 +1429,12 @@ pub fn remote_refs(
     args.extend(names.iter().cloned());
     let out = git.raw(&args)?;
     if !out.success() {
-        bail!(
+        return Err(Failure::unanswered(format!(
             "cannot list the refs of the publish remote '{}': {}",
             redacted(remote),
             out.into_error()
-        );
+        ))
+        .into());
     }
     Ok(out
         .stdout

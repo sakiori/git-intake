@@ -12,8 +12,36 @@ use url::Url;
 
 use super::http::{Auth, Client, Method};
 use super::{
-    Forge, Kind, Location, MergeRequest, ReleaseLookup, Review, State, endpoint, instant, text,
+    Account, Failure, Forge, Kind, Location, Merge, MergeRequest, Pipeline, Queued, ReleaseLookup,
+    Review, State, assigns, endpoint, instant, pipeline_state, text,
 };
+
+/// The merge statuses of a merge request whose mergeability GitLab is still
+/// working out, after which a merge refused for them may pass.
+const DECIDING: [&str; 5] = [
+    "checking",
+    "unchecked",
+    "ci_still_running",
+    "preparing",
+    "approvals_syncing",
+];
+
+/// The merge statuses of a merge request that a catch-up does not change and
+/// a pause of the merge queue would wait out for nothing. The others either
+/// follow from the branch being behind or pass with its next pipeline.
+const BLOCKING: [&str; 11] = [
+    "discussions_not_resolved",
+    "draft_status",
+    "jira_association_missing",
+    "locked_lfs_files",
+    "locked_paths",
+    "merge_request_blocked",
+    "merge_time",
+    "not_approved",
+    "requested_changes",
+    "security_policy_violations",
+    "title_regex",
+];
 
 /// The longest description GitLab takes.
 const DESCRIPTION_LIMIT: usize = 1_048_576;
@@ -51,6 +79,32 @@ impl GitLab {
     fn project(&self) -> Result<Value> {
         self.client.json(Method::Get, &self.url(&[], &[]), None)
     }
+
+    fn single(&self, number: u64, query: &[(&str, &str)]) -> Result<Value> {
+        let n = number.to_string();
+        self.client
+            .json(Method::Get, &self.url(&["merge_requests", &n], query), None)
+    }
+}
+
+/// The pipeline GitLab reports as a merge request's `head_pipeline`.
+fn head_pipeline(v: &Value) -> Option<Pipeline> {
+    let p = v.get("head_pipeline").filter(|p| p.is_object())?;
+    Some(Pipeline {
+        state: pipeline_state(p.get("status").and_then(Value::as_str).unwrap_or_default()),
+        url: text(p, "web_url"),
+    })
+}
+
+fn assignee_ids(v: &Value) -> Vec<u64> {
+    v.get("assignees")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|a| a.get("id").and_then(Value::as_u64))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Whether a merge request comes from a branch of the project itself, not
@@ -112,17 +166,13 @@ impl Forge for GitLab {
             ("state", if open_only { "opened" } else { "all" }),
             ("order_by", "updated_at"),
             ("sort", "desc"),
-            ("per_page", "100"),
         ];
         if let Some(target) = target {
             query.push(("target_branch", target));
         }
         let list = self
             .client
-            .json(Method::Get, &self.url(&["merge_requests"], &query), None)?;
-        let list = list
-            .as_array()
-            .context("GitLab answered the list of merge requests with something else")?;
+            .list(&self.url(&["merge_requests"], &query), "merge requests")?;
         // Only the project's own merge requests: one from a fork may come
         // from a branch of the same name, with any description.
         list.iter()
@@ -161,7 +211,11 @@ impl Forge for GitLab {
             // Another open merge request from the branch into the target.
             409 => Ok(None),
             _ if reply.success() => merge_request(&reply.json).map(Some),
-            _ => anyhow::bail!("{}", self.client.refusal(Method::Post, &url, &reply)),
+            _ => Err(Failure::answered(
+                reply.status,
+                self.client.refusal(Method::Post, &url, &reply),
+            )
+            .into()),
         }
     }
 
@@ -209,6 +263,148 @@ impl Forge for GitLab {
             _ if reply.success() => Ok(ReleaseLookup::Published),
             _ => anyhow::bail!("{}", self.client.refusal(Method::Get, &one, &reply)),
         }
+    }
+
+    fn with_pipeline(&self, number: u64) -> Result<(MergeRequest, Option<Pipeline>)> {
+        let v = self.single(number, &[])?;
+        Ok((merge_request(&v)?, head_pipeline(&v)))
+    }
+
+    fn merge(&self, number: u64, head: &str) -> Result<Merge> {
+        let n = number.to_string();
+        // A merge reads `squash` only when true, and otherwise goes by the
+        // merge request's own flag, which a person may have set.
+        if self
+            .single(number, &[])?
+            .get("squash")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            self.client.json(
+                Method::Put,
+                &self.url(&["merge_requests", &n], &[]),
+                Some(&json!({ "squash": false })),
+            )?;
+        }
+        let url = self.url(&["merge_requests", &n, "merge"], &[]);
+        let body = json!({ "sha": head, "squash": false, "should_remove_source_branch": true });
+        let reply = self.client.send(Method::Put, &url, Some(&body))?;
+        if reply.success() {
+            return Ok(Merge::Accepted);
+        }
+        match reply.status {
+            409 => Ok(Merge::HeadMoved),
+            405 | 406 | 422 => {
+                let now = self.single(number, &[])?;
+                let status = text(&now, "detailed_merge_status");
+                let mut why = reply.message();
+                let error = text(&now, "merge_error");
+                if !error.is_empty() {
+                    why.push_str(&format!(": {error}"));
+                }
+                Ok(match status.as_str() {
+                    s if DECIDING.contains(&s) => Merge::NotYet,
+                    "mergeable" => Merge::Contested(why),
+                    "" => Merge::Refused(why),
+                    s => Merge::Refused(format!("{why} (its merge status is `{s}`)")),
+                })
+            }
+            status => Err(Failure::answered(
+                status,
+                self.client.refusal(Method::Put, &url, &reply),
+            )
+            .into()),
+        }
+    }
+
+    fn merge_blocker(&self, number: u64) -> Result<Option<String>> {
+        let status = text(&self.single(number, &[])?, "detailed_merge_status");
+        Ok(BLOCKING.contains(&status.as_str()).then_some(status))
+    }
+
+    fn account(&self, username: &str) -> Result<Option<Account>> {
+        let url = endpoint(self.client.base(), &["users"], &[("username", username)]);
+        let list = self.client.json(Method::Get, &url, None)?;
+        Ok(list
+            .as_array()
+            .context("GitLab answered the list of users with something else")?
+            .iter()
+            .find(|u| text(u, "username").eq_ignore_ascii_case(username))
+            .and_then(|u| {
+                Some(Account {
+                    id: u.get("id")?.as_u64()?,
+                    username: text(u, "username"),
+                })
+            }))
+    }
+
+    fn assigned(&self, target: &str, account: &Account) -> Result<Vec<u64>> {
+        let id = account.id.to_string();
+        let query = [
+            ("state", "opened"),
+            ("target_branch", target),
+            ("assignee_id", id.as_str()),
+        ];
+        let list = self
+            .client
+            .list(&self.url(&["merge_requests"], &query), "merge requests")?;
+        Ok(list
+            .iter()
+            .filter(|v| assignee_ids(v).contains(&account.id))
+            .filter_map(|v| v.get("iid").and_then(Value::as_u64))
+            .collect())
+    }
+
+    fn queued(&self, number: u64) -> Result<Queued> {
+        let v = self.single(number, &[("include_diverged_commits_count", "true")])?;
+        let mr = merge_request(&v)?;
+        Ok(Queued {
+            number,
+            url: mr.url,
+            state: mr.state,
+            assignees: assignee_ids(&v),
+            current: v.get("diverged_commits_count").and_then(Value::as_u64) == Some(0),
+            pipeline: head_pipeline(&v).map(|p| p.state),
+        })
+    }
+
+    fn assigned_at(&self, number: u64, account: &Account) -> Result<Option<jiff::Timestamp>> {
+        let n = number.to_string();
+        let url = self.url(
+            &["merge_requests", &n, "notes"],
+            &[("sort", "desc"), ("order_by", "created_at")],
+        );
+        let mut at = None;
+        self.client.pages(&url, "notes", |page| {
+            let found = page.iter().find(|v| {
+                v.get("system").and_then(Value::as_bool) == Some(true)
+                    && assigns(&text(v, "body"), &account.username)
+            });
+            at = found.and_then(|v| instant(v, "created_at"));
+            found.is_none()
+        })?;
+        Ok(at)
+    }
+
+    fn assign(&self, number: u64, assignees: &[u64]) -> Result<()> {
+        let n = number.to_string();
+        let body = json!({ "assignee_ids": assignees });
+        self.client.json(
+            Method::Put,
+            &self.url(&["merge_requests", &n], &[]),
+            Some(&body),
+        )?;
+        Ok(())
+    }
+
+    fn comment(&self, number: u64, body: &str) -> Result<()> {
+        let n = number.to_string();
+        self.client.json(
+            Method::Post,
+            &self.url(&["merge_requests", &n, "notes"], &[]),
+            Some(&json!({ "body": body })),
+        )?;
+        Ok(())
     }
 }
 

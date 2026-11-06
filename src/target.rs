@@ -1,12 +1,103 @@
 //! The commit of an upstream that `start` or `contribute` names with a
-//! revision.
+//! revision, and the tag an update takes within a conflict limit.
 
 use anyhow::Result;
 
 use crate::config::Upstream;
+use crate::drift;
 use crate::git::{Git, abbrev};
 use crate::redact::redacted;
-use crate::tags::UpstreamTags;
+use crate::tags::{Release, TagPattern, UpstreamTags};
+
+/// The tag an update takes within an upstream's `max_conflicts`.
+#[derive(Debug, Clone)]
+pub struct Limited {
+    pub release: Release,
+    /// The files its merge is predicted to conflict in.
+    pub conflicts: Vec<String>,
+    /// Whether that is within the limit; when it is not, no newer tag is.
+    pub within: bool,
+    /// The newer tags passed over for the limit, newest first, with the
+    /// number of files each is predicted to conflict in.
+    pub passed_over: Vec<(String, usize)>,
+}
+
+/// The newest of the tags an update could take next (see
+/// [`UpstreamTags::newer`]) whose merge into `base` is predicted to conflict
+/// in at most `up`'s `max_conflicts` files, or the oldest of them when none
+/// is. `None` when there is no such tag, or no limit.
+pub fn within_limit(
+    git: &Git,
+    base: &str,
+    up: &Upstream,
+    (tags, pattern): (&UpstreamTags, &TagPattern),
+    tip: &str,
+    last: Option<&str>,
+) -> Result<Option<Limited>> {
+    let Some(limit) = up.max_conflicts else {
+        return Ok(None);
+    };
+    let newer = tags.newer(git, pattern, up.prereleases, tip, base, last)?;
+    let mut over: Vec<(Release, Vec<String>)> = Vec::new();
+    for release in newer {
+        let conflicts = drift::predict_conflicts(git, base, &release.commit, up.path.as_deref())?;
+        if conflicts.len() <= limit as usize {
+            return Ok(Some(Limited {
+                release,
+                conflicts,
+                within: true,
+                passed_over: passed(&over),
+            }));
+        }
+        over.push((release, conflicts));
+    }
+    Ok(over.pop().map(|(release, conflicts)| Limited {
+        release,
+        conflicts,
+        within: false,
+        passed_over: passed(&over),
+    }))
+}
+
+fn passed(over: &[(Release, Vec<String>)]) -> Vec<(String, usize)> {
+    over.iter()
+        .map(|(release, files)| (release.tag.clone(), files.len()))
+        .collect()
+}
+
+impl Limited {
+    /// What `start` and `sync` say of the tag they took for `up`.
+    pub fn describe(&self, up: &Upstream) -> String {
+        let limit = up.max_conflicts.unwrap_or_default();
+        let n = self.conflicts.len();
+        let files = |n: usize| format!("{n} file{}", if n == 1 { "" } else { "s" });
+        let mut text = if self.within {
+            format!(
+                "{}: takes {}, predicted to conflict in {}, within max_conflicts = {limit}",
+                up.name,
+                self.release.tag,
+                files(n)
+            )
+        } else {
+            format!(
+                "{}: takes {}, the oldest newer tag, predicted to conflict in {}; no newer tag is within \
+                 max_conflicts = {limit}",
+                up.name,
+                self.release.tag,
+                files(n)
+            )
+        };
+        if !self.passed_over.is_empty() {
+            let over: Vec<String> = self
+                .passed_over
+                .iter()
+                .map(|(tag, n)| format!("{tag} ({})", files(*n)))
+                .collect();
+            text.push_str(&format!("; passed over {} for the limit", over.join(", ")));
+        }
+        text
+    }
+}
 
 /// The commit a revision names, with the upstream tag it named, if any.
 #[derive(Debug, Clone, PartialEq, Eq)]

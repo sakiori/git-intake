@@ -10,6 +10,7 @@ use crate::Exit;
 use crate::commands::update::{require_merging, require_worktree};
 use crate::config::{self, Check};
 use crate::git::{Git, abbrev};
+use crate::output::say;
 use crate::port::Verb;
 use crate::repo::{Repo, bullet};
 use crate::state::{
@@ -71,10 +72,10 @@ pub fn run(repo: &Repo, only: &[String], skip: &[String]) -> Result<Exit> {
         return partial_run(repo, &mut state, &head, &selected);
     }
     if verify_head(repo, &mut state, &head)? {
-        println!("verified {}; next: git intake finish", abbrev(&head));
+        say!("verified {}; next: git intake finish", abbrev(&head));
         Ok(Exit::Success)
     } else {
-        println!(
+        say!(
             "verification failed; fix it on the update branch in {}, commit, and run `git intake verify` again",
             state.worktree.display()
         );
@@ -154,7 +155,7 @@ fn partial_run(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    println!(
+    say!(
         "running {ran} on {} in {}, leaving out {}",
         abbrev(head),
         state.worktree.display(),
@@ -176,11 +177,11 @@ fn partial_run(
          and verify it"
             .to_string()
     };
-    println!(
+    say!(
         "this partial run {outcome} and did not verify the update: it left out some of the update's checks; {standing}"
     );
     if !passed {
-        println!(
+        say!(
             "fix the failures on the update branch in {}, commit, and run `git intake verify` again",
             state.worktree.display()
         );
@@ -197,7 +198,7 @@ fn partial_run(
 /// partial run, and returns whether it passed. `finish` runs it on a
 /// catch-up merge it made.
 pub fn verify_head(repo: &Repo, state: &mut UpdateState, head: &str) -> Result<bool> {
-    println!("verifying {} in {}", abbrev(head), state.worktree.display());
+    say!("verifying {} in {}", abbrev(head), state.worktree.display());
     let checks = state.config.checks.clone();
     let run = run_checks(repo, state, head, &checks, &repo.paths.verify_logs)?;
     let passed = run.passed;
@@ -225,7 +226,7 @@ fn run_checks(
     let environment = check_environment(state, head);
     let mut problems = Vec::new();
     if let Err(why) = merged_config_problem(&wt, head, &state.config.integration)? {
-        println!("FAILED   {why}");
+        say!("FAILED   {why}");
         problems.push(why);
     }
     // A broken merged configuration fails the run; the commands are skipped.
@@ -266,7 +267,7 @@ fn run_checks(
     let head_after = wt.line(&["rev-parse", "HEAD"])?;
     if head_after != head {
         let why = "the update branch moved during verification; verify again".to_string();
-        println!("{why}");
+        say!("{why}");
         problems.push(why);
     }
     let changed = wt.tracked_changes()?;
@@ -275,7 +276,7 @@ fn run_checks(
             "the commands changed tracked files, so the verified tree would differ from the commit:\n{}",
             bullet(&changed)
         );
-        println!("{why}");
+        say!("{why}");
         problems.push(why);
     }
     let passed = problems.is_empty()
@@ -303,7 +304,7 @@ fn run_command(
     environment: &[(String, String)],
 ) -> Result<CommandResult> {
     if skipped {
-        println!("skipped  {label}");
+        say!("skipped  {label}");
         return Ok(CommandResult {
             outcome: CheckOutcome::Skipped,
             exit_code: None,
@@ -312,13 +313,13 @@ fn run_command(
     }
     let code = run_logged(command, dir, &log, environment)?;
     let outcome = if code == Some(0) {
-        println!("passed   {label}  (log: {})", log.display());
+        say!("passed   {label}  (log: {})", log.display());
         CheckOutcome::Passed
     } else {
         let status = code.map_or("terminated by a signal".to_string(), |c| {
             format!("exit {c}")
         });
-        println!("FAILED   {label}  ({status}; log: {})", log.display());
+        say!("FAILED   {label}  ({status}; log: {})", log.display());
         CheckOutcome::Failed
     };
     Ok(CommandResult {

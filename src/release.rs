@@ -220,7 +220,7 @@ pub fn base_of(
 ) -> Result<Base> {
     let pattern = TagPattern::parse(&settings.tags)
         .map_err(|why| anyhow::anyhow!("release.tags '{}': {why}", settings.tags))?;
-    let Some(found) = tags.release(git, &pattern, commit)? else {
+    let Some(found) = tags.release(git, &pattern, false, commit)? else {
         bail!(
             "{} contains no release of upstream '{}' ({}) whose tag matches '{}'; the release base comes \
              from the newest upstream release a commit contains",

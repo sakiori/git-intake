@@ -16,6 +16,8 @@
 //! other end leaves no update it created, so that the next run meets the
 //! same situation.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 
 use crate::Exit;
@@ -32,8 +34,10 @@ use crate::commands::update::{
 use crate::commands::{env, finish, verify};
 use crate::config::{Config, Mode, Publish, PublishVia};
 use crate::description::{self, Targets};
-use crate::forge::{Forge, MergeRequest, State};
+use crate::forge::{Failure, Forge, MergeRequest, State, patiently};
 use crate::git::{Git, abbrev, branch_ref};
+use crate::output::{esay, say};
+use crate::pause;
 use crate::port::{self, Standing, Verb};
 use crate::repo::Repo;
 use crate::state::{
@@ -45,6 +49,52 @@ use crate::tags::UpstreamTags;
 use crate::update_line::{self, History};
 use crate::upstreams::{self, Fetches};
 
+/// How many times `sync` is run in all when it fails on what may pass: a 5xx,
+/// or a network error of the forge or of git.
+pub const ATTEMPTS: u32 = 3;
+
+/// The time between those runs.
+const RETRY_GAP: Duration = Duration::from_secs(5);
+
+/// The time between those runs as the tests set it; builds without debug
+/// assertions ignore that.
+pub fn retry_gap() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("GIT_INTAKE_TEST_RETRY_GAP_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    RETRY_GAP
+}
+
+/// The command a catch-up of the open merge request runs under, as its
+/// messages name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caller {
+    Sync,
+    Land,
+}
+
+impl Caller {
+    fn name(self) -> &'static str {
+        match self {
+            Caller::Sync => "sync",
+            Caller::Land => "land",
+        }
+    }
+
+    /// What follows a merge request or an integration branch that changed
+    /// just before the push.
+    fn after_a_change(self) -> &'static str {
+        match self {
+            Caller::Sync => "Run the command again",
+            Caller::Land => "`git intake land` reads them again",
+        }
+    }
+}
+
 pub fn run(repo: &Repo) -> Result<Exit> {
     if let Some(state) = repo.state()? {
         let wt = Git::worktree(&state.worktree);
@@ -54,34 +104,45 @@ pub fn run(repo: &Repo) -> Result<Exit> {
             update::next_step(&state, &wt)?
         );
     }
-    let (config, publish) = prepare(repo)?;
+    let (config, publish) = patiently(ATTEMPTS, retry_gap(), || prepare(repo))?;
     match publish.via {
+        // A run that verified an update leaves it in progress, so only the
+        // run through a merge request, which leaves nothing, can go again.
         PublishVia::Push => by_push(repo, config),
-        PublishVia::MergeRequest => by_merge_request(repo, config, publish),
+        PublishVia::MergeRequest => patiently(ATTEMPTS, retry_gap(), || {
+            by_merge_request(repo, config.clone(), publish.clone())
+        }),
     }
+}
+
+/// The configuration committed at HEAD and its publish setting, which
+/// `sync` and `land` need.
+pub fn configured(repo: &Repo) -> Result<(Config, Publish)> {
+    let head = repo
+        .head()
+        .context("HEAD names no commit; run the command in a checkout of the integration branch")?;
+    let at_head = repo.config_at(head)?.with_context(|| {
+        format!(
+            "no {} is committed at HEAD; run the command in a checkout of the integration branch",
+            crate::config::FILE_NAME
+        )
+    })?;
+    let publish = at_head.publish.clone().with_context(|| {
+        format!(
+            "the command works through the publish remote, but the {} at HEAD has no [publish] setting; add one \
+             naming the publish remote",
+            crate::config::FILE_NAME
+        )
+    })?;
+    Ok((at_head, publish))
 }
 
 /// Brings the local integration branch up to date with the publish
 /// remote's, as `start` does, creating it when it is missing, and reads the
 /// configuration again at its tip.
-fn prepare(repo: &Repo) -> Result<(Config, Publish)> {
-    let head = repo.head().context(
-        "HEAD names no commit; run `git intake sync` in a checkout of the integration branch",
-    )?;
-    let at_head = repo.config_at(head)?.with_context(|| {
-        format!(
-            "no {} is committed at HEAD; run `git intake sync` in a checkout of the integration branch",
-            crate::config::FILE_NAME
-        )
-    })?;
+pub fn prepare(repo: &Repo) -> Result<(Config, Publish)> {
+    let (at_head, publish) = configured(repo)?;
     let integration = at_head.integration.clone();
-    let publish = at_head.publish.clone().with_context(|| {
-        format!(
-            "`git intake sync` publishes what it takes in, but the {} at HEAD has no [publish] setting; add one \
-             naming the publish remote",
-            crate::config::FILE_NAME
-        )
-    })?;
     let git = &repo.git;
     if git.commit(&branch_ref(&integration))?.is_none() {
         let tip = fetch_integration(git, &publish.remote, &integration)?;
@@ -93,7 +154,7 @@ fn prepare(repo: &Repo) -> Result<(Config, Publish)> {
             &tip,
             "",
         ])?;
-        println!(
+        say!(
             "created '{integration}' at {} from '{}/{integration}'",
             abbrev(&tip),
             publish.remote
@@ -105,15 +166,14 @@ fn prepare(repo: &Repo) -> Result<(Config, Publish)> {
     let config = repo.load_config()?.config;
     let reread = config.publish.clone().with_context(|| {
         format!(
-            "the {} at the tip of '{integration}' has no [publish] setting; `git intake sync` publishes what it \
-             takes in",
+            "the {} at the tip of '{integration}' has no [publish] setting, which the command needs",
             crate::config::FILE_NAME
         )
     })?;
     if reread.remote != publish.remote {
         bail!(
-            "the {} at the tip of '{integration}' names '{}' as the publish remote instead of '{}'; run \
-             `git intake sync` again to use that configuration",
+            "the {} at the tip of '{integration}' names '{}' as the publish remote instead of '{}'; run the \
+             command again to use that configuration",
             crate::config::FILE_NAME,
             reread.remote,
             publish.remote
@@ -152,8 +212,15 @@ impl Plan {
 /// is behind, as `start` would with no upstream named. An upstream for
 /// which `start` would refuse, were it the only one selected, is left out
 /// and named; a port upstream is never taken, and named when it has pending
-/// commits.
-fn plan(repo: &Repo, config: &Config, base: &str, fetches: &mut Fetches) -> Result<Plan> {
+/// commits. `within_limit` says whether `max_conflicts` picks the targets, as
+/// it does for an update about to start.
+fn plan(
+    repo: &Repo,
+    config: &Config,
+    base: &str,
+    fetches: &mut Fetches,
+    within_limit: bool,
+) -> Result<Plan> {
     let git = &repo.git;
     let mut tips = Vec::new();
     let mut fetched = Vec::new();
@@ -177,7 +244,7 @@ fn plan(repo: &Repo, config: &Config, base: &str, fetches: &mut Fetches) -> Resu
                     Mode::Follow => plan
                         .left_out
                         .push(format!("upstream '{}' cannot be fetched: {why}", up.name)),
-                    Mode::Port => println!(
+                    Mode::Port => say!(
                         "{}: port upstream not taken by sync, and it cannot be fetched: {why}",
                         up.name
                     ),
@@ -190,7 +257,7 @@ fn plan(repo: &Repo, config: &Config, base: &str, fetches: &mut Fetches) -> Resu
                 Ok(Standing::Known(a)) => {
                     let n = a.pending().len() as u64;
                     if n > 0 {
-                        println!(
+                        say!(
                             "{}: port upstream with {n} pending commit{}; sync never takes a port upstream, \
                                  `git intake start {}` plans them for review",
                             up.name,
@@ -199,17 +266,17 @@ fn plan(repo: &Repo, config: &Config, base: &str, fetches: &mut Fetches) -> Resu
                         );
                     }
                 }
-                Ok(Standing::Rewritten(rewrite)) => println!(
+                Ok(Standing::Rewritten(rewrite)) => say!(
                     "{}: port upstream not taken by sync, and it was rewritten: {}",
                     up.name,
                     rewrite.describe(&up.name)
                 ),
-                Ok(Standing::NoBase) => println!(
+                Ok(Standing::NoBase) => say!(
                     "{}: port upstream not taken by sync: {}",
                     up.name,
                     port::no_base_advice(&up.name)
                 ),
-                Err(err) => println!(
+                Err(err) => say!(
                     "{}: port upstream not taken by sync: {}",
                     up.name,
                     crate::redact::redacted(&format!("{err:#}"))
@@ -228,18 +295,22 @@ fn plan(repo: &Repo, config: &Config, base: &str, fetches: &mut Fetches) -> Resu
                     base,
                     up,
                     latest.get(&up.name),
-                    Fetched { tip, tags: &tags },
+                    Fetched {
+                        tip,
+                        tags: &tags,
+                        within_limit,
+                    },
                     None,
                 )? {
                     Queued::Work(q) => plan.queue.push(*q),
-                    Queued::Current(message) => println!("{message}"),
+                    Queued::Current(message) => say!("{message}"),
                     Queued::Refused(why) => plan.left_out.push(why),
                 }
             }
         }
     }
     for why in &plan.left_out {
-        println!("left out: {}", crate::redact::redacted(why));
+        say!("left out: {}", crate::redact::redacted(why));
     }
     Ok(plan)
 }
@@ -247,9 +318,9 @@ fn plan(repo: &Repo, config: &Config, base: &str, fetches: &mut Fetches) -> Resu
 /// Says that nothing is behind.
 fn nothing_behind(plan: &Plan) {
     if plan.left_out.is_empty() {
-        println!("every follow upstream is current; nothing to update");
+        say!("every follow upstream is current; nothing to update");
     } else {
-        println!("every follow upstream sync can take is current; nothing to update");
+        say!("every follow upstream sync can take is current; nothing to update");
     }
 }
 
@@ -264,7 +335,7 @@ fn by_push(repo: &Repo, config: Config) -> Result<Exit> {
         .commit(&branch_ref(&integration))?
         .with_context(|| format!("the integration branch '{integration}' does not exist"))?;
     let mut fetches = Fetches::new(repo);
-    let plan = plan(repo, &config, &base, &mut fetches)?;
+    let plan = plan(repo, &config, &base, &mut fetches, true)?;
     if plan.queue.is_empty() {
         nothing_behind(&plan);
         return Ok(plan.exit());
@@ -285,7 +356,7 @@ fn by_push(repo: &Repo, config: Config) -> Result<Exit> {
         // brings whether they pass or fail.
         announced.check_changes(repo, &state, &head)?;
         if !verify::verify_head(repo, &mut state, &head)? {
-            println!(
+            say!(
                 "the checks failed; nothing was published, and the update stays in progress, unverified, in {}. \
                  Fix it there and run `git intake verify` and `git intake finish`, or run `git intake abort`",
                 state.worktree.display()
@@ -309,7 +380,7 @@ fn by_push(repo: &Repo, config: Config) -> Result<Exit> {
 
 /// What a stop on conflicts says beyond what the merge printed.
 fn stopped_on_conflict() -> Exit {
-    println!(
+    say!(
         "sync stopped with the update in progress and nothing published; resolve the conflicts, then run \
          `git intake continue` and `git intake finish`"
     );
@@ -323,6 +394,7 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
     let remote = setting.remote.clone();
     crate::forge::refuse_job_token_push(git, &remote)?;
     require_published(repo, &remote, &integration)?;
+    pause::warn_if_on(repo, &setting, &config.upstreams);
     let forge = connect(repo, &setting)?;
     let kind = forge.kind();
     let term = kind.term();
@@ -341,9 +413,10 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
             open,
             &tip,
             &mut fetches,
+            Caller::Sync,
         );
     }
-    let plan = plan(repo, &config, &tip, &mut fetches)?;
+    let plan = plan(repo, &config, &tip, &mut fetches, true)?;
     let declined: Option<(MergeRequest, Targets)> = reqs
         .latest_ended()
         .filter(|m| m.state == State::Closed)
@@ -351,7 +424,7 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
     if let Some(at) = remote_branch(repo, &mut fetches, &remote, UPDATE_BRANCH)? {
         match classify(git, &config, &at, &tip, &reqs.ended, None)? {
             Branch::Leftover | Branch::Contained => {
-                println!(
+                say!(
                     "the branch '{UPDATE_BRANCH}' on '{remote}' holds nothing but what landed or what a closed or \
                      merged {term} held; deleting it"
                 );
@@ -362,9 +435,10 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
                     &at,
                     &crate::identity::Upstreams::new(git, &config.upstreams)?,
                 )? {
-                    bail!(
+                    return Err(Failure::unanswered(format!(
                         "the branch '{UPDATE_BRANCH}' remains on '{remote}'; nothing was pushed. Run `git intake sync` again"
-                    );
+                    ))
+                    .into());
                 }
             }
             Branch::Update(history) => {
@@ -383,7 +457,7 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
                         named(kind, mr)
                     );
                 }
-                println!(
+                say!(
                     "the branch '{UPDATE_BRANCH}' on '{remote}' at {} holds an update no {term} carries; carrying it on",
                     abbrev(&at)
                 );
@@ -396,6 +470,7 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
                     &history,
                     &tip,
                     None,
+                    Caller::Sync,
                 )?;
                 return Ok(worse(exit, plan.exit()));
             }
@@ -410,7 +485,7 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
     if let Some((mr, targets)) = &declined
         && planned.iter().all(|(n, t)| targets.get(n) == Some(t))
     {
-        println!(
+        say!(
             "the {} was closed without merging, which declined these targets: {}. Nothing was started; the next \
              update comes when an upstream moves on, or by hand with `git intake start` and `git intake finish`",
             named(kind, mr),
@@ -429,7 +504,7 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
         && recorded.iter().all(|(n, t)| planned.get(n) == Some(t))
         && merged_without_history(git, merged, &tip)?
     {
-        eprintln!(
+        esay!(
             "warning: the {} was merged without the update's history, which a squash or rebase drops, so its sync \
              records never landed; sync proposes the same targets again, and merging the new {term} with its \
              history records them",
@@ -485,15 +560,16 @@ fn conclude(repo: &Repo, state: &UpdateState, published: Published) -> Result<Ex
             Ok(Exit::Success)
         }
         Published::Stopped(stop) => {
-            println!("{}", stop.message);
+            say!("{}", stop.message);
             discard(repo, state)?;
             Ok(stop.exit)
         }
     }
 }
 
-/// `sync` with the update's merge request open.
-fn sync_open(
+/// `sync` with the update's merge request open, as `caller` runs it.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_open(
     repo: &Repo,
     config: Config,
     forge: &dyn Forge,
@@ -501,6 +577,7 @@ fn sync_open(
     open: MergeRequest,
     tip: &str,
     fetches: &mut Fetches,
+    caller: Caller,
 ) -> Result<Exit> {
     let git = &repo.git;
     let kind = forge.kind();
@@ -522,29 +599,31 @@ fn sync_open(
     if rewritten {
         bail!(
             "the {} was rewritten: its head {} lacks the sync records of the targets it records, as a rebase \
-             drops them, so merging it would not record what it takes in. sync does not touch it, and nothing was \
+             drops them, so merging it would not record what it takes in. {} does not touch it, and nothing was \
              pushed. Withdraw it with `git intake abort --merge-request`, which declines its targets, so that sync \
              proposes them again only once an upstream moves on; `git intake start` and `git intake finish` \
              publish them again by hand",
             named(kind, &open),
-            abbrev(&head)
+            abbrev(&head),
+            caller.name()
         );
     }
     if git.is_ancestor(tip, &head)? {
-        println!(
+        say!(
             "the update waits for the {} at {}, which contains '{}' at {}; nothing changed",
             named(kind, &open),
             abbrev(&head),
             config.integration,
             abbrev(tip)
         );
-        let plan = plan(repo, &config, tip, fetches)?;
+        // Nothing starts, so no target is worth a prediction per tag.
+        let plan = plan(repo, &config, tip, fetches, false)?;
         for q in &plan.queue {
             if let Some(f) = q.follow()
                 && !git.is_ancestor(&f.target, &head)?
             {
-                println!(
-                    "{}: moved on to {} since the {term} was opened; the next update takes it",
+                say!(
+                    "{}: moved on to {} since the {term} was opened, for a later update",
                     q.name,
                     abbrev(&f.target)
                 );
@@ -561,6 +640,7 @@ fn sync_open(
         &history,
         tip,
         Some(&open),
+        caller,
     )
 }
 
@@ -577,6 +657,7 @@ fn carry_and_publish(
     history: &History,
     tip: &str,
     open: Option<&MergeRequest>,
+    caller: Caller,
 ) -> Result<Exit> {
     let git = &repo.git;
     let kind = forge.kind();
@@ -603,9 +684,10 @@ fn carry_and_publish(
         if !git.is_ancestor(tip, head)? {
             catch_up::require_possible(repo, &state, tip, Advice::Sync(&request), true)?;
             if let Some(exit) = catch_up::run(repo, &mut state, tip)? {
-                println!(
-                    "sync stopped on the catch-up merge with the update in progress and nothing pushed{}; resolve \
+                say!(
+                    "{} stopped on the catch-up merge with the update in progress and nothing pushed{}; resolve \
                      the conflicts, then run `git intake continue` and `git intake finish`",
+                    caller.name(),
                     open.map(|m| format!(": the {} keeps its head", named(kind, m)))
                         .unwrap_or_default()
                 );
@@ -624,8 +706,16 @@ fn carry_and_publish(
             Some(open) => {
                 let upstreams =
                     crate::identity::Upstreams::new(&repo.git, &state.config.upstreams)?;
-                let mut guard =
-                    merge_request::guard(repo, forge, remote, open, head, tip, &upstreams);
+                let mut guard = merge_request::guard(
+                    repo,
+                    forge,
+                    remote,
+                    open,
+                    head,
+                    tip,
+                    &upstreams,
+                    caller.after_a_change(),
+                );
                 publish(
                     repo,
                     &mut state,
@@ -695,7 +785,7 @@ fn carry_on(
     repo.save_state(&state)?;
     upstreams::hold(git, &state)?;
     let names: Vec<&str> = state.upstreams.iter().map(|q| q.name.as_str()).collect();
-    println!(
+    say!(
         "carried on the update at {} in {}: {}",
         abbrev(head),
         state.worktree.display(),

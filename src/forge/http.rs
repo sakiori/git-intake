@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use url::Url;
 
+use super::Failure;
 use crate::state::RELEASE;
 
 /// How many redirects one request follows.
@@ -20,6 +21,9 @@ const MAX_REDIRECTS: usize = 5;
 
 /// The most of a response body an error message quotes.
 const QUOTED: usize = 400;
+
+/// How many items one page of a list asks for, the most both forges give.
+pub const PER_PAGE: usize = 100;
 
 /// A token read from the environment. It is never shown: neither its
 /// `Debug` nor any message of the tool prints it.
@@ -236,9 +240,47 @@ impl Client {
     pub fn json(&self, method: Method, url: &Url, body: Option<&Value>) -> Result<Value> {
         let reply = self.send(method, url, body)?;
         if !reply.success() {
-            bail!("{}", self.refusal(method, url, &reply));
+            return Err(Failure::answered(reply.status, self.refusal(method, url, &reply)).into());
         }
         Ok(reply.json)
+    }
+
+    /// Reads the list at `url` page by page, handing each to `page` until it
+    /// returns `false` or the list ends. `what` names the list in a message.
+    pub fn pages(
+        &self,
+        url: &Url,
+        what: &str,
+        mut page: impl FnMut(&[Value]) -> bool,
+    ) -> Result<()> {
+        let mut number = 0usize;
+        loop {
+            number += 1;
+            let mut one = url.clone();
+            one.query_pairs_mut()
+                .append_pair("per_page", &PER_PAGE.to_string())
+                .append_pair("page", &number.to_string());
+            let reply = self.json(Method::Get, &one, None)?;
+            let items = reply.as_array().with_context(|| {
+                format!(
+                    "the {} API answered the list of {what} with something else",
+                    self.forge
+                )
+            })?;
+            if !page(items) || items.len() < PER_PAGE {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Every item of the list at `url`.
+    pub fn list(&self, url: &Url, what: &str) -> Result<Vec<Value>> {
+        let mut all = Vec::new();
+        self.pages(url, what, |page| {
+            all.extend_from_slice(page);
+            true
+        })?;
+        Ok(all)
     }
 
     /// The message of a request the forge rejected: its status and what it
@@ -294,7 +336,11 @@ impl Client {
             };
         }
         let unreachable = |e: ureq::Error| {
-            anyhow::anyhow!("cannot reach the {} API at {}: {e}", self.forge, shown(url))
+            anyhow::Error::from(Failure::unanswered(format!(
+                "cannot reach the {} API at {}: {e}",
+                self.forge,
+                shown(url)
+            )))
         };
         let response = match body {
             Some(body) => {

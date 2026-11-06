@@ -51,9 +51,101 @@ pub struct FakeMr {
     pub pinned_head: Option<String>,
     /// Whether it comes from a fork, whose branch is not the project's.
     pub fork: bool,
+    /// How many more reads report `pinned_head`, as a forge that has not
+    /// processed a push yet does; `None` for all of them.
+    pub lagging_reads: Option<usize>,
     /// GitLab: what the request asked for.
     pub squash: Option<bool>,
     pub remove_source_branch: Option<bool>,
+    /// GitLab: what keeps it from merging, whatever the branches say, as a
+    /// `detailed_merge_status`.
+    pub blocked: Option<&'static str>,
+    /// GitLab: why the last merge failed.
+    pub merge_error: Option<&'static str>,
+    /// The ids of its assignees.
+    pub assignees: Vec<u64>,
+}
+
+/// One note on a merge request of the fake forge.
+#[derive(Debug, Clone)]
+pub struct FakeNote {
+    pub number: u64,
+    pub body: String,
+    /// Whether the forge wrote it, as it records an assignment.
+    pub system: bool,
+    /// When, as a count of the fake's clock.
+    pub at: u64,
+}
+
+/// Something that happens on the fake forge at a step of a pipeline
+/// script, as people and a merge queue act while the tool waits.
+#[derive(Debug, Clone)]
+pub enum Action {
+    /// Points a reference of the publish remote at a commit.
+    SetRef(String, String),
+    /// Removes a reference of the publish remote.
+    DeleteRef(String),
+    /// Merges a merge request, by fast-forward when its head contains its
+    /// target, as a queue does.
+    Merge(u64),
+    /// Assigns a merge request to an account, keeping its assignees.
+    Assign(u64, u64),
+    /// Answers the next requests whose path ends with a suffix with a
+    /// failure: method, path suffix, status and how many.
+    FailTimes(String, String, u16, usize),
+    /// Creates a file, as the test environment's SSH shim reads one.
+    Touch(PathBuf),
+    /// Writes a file, as the test environment's SSH shim reads one.
+    Write(PathBuf, String),
+    /// Removes that file.
+    Remove(PathBuf),
+    /// Hides the project from the token, which GitLab and GitHub then answer
+    /// with 404 on every request of it, as they do when it loses access.
+    Hide,
+    /// Sends a signal, such as `TERM`, to a process the test started.
+    Signal(u32, &'static str),
+    /// Makes actions happen once the next request with a method and a path
+    /// suffix has been answered, as [`FakeForge::on_request`].
+    OnRequest(String, String, Vec<Action>),
+}
+
+/// One read of a pipeline: its state, or `None` before it exists, and what
+/// happens when it is read.
+#[derive(Debug, Clone)]
+pub struct Step {
+    pub state: Option<&'static str>,
+    pub then: Vec<Action>,
+    /// What happens once the read has been answered, as a person acts just
+    /// after the tool read.
+    pub after: Vec<Action>,
+}
+
+impl Step {
+    pub fn is(state: &'static str) -> Self {
+        Self {
+            state: Some(state),
+            then: Vec::new(),
+            after: Vec::new(),
+        }
+    }
+
+    pub fn none() -> Self {
+        Self {
+            state: None,
+            then: Vec::new(),
+            after: Vec::new(),
+        }
+    }
+
+    pub fn then(mut self, action: Action) -> Self {
+        self.then.push(action);
+        self
+    }
+
+    pub fn after(mut self, action: Action) -> Self {
+        self.after.push(action);
+        self
+    }
 }
 
 /// One request the tool made.
@@ -94,6 +186,16 @@ pub struct World {
     /// Requests answered with a failure: method, path suffix, status and
     /// message.
     pub failures: Vec<(String, String, u16, String)>,
+    /// Requests answered with a failure a number of times: method, path
+    /// suffix, status and how many times more.
+    pub flaky: Vec<(String, String, u16, usize)>,
+    /// What happens once the current request has been answered.
+    pub after: Vec<Action>,
+    /// What happens once the next request with a method and a path suffix
+    /// has been answered.
+    pub on_request: Vec<(String, String, Vec<Action>)>,
+    /// Whether the project is hidden from the token.
+    pub hidden: bool,
     /// Requests answered with a redirect: method, path suffix and target.
     pub redirects: Vec<(String, String, String)>,
     /// How many lists of merge requests still leave out every merge
@@ -109,6 +211,34 @@ pub struct World {
     pub releases: Vec<String>,
     /// Whether the project is shown only to a request with a credential.
     pub private: bool,
+    /// The forge's accounts: id and name.
+    pub users: Vec<(u64, String)>,
+    pub notes: Vec<FakeNote>,
+    /// The pipeline of each commit, read by read: each read takes the next
+    /// step, and the last one stays.
+    pub pipelines: std::collections::HashMap<String, std::collections::VecDeque<Step>>,
+    /// The pipelines of the heads of the merge requests from a branch that
+    /// have no script of their own, read by read, as for a head pushed
+    /// while the tool runs.
+    pub branch_pipelines: std::collections::HashMap<String, std::collections::VecDeque<Step>>,
+    /// The pipeline state of a commit without a script; `None` for no
+    /// pipeline.
+    pub default_pipeline: Option<&'static str>,
+    /// GitHub: check runs of every commit besides the scripted one: name,
+    /// status and conclusion.
+    pub check_runs: Vec<(String, &'static str, Option<&'static str>)>,
+    /// GitHub: the check `ci` of each commit as last read.
+    pub read_checks: std::collections::HashMap<String, Option<&'static str>>,
+    /// GitLab: how the next requests to merge are answered: status, message
+    /// and the `detailed_merge_status` reads show afterwards.
+    pub merge_answers: std::collections::VecDeque<(u16, &'static str, &'static str)>,
+    /// A status reads show since the last of `merge_answers`.
+    pub merge_status: Option<&'static str>,
+    /// What happens when a request to merge arrives, before it is judged.
+    pub on_merge: Vec<Action>,
+    /// Each change of a merge request's assignees: its number, and the
+    /// message of the commit `refs/git-intake/pause` pointed at then.
+    pub assignments: Vec<(u64, Option<String>)>,
     clock: u64,
 }
 
@@ -175,12 +305,27 @@ impl FakeForge {
             mrs: Vec::new(),
             requests: Vec::new(),
             failures: Vec::new(),
+            flaky: Vec::new(),
+            after: Vec::new(),
+            on_request: Vec::new(),
+            hidden: false,
             redirects: Vec::new(),
             stale_lists: 0,
             merge_when: None,
             full_name: format!("{OWNER}/{REPO}"),
             releases: Vec::new(),
             private: false,
+            users: Vec::new(),
+            notes: Vec::new(),
+            pipelines: std::collections::HashMap::new(),
+            branch_pipelines: std::collections::HashMap::new(),
+            default_pipeline: Some("success"),
+            check_runs: Vec::new(),
+            read_checks: std::collections::HashMap::new(),
+            merge_answers: std::collections::VecDeque::new(),
+            merge_status: None,
+            on_merge: Vec::new(),
+            assignments: Vec::new(),
             clock: 0,
         }));
         let mut mocks = Vec::new();
@@ -294,6 +439,27 @@ impl FakeForge {
             .push((method.into(), suffix.into(), status, message.into()));
     }
 
+    /// Hides the project from the token, as for [`Action::Hide`].
+    pub fn hide(&self) {
+        self.world().hidden = true;
+    }
+
+    /// Makes `actions` happen once the next request with `method` whose path
+    /// ends with `suffix` has been answered.
+    pub fn on_request(&self, method: &str, suffix: &str, actions: Vec<Action>) {
+        self.world()
+            .on_request
+            .push((method.into(), suffix.into(), actions));
+    }
+
+    /// Answers the next `times` requests whose path ends with `suffix` with
+    /// `status`.
+    pub fn fail_times(&self, method: &str, suffix: &str, status: u16, times: usize) {
+        self.world()
+            .flaky
+            .push((method.into(), suffix.into(), status, times));
+    }
+
     /// Answers requests whose path ends with `suffix` with a redirect to
     /// `target`.
     pub fn redirect(&self, method: &str, suffix: &str, target: &str) {
@@ -350,9 +516,13 @@ impl FakeForge {
             head: None,
             ended: None,
             pinned_head: None,
+            lagging_reads: None,
             fork: false,
             squash: None,
             remove_source_branch: None,
+            blocked: None,
+            merge_error: None,
+            assignees: Vec::new(),
         });
         number
     }
@@ -375,6 +545,32 @@ impl FakeForge {
         mr.pinned_head = Some(head.into());
     }
 
+    /// Makes the forge report `head` as an open merge request's head for the
+    /// next `reads` reads of it, and its branch's tip from then on.
+    pub fn lag_head(&self, number: u64, head: &str, reads: usize) {
+        let mut w = self.world();
+        let mr = w.mrs.iter_mut().find(|m| m.number == number).unwrap();
+        mr.pinned_head = Some(head.into());
+        mr.lagging_reads = Some(reads);
+    }
+
+    /// Answers the next requests to merge with these: status, message and
+    /// the `detailed_merge_status` reads show afterwards.
+    pub fn answer_merges(&self, answers: &[(u16, &'static str, &'static str)]) {
+        self.world().merge_answers.extend(answers.iter().copied());
+    }
+
+    /// Runs `action` when the next request to merge arrives.
+    pub fn on_merge(&self, action: Action) {
+        self.world().on_merge.push(action);
+    }
+
+    /// Changes a merge request on the forge.
+    pub fn edit(&self, number: u64, change: impl FnOnce(&mut FakeMr)) {
+        let mut w = self.world();
+        change(w.mrs.iter_mut().find(|m| m.number == number).unwrap());
+    }
+
     /// Ends a merge request as `merged` or `closed`, keeping its head.
     pub fn end(&self, number: u64, state: &'static str) {
         let head = branch_tip(&self.publish, &self.mr(number).source);
@@ -393,6 +589,57 @@ impl FakeForge {
         self.world().releases.push(tag.to_string());
     }
 
+    /// Adds an account to the forge.
+    pub fn add_user(&self, id: u64, username: &str) {
+        self.world().users.push((id, username.to_string()));
+    }
+
+    /// Assigns merge request `number` to the account `id` besides its
+    /// assignees, as a person queues it, with the note the forge writes.
+    pub fn assign(&self, number: u64, id: u64) {
+        let bare = self.publish.clone();
+        act(&mut self.world(), &bare, &Action::Assign(number, id));
+    }
+
+    /// The notes of merge request `number`, oldest first.
+    pub fn notes(&self, number: u64) -> Vec<FakeNote> {
+        self.world()
+            .notes
+            .iter()
+            .filter(|n| n.number == number)
+            .cloned()
+            .collect()
+    }
+
+    /// Adds a note to merge request `number`, as a person or another run
+    /// writes it.
+    pub fn add_note(&self, number: u64, body: &str) {
+        let mut w = self.world();
+        w.clock += 1;
+        let at = w.clock;
+        w.notes.push(FakeNote {
+            number,
+            body: body.into(),
+            system: false,
+            at,
+        });
+    }
+
+    /// Scripts the pipeline of `commit`, read by read.
+    pub fn script(&self, commit: &str, steps: Vec<Step>) {
+        self.world()
+            .pipelines
+            .insert(commit.to_string(), steps.into_iter().collect());
+    }
+
+    /// Scripts the pipelines of the heads of the merge requests from
+    /// `branch` that have no script of their own, read by read.
+    pub fn script_branch(&self, branch: &str, steps: Vec<Step>) {
+        self.world()
+            .branch_pipelines
+            .insert(branch.to_string(), steps.into_iter().collect());
+    }
+
     /// Sets the description of a merge request, as a person edits it.
     pub fn describe(&self, number: u64, description: &str) {
         let mut w = self.world();
@@ -403,6 +650,20 @@ impl FakeForge {
 
 /// The tip of `branch` in the bare repository `bare`.
 pub fn branch_tip(bare: &Path, branch: &str) -> Option<String> {
+    bare_git(
+        bare,
+        &[
+            "rev-parse",
+            "-q",
+            "--verify",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+}
+
+/// Runs git on the bare repository `bare`; its output, trimmed, or `None`
+/// when it fails.
+fn bare_git(bare: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
     for var in [
         "GIT_DIR",
@@ -412,20 +673,220 @@ pub fn branch_tip(bare: &Path, branch: &str) -> Option<String> {
     ] {
         cmd.env_remove(var);
     }
-    let out = cmd
-        .arg("--git-dir")
-        .arg(bare)
-        .args([
-            "rev-parse",
-            "-q",
-            "--verify",
-            &format!("refs/heads/{branch}"),
-        ])
-        .output()
-        .ok()?;
+    // The forge commits merges as itself, whatever the machine running the tests has configured.
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Fake Forge")
+        .env("GIT_AUTHOR_EMAIL", "forge@example.com")
+        .env("GIT_COMMITTER_NAME", "Fake Forge")
+        .env("GIT_COMMITTER_EMAIL", "forge@example.com");
+    let out = cmd.arg("--git-dir").arg(bare).args(args).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Whether `a` is an ancestor of `b` in the bare repository.
+fn contains(bare: &Path, b: &str, a: &str) -> bool {
+    bare_git(bare, &["merge-base", "--is-ancestor", a, b]).is_some()
+}
+
+fn username(w: &World, id: u64) -> String {
+    w.users
+        .iter()
+        .find(|(i, _)| *i == id)
+        .map(|(_, n)| n.clone())
+        .unwrap_or_else(|| format!("user{id}"))
+}
+
+/// Sets a merge request's assignees, with the notes the forge writes.
+fn set_assignees(w: &mut World, number: u64, assignees: Vec<u64>) {
+    let Some(before) = w
+        .mrs
+        .iter()
+        .find(|m| m.number == number)
+        .map(|m| m.assignees.clone())
+    else {
+        return;
+    };
+    let added: Vec<String> = assignees
+        .iter()
+        .filter(|a| !before.contains(a))
+        .map(|a| format!("@{}", username(w, *a)))
+        .collect();
+    let removed: Vec<String> = before
+        .iter()
+        .filter(|a| !assignees.contains(a))
+        .map(|a| format!("@{}", username(w, *a)))
+        .collect();
+    let mut parts = Vec::new();
+    if !added.is_empty() {
+        parts.push(format!("assigned to {}", added.join(" and ")));
+    }
+    if !removed.is_empty() {
+        parts.push(format!("unassigned {}", removed.join(" and ")));
+    }
+    if let Some(mr) = w.mrs.iter_mut().find(|m| m.number == number) {
+        mr.assignees = assignees;
+    }
+    if !parts.is_empty() {
+        w.clock += 1;
+        let at = w.clock;
+        w.notes.push(FakeNote {
+            number,
+            body: parts.join(" and "),
+            system: true,
+            at,
+        });
+    }
+}
+
+/// Merges an open merge request into its target as the project's merge
+/// method does: by fast-forward with `ff`, and otherwise with a merge commit,
+/// or with one squashed commit when the merge request asks for squashing and
+/// the project lets it. Returns whether it merged.
+fn merge_mr(w: &mut World, bare: &Path, number: u64, remove_source: bool) -> bool {
+    let Some(mr) = w
+        .mrs
+        .iter()
+        .find(|m| m.number == number && m.state == "open")
+        .cloned()
+    else {
+        return false;
+    };
+    let head = head_of(&mr, bare);
+    let target_ref = format!("refs/heads/{}", mr.target);
+    let Some(target) = bare_git(bare, &["rev-parse", &target_ref]) else {
+        return false;
+    };
+    let squashed = mr.squash == Some(true) && w.project["squash_option"] != "never";
+    let fast_forward = w.project["merge_method"] == "ff" && contains(bare, &head, &target);
+    let merged = if squashed {
+        bare_git(
+            bare,
+            &[
+                "commit-tree",
+                &format!("{head}^{{tree}}"),
+                "-p",
+                &target,
+                "-m",
+                &format!("Squashed '{}'", mr.source),
+            ],
+        )
+    } else if fast_forward {
+        Some(head.clone())
+    } else {
+        bare_git(
+            bare,
+            &[
+                "commit-tree",
+                &format!("{head}^{{tree}}"),
+                "-p",
+                &target,
+                "-p",
+                &head,
+                "-m",
+                &format!("Merge branch '{}'", mr.source),
+            ],
+        )
+    };
+    let Some(merged) = merged else {
+        return false;
+    };
+    bare_git(bare, &["update-ref", &target_ref, &merged]);
+    if remove_source {
+        bare_git(
+            bare,
+            &["update-ref", "-d", &format!("refs/heads/{}", mr.source)],
+        );
+    }
+    w.clock += 1;
+    let clock = w.clock;
+    if let Some(m) = w.mrs.iter_mut().find(|m| m.number == number) {
+        m.head = Some(head);
+        m.state = "merged";
+        m.ended = Some(clock);
+    }
+    true
+}
+
+fn act(w: &mut World, bare: &Path, action: &Action) {
+    match action {
+        Action::SetRef(name, commit) => {
+            bare_git(bare, &["update-ref", name, commit]);
+        }
+        Action::DeleteRef(name) => {
+            bare_git(bare, &["update-ref", "-d", name]);
+        }
+        Action::FailTimes(method, suffix, status, times) => {
+            w.flaky
+                .push((method.clone(), suffix.clone(), *status, *times));
+        }
+        Action::Touch(path) => {
+            std::fs::write(path, "").unwrap();
+        }
+        Action::Write(path, text) => {
+            std::fs::write(path, text).unwrap();
+        }
+        Action::Remove(path) => {
+            std::fs::remove_file(path).unwrap();
+        }
+        Action::Hide => w.hidden = true,
+        Action::OnRequest(method, suffix, actions) => {
+            w.on_request
+                .push((method.clone(), suffix.clone(), actions.clone()));
+        }
+        Action::Signal(pid, signal) => {
+            let sent = std::process::Command::new("kill")
+                .args([format!("-{signal}"), pid.to_string()])
+                .status()
+                .unwrap();
+            assert!(sent.success());
+        }
+        Action::Merge(number) => {
+            merge_mr(w, bare, *number, true);
+        }
+        Action::Assign(number, id) => {
+            let mut assignees = w
+                .mrs
+                .iter()
+                .find(|m| m.number == *number)
+                .map(|m| m.assignees.clone())
+                .unwrap_or_default();
+            if !assignees.contains(id) {
+                assignees.push(*id);
+            }
+            set_assignees(w, *number, assignees);
+        }
+    }
+}
+
+/// Reads the pipeline of `commit` once: the state of the next step of its
+/// script, after the step's actions.
+fn read_pipeline(
+    w: &mut World,
+    bare: &Path,
+    commit: &str,
+    branch: Option<&str>,
+) -> Option<&'static str> {
+    let script = match w.pipelines.contains_key(commit) {
+        true => w.pipelines.get_mut(commit),
+        false => branch.and_then(|b| w.branch_pipelines.get_mut(b)),
+    };
+    let step = match script {
+        None => return w.default_pipeline,
+        Some(steps) if steps.len() > 1 => steps.pop_front(),
+        Some(steps) => steps.front_mut().map(|s| Step {
+            state: s.state,
+            then: std::mem::take(&mut s.then),
+            after: std::mem::take(&mut s.after),
+        }),
+    }?;
+    for action in &step.then {
+        act(w, bare, action);
+    }
+    w.after.extend(step.after);
+    step.state
 }
 
 fn time(clock: u64) -> String {
@@ -449,6 +910,17 @@ impl Query {
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     }
+}
+
+/// The page of a list a request asks for, as both forges cut it.
+fn page<T: Clone>(list: &[T], q: &Query) -> Vec<T> {
+    let per_page: usize = q.get("per_page").and_then(|p| p.parse().ok()).unwrap_or(20);
+    let page: usize = q.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+    list.iter()
+        .skip(per_page * (page - 1))
+        .take(per_page)
+        .cloned()
+        .collect()
 }
 
 fn reply(status: u16, body: Value) -> Reply {
@@ -495,6 +967,13 @@ fn answer(kind: Kind, w: &mut World, req: &Request, bare: &Path, host: &str) -> 
             mr.ended = Some(clock);
         }
     }
+    let hidden = [
+        format!("/api/v4/projects/{OWNER}%2F{REPO}"),
+        format!("/api/v3/repos/{OWNER}/{REPO}"),
+    ];
+    if w.hidden && hidden.iter().any(|p| path.starts_with(p.as_str())) {
+        return reply(404, json!({"message": "404 Project Not Found"}));
+    }
     if let Some((_, _, target)) = w
         .redirects
         .iter()
@@ -509,6 +988,18 @@ fn answer(kind: Kind, w: &mut World, req: &Request, bare: &Path, host: &str) -> 
     {
         return reply(*status, json!({ "message": message }));
     }
+    if let Some(flaky) = w
+        .flaky
+        .iter_mut()
+        .find(|(m, s, _, times)| *m == method && path.ends_with(s.as_str()) && *times > 0)
+    {
+        flaky.3 -= 1;
+        let status = flaky.2;
+        return reply(
+            status,
+            json!({ "message": format!("{status} from the forge") }),
+        );
+    }
     let body: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     let credential = req
         .headers()
@@ -517,10 +1008,22 @@ fn answer(kind: Kind, w: &mut World, req: &Request, bare: &Path, host: &str) -> 
     if w.private && !credential {
         return reply(404, json!({"message": "404 Project Not Found"}));
     }
-    match kind {
+    if let Some(at) = w
+        .on_request
+        .iter()
+        .position(|(m, s, _)| *m == method && path.ends_with(s.as_str()))
+    {
+        let (_, _, actions) = w.on_request.remove(at);
+        w.after.extend(actions);
+    }
+    let answered = match kind {
         Kind::GitLab => gitlab(w, &method, path, &q, &body, bare, host),
         Kind::GitHub => github(w, &method, path, &q, &body, bare, host),
+    };
+    for action in std::mem::take(&mut w.after) {
+        act(w, bare, &action);
     }
+    answered
 }
 
 fn head_of(mr: &FakeMr, bare: &Path) -> String {
@@ -547,7 +1050,63 @@ fn gitlab_mr(mr: &FakeMr, bare: &Path, host: &str) -> Value {
         "description": mr.description,
         "merged_at": (mr.state == "merged").then(|| time(mr.ended.unwrap_or(0))),
         "closed_at": (mr.state == "closed").then(|| time(mr.ended.unwrap_or(0))),
+        "assignees": mr.assignees.iter().map(|a| json!({"id": a})).collect::<Vec<_>>(),
     })
+}
+
+/// A merge request as GitLab answers a request for it alone: with its
+/// assignees, the pipeline of its head, which counts as a read of it, and
+/// how far its head is behind its target.
+fn gitlab_single(w: &mut World, number: u64, bare: &Path, host: &str) -> Option<Value> {
+    let (head, source) = w
+        .mrs
+        .iter()
+        .find(|m| m.number == number)
+        .map(|m| (head_of(m, bare), m.source.clone()))?;
+    let pipeline = if head.is_empty() {
+        None
+    } else {
+        read_pipeline(w, bare, &head, Some(&source))
+    };
+    // What the read set off shows in the same answer.
+    let mr = w.mrs.iter().find(|m| m.number == number)?.clone();
+    if let Some(m) = w.mrs.iter_mut().find(|m| m.number == number)
+        && let Some(reads) = &mut m.lagging_reads
+    {
+        *reads = reads.saturating_sub(1);
+        if *reads == 0 {
+            m.lagging_reads = None;
+            m.pinned_head = None;
+        }
+    }
+    let mut v = gitlab_mr(&mr, bare, host);
+    v["head_pipeline"] = match pipeline {
+        Some(status) => json!({
+            "id": 100 + mr.number,
+            "sha": head,
+            "status": status,
+            "web_url": format!("{host}/{OWNER}/{REPO}/-/pipelines/{}", 100 + mr.number),
+        }),
+        None => Value::Null,
+    };
+    v["assignees"] = Value::Array(
+        mr.assignees
+            .iter()
+            .map(|a| json!({"id": a, "username": username(w, *a)}))
+            .collect(),
+    );
+    let current = bare_git(bare, &["rev-parse", &format!("refs/heads/{}", mr.target)])
+        .is_some_and(|target| contains(bare, &head, &target));
+    v["diverged_commits_count"] = json!(if current { 0 } else { 1 });
+    v["detailed_merge_status"] = json!(match (w.merge_status, mr.blocked, current) {
+        (Some(status), _, _) => status,
+        (None, Some(blocked), _) => blocked,
+        (None, None, true) => "mergeable",
+        (None, None, false) => "need_rebase",
+    });
+    v["squash"] = json!(mr.squash == Some(true));
+    v["merge_error"] = json!(mr.merge_error);
+    Some(v)
 }
 
 fn gitlab(
@@ -559,6 +1118,19 @@ fn gitlab(
     bare: &Path,
     host: &str,
 ) -> Reply {
+    if (method, path) == ("GET", "/api/v4/users") {
+        let name = q.get("username").unwrap_or_default();
+        return reply(
+            200,
+            Value::Array(
+                w.users
+                    .iter()
+                    .filter(|(_, n)| n == name)
+                    .map(|(id, n)| json!({"id": id, "username": n}))
+                    .collect(),
+            ),
+        );
+    }
     let project = format!("/api/v4/projects/{OWNER}%2F{REPO}");
     let Some(rest) = path.strip_prefix(&project) else {
         return reply(404, json!({"message": "404 Project Not Found"}));
@@ -584,6 +1156,10 @@ fn gitlab(
                 .iter()
                 .filter(|m| q.get("source_branch").is_none_or(|s| m.source == s))
                 .filter(|m| q.get("target_branch").is_none_or(|t| m.target == t))
+                .filter(|m| {
+                    q.get("assignee_id")
+                        .is_none_or(|a| m.assignees.iter().any(|i| i.to_string() == a))
+                })
                 .filter(|m| match q.get("state") {
                     Some("opened") => m.state == "open",
                     Some("merged") => m.state == "merged",
@@ -594,13 +1170,98 @@ fn gitlab(
             list.sort_by_key(|m| std::cmp::Reverse(m.number));
             reply(
                 200,
-                Value::Array(list.iter().map(|m| gitlab_mr(m, bare, host)).collect()),
+                Value::Array(
+                    page(&list, q)
+                        .iter()
+                        .map(|m| gitlab_mr(m, bare, host))
+                        .collect(),
+                ),
             )
         }
-        ("GET", ["merge_requests", n]) => match w.mrs.iter().find(|m| m.number.to_string() == *n) {
-            Some(m) => reply(200, gitlab_mr(m, bare, host)),
-            None => reply(404, json!({"message": "404 Not found"})),
-        },
+        ("GET", ["merge_requests", n]) => {
+            match gitlab_single(w, n.parse().unwrap_or_default(), bare, host) {
+                Some(v) => reply(200, v),
+                None => reply(404, json!({"message": "404 Not found"})),
+            }
+        }
+        ("GET", ["merge_requests", n, "notes"]) => {
+            let mut notes: Vec<&FakeNote> = w
+                .notes
+                .iter()
+                .filter(|x| x.number.to_string() == *n)
+                .collect();
+            if q.get("sort") != Some("asc") {
+                notes.reverse();
+            }
+            reply(
+                200,
+                Value::Array(
+                    page(&notes, q)
+                        .iter()
+                        .map(|x| json!({"body": x.body, "system": x.system, "created_at": time(x.at)}))
+                        .collect(),
+                ),
+            )
+        }
+        ("POST", ["merge_requests", n, "notes"]) => {
+            let Ok(number) = n.parse::<u64>() else {
+                return reply(404, json!({"message": "404 Not found"}));
+            };
+            w.clock += 1;
+            let at = w.clock;
+            w.notes.push(FakeNote {
+                number,
+                body: body["body"].as_str().unwrap_or_default().into(),
+                system: false,
+                at,
+            });
+            reply(201, json!({"body": body["body"], "system": false}))
+        }
+        // As `lib/api/merge_requests.rb` answers: the head first, then a
+        // squash asked for, then whether it can merge.
+        ("PUT", ["merge_requests", n, "merge"]) => {
+            let number: u64 = n.parse().unwrap_or_default();
+            for action in std::mem::take(&mut w.on_merge) {
+                act(w, bare, &action);
+            }
+            let Some(mr) = w.mrs.iter().find(|m| m.number == number).cloned() else {
+                return reply(404, json!({"message": "404 Not found"}));
+            };
+            if mr.state == "open"
+                && body["sha"]
+                    .as_str()
+                    .is_some_and(|sha| sha != head_of(&mr, bare))
+            {
+                return reply(
+                    409,
+                    json!({"message": "SHA does not match HEAD of source branch"}),
+                );
+            }
+            if body["squash"].as_bool() == Some(true)
+                && let Some(m) = w.mrs.iter_mut().find(|m| m.number == number)
+            {
+                m.squash = Some(true);
+            }
+            w.merge_status = None;
+            if let Some((status, message, then)) = w.merge_answers.pop_front() {
+                w.merge_status = Some(then);
+                return reply(status, json!({ "message": message }));
+            }
+            let target = bare_git(bare, &["rev-parse", &format!("refs/heads/{}", mr.target)])
+                .unwrap_or_default();
+            if mr.state != "open"
+                || mr.blocked.is_some()
+                || !contains(bare, &head_of(&mr, bare), &target)
+            {
+                return reply(405, json!({"message": "405 Method Not Allowed"}));
+            }
+            let remove = body["should_remove_source_branch"].as_bool() == Some(true);
+            if !merge_mr(w, bare, number, remove) {
+                return reply(422, json!({"message": "Branch cannot be merged"}));
+            }
+            let m = w.mrs.iter().find(|m| m.number == number).cloned().unwrap();
+            reply(200, gitlab_mr(&m, bare, host))
+        }
         ("POST", ["merge_requests"]) => {
             let source = body["source_branch"]
                 .as_str()
@@ -634,9 +1295,13 @@ fn gitlab(
                 head: None,
                 ended: None,
                 pinned_head: None,
+                lagging_reads: None,
                 fork: false,
                 squash: body["squash"].as_bool(),
                 remove_source_branch: body["remove_source_branch"].as_bool(),
+                blocked: None,
+                merge_error: None,
+                assignees: Vec::new(),
             };
             let json = gitlab_mr(&mr, bare, host);
             w.mrs.push(mr);
@@ -662,7 +1327,15 @@ fn gitlab(
                 mr.state = "closed";
                 mr.ended = Some(clock);
             }
-            reply(200, gitlab_mr(mr, bare, host))
+            let number = mr.number;
+            if let Some(ids) = body["assignee_ids"].as_array() {
+                let ids = ids.iter().filter_map(Value::as_u64).collect();
+                set_assignees(w, number, ids);
+                let record = bare_git(bare, &["log", "-1", "--format=%B", "refs/git-intake/pause"]);
+                w.assignments.push((number, record));
+            }
+            let m = w.mrs.iter().find(|m| m.number == number).cloned().unwrap();
+            reply(200, gitlab_mr(&m, bare, host))
         }
         _ => reply(404, json!({"message": "404 Not Found"})),
     }
@@ -746,7 +1419,8 @@ fn github(
             reply(
                 200,
                 Value::Array(
-                    list.iter()
+                    page(&list, q)
+                        .iter()
                         .map(|m| github_pr(m, bare, host, &w.full_name))
                         .collect(),
                 ),
@@ -756,6 +1430,125 @@ fn github(
             Some(m) => reply(200, github_pr(m, bare, host, &w.full_name)),
             None => reply(404, json!({"message": "Not Found"})),
         },
+        ("GET", ["commits", sha, "check-runs"]) => {
+            let source = w
+                .mrs
+                .iter()
+                .find(|m| m.state == "open" && head_of(m, bare) == *sha)
+                .map(|m| m.source.clone());
+            let scripted = if q.get("page").is_none_or(|p| p == "1") {
+                let state = read_pipeline(w, bare, sha, source.as_deref());
+                w.read_checks.insert(sha.to_string(), state);
+                state
+            } else {
+                w.read_checks.get(*sha).copied().flatten()
+            };
+            let mut runs: Vec<Value> = Vec::new();
+            if let Some(state) = scripted {
+                let (status, conclusion) = match state {
+                    "success" => ("completed", Some("success")),
+                    "failed" => ("completed", Some("failure")),
+                    "canceled" => ("completed", Some("cancelled")),
+                    _ => ("in_progress", None),
+                };
+                runs.push(json!({"name": "ci", "status": status, "conclusion": conclusion}));
+            }
+            runs.extend(w.check_runs.iter().map(|(name, status, conclusion)| {
+                json!({"name": name, "status": status, "conclusion": conclusion})
+            }));
+            reply(
+                200,
+                json!({"total_count": runs.len(), "check_runs": page(&runs, q)}),
+            )
+        }
+        ("GET", ["commits", _, "status"]) => {
+            reply(200, json!({"state": "pending", "statuses": []}))
+        }
+        ("PUT", ["pulls", n, "merge"]) => {
+            let number: u64 = n.parse().unwrap_or_default();
+            for action in std::mem::take(&mut w.on_merge) {
+                act(w, bare, &action);
+            }
+            let Some(mr) = w.mrs.iter().find(|m| m.number == number).cloned() else {
+                return reply(404, json!({"message": "Not Found"}));
+            };
+            if mr.state != "open" {
+                return reply(405, json!({"message": "Pull Request is not mergeable"}));
+            }
+            if body["sha"].as_str() != Some(head_of(&mr, bare).as_str()) {
+                return reply(
+                    409,
+                    json!({"message": "Head branch was modified. Review and try the merge again."}),
+                );
+            }
+            if body["merge_method"] != "merge" {
+                return reply(405, json!({"message": "Merge method not allowed"}));
+            }
+            let required = w
+                .rules
+                .as_array()
+                .is_some_and(|rules| rules.iter().any(|r| r["type"] == "required_status_checks"));
+            let head = head_of(&mr, bare);
+            if required && w.read_checks.get(&head).copied().flatten().is_none() {
+                return reply(
+                    405,
+                    json!({"message": "Required status check \"ci\" is expected."}),
+                );
+            }
+            let target = bare_git(bare, &["rev-parse", &format!("refs/heads/{}", mr.target)])
+                .unwrap_or_default();
+            let head = head_of(&mr, bare);
+            let merged = bare_git(
+                bare,
+                &[
+                    "commit-tree",
+                    &format!("{head}^{{tree}}"),
+                    "-p",
+                    &target,
+                    "-p",
+                    &head,
+                    "-m",
+                    &format!("Merge pull request #{number}"),
+                ],
+            )
+            .unwrap_or_default();
+            bare_git(
+                bare,
+                &["update-ref", &format!("refs/heads/{}", mr.target), &merged],
+            );
+            w.clock += 1;
+            let clock = w.clock;
+            if let Some(m) = w.mrs.iter_mut().find(|m| m.number == number) {
+                m.head = Some(head);
+                m.state = "merged";
+                m.ended = Some(clock);
+            }
+            reply(200, json!({"merged": true, "sha": merged}))
+        }
+        ("GET", ["issues", n, "comments"]) => reply(
+            200,
+            Value::Array(
+                w.notes
+                    .iter()
+                    .filter(|x| x.number.to_string() == *n)
+                    .map(|x| json!({"body": x.body, "created_at": time(x.at)}))
+                    .collect(),
+            ),
+        ),
+        ("POST", ["issues", n, "comments"]) => {
+            let Ok(number) = n.parse::<u64>() else {
+                return reply(404, json!({"message": "Not Found"}));
+            };
+            w.clock += 1;
+            let at = w.clock;
+            w.notes.push(FakeNote {
+                number,
+                body: body["body"].as_str().unwrap_or_default().into(),
+                system: false,
+                at,
+            });
+            reply(201, json!({"body": body["body"]}))
+        }
         ("POST", ["pulls"]) => {
             let source = body["head"].as_str().unwrap_or_default().to_string();
             let target = body["base"].as_str().unwrap_or_default().to_string();
@@ -782,9 +1575,13 @@ fn github(
                 head: None,
                 ended: None,
                 pinned_head: None,
+                lagging_reads: None,
                 fork: false,
                 squash: None,
                 remove_source_branch: None,
+                blocked: None,
+                merge_error: None,
+                assignees: Vec::new(),
             };
             let json = github_pr(&mr, bare, host, &w.full_name);
             w.mrs.push(mr);

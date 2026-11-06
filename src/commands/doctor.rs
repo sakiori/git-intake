@@ -13,6 +13,7 @@ use crate::drift::adopted_base;
 use crate::git::{Git, abbrev, branch_ref, lines};
 use crate::identity;
 use crate::output::{Render, emit};
+use crate::pause;
 use crate::port::{self, Standing};
 use crate::redact::redacted;
 use crate::repo::{MainWorktree, Repo};
@@ -87,6 +88,7 @@ pub fn run(repo: &Repo, json: bool) -> Result<Exit> {
         upstream_checks(repo, &loaded.config, &mut checks)?;
         remote_checks(repo, &loaded.config, &mut checks)?;
         journal_checks(repo, &loaded.config, &mut checks)?;
+        pause_checks(repo, &loaded.config, &mut checks);
         forge_checks(repo, &loaded.config, &mut checks);
     }
     checkout_checks(repo, &mut checks)?;
@@ -447,6 +449,39 @@ fn port_checks(
     checks.add("journal", name, status, detail);
 }
 
+/// In merge-request mode: whether the publish remote records a pause of the
+/// merge queue, which leaves merge requests out of it until it ends.
+fn pause_checks(repo: &Repo, config: &Config, checks: &mut Checks) {
+    let Some(publish) = config
+        .publish
+        .as_ref()
+        .filter(|p| p.via == PublishVia::MergeRequest)
+    else {
+        return;
+    };
+    match pause::look(repo, publish, &config.upstreams) {
+        Ok(Some(r)) => checks.add(
+            "merge_queue_pause",
+            None,
+            CheckStatus::Warn,
+            pause::described(&publish.remote, &r.pause),
+        ),
+        Ok(None) if publish.queue.is_some() => checks.add(
+            "merge_queue_pause",
+            None,
+            CheckStatus::Pass,
+            format!("'{}' records no pause of the merge queue", publish.remote),
+        ),
+        Ok(None) => {}
+        Err(err) => checks.add(
+            "merge_queue_pause",
+            None,
+            CheckStatus::Fail,
+            format!("{err:#}"),
+        ),
+    }
+}
+
 /// In merge-request mode: the forge is recognised, a token is set and
 /// accepted, and the merge settings guarantee that only a tree the required
 /// pipeline tested is merged.
@@ -518,6 +553,30 @@ fn forge_checks(repo: &Repo, config: &Config, checks: &mut Checks) {
             for warning in review.warnings {
                 checks.add("merge_settings", None, CheckStatus::Warn, warning);
             }
+        }
+    }
+    if let Some(queue) = &publish.queue {
+        match forge.account(queue) {
+            Ok(Some(account)) => checks.add(
+                "merge_queue",
+                None,
+                CheckStatus::Pass,
+                format!(
+                    "the merge queue's account @{} exists on {}",
+                    account.username,
+                    forge.kind().name()
+                ),
+            ),
+            Ok(None) => checks.add(
+                "merge_queue",
+                None,
+                CheckStatus::Fail,
+                format!(
+                    "publish queue: {} knows no account '{queue}'; name the account of the merge queue",
+                    forge.kind().name()
+                ),
+            ),
+            Err(err) => checks.add("merge_queue", None, CheckStatus::Fail, format!("{err:#}")),
         }
     }
 }

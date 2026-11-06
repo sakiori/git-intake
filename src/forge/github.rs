@@ -10,13 +10,14 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use url::Url;
 
-use super::http::{Auth, Client, Method};
+use super::http::{Auth, Client, Method, PER_PAGE};
 use super::{
-    Forge, Kind, Location, MergeRequest, ReleaseLookup, Review, State, endpoint, instant, text,
+    Account, Failure, Forge, Kind, Location, Merge, MergeRequest, Pipeline, PipelineState, Queued,
+    ReleaseLookup, Review, State, endpoint, failure, instant, pipeline_state, text,
 };
 
 /// The API version every request asks for.
@@ -77,17 +78,13 @@ impl GitHub {
             ("head", head.as_str()),
             ("sort", "updated"),
             ("direction", "desc"),
-            ("per_page", "100"),
         ];
         if let Some(target) = target {
             query.push(("base", target));
         }
         let list = self
             .client
-            .json(Method::Get, &self.url(&["pulls"], &query), None)?;
-        let list = list
-            .as_array()
-            .context("GitHub answered the list of pull requests with something else")?;
+            .list(&self.url(&["pulls"], &query), "pull requests")?;
         // Only the repository's own pull requests: one from a fork in the
         // same organisation matches the head filter too, and one whose fork
         // was deleted has no head repository at all.
@@ -96,6 +93,120 @@ impl GitHub {
             .map(pull)
             .collect()
     }
+
+    /// The active rules of repository and organisation rulesets for `target`.
+    fn rules(&self, target: &str) -> Result<Value> {
+        let url = self.url(&["rules", "branches", target], &[]);
+        let rules = self.client.send(Method::Get, &url, None)?;
+        match rules.status {
+            // An instance without rulesets, or a plan without them, has none.
+            404 => Ok(Value::Array(Vec::new())),
+            _ if rules.success() => Ok(rules.json),
+            status => Err(Failure::answered(
+                status,
+                self.client.refusal(Method::Get, &url, &rules),
+            )
+            .into()),
+        }
+    }
+
+    /// The classic protection of `target`, as far as the token can read it.
+    fn protection(&self, target: &str) -> Result<Classic> {
+        let branch_url = self.url(&["branches", target], &[]);
+        let branch = self.client.send(Method::Get, &branch_url, None)?;
+        let protected = match branch.status {
+            404 => false,
+            _ if branch.success() => {
+                branch.json.get("protected").and_then(Value::as_bool) == Some(true)
+            }
+            status => {
+                return Err(Failure::answered(
+                    status,
+                    self.client.refusal(Method::Get, &branch_url, &branch),
+                )
+                .into());
+            }
+        };
+        if !protected {
+            return Ok(Classic::None);
+        }
+        let url = self.url(&["branches", target, "protection"], &[]);
+        let reply = self.client.send(Method::Get, &url, None)?;
+        Ok(classic(reply.status, reply.json))
+    }
+
+    /// Every item a commit's paged object lists under `key`, and how many it
+    /// says there are.
+    fn commit_list(&self, sha: &str, list: &str, key: &str) -> Result<(Vec<Value>, u64)> {
+        let per_page = PER_PAGE.to_string();
+        let mut items = Vec::new();
+        let mut page = 1usize;
+        loop {
+            let number = page.to_string();
+            let url = self.url(
+                &["commits", sha, list],
+                &[("per_page", per_page.as_str()), ("page", number.as_str())],
+            );
+            let reply = self.client.json(Method::Get, &url, None)?;
+            let got = reply
+                .get(key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let last = got.len() < PER_PAGE;
+            items.extend(got);
+            if last {
+                let total = reply
+                    .get("total_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(items.len() as u64);
+                return Ok((items, total));
+            }
+            page += 1;
+        }
+    }
+}
+
+/// An error reading what a pull request's head needs, with the permission
+/// that gives it when the forge refused for lack of one.
+fn with_permission(err: anyhow::Error, permission: &str) -> anyhow::Error {
+    if failure(&err).is_some_and(|f| matches!(f.status, Some(401 | 403 | 404))) {
+        return err.context(format!(
+            "`land` reads the checks of the pull request's head, which on a private repository takes {permission}"
+        ));
+    }
+    err
+}
+
+/// The checks that branch protection or a ruleset requires of `target`.
+fn required_checks(rules: &Value, classic: &Classic) -> Vec<String> {
+    let names = |list: Option<&Value>, key: Option<&str>| -> Vec<String> {
+        list.and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| match key {
+                Some(key) => c.get(key).and_then(Value::as_str),
+                None => c.as_str(),
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let mut required = Vec::new();
+    for rule in rules.as_array().into_iter().flatten() {
+        if rule.get("type").and_then(Value::as_str) == Some("required_status_checks") {
+            required.extend(names(
+                rule.pointer("/parameters/required_status_checks"),
+                Some("context"),
+            ));
+        }
+    }
+    if let Classic::Read(p) = classic
+        && let Some(checks) = p.get("required_status_checks")
+    {
+        required.extend(names(checks.get("contexts"), None));
+        required.extend(names(checks.get("checks"), Some("context")));
+    }
+    required
 }
 
 /// Whether a pull request comes from a branch of its base repository
@@ -181,7 +292,11 @@ impl Forge for GitHub {
         if reply.status == 422 && !self.pulls(source, Some(target), "open")?.is_empty() {
             return Ok(None);
         }
-        bail!("{}", self.client.refusal(Method::Post, &url, &reply))
+        Err(Failure::answered(
+            reply.status,
+            self.client.refusal(Method::Post, &url, &reply),
+        )
+        .into())
     }
 
     fn update(&self, number: u64, title: &str, description: &str) -> Result<MergeRequest> {
@@ -204,30 +319,8 @@ impl Forge for GitHub {
 
     fn review(&self, target: &str) -> Result<Review> {
         let repository = self.get(&[])?;
-        let rules_url = self.url(&["rules", "branches", target], &[]);
-        let rules = self.client.send(Method::Get, &rules_url, None)?;
-        let rules = match rules.status {
-            // An instance without rulesets, or a plan without them, has none.
-            404 => Value::Array(Vec::new()),
-            _ if rules.success() => rules.json,
-            _ => bail!("{}", self.client.refusal(Method::Get, &rules_url, &rules)),
-        };
-        let branch_url = self.url(&["branches", target], &[]);
-        let branch = self.client.send(Method::Get, &branch_url, None)?;
-        let protected = match branch.status {
-            404 => false,
-            _ if branch.success() => {
-                branch.json.get("protected").and_then(Value::as_bool) == Some(true)
-            }
-            _ => bail!("{}", self.client.refusal(Method::Get, &branch_url, &branch)),
-        };
-        let classic = if protected {
-            let url = self.url(&["branches", target, "protection"], &[]);
-            let reply = self.client.send(Method::Get, &url, None)?;
-            classic(reply.status, reply.json)
-        } else {
-            Classic::None
-        };
+        let rules = self.rules(target)?;
+        let classic = self.protection(target)?;
         Ok(review(target, &repository, &rules, &classic))
     }
 
@@ -251,6 +344,141 @@ impl Forge for GitHub {
             _ => anyhow::bail!("{}", self.client.refusal(Method::Get, &one, &reply)),
         }
     }
+
+    fn with_pipeline(&self, number: u64) -> Result<(MergeRequest, Option<Pipeline>)> {
+        let mr = self.merge_request(number)?;
+        if mr.head.is_empty() || mr.state != State::Open {
+            return Ok((mr, None));
+        }
+        let (runs, total) = self
+            .commit_list(&mr.head, "check-runs", "check_runs")
+            .map_err(|err| {
+                with_permission(
+                    err,
+                    "*Checks: read*, which a fine-grained personal access token cannot have: use a GitHub App's \
+                     installation token, or a classic personal access token with the `repo` scope",
+                )
+            })?;
+        let (statuses, _) = self
+            .commit_list(&mr.head, "status", "statuses")
+            .map_err(|err| with_permission(err, "*Commit statuses: read*"))?;
+        let required = required_checks(&self.rules(&mr.target)?, &self.protection(&mr.target)?);
+        let pipeline = commit_pipeline(
+            &CommitChecks {
+                runs: &runs,
+                runs_total: total,
+                statuses: &statuses,
+                required: &required,
+            },
+            format!("{}/checks", mr.url),
+        );
+        Ok((mr, pipeline))
+    }
+
+    fn merge(&self, number: u64, head: &str) -> Result<Merge> {
+        let url = self.url(&["pulls", &number.to_string(), "merge"], &[]);
+        let body = json!({ "sha": head, "merge_method": "merge" });
+        let reply = self.client.send(Method::Put, &url, Some(&body))?;
+        match reply.status {
+            _ if reply.success() => Ok(Merge::Accepted),
+            409 => Ok(Merge::HeadMoved),
+            405 | 422 => Ok(Merge::Refused(reply.message())),
+            status => Err(Failure::answered(
+                status,
+                self.client.refusal(Method::Put, &url, &reply),
+            )
+            .into()),
+        }
+    }
+
+    fn merge_blocker(&self, _number: u64) -> Result<Option<String>> {
+        Err(no_queue())
+    }
+
+    fn account(&self, _username: &str) -> Result<Option<Account>> {
+        Err(no_queue())
+    }
+
+    fn assigned(&self, _target: &str, _account: &Account) -> Result<Vec<u64>> {
+        Err(no_queue())
+    }
+
+    fn queued(&self, _number: u64) -> Result<Queued> {
+        Err(no_queue())
+    }
+
+    fn assigned_at(&self, _number: u64, _account: &Account) -> Result<Option<jiff::Timestamp>> {
+        Err(no_queue())
+    }
+
+    fn assign(&self, _number: u64, _assignees: &[u64]) -> Result<()> {
+        Err(no_queue())
+    }
+
+    fn comment(&self, _number: u64, _body: &str) -> Result<()> {
+        Err(no_queue())
+    }
+}
+
+/// What GitHub says of the checks of a commit.
+struct CommitChecks<'a> {
+    runs: &'a [Value],
+    /// How many check runs GitHub says there are.
+    runs_total: u64,
+    statuses: &'a [Value],
+    /// The checks a rule or the branch's protection requires.
+    required: &'a [String],
+}
+
+/// The pipeline of a commit: its check runs and its commit statuses taken
+/// together, failed when one failed, running while one has no outcome, and
+/// passed when every one passed or, for a check run, ended neutral or
+/// skipped. A required check that has not registered yet, or a list that came
+/// back short, is no outcome either. `None` without any.
+fn commit_pipeline(checks: &CommitChecks, url: String) -> Option<Pipeline> {
+    let mut states = Vec::new();
+    let mut seen = Vec::new();
+    for run in checks.runs {
+        seen.push(text(run, "name"));
+        let conclusion = run.get("conclusion").and_then(Value::as_str);
+        states.push(
+            match (run.get("status").and_then(Value::as_str), conclusion) {
+                (Some("completed"), Some("success" | "neutral" | "skipped")) => {
+                    PipelineState::Passed
+                }
+                (Some("completed"), Some("cancelled")) => PipelineState::Canceled,
+                (Some("completed"), _) => PipelineState::Failed,
+                _ => PipelineState::Running,
+            },
+        );
+    }
+    for s in checks.statuses {
+        seen.push(text(s, "context"));
+        states.push(pipeline_state(
+            s.get("state").and_then(Value::as_str).unwrap_or_default(),
+        ));
+    }
+    let unsettled = (checks.runs.len() as u64) < checks.runs_total
+        || checks.required.iter().any(|r| !seen.contains(r));
+    let state = if states.is_empty() {
+        return None;
+    } else if states.contains(&PipelineState::Failed) {
+        PipelineState::Failed
+    } else if states.contains(&PipelineState::Canceled) {
+        PipelineState::Canceled
+    } else if unsettled || states.contains(&PipelineState::Running) {
+        PipelineState::Running
+    } else {
+        PipelineState::Passed
+    };
+    Some(Pipeline { state, url })
+}
+
+/// What GitHub has no counterpart for.
+fn no_queue() -> anyhow::Error {
+    anyhow::anyhow!(
+        "GitHub has no merge queue that takes the pull requests assigned to an account; `queue` is a GitLab setting"
+    )
 }
 
 /// The classic protection a reply to `GET .../branches/{b}/protection`
@@ -485,6 +713,58 @@ mod tests {
             "{:?}",
             r.refusals
         );
+    }
+
+    #[test]
+    fn a_pipeline_passes_only_with_every_check_it_needs() {
+        let passed = json!({"name": "ci", "status": "completed", "conclusion": "success"});
+        let failed = json!({"name": "lint", "status": "completed", "conclusion": "failure"});
+        let required = ["ci".to_string()];
+        let state = |runs: &[Value], total: u64, required: &[String]| {
+            commit_pipeline(
+                &CommitChecks {
+                    runs,
+                    runs_total: total,
+                    statuses: &[],
+                    required,
+                },
+                String::new(),
+            )
+            .map(|p| p.state)
+        };
+        assert_eq!(
+            state(std::slice::from_ref(&passed), 1, &required),
+            Some(PipelineState::Passed)
+        );
+        assert_eq!(state(&[], 0, &required), None);
+        // GitHub counts more runs than it listed.
+        assert_eq!(
+            state(std::slice::from_ref(&passed), 2, &required),
+            Some(PipelineState::Running)
+        );
+        // Another check passed, the required one has not registered.
+        let lint = json!({"name": "lint", "status": "completed", "conclusion": "success"});
+        assert_eq!(
+            state(std::slice::from_ref(&lint), 1, &required),
+            Some(PipelineState::Running)
+        );
+        // A failure stands whatever is missing.
+        assert_eq!(
+            state(std::slice::from_ref(&failed), 3, &required),
+            Some(PipelineState::Failed)
+        );
+    }
+
+    #[test]
+    fn required_checks_come_from_rules_and_classic_protection() {
+        let classic_read = Classic::Read(json!({"required_status_checks": {
+            "contexts": ["old"], "checks": [{"context": "new"}]
+        }}));
+        assert_eq!(
+            required_checks(&checks(true), &classic_read),
+            ["ci", "old", "new"]
+        );
+        assert!(required_checks(&json!([]), &Classic::None).is_empty());
     }
 
     #[test]

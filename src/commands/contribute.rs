@@ -6,6 +6,7 @@ use anyhow::{Result, bail};
 use crate::Exit;
 use crate::cli::UpstreamTarget;
 use crate::git::{abbrev, branch_ref};
+use crate::output::say;
 use crate::repo::Repo;
 use crate::tags::UpstreamTags;
 use crate::target;
@@ -66,13 +67,13 @@ pub fn run(repo: &Repo, upstream: &UpstreamTarget, branch: &str) -> Result<Exit>
         "",
     ])?;
     drop(fetches);
-    println!(
+    say!(
         "created branch '{branch}' at {} of upstream '{}' ({})",
         named,
         up.name,
         abbrev(&commit)
     );
-    println!(
+    say!(
         "it holds only upstream history and has no tracking branch; copy the change onto it, then push it to where \
          pull requests to {} come from, such as your fork on the upstream's host. The tool does not push it",
         crate::redact::redacted(&up.url)

@@ -43,6 +43,10 @@ struct RawUpstream {
     mode: Mode,
     path: Option<String>,
     tags: Option<String>,
+    prereleases: Option<bool>,
+    /// Read as a signed number so that zero and negative values get a
+    /// message of their own.
+    max_conflicts: Option<i64>,
     /// Settings of earlier releases, read only to name what replaces them.
     remote: Option<toml::Value>,
     mirror: Option<toml::Value>,
@@ -58,6 +62,7 @@ struct RawPublish {
     /// accepted.
     forge: Option<String>,
     api: Option<String>,
+    queue: Option<String>,
 }
 
 /// How an upstream is taken.
@@ -124,6 +129,10 @@ pub struct Publish {
     /// URL on the publish remote's host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
+    /// Merge-request mode: the account of a merge queue that takes the
+    /// merge requests assigned to it, which `land` pauses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
 }
 
 /// A validated configuration.
@@ -182,6 +191,14 @@ pub struct Upstream {
     /// take the newest release tag on the branch instead of its tip.
     #[serde(default)]
     pub tags: Option<String>,
+    /// Follow mode with `tags`: whether tags with a prerelease part count as
+    /// targets.
+    #[serde(default)]
+    pub prereleases: bool,
+    /// Follow mode with `tags`: the most files a target's merge may be
+    /// predicted to conflict in, when an update names no revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_conflicts: Option<u32>,
 }
 
 impl Upstream {
@@ -345,6 +362,29 @@ pub fn parse(text: &str) -> Result<Config> {
                 problems.push(format!("{label} tags '{tags}': {why}"));
             }
         }
+        for (key, set) in [
+            ("prereleases", up.prereleases.is_some()),
+            ("max_conflicts", up.max_conflicts.is_some()),
+        ] {
+            if set && up.tags.is_none() {
+                problems.push(format!(
+                    "{label}: `{key}` applies to the tags a follow upstream is taken at; set `tags` to their pattern, \
+                     or remove `{key}`"
+                ));
+            }
+        }
+        let max_conflicts = match up.max_conflicts {
+            None => None,
+            Some(n) => match u32::try_from(n) {
+                Ok(n) if n > 0 => Some(n),
+                _ => {
+                    problems.push(format!(
+                        "{label} max_conflicts: {n} is not a positive number of files"
+                    ));
+                    None
+                }
+            },
+        };
         upstreams.push(Upstream {
             name: up.name,
             url,
@@ -352,6 +392,8 @@ pub fn parse(text: &str) -> Result<Config> {
             mode: up.mode,
             path,
             tags: up.tags,
+            prereleases: up.prereleases.unwrap_or(false),
+            max_conflicts,
         });
     }
 
@@ -670,12 +712,41 @@ fn parse_publish(value: toml::Value) -> std::result::Result<Publish, String> {
         None => None,
         Some(api) => Some(check_api(api)?),
     };
+    let queue = match raw.queue.as_deref().map(str::trim) {
+        None => None,
+        Some(_) if raw.via == PublishVia::Push => {
+            return Err(
+                "publish queue: a merge queue takes merge requests, and `via = \"push\"` opens none; remove \
+                 `queue`, or publish with `via = \"merge-request\"`"
+                    .to_string(),
+            );
+        }
+        Some(account) => Some(check_account(account)?),
+    };
     Ok(Publish {
         remote: raw.remote,
         via: raw.via,
         forge,
         api,
+        queue,
     })
+}
+
+/// Validates the setting `queue`: an account name as a forge writes it,
+/// without the `@` of a mention.
+fn check_account(account: &str) -> std::result::Result<String, String> {
+    let account = account.strip_prefix('@').unwrap_or(account);
+    if account.is_empty()
+        || !account
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(format!(
+            "publish queue: '{account}' is not an account name; give the name of the merge queue's account, \
+             such as \"merge-bot\""
+        ));
+    }
+    Ok(account.to_string())
 }
 
 /// Validates the setting `api`: an `https` URL with a host, without
@@ -939,6 +1010,7 @@ via = "merge-request"
                 via: PublishVia::MergeRequest,
                 forge: None,
                 api: None,
+                queue: None,
             })
         );
         assert_eq!(
@@ -1057,6 +1129,50 @@ via = "merge-request"
             e.contains("upstream 'a': `tags` selects the target of a follow upstream"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn prereleases_and_the_conflict_limit_need_tags() {
+        let cfg = parse(&format!(
+            "integration = \"main\"\n{}",
+            UP_A.replace(
+                "branch",
+                "tags = \"v*\"\nprereleases = true\nmax_conflicts = 150\nbranch"
+            )
+        ))
+        .unwrap();
+        assert!(cfg.upstreams[0].prereleases);
+        assert_eq!(cfg.upstreams[0].max_conflicts, Some(150));
+        let cfg = parse(&format!("integration = \"main\"\n{UP_A}")).unwrap();
+        assert!(!cfg.upstreams[0].prereleases);
+        assert_eq!(cfg.upstreams[0].max_conflicts, None);
+        let e = err(&format!(
+            "integration = \"main\"\n{}",
+            UP_A.replace("branch", "prereleases = true\nmax_conflicts = 5\nbranch")
+        ));
+        assert!(
+            e.contains("upstream 'a': `prereleases` applies to the tags"),
+            "{e}"
+        );
+        assert!(
+            e.contains("upstream 'a': `max_conflicts` applies to the tags"),
+            "{e}"
+        );
+        for bad in ["0", "-3"] {
+            let e = err(&format!(
+                "integration = \"main\"\n{}",
+                UP_A.replace(
+                    "branch",
+                    &format!("tags = \"v*\"\nmax_conflicts = {bad}\nbranch")
+                )
+            ));
+            assert!(
+                e.contains(&format!(
+                    "upstream 'a' max_conflicts: {bad} is not a positive number of files"
+                )),
+                "{e}"
+            );
+        }
     }
 
     #[test]
@@ -1401,6 +1517,33 @@ via = "merge-request"
             "{e}"
         );
         assert!(!e.contains("secret") && !e.contains("user"), "{e}");
+    }
+
+    #[test]
+    fn the_queue_is_an_account_of_merge_request_mode() {
+        let cfg = parse(&format!(
+            "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\nvia = \"merge-request\"\n\
+             queue = \"@merge-bot\"\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.publish.unwrap().queue.as_deref(), Some("merge-bot"));
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\nqueue = \"merge-bot\"\n"
+        ));
+        assert!(
+            e.contains(
+                "publish queue: a merge queue takes merge requests, and `via = \"push\"` opens none"
+            ),
+            "{e}"
+        );
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\nvia = \"merge-request\"\n\
+             queue = \"merge bot\"\n"
+        ));
+        assert!(
+            e.contains("publish queue: 'merge bot' is not an account name"),
+            "{e}"
+        );
     }
 
     #[test]

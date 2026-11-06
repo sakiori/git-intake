@@ -342,3 +342,235 @@ fn releases_outside_the_branch_cost_no_git_command_each() {
     let ancestry = log.lines().filter(|l| l.contains("--is-ancestor")).count();
     assert!(ancestry <= 2, "{ancestry} ancestry checks:\n{log}");
 }
+
+#[test]
+fn prerelease_tags_count_as_targets_when_the_upstream_says_so() {
+    let f = Fork::new();
+    f.reconfigure(
+        "mode = \"follow\"\n",
+        "mode = \"follow\"\ntags = \"v*-nightly.*\"\nprereleases = true\n",
+    );
+    let env = &f.env;
+    let c1 = push(&f, "c1");
+    let c2 = push(&f, "c2");
+    push(&f, "dev");
+    tag(&f, "v1.2.3-nightly.20260101.7", &c1);
+    tag(&f, "v1.2.3-nightly.20260102.8", &c2);
+    tag(&f, "v1.2.3-nightly.20260102.8+build.1", &c2);
+
+    f.tool(&["start"]).success().stdout(contains(format!(
+        "upstream: queued at {} (v1.2.3-nightly.20260102.8)",
+        &c2[..12]
+    )));
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+    assert_eq!(env.rev(&f.down, "main^2"), c2);
+    let msg = tip_message(&f);
+    assert!(
+        msg.contains("Intake-Tag: v1.2.3-nightly.20260102.8\n"),
+        "{msg}"
+    );
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["upstreams"][0]["state"], "current");
+    assert_eq!(
+        status["upstreams"][0]["release_tag"],
+        "v1.2.3-nightly.20260102.8"
+    );
+}
+
+/// A fork synced at `v1.0.0` whose own changes to `f1` to `f4` conflict
+/// with the upstream's: `v1.1.0` changes `f1` and `f2`, `v1.2.0` also `f3`,
+/// and `v1.3.0` also `f4`, so their merges conflict in 2, 3 and 4 files.
+fn limited_fork(limit: u32) -> (Fork, [String; 3]) {
+    let f = Fork::new();
+    f.reconfigure(
+        "mode = \"follow\"\n",
+        &format!("mode = \"follow\"\ntags = \"v*\"\nmax_conflicts = {limit}\n"),
+    );
+    let env = &f.env;
+    let files = ["f1", "f2", "f3", "f4"];
+    let base: Vec<(String, &str)> = files
+        .iter()
+        .map(|n| (format!("{n}.txt"), "base\n"))
+        .collect();
+    let base: Vec<(&str, &str)> = base.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+    let c0 = env.push_upstream(&f.up, &base, "upstream: base");
+    tag(&f, "v1.0.0", &c0);
+    cycle(&f, &["start"]);
+    let ours: Vec<(String, &str)> = files
+        .iter()
+        .map(|n| (format!("{n}.txt"), "ours\n"))
+        .collect();
+    let ours: Vec<(&str, &str)> = ours.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+    env.commit(&f.down, &ours, "fork: our changes");
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
+    let mut tagged = Vec::new();
+    for (version, changed) in [
+        ("v1.1.0", &files[..2]),
+        ("v1.2.0", &files[2..3]),
+        ("v1.3.0", &files[3..]),
+    ] {
+        let theirs: Vec<(String, &str)> = changed
+            .iter()
+            .map(|n| (format!("{n}.txt"), "theirs\n"))
+            .collect();
+        let theirs: Vec<(&str, &str)> = theirs.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+        let c = env.push_upstream(&f.up, &theirs, &format!("upstream: {version}"));
+        tag(&f, version, &c);
+        tagged.push(c);
+    }
+    push(&f, "dev");
+    (f, tagged.try_into().unwrap())
+}
+
+#[test]
+fn the_conflict_limit_takes_the_newest_tag_within_it() {
+    let (f, [_, v12, _]) = limited_fork(3);
+    let env = &f.env;
+    let out = stdout(&f.tool(&["status", "--check"]).code(1));
+    assert!(
+        out.contains(
+            "upstream: 3 commits behind; an update would take v1.2.0, within max_conflicts = 3, and would conflict in:\n  f1.txt\n  f2.txt\n  f3.txt\n"
+        ),
+        "{out}"
+    );
+    let status = env.tool_json(&f.down, &["status", "--check", "--json"], 1);
+    let up = &status["upstreams"][0];
+    assert_eq!(up["next_tag"], "v1.2.0");
+    assert_eq!(up["next_target"], v12.as_str());
+    assert_eq!(up["next_within_limit"], true);
+    assert_eq!(up["release_tag"], "v1.3.0");
+    assert_eq!(up["conflicts"].as_array().unwrap().len(), 3);
+
+    let out = stdout(&f.tool(&["start"]).code(1));
+    assert!(
+        out.contains(
+            "upstream: takes v1.2.0, predicted to conflict in 3 files, within max_conflicts = 3; \
+             passed over v1.3.0 (4 files) for the limit"
+        ),
+        "{out}"
+    );
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["upstreams"][0]["target"], v12.as_str());
+    assert_eq!(status["update"]["upstreams"][0]["tag"], "v1.2.0");
+    f.tool(&["abort"]).success();
+
+    // `sync` takes the same tag, and stops on its conflicts.
+    let out = stdout(&f.tool(&["sync"]).code(1));
+    assert!(
+        out.contains("upstream: takes v1.2.0, predicted to conflict in 3 files"),
+        "{out}"
+    );
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["upstreams"][0]["tag"], "v1.2.0");
+}
+
+#[test]
+fn without_a_tag_within_the_limit_the_oldest_newer_tag_is_taken() {
+    let (f, [v11, _, _]) = limited_fork(1);
+    let out = stdout(&f.tool(&["start"]).code(1));
+    assert!(
+        out.contains(
+            "upstream: takes v1.1.0, the oldest newer tag, predicted to conflict in 2 files; no newer tag is \
+             within max_conflicts = 1; passed over v1.3.0 (4 files), v1.2.0 (3 files) for the limit"
+        ),
+        "{out}"
+    );
+    let status = f.env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["upstreams"][0]["target"], v11.as_str());
+    f.tool(&["abort"]).success();
+    let status = f
+        .env
+        .tool_json(&f.down, &["status", "--check", "--json"], 1);
+    assert_eq!(status["upstreams"][0]["next_tag"], "v1.1.0");
+    assert_eq!(status["upstreams"][0]["next_within_limit"], false);
+}
+
+#[test]
+fn a_named_revision_overrides_the_conflict_limit() {
+    let (f, [_, _, v13]) = limited_fork(1);
+    let out = stdout(&f.tool(&["start", "upstream=v1.3.0"]).code(1));
+    assert!(!out.contains("max_conflicts"), "{out}");
+    let status = f.env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["upstreams"][0]["target"], v13.as_str());
+    assert_eq!(status["update"]["upstreams"][0]["tag"], "v1.3.0");
+}
+
+#[test]
+fn status_check_agrees_with_start_on_a_lower_version_after_the_newest() {
+    let f = Fork::new();
+    f.reconfigure(
+        "mode = \"follow\"\n",
+        "mode = \"follow\"\ntags = \"v*\"\nmax_conflicts = 5\n",
+    );
+    let c0 = push(&f, "c0");
+    tag(&f, "v2.0.0", &c0);
+    cycle(&f, &["start"]);
+    let c1 = push(&f, "c1");
+    tag(&f, "v1.9.9", &c1);
+    let status = f
+        .env
+        .tool_json(&f.down, &["status", "--check", "--json"], 1);
+    assert_eq!(status["upstreams"][0]["state"], "behind");
+    assert_eq!(status["upstreams"][0]["next_tag"], "v1.9.9");
+    assert_eq!(status["upstreams"][0]["next_target"], c1.as_str());
+    assert_eq!(status["upstreams"][0]["commits_behind"], 1);
+    f.tool(&["start"])
+        .success()
+        .stdout(contains("upstream: takes v1.9.9"));
+}
+
+#[test]
+fn status_check_forecasts_from_the_tip_start_would_update_from() {
+    let f = Fork::new();
+    f.reconfigure(
+        "mode = \"follow\"\n",
+        "mode = \"follow\"\ntags = \"v*\"\nmax_conflicts = 5\n",
+    );
+    let c0 = push(&f, "c0");
+    tag(&f, "v1.0.0", &c0);
+    cycle(&f, &["start"]);
+    // This clone lags the publish remote, which holds the update already.
+    f.env.git(&f.down, &["reset", "-q", "--hard", "main^"]);
+    let status = f
+        .env
+        .tool_json(&f.down, &["status", "--check", "--json"], 0);
+    assert_eq!(status["upstreams"][0]["state"], "current");
+    assert!(status["upstreams"][0]["next_tag"].is_null());
+    f.tool(&["start"])
+        .success()
+        .stdout(contains("every selected upstream is current"));
+}
+
+#[test]
+fn sync_with_a_current_merge_request_plans_nothing_within_the_limit() {
+    let f = Fork::merge_request();
+    f.reconfigure(
+        "mode = \"follow\"\n",
+        "mode = \"follow\"\ntags = \"v*\"\nmax_conflicts = 5\n",
+    );
+    let c0 = push(&f, "c0");
+    tag(&f, "v1.0.0", &c0);
+    f.tool(&["start"]).success();
+    f.tool(&["finish"]).success();
+    let c1 = push(&f, "c1");
+    tag(&f, "v1.1.0", &c1);
+    let trace = f.env.path("trace");
+    let out = f
+        .env
+        .tool_env(
+            &f.down,
+            &["sync"],
+            &[("GIT_TRACE", &trace.to_string_lossy())],
+        )
+        .success();
+    let out = stdout(&out);
+    assert!(
+        out.contains("the update waits for the merge request"),
+        "{out}"
+    );
+    assert!(out.contains("upstream: moved on to"), "{out}");
+    assert!(!out.contains("upstream: takes"), "{out}");
+    let trace = std::fs::read_to_string(trace).unwrap();
+    assert!(!trace.contains("merge-tree"), "{trace}");
+}

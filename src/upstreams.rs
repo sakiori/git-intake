@@ -15,6 +15,7 @@ use anyhow::Result;
 
 use crate::config::Upstream;
 use crate::git::{Git, lines};
+use crate::output::esay;
 use crate::repo::Repo;
 use crate::state::UpdateState;
 
@@ -193,6 +194,23 @@ impl<'r> Fetches<'r> {
         })
     }
 
+    /// Fetches the reference `full` of the git remote `remote`. Returns the
+    /// commit it points at, or git's error.
+    pub fn remote_ref(
+        &mut self,
+        remote: &str,
+        full: &str,
+    ) -> Result<std::result::Result<String, String>> {
+        let name = format!("{}refs/{remote}/{full}", self.namespace);
+        if let Err(why) = self.fetch_from(remote, &format!("+{full}:{name}"))? {
+            return Ok(Err(why));
+        }
+        Ok(match self.git.commit(&name)? {
+            Some(oid) => Ok(oid),
+            None => Err(format!("fetching '{full}' from '{remote}' left no commit")),
+        })
+    }
+
     /// Fetches branch `integration` and the tags whose names start with `v`
     /// of the git remote `remote`, as the release commands read them.
     /// Returns the branch's tip and each tag with the commit it points at,
@@ -288,7 +306,7 @@ impl<'r> Fetches<'r> {
 impl Drop for Fetches<'_> {
     fn drop(&mut self) {
         if let Err(err) = self.clean_up() {
-            eprintln!(
+            esay!(
                 "warning: cannot remove the references this command fetched under {}: {}; \
                  `git intake doctor` lists them",
                 self.namespace,

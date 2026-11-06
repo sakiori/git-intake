@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Config};
 use crate::git::{Git, branch_ref};
+use crate::output::esay;
 use crate::state::{self, Paths, Stored, UpdateState};
 
 pub struct Repo {
@@ -179,7 +180,7 @@ impl Repo {
             Some(mut s) => {
                 let checked = check(&s)?;
                 if let Some(warning) = state::release_warning(&s) {
-                    eprintln!("warning: {warning}");
+                    esay!("warning: {warning}");
                     s.release_warned = Some(state::RELEASE.to_string());
                     self.save_state(&s)?;
                 }
@@ -194,7 +195,7 @@ impl Repo {
     /// after an interrupted `start`, and says so.
     pub fn restore_held_references(&self, state: &UpdateState) -> Result<()> {
         for name in crate::upstreams::restore_held(&self.git, state)? {
-            eprintln!("note: restored the update's reference {name} at the tip `start` fetched");
+            esay!("note: restored the update's reference {name} at the tip `start` fetched");
         }
         Ok(())
     }
@@ -533,7 +534,7 @@ impl Repo {
         }
         let working_copy_differs = self.working_copy_differs(&text)?;
         if working_copy_differs {
-            eprintln!(
+            esay!(
                 "note: the working copy of {} differs from the version committed on '{integration}'; using the committed version",
                 config::FILE_NAME
             );
@@ -662,7 +663,7 @@ impl Repo {
                 let why = unplaced.unwrap_or_else(|| {
                     "git does not register it as a worktree, so the tool cannot tell that it created it".to_string()
                 });
-                eprintln!(
+                esay!(
                     "warning: left {}: {why}; the tool removes only the update worktree it created. \
                      Remove it yourself if nothing in it is needed",
                     wt.display()
@@ -818,9 +819,7 @@ impl Repo {
     /// Printed once the command's own output is complete.
     pub fn note_removed_directory(&self) {
         if self.left_removed_directory.get() {
-            eprintln!(
-                "note: the current directory was in the update worktree, which is now removed"
-            );
+            esay!("note: the current directory was in the update worktree, which is now removed");
         }
     }
 

@@ -80,8 +80,16 @@ impl Env {
             &shim,
             format!(
                 "#!/bin/sh\n# git runs: ssh-shim <host> \"<git-upload-pack|git-receive-pack> '<path>'\"\n\
-                 shift\neval \"set -- $1\"\nexec git \"${{1#git-}}\" \"{}$2\"\n",
-                dir.path().join("served").display()
+                 echo connection >> '{log}'\n\
+                 if [ -e '{down}' ]; then echo 'ssh: connect to host: Network is unreachable' >&2; exit 255; fi\n\
+                 if [ -e '{at}' ]; then n=$(cat '{at}'); if [ \"$n\" -le 1 ]; then rm -f '{at}'; \
+                 echo 'git@forge.example: Permission denied (publickey).' >&2; exit 255; fi; \
+                 echo $((n - 1)) > '{at}'; fi\n\
+                 shift\neval \"set -- $1\"\nexec git \"${{1#git-}}\" \"{served}$2\"\n",
+                log = dir.path().join("ssh-log").display(),
+                down = dir.path().join("ssh-down").display(),
+                at = dir.path().join("ssh-fail-at").display(),
+                served = dir.path().join("served").display()
             ),
         )
         .unwrap();
@@ -118,7 +126,11 @@ impl Env {
         fs::create_dir_all(dir.path().join("home")).unwrap();
         Self {
             dir,
-            vars: RefCell::new(Vec::new()),
+            // The pause between attempts takes no real time.
+            vars: RefCell::new(vec![(
+                "GIT_INTAKE_TEST_RETRY_GAP_MS".to_string(),
+                "0".to_string(),
+            )]),
         }
     }
 
@@ -146,7 +158,7 @@ impl Env {
         self.vars.borrow_mut().retain(|(n, _)| n != name);
     }
 
-    fn tool_command(&self, cwd: &Path, args: &[&str]) -> Command {
+    pub fn tool_command(&self, cwd: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("git-intake"));
         cmd.current_dir(cwd).args(args);
         self.apply_env(&mut cmd);

@@ -108,7 +108,7 @@ pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
                     };
                     let pattern = TagPattern::parse(text)
                         .map_err(|why| anyhow::anyhow!("upstream '{}' tags: {why}", up.name))?;
-                    match tags.release(git, &pattern, &tip)? {
+                    match tags.release(git, &pattern, up.prereleases, &tip)? {
                         Some(release) => {
                             target = release.commit.clone();
                             entry.release = Some(release.commit);

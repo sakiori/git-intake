@@ -1287,3 +1287,75 @@ fn a_catch_up_whose_checks_fail_names_the_update_s_own_checks() {
     assert!(out.contains(CI_NOTICE), "{out}");
     assert!(out.contains("verification of the catch-up merge"), "{out}");
 }
+
+#[test]
+fn conflicts_lists_the_files_updates_resolved_beneath_catch_up_merges() {
+    let f = Fork::new();
+    let env = &f.env;
+    let base = "1\n2\n3\n";
+    env.push_upstream(
+        &f.up,
+        &[("src/ui/a.tsx", base), ("src/server/b.ts", base)],
+        "upstream: files",
+    );
+    f.tool(&["start"]).success();
+    f.tool(&["verify"]).success();
+    f.tool(&["finish"]).success();
+    let before = env.rev(&f.down, "main");
+    // The update conflicts in `src/ui/a.tsx`, and its catch-up merge in
+    // `src/server/b.ts`.
+    env.commit(&f.down, &[("src/ui/a.tsx", "1\nours\n3\n")], "fork: a");
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
+    env.push_upstream(
+        &f.up,
+        &[
+            ("src/ui/a.tsx", "1\ntheirs\n3\n"),
+            ("src/server/b.ts", "1\nup\n3\n"),
+        ],
+        "upstream: a and b",
+    );
+    f.tool(&["start"]).code(1);
+    let wt = env.update_worktree(&f.down);
+    fs::write(wt.join("src/ui/a.tsx"), "1\nboth\n3\n").unwrap();
+    env.git(&wt, &["add", "src/ui/a.tsx"]);
+    f.tool(&["continue"]).success();
+    f.tool(&["verify"]).success();
+    land(&f, &[("src/server/b.ts", "1\nother\n3\n")], "other: b");
+    f.tool(&["finish"]).code(1);
+    fs::write(wt.join("src/server/b.ts"), "1\nup and other\n3\n").unwrap();
+    env.git(&wt, &["add", "src/server/b.ts"]);
+    f.tool(&["continue"]).success();
+    f.tool(&["finish"]).success();
+    let merge = env.rev(&f.down, "main");
+    assert!(message(&f, &merge).contains(TRAILER));
+    let sync = env.rev(&f.down, "main^2");
+    assert!(message(&f, &sync).contains("Intake-Upstream: upstream"));
+
+    let out = stdout(&f.tool(&["conflicts"]).success());
+    assert_eq!(out, "src/server/b.ts\nsrc/ui/a.tsx\n");
+    let doc = env.tool_json(&f.down, &["conflicts", "--json"], 0);
+    let merges = doc["merges"].as_array().unwrap();
+    let of = |commit: &str| merges.iter().find(|m| m["commit"] == commit).unwrap();
+    assert_eq!(of(&merge)["catch_up"], true);
+    assert!(of(&merge)["upstream"].is_null());
+    assert_eq!(of(&merge)["paths"], serde_json::json!(["src/server/b.ts"]));
+    assert_eq!(of(&sync)["upstream"], "upstream");
+    assert_eq!(of(&sync)["catch_up"], false);
+    assert_eq!(of(&sync)["paths"], serde_json::json!(["src/ui/a.tsx"]));
+
+    let out = stdout(
+        &f.tool(&["conflicts", "--since", &before, "--path", "src/ui/*"])
+            .success(),
+    );
+    assert_eq!(out, "src/ui/a.tsx\n");
+    let out = stdout(&f.tool(&["conflicts", "--path", "src/*"]).success());
+    assert_eq!(out, "");
+    let out = stdout(&f.tool(&["conflicts", "--path", "src/**"]).success());
+    assert_eq!(out, "src/server/b.ts\nsrc/ui/a.tsx\n");
+
+    // Nothing landed after the tip.
+    let out = stdout(&f.tool(&["conflicts", "--since", "main"]).success());
+    assert_eq!(out, "");
+    let doc = env.tool_json(&f.down, &["conflicts", "--since", "main", "--json"], 0);
+    assert_eq!(doc["merges"], serde_json::json!([]));
+}

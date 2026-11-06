@@ -2,10 +2,13 @@
 
 pub mod branches;
 pub mod catch_up;
+pub mod conflicts;
 pub mod contribute;
+pub mod delta;
 pub mod doctor;
 pub mod env;
 pub mod finish;
+pub mod land;
 pub mod log;
 pub mod merge_request;
 pub mod port_plan;

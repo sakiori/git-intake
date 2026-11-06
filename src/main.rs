@@ -1,6 +1,10 @@
 //! `git intake`: verified, resumable updates of a downstream repository from
 //! one or more upstreams, merged as a whole or ported commit by commit.
 
+// Messages go through `output::say` and `output::esay`, results through
+// `output::print`.
+#![warn(clippy::print_stdout, clippy::print_stderr)]
+
 mod cli;
 mod commands;
 mod config;
@@ -11,6 +15,7 @@ mod git;
 mod identity;
 mod integration_line;
 mod output;
+mod pause;
 mod port;
 mod redact;
 mod release;
@@ -27,6 +32,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use cli::{Cli, Command, ReleaseCommand};
+use output::esay;
 
 /// The outcome of a command that ran to completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,12 +64,28 @@ fn run(command: Command) -> anyhow::Result<Exit> {
         Command::Verify { only, skip } => commands::verify::run(&repo, &only, &skip),
         Command::Finish { no_publish } => commands::finish::run(&repo, no_publish),
         Command::Sync => commands::sync::run(&repo),
+        Command::Land {
+            resume,
+            timeout,
+            poll,
+        } => commands::land::run(
+            &repo,
+            resume,
+            commands::land::Waits {
+                timeout: std::time::Duration::from_secs(timeout),
+                poll: std::time::Duration::from_secs(poll),
+            },
+        ),
         Command::Env {
             rev,
             dotenv,
             json,
             command,
         } => commands::env::run(&repo, rev.as_deref(), dotenv, json, &command),
+        Command::Delta { rev } => commands::delta::run(&repo, rev.as_deref()),
+        Command::Conflicts { since, paths, json } => {
+            commands::conflicts::run(&repo, since.as_deref(), &paths, json)
+        }
         Command::Status { check, json } => commands::status::run(&repo, check, json),
         Command::Report { json } => commands::report::run(&repo, json),
         Command::Log { upstreams, json } => commands::log::run(&repo, &upstreams, json),
@@ -96,10 +118,10 @@ fn main() -> ExitCode {
     }
     // A panic's message goes the same way as every other.
     std::panic::set_hook(Box::new(|info| {
-        eprintln!("{}", redact::redacted(&info.to_string()));
+        esay!("{}", redact::redacted(&info.to_string()));
         let backtrace = std::backtrace::Backtrace::capture();
         if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
-            eprintln!("{}", redact::redacted(&backtrace.to_string()));
+            esay!("{}", redact::redacted(&backtrace.to_string()));
         }
     }));
     match run(cli.command) {
@@ -107,7 +129,7 @@ fn main() -> ExitCode {
         Ok(Exit::Negative) => ExitCode::from(1),
         Ok(Exit::Code(code)) => ExitCode::from(code),
         Err(err) => {
-            eprintln!("error: {}", redact::redacted(&format!("{err:#}")));
+            esay!("error: {}", redact::redacted(&format!("{err:#}")));
             ExitCode::from(ERROR_STATUS)
         }
     }

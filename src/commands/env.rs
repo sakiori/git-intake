@@ -20,6 +20,7 @@ use crate::commands::verify::{self, Described};
 use crate::config::{self, Config, Mode};
 use crate::drift;
 use crate::git::{abbrev, branch_ref};
+use crate::output::esay;
 use crate::repo::Repo;
 use crate::sync_record;
 use crate::update_line::{self, History};
@@ -36,7 +37,7 @@ pub fn run(
     // before a command could run without them.
     let (commit, vars) = variables(repo, rev)?;
     if vars.is_none() {
-        eprintln!(
+        esay!(
             "{} carries no update; no {}* variable is set",
             abbrev(&commit),
             verify::ENV_PREFIX
@@ -60,21 +61,23 @@ pub fn run(
             None => Exit::Code(signal_status(&status)),
         });
     }
+    let mut out = String::new();
     if json {
         let object: Map<String, Value> = vars
             .iter()
             .map(|(k, v)| (k.clone(), Value::String(v.clone())))
             .collect();
-        println!("{}", serde_json::to_string_pretty(&Value::Object(object))?);
+        out = serde_json::to_string_pretty(&Value::Object(object))? + "\n";
     } else {
         for (k, v) in &vars {
             if dotenv {
-                println!("{k}={v}");
+                out.push_str(&format!("{k}={v}\n"));
             } else {
-                println!("export {k}={}", shell_quote(v));
+                out.push_str(&format!("export {k}={}\n", shell_quote(v)));
             }
         }
     }
+    crate::output::print(&out)?;
     Ok(Exit::Success)
 }
 
@@ -98,6 +101,32 @@ type Variables = Vec<(String, String)>;
 /// The commit `rev` names and its variables, or `None` when it carries no
 /// update.
 fn variables(repo: &Repo, rev: &str) -> Result<(String, Option<Variables>)> {
+    let (commit, update) = update_at(repo, rev)?;
+    let Some(update) = update else {
+        return Ok((commit, None));
+    };
+    let upstreams = described(&repo.git, &update.config, &update.history, &update.base)?;
+    let vars = verify::variables(
+        &update.base,
+        &commit,
+        &update.config.integration,
+        &upstreams,
+    );
+    Ok((commit, Some(vars)))
+}
+
+/// The update a commit carries, read from history alone.
+pub struct Update {
+    /// The configuration at the integration tip.
+    pub config: Config,
+    /// The integration tip the update started from or last caught up with.
+    pub base: String,
+    pub history: History,
+}
+
+/// The commit `rev` names and the update it carries, or `None` when the
+/// integration branch contains it or it carries none.
+pub fn update_at(repo: &Repo, rev: &str) -> Result<(String, Option<Update>)> {
     let git = &repo.git;
     let commit = repo
         .here
@@ -137,9 +166,14 @@ fn variables(repo: &Repo, rev: &str) -> Result<(String, Option<Variables>)> {
     if !history.carries_update() {
         return Ok((commit, None));
     }
-    let upstreams = described(git, &config, &history, &base)?;
-    let vars = verify::variables(&base, &commit, &config.integration, &upstreams);
-    Ok((commit, Some(vars)))
+    Ok((
+        commit,
+        Some(Update {
+            config,
+            base,
+            history,
+        }),
+    ))
 }
 
 /// The upstreams of the update `history` holds over `base`, in queue order,

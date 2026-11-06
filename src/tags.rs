@@ -62,8 +62,14 @@ impl TagPattern {
     /// The version of a tag that names a release: a version without a
     /// prerelease part or build metadata.
     pub fn release_version(&self, tag: &str) -> Option<Version> {
+        self.target_version(tag, false)
+    }
+
+    /// The version of a tag an upstream may be taken at: a version without
+    /// build metadata, and without a prerelease part unless `prereleases`.
+    pub fn target_version(&self, tag: &str, prereleases: bool) -> Option<Version> {
         self.version(tag)
-            .filter(|v| v.pre.is_empty() && v.build.is_empty())
+            .filter(|v| (prereleases || v.pre.is_empty()) && v.build.is_empty())
     }
 }
 
@@ -145,29 +151,48 @@ impl UpstreamTags {
         self.tags.get(name).map(String::as_str)
     }
 
+    /// The tags matching `pattern` whose name is a target version (see
+    /// [`TagPattern::target_version`]), highest version first.
+    fn versions<'a>(&'a self, pattern: &TagPattern, prereleases: bool) -> Vec<&'a str> {
+        let mut candidates: Vec<(Option<Version>, &str)> = self
+            .tags
+            .keys()
+            .filter(|name| pattern.matches(name))
+            .filter_map(|name| {
+                Some((
+                    Some(pattern.target_version(name, prereleases)?),
+                    name.as_str(),
+                ))
+            })
+            .collect();
+        candidates.sort_by(|a, b| by_version(b, a));
+        candidates.into_iter().map(|(_, name)| name).collect()
+    }
+
     /// The newest release that `pattern` selects on the branch fetched at
     /// `tip`: of the tags matching the pattern whose name is a semantic
-    /// version without a prerelease part or build metadata, the one with the
-    /// highest version whose commit the branch contains.
+    /// version without build metadata, and without a prerelease part unless
+    /// `prereleases`, the one with the highest version whose commit the
+    /// branch contains.
     ///
     /// One `cat-file` finds which candidates the repository has as commits;
     /// a tag outside the fetched branch usually names an object it lacks.
     /// Ancestry is checked only for those, newest first, stopping at the
     /// first on the branch.
-    pub fn release(&self, git: &Git, pattern: &TagPattern, tip: &str) -> Result<Option<Release>> {
-        let mut candidates: Vec<(Option<Version>, &str)> = self
-            .tags
-            .keys()
-            .filter(|name| pattern.matches(name))
-            .filter_map(|name| Some((Some(pattern.release_version(name)?), name.as_str())))
-            .collect();
+    pub fn release(
+        &self,
+        git: &Git,
+        pattern: &TagPattern,
+        prereleases: bool,
+        tip: &str,
+    ) -> Result<Option<Release>> {
+        let candidates = self.versions(pattern, prereleases);
         if candidates.is_empty() {
             return Ok(None);
         }
-        candidates.sort_by(|a, b| by_version(b, a));
         let input: String = candidates
             .iter()
-            .map(|(_, name)| format!("{}\n", self.tags[*name]))
+            .map(|name| format!("{}\n", self.tags[*name]))
             .collect();
         let out = git.run_with_input(
             &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
@@ -178,7 +203,7 @@ impl UpstreamTags {
             kinds.len() == candidates.len(),
             "unexpected output from git cat-file --batch-check"
         );
-        for ((_, name), kind) in candidates.iter().zip(kinds) {
+        for (name, kind) in candidates.iter().zip(kinds) {
             let Some(commit) = kind.strip_suffix(" commit") else {
                 continue;
             };
@@ -190,6 +215,50 @@ impl UpstreamTags {
             }
         }
         Ok(None)
+    }
+
+    /// The releases an update could take next, highest version first: those
+    /// [`release`](Self::release) admits whose commit is on the branch
+    /// fetched at `tip`, lacking from `base` and, when there is one,
+    /// containing the last synced commit `last`.
+    pub fn newer(
+        &self,
+        git: &Git,
+        pattern: &TagPattern,
+        prereleases: bool,
+        tip: &str,
+        base: &str,
+        last: Option<&str>,
+    ) -> Result<Vec<Release>> {
+        let candidates = self.versions(pattern, prereleases);
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let listed = |args: &[&str]| -> Result<std::collections::HashSet<String>> {
+            Ok(git.run(args)?.lines().map(str::to_string).collect())
+        };
+        let lacking = listed(&["rev-list", tip, &format!("^{base}"), "--"])?;
+        let after = match last {
+            Some(last) => Some(listed(&[
+                "rev-list",
+                "--ancestry-path",
+                &format!("{last}..{tip}"),
+                "--",
+            ])?),
+            None => None,
+        };
+        Ok(candidates
+            .into_iter()
+            .filter_map(|name| {
+                let commit = self.tags[name].to_ascii_lowercase();
+                let admitted = lacking.contains(&commit)
+                    && after.as_ref().is_none_or(|after| after.contains(&commit));
+                admitted.then(|| Release {
+                    tag: name.to_string(),
+                    commit,
+                })
+            })
+            .collect())
     }
 
     /// The tag that names `commit` in its sync record, when any of the
@@ -279,6 +348,31 @@ mod tests {
         assert!(p.release_version("v1.2.3-rc.1").is_none());
         assert!(p.release_version("v1.2.3+build.5").is_none());
         assert!(p.release_version("vnext").is_none());
+        assert!(p.target_version("v1.2.3-rc.1", true).is_some());
+        assert!(p.target_version("v1.2.3+build.5", true).is_none());
+        assert!(p.target_version("v1.2.3-rc.1", false).is_none());
+    }
+
+    #[test]
+    fn prereleases_order_by_precedence() {
+        let t = tags(&[
+            ("c1", "v1.2.3-nightly.20260101.7"),
+            ("c2", "v1.2.3-nightly.20260102.8"),
+            ("c3", "v1.2.3-nightly.20260102.10"),
+            ("c4", "v1.2.2"),
+            ("c5", "v1.2.3+build.1"),
+        ]);
+        let p = TagPattern::parse("v*").unwrap();
+        assert_eq!(
+            t.versions(&p, true),
+            [
+                "v1.2.3-nightly.20260102.10",
+                "v1.2.3-nightly.20260102.8",
+                "v1.2.3-nightly.20260101.7",
+                "v1.2.2"
+            ]
+        );
+        assert_eq!(t.versions(&p, false), ["v1.2.2"]);
     }
 
     #[test]

@@ -1089,3 +1089,24 @@ fn path_imported_on_a_branch_merged_with_a_merge_commit_is_adopted() {
         "a1\na2-up\na3\n"
     );
 }
+
+#[test]
+fn a_result_that_cannot_be_written_is_an_error() {
+    let f = Fork::new();
+    for args in [&["status", "--json"][..], &["log"]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let out = f
+            .env
+            .tool_command(&f.down, args)
+            .stdout(writer)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("cannot write the result to stdout"),
+            "{args:?}: {err}"
+        );
+    }
+}

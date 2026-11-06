@@ -9,9 +9,10 @@ use crate::Exit;
 use crate::commands::merge_request;
 use crate::commands::release::{self, ReleaseState};
 use crate::commands::update::{
-    blocking_prefix, described, next_step, no_release, plural, step_name, unrelated_content,
+    blocking_prefix, described, limited, next_step, no_release, plural, step_name,
+    unrelated_content,
 };
-use crate::config::{Check, Mode, PublishVia, Upstream};
+use crate::config::{Check, Config, Mode, PublishVia, Upstream};
 use crate::drift::{self, Drift, DriftState, SyncSource};
 use crate::git::{Git, abbrev, branch_ref};
 use crate::output::{Render, emit, table};
@@ -47,6 +48,12 @@ pub struct StatusDoc {
     /// Merge-request mode: the newest merge request of the update merged
     /// without its history, or `null`.
     pub merged_without_history: Option<RequestView>,
+    /// Merge-request mode: a pause of the merge queue the publish remote
+    /// records, or `null`.
+    pub pause: Option<PauseView>,
+    /// Merge-request mode: why the record of a pause could not be read, or
+    /// `null`.
+    pub pause_error: Option<String>,
     /// Merge-request mode: why the forge could not be read, or `null`.
     pub forge_error: Option<String>,
     /// The forge's term for a merge request, for the text form.
@@ -72,6 +79,22 @@ pub struct OpenRequestView {
     /// How messages write its number, such as `!7` or `#7`.
     #[serde(skip)]
     pub reference: String,
+}
+
+#[derive(Serialize)]
+pub struct PauseView {
+    /// The merge request it was started for.
+    pub number: u64,
+    pub url: String,
+    /// The merge queue's account.
+    pub account: String,
+    /// The paused merge requests, in the order they return in.
+    pub merge_requests: Vec<u64>,
+    /// The merge requests the queue was landing when it began.
+    pub in_flight: Vec<u64>,
+    /// What the text form says of it.
+    #[serde(skip)]
+    pub described: String,
 }
 
 #[derive(Serialize)]
@@ -127,8 +150,18 @@ pub struct UpstreamStatus {
     /// first-parent line.
     pub off_line: Option<OffLineView>,
     /// Files a merge of the tip would conflict in; only with `--check`, for
-    /// a follow upstream.
+    /// a follow upstream. With `max_conflicts`, those of `next_tag`.
     pub conflicts: Option<Vec<String>>,
+    /// With `--check` and `max_conflicts`, for an upstream behind: the tag
+    /// an update would take, or `null`.
+    pub next_tag: Option<String>,
+    /// Its commit.
+    pub next_target: Option<String>,
+    /// Whether its predicted conflicts are within `max_conflicts`.
+    pub next_within_limit: Option<bool>,
+    /// The configured `max_conflicts`.
+    #[serde(skip)]
+    pub max_conflicts: Option<u32>,
 }
 
 impl UpstreamStatus {
@@ -157,6 +190,10 @@ impl UpstreamStatus {
             pending: None,
             off_line: None,
             conflicts: None,
+            next_tag: None,
+            next_target: None,
+            next_within_limit: None,
+            max_conflicts: up.max_conflicts,
         }
     }
 }
@@ -337,14 +374,18 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     }
     let fetch_failed = fetched.iter().any(|f| f.is_err());
     let tips: Vec<String> = fetched.iter().filter_map(|f| f.clone().ok()).collect();
-    let latest = sync_record::latest(git, &sync_record::records(git, &tip, &tips)?)?;
+    let compared = match check {
+        true => tip_start_updates_from(git, config, &tip),
+        false => tip.clone(),
+    };
+    let latest = sync_record::latest(git, &sync_record::records(git, &compared, &tips)?)?;
     let mut upstreams = Vec::new();
     for ((up, fetched), tags) in config.upstreams.iter().zip(&fetched).zip(&tag_lists) {
         let fetched = fetched.as_deref().map_err(String::as_str);
         let last = latest.get(&up.name);
         upstreams.push(match up.mode {
-            Mode::Follow => follow_status(git, &tip, up, last, fetched, tags.as_ref(), check)?,
-            Mode::Port => port_status(git, &tip, up, last, fetched, &tips),
+            Mode::Follow => follow_status(git, &compared, up, last, fetched, tags.as_ref(), check)?,
+            Mode::Port => port_status(git, &compared, up, last, fetched, &tips),
         });
     }
     drop(fetches);
@@ -352,11 +393,26 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     let all_current = upstreams.iter().all(|u| u.state == DriftState::Current);
     let mut merge_request = None;
     let mut merged_without_history = None;
+    let mut pause = None;
+    let mut pause_error = None;
     let mut forge_error = None;
     let mut term = "merge request";
     if let Some(publish) = &config.publish
         && publish.via == PublishVia::MergeRequest
     {
+        match crate::pause::look(repo, publish, &config.upstreams) {
+            Ok(recorded) => {
+                pause = recorded.map(|r| PauseView {
+                    described: crate::pause::described(&publish.remote, &r.pause),
+                    number: r.pause.merge_request.number,
+                    url: r.pause.merge_request.url.clone(),
+                    account: r.pause.account.username.clone(),
+                    merge_requests: r.pause.numbers(),
+                    in_flight: r.pause.in_flight.clone(),
+                });
+            }
+            Err(err) => pause_error = Some(format!("{err:#}")),
+        }
         // The merge request is judged against the integration branch it
         // goes into, the publish remote's, which the local one may lag.
         let read = merge_request::fetch_integration(git, &publish.remote, &config.integration)
@@ -418,6 +474,8 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
         upstreams,
         merge_request,
         merged_without_history,
+        pause,
+        pause_error,
         forge_error,
         term,
         update,
@@ -430,6 +488,19 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     } else {
         Exit::Success
     })
+}
+
+/// The integration tip an update would start from: the publish remote's when
+/// the local branch lags it, as `start` fast-forwards it first, and the local
+/// tip otherwise, also when the remote cannot be read.
+fn tip_start_updates_from(git: &Git, config: &Config, tip: &str) -> String {
+    let Some(publish) = &config.publish else {
+        return tip.to_string();
+    };
+    match merge_request::fetch_integration(git, &publish.remote, &config.integration) {
+        Ok(remote) if git.is_ancestor(tip, &remote).unwrap_or(false) => remote,
+        _ => tip.to_string(),
+    }
 }
 
 fn follow_status(
@@ -448,10 +519,14 @@ fn follow_status(
     // With release tags, the newest release stands where the tip stands
     // otherwise: what the integration branch lacks is counted up to it.
     let mut release = None;
+    let mut next = None;
     if let (Some(text), Some(tags), Some(upstream_tip)) = (&up.tags, tags, &d.tip) {
         let pattern = TagPattern::parse(text)
             .map_err(|why| anyhow::anyhow!("upstream '{}' tags: {why}", up.name))?;
-        release = tags.release(git, &pattern, upstream_tip)?;
+        release = tags.release(git, &pattern, up.prereleases, upstream_tip)?;
+        if check {
+            next = limited(git, tip, up, &d, tags, &pattern, upstream_tip)?;
+        }
         if matches!(d.state, DriftState::Current | DriftState::Behind) {
             match &release {
                 Some(r) => {
@@ -470,12 +545,20 @@ fn follow_status(
                 }
             }
         }
+        // `start` goes by the tag the limit picks, even one of a lower version
+        // than a release already taken in.
+        if let Some(next) = next.as_ref().filter(|_| d.state == DriftState::Current) {
+            d.commits_behind = Some(git.count(tip, &next.release.commit)?);
+            d.state = DriftState::Behind;
+        }
     }
-    let conflicts = if check {
-        let target = release.as_ref().map(|r| r.commit.clone()).or(d.tip.clone());
-        Some(predicted(git, tip, up, target.as_deref(), &mut d)?)
-    } else {
-        None
+    let conflicts = match &next {
+        Some(next) if d.state == DriftState::Behind => Some(next.conflicts.clone()),
+        _ if check => {
+            let target = release.as_ref().map(|r| r.commit.clone()).or(d.tip.clone());
+            Some(predicted(git, tip, up, target.as_deref(), &mut d)?)
+        }
+        _ => None,
     };
     let mut status = UpstreamStatus::new(up, d.tip, d.state);
     status.detail = d.detail;
@@ -492,6 +575,11 @@ fn follow_status(
     }
     status.commits_behind = d.commits_behind;
     status.conflicts = conflicts;
+    if let Some(next) = next.filter(|_| status.state == DriftState::Behind) {
+        status.next_tag = Some(next.release.tag);
+        status.next_target = Some(next.release.commit);
+        status.next_within_limit = Some(next.within);
+    }
     Ok(status)
 }
 
@@ -832,18 +920,23 @@ impl Render for StatusDoc {
                 && u.state == DriftState::Behind
             {
                 let behind = u.commits_behind.unwrap_or_default();
+                let lead = match (&u.next_tag, u.next_within_limit, u.max_conflicts) {
+                    (Some(tag), Some(within), Some(limit)) => format!(
+                        "{}: {behind} commit{} behind; an update would take {tag}, {} max_conflicts = {limit}, and",
+                        u.name,
+                        plural(behind),
+                        if within {
+                            "within"
+                        } else {
+                            "the oldest newer tag, as no newer tag is within"
+                        }
+                    ),
+                    _ => format!("{}: {behind} commit{} behind,", u.name, plural(behind)),
+                };
                 if conflicts.is_empty() {
-                    out.push_str(&format!(
-                        "{}: {behind} commit{} behind, would merge without conflicts\n",
-                        u.name,
-                        plural(behind)
-                    ));
+                    out.push_str(&format!("{lead} would merge without conflicts\n"));
                 } else {
-                    out.push_str(&format!(
-                        "{}: {behind} commit{} behind, would conflict in:\n",
-                        u.name,
-                        plural(behind)
-                    ));
+                    out.push_str(&format!("{lead} would conflict in:\n"));
                     for f in conflicts {
                         out.push_str(&format!("  {f}\n"));
                     }
@@ -882,6 +975,14 @@ impl Render for StatusDoc {
                 "{term} {} ({}) was merged without the update's history, which a squash or rebase drops; its sync \
                  records never landed, and `git intake sync` proposes its targets again\n",
                 m.reference, m.url
+            ));
+        }
+        if let Some(p) = &self.pause {
+            out.push_str(&format!("{}\n", p.described));
+        }
+        if let Some(why) = &self.pause_error {
+            out.push_str(&format!(
+                "\ncannot tell whether the merge queue is paused: {why}\n"
             ));
         }
         if let Some(why) = &self.forge_error {

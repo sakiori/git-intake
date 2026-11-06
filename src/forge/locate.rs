@@ -446,6 +446,7 @@ mod tests {
             via: PublishVia::MergeRequest,
             forge,
             api: api.map(str::to_string),
+            queue: None,
         }
     }
 

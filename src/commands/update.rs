@@ -14,6 +14,7 @@ use crate::commands::{catch_up, finish, port_plan};
 use crate::config::{Config, Mode, PublishVia, Upstream};
 use crate::drift::{self, DriftState};
 use crate::git::{Git, abbrev, branch_ref, tracking_ref};
+use crate::output::say;
 use crate::port::{self, PlanLine};
 use crate::repo::{Repo, bullet};
 use crate::state::{
@@ -78,6 +79,7 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
         && publish.via == PublishVia::MergeRequest
     {
         require_published(repo, &publish.remote, &config.integration)?;
+        crate::pause::warn_if_on(repo, &publish, &config.upstreams);
         merge_request::require_startable(repo, &publish, &config.integration)?;
     }
     let selected = config.select(&names)?;
@@ -132,7 +134,11 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
         } else {
             UpstreamTags::default()
         };
-        let fetched = Fetched { tip, tags: &tags };
+        let fetched = Fetched {
+            tip,
+            tags: &tags,
+            within_limit: true,
+        };
         let queued = match up.mode {
             Mode::Follow => queue_follow(repo, &base, up, latest.get(&up.name), fetched, rev)?,
             Mode::Port => queue_port(
@@ -155,10 +161,10 @@ pub fn start(repo: &Repo, targets: &[UpstreamTarget]) -> Result<Exit> {
         bail!("cannot start the update:\n{}", bullet(&refusals));
     }
     for message in &current {
-        println!("{message}");
+        say!("{message}");
     }
     if queue.is_empty() {
-        println!("every selected upstream is current; nothing to update");
+        say!("every selected upstream is current; nothing to update");
         return Ok(Exit::Success);
     }
 
@@ -268,7 +274,7 @@ pub fn begin(
     repo.save_state(&state)?;
     // The update holds its references from now on.
     upstreams::hold(git, &state)?;
-    println!(
+    say!(
         "update started from {} at {} in {}",
         state.config.integration,
         abbrev(base),
@@ -276,7 +282,7 @@ pub fn begin(
     );
     for q in &state.upstreams {
         match &q.work {
-            Work::Follow(f) => println!(
+            Work::Follow(f) => say!(
                 "{}: queued at {} ({} new commit{})",
                 q.name,
                 described(&f.target, f.named_by(q)),
@@ -293,7 +299,7 @@ pub fn begin(
                     ),
                     None => String::new(),
                 };
-                println!("{}: {n} pending commit{} planned{limit}", q.name, plural(n));
+                say!("{}: {n} pending commit{} planned{limit}", q.name, plural(n));
             }
         }
     }
@@ -306,6 +312,9 @@ pub fn begin(
 pub struct Fetched<'a> {
     pub tip: &'a str,
     pub tags: &'a UpstreamTags,
+    /// Whether `max_conflicts` picks the target, which takes a prediction per
+    /// tag; otherwise the newest release is the target.
+    pub within_limit: bool,
 }
 
 /// What `start` makes of one selected upstream.
@@ -326,7 +335,11 @@ pub fn queue_follow(
     base: &str,
     up: &Upstream,
     last: Option<&Record>,
-    Fetched { tip, tags }: Fetched,
+    Fetched {
+        tip,
+        tags,
+        within_limit,
+    }: Fetched,
     rev: Option<String>,
 ) -> Result<Queued> {
     let git = &repo.git;
@@ -353,22 +366,32 @@ pub fn queue_follow(
             }
             Err(why) => return Ok(Queued::Refused(why)),
         },
-        (None, Some(pattern)) => match tags.release(git, pattern, tip)? {
-            Some(release) => {
-                // The newest release is already taken in, even when the
-                // branch went past it by a revision named before.
-                if matches!(d.state, DriftState::Current | DriftState::Behind)
-                    && git.is_ancestor(&release.commit, base)?
-                {
-                    return Ok(Queued::Current(format!(
-                        "{}: current at {}",
-                        up.name,
-                        described(&release.commit, Some(&release.tag))
-                    )));
-                }
-                (release.commit, Some(release.tag))
+        (None, Some(pattern)) => match within_limit
+            .then(|| limited(git, base, up, &d, tags, pattern, tip))
+            .transpose()?
+            .flatten()
+        {
+            Some(limited) => {
+                say!("{}", limited.describe(up));
+                (limited.release.commit, Some(limited.release.tag))
             }
-            None => return Ok(Queued::Refused(no_release(up))),
+            None => match tags.release(git, pattern, up.prereleases, tip)? {
+                Some(release) => {
+                    // The newest release is already taken in, even when the
+                    // branch went past it by a revision named before.
+                    if matches!(d.state, DriftState::Current | DriftState::Behind)
+                        && git.is_ancestor(&release.commit, base)?
+                    {
+                        return Ok(Queued::Current(format!(
+                            "{}: current at {}",
+                            up.name,
+                            described(&release.commit, Some(&release.tag))
+                        )));
+                    }
+                    (release.commit, Some(release.tag))
+                }
+                None => return Ok(Queued::Refused(no_release(up))),
+            },
         },
         (None, None) => (tip.to_string(), tags.naming(None, tip)),
     };
@@ -428,14 +451,43 @@ pub fn queue_follow(
     })
 }
 
+/// The tag an update of `up` takes within its `max_conflicts`, when it has
+/// the setting, is imported and has a newer tag to take.
+pub fn limited(
+    git: &Git,
+    base: &str,
+    up: &Upstream,
+    d: &drift::Drift,
+    tags: &UpstreamTags,
+    pattern: &TagPattern,
+    tip: &str,
+) -> Result<Option<target::Limited>> {
+    if !matches!(d.state, DriftState::Current | DriftState::Behind) {
+        return Ok(None);
+    }
+    target::within_limit(
+        git,
+        base,
+        up,
+        (tags, pattern),
+        tip,
+        d.last_synced.as_deref(),
+    )
+}
+
 /// Why `start` cannot take a follow upstream at a release.
 pub fn no_release(up: &Upstream) -> String {
     format!(
-        "upstream '{}': no tag of {} matching '{}' is a release version on {} as fetched; \
+        "upstream '{}': no tag of {} matching '{}' is a {} on {} as fetched; \
          name the target with `git intake start {}=<rev>`",
         up.name,
         crate::redact::redacted(&up.url),
         up.tags.as_deref().unwrap_or_default(),
+        if up.prereleases {
+            "version without build metadata"
+        } else {
+            "release version"
+        },
         up.source(),
         up.name
     )
@@ -448,7 +500,7 @@ fn queue_port(
     base: &str,
     up: &Upstream,
     last: Option<&Record>,
-    Fetched { tip, tags }: Fetched,
+    Fetched { tip, tags, .. }: Fetched,
     upstream_tips: &[String],
     rev: Option<String>,
 ) -> Result<Queued> {
@@ -610,14 +662,12 @@ pub fn advance(repo: &Repo, state: &mut UpdateState) -> Result<Advanced> {
         let stopped = match (state.upstreams[i].step, &state.upstreams[i].work) {
             (UpstreamStep::Merged, _) => None,
             (UpstreamStep::Plan, Work::Port(plan)) => {
-                println!(
+                say!(
                     "{}: the plan is in {}",
                     state.upstreams[i].name,
                     plan.plan.display()
                 );
-                println!(
-                    "mark each commit take, skip, have or later, then run `git intake continue`"
-                );
+                say!("mark each commit take, skip, have or later, then run `git intake continue`");
                 return Ok(Advanced::Plan);
             }
             (_, Work::Follow(_)) => merge_follow(repo, state, i)?,
@@ -635,7 +685,7 @@ pub fn advance(repo: &Repo, state: &mut UpdateState) -> Result<Advanced> {
 fn finish_advance(repo: &Repo, state: &mut UpdateState) -> Result<Exit> {
     Ok(match advance(repo, state)? {
         Advanced::Merged => {
-            println!(
+            say!(
                 "every queued upstream is merged or its plan carried out; next: {}",
                 next_step(state, &Git::worktree(&state.worktree))?
             );
@@ -681,7 +731,7 @@ fn merge_follow(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<Option
     let head_before = wt.line(&["rev-parse", "HEAD"])?;
     follow_mut(state, i)?.head_before = Some(head_before);
     repo.save_state(state)?;
-    println!(
+    say!(
         "{}: merging {} at {}",
         up.name,
         up.source(),
@@ -763,7 +813,7 @@ pub fn save_merge_output(path: &std::path::Path, out: &crate::git::Output) -> Re
 }
 
 fn mark_merged(repo: &Repo, state: &mut UpdateState, i: usize, commit: String) -> Result<()> {
-    println!("{}: merged as {}", state.upstreams[i].name, abbrev(&commit));
+    say!("{}: merged as {}", state.upstreams[i].name, abbrev(&commit));
     let f = follow_mut(state, i)?;
     settle(&mut f.conflicts);
     f.merge_commit = Some(commit);
@@ -939,7 +989,7 @@ fn print_conflict(state: &UpdateState, i: usize, stderr: &str) {
     let q = &state.upstreams[i];
     let up = state.config.upstream(&q.name);
     let target = q.follow().map(|f| f.target.as_str()).unwrap_or_default();
-    println!(
+    say!(
         "{}: conflicts merging {} at {} in {}",
         q.name,
         up.map(Upstream::source).unwrap_or_default(),
@@ -947,7 +997,7 @@ fn print_conflict(state: &UpdateState, i: usize, stderr: &str) {
         state.worktree.display()
     );
     if q.conflicts().is_empty() {
-        println!(
+        say!(
             "the merge stopped without conflicted files:\n{}",
             stderr.trim()
         );
@@ -965,9 +1015,9 @@ fn print_conflict(state: &UpdateState, i: usize, stderr: &str) {
         .filter(|u| u.step == UpstreamStep::Pending)
         .map(|u| u.name.as_str())
         .collect();
-    println!("merged: {}", list_or_none(&merged));
-    println!("pending: {}", list_or_none(&pending));
-    println!(
+    say!("merged: {}", list_or_none(&merged));
+    say!("pending: {}", list_or_none(&pending));
+    say!(
         "resolve the conflicts in {}, stage them with `git add`, then run `git intake continue`",
         state.worktree.display()
     );
@@ -976,13 +1026,13 @@ fn print_conflict(state: &UpdateState, i: usize, stderr: &str) {
 /// Lists conflicted files with the source of their resolution.
 pub fn print_conflicted_files(conflicts: &[ConflictFile]) {
     for c in conflicts {
-        println!("  {}  ({})", c.path, c.resolution.describe());
+        say!("  {}  ({})", c.path, c.resolution.describe());
     }
     if conflicts
         .iter()
         .any(|c| c.resolution == Resolution::Recorded)
     {
-        println!(
+        say!(
             "files resolved by a recorded resolution already hold the earlier resolution; review them and stage them"
         );
     }
@@ -999,7 +1049,7 @@ pub fn resume(repo: &Repo) -> Result<Exit> {
         if let catch_up::Concluded::Stopped(exit) = catch_up::conclude(repo, &mut state, true)? {
             return Ok(exit);
         }
-        println!("next: {}", next_step(&state, &wt)?);
+        say!("next: {}", next_step(&state, &wt)?);
         return Ok(Exit::Success);
     }
     if let Some(i) = state
@@ -1022,7 +1072,7 @@ pub fn resume(repo: &Repo) -> Result<Exit> {
     {
         read_plan(repo, &mut state, i)?;
     } else if state.all_merged() {
-        println!(
+        say!(
             "every queued upstream is already merged or its plan carried out; next: {}",
             next_step(&state, &wt)?
         );
@@ -1113,7 +1163,7 @@ fn read_plan(repo: &Repo, state: &mut UpdateState, i: usize) -> Result<()> {
         .map(|l| l.index)
         .collect();
     let count = |verb| plan.commits.iter().filter(|c| c.verb == Some(verb)).count() as u64;
-    println!(
+    say!(
         "{name}: the plan takes {}, skips {}, records {} as present and leaves {} pending",
         count(port::Verb::Take),
         count(port::Verb::Skip),
@@ -1209,12 +1259,12 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
     removed.extend(repo.remove_logs()?);
     repo.paths.remove(&repo.paths.state)?;
     for r in &removed {
-        println!("removed {r}");
+        say!("removed {r}");
     }
     match &stored {
-        Some(stored) => println!("update aborted; '{}' is unchanged", stored.integration()),
-        None if !removed.is_empty() => println!("removed the remains of an interrupted update"),
-        None if withdrawal.is_none() => println!("no update is in progress; nothing to abort"),
+        Some(stored) => say!("update aborted; '{}' is unchanged", stored.integration()),
+        None if !removed.is_empty() => say!("removed the remains of an interrupted update"),
+        None if withdrawal.is_none() => say!("no update is in progress; nothing to abort"),
         None => {}
     }
     if let Some((publish, integration, upstreams)) = withdrawal {
@@ -1223,13 +1273,13 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
         return Ok(Exit::Success);
     }
     if let Some(carried) = state.and_then(|s| s.carried_from.as_ref()) {
-        println!(
+        say!(
             "the update was carried on from {}, which stays open; `git intake abort --merge-request` withdraws it",
             carried.url
         );
     }
     if let (Some(w), Some(found)) = (waiting, &earlier_state) {
-        println!(
+        say!(
             "{found}; it is kept, with its branch '{}'; `git intake abort --merge-request` withdraws it",
             w.merge_request.branch
         );
@@ -1250,13 +1300,13 @@ pub fn abort(repo: &Repo, withdraw: bool) -> Result<Exit> {
             Ok((forge.kind(), reqs.open))
         });
         match found {
-            Ok((kind, Some(open))) => println!(
+            Ok((kind, Some(open))) => say!(
                 "the update's {} is open; `git intake abort --merge-request` withdraws it",
                 merge_request::named(kind, &open)
             ),
             Ok((_, None)) => {}
             Err(err) => {
-                println!(
+                say!(
                     "could not read the forge for the update's merge request: {}",
                     crate::redact::redacted(&format!("{err:#}"))
                 )

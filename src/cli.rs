@@ -24,10 +24,11 @@ use clap::{Parser, Subcommand};
         a failed doctor check, a failed verify, an upstream that status, log or branches could not \
         fetch, a stop on conflicts or on the failed commit of a copy, failed checks in finish or \
         sync, an integration branch that moved again while finish made or verified a catch-up \
-        merge, an upstream sync left out, a release at the integration tip that release tag finds \
-        unpublished, or a problem release check finds); 2 on an error (invalid configuration, a refused \
-        command, such as start with an upstream that cannot be fetched, a git or forge failure, a \
-        release tag another run pushed first, or invalid usage). env -- <command> exits with the command's status."
+        merge, an upstream sync left out, a failed or canceled pipeline or a catch-up conflict in \
+        land, a release at the integration tip that release tag finds unpublished, or a problem \
+        release check finds); 2 on an error (invalid configuration, a refused command, such as start \
+        with an upstream that cannot be fetched, a git or forge failure, a release tag another run \
+        pushed first, land after its timeout, or invalid usage). env -- <command> exits with the command's status."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -43,9 +44,12 @@ pub enum Command {
     ///
     /// Fetches the selected upstreams. A follow upstream gets a fixed target: its fetched branch
     /// tip, or, with `tags` in its configuration, the newest release tag on that branch: of the
-    /// upstream's tags that match the pattern and are a semantic version without a prerelease
-    /// part or build metadata after the pattern's literal prefix and an optional `v` or `V`, the
-    /// highest version. For an upstream named as
+    /// upstream's tags that match the pattern and are a semantic version without build metadata,
+    /// and without a prerelease part unless the upstream sets `prereleases = true`, after the
+    /// pattern's literal prefix and an optional `v` or `V`, the highest version. With
+    /// `max_conflicts`, it is the newest such tag the integration branch lacks whose merge is
+    /// predicted to conflict in at most that many files, or the oldest of them when none is, and
+    /// `start` names the tags it passed over. For an upstream named as
     /// `UPSTREAM=REV`, the target is the commit REV names. REV is a tag of the upstream's
     /// repository (its URL is asked for its tags), a commit id, or anything else git resolves,
     /// but not one of the repository's own tags; its commit must be on the fetched upstream branch
@@ -151,6 +155,39 @@ pub enum Command {
     /// named; port upstreams with pending commits are named, never taken. A conflict, or failed
     /// checks in push mode, stop it with the update in progress, as `start` stops.
     Sync,
+    /// Carry the update's open merge request to the integration branch
+    ///
+    /// Works from any clone, without an update in progress. Waits for the pipeline of the merge
+    /// request's head. When it passed and the head contains the integration tip, merges that
+    /// head, naming it so that a head moved meanwhile is not merged, never squashed and never
+    /// rebased, and exits once the forge reports the merge. When it passed and the integration
+    /// branch moved, catches the merge request up by a catch-up merge as `sync` does and waits for
+    /// the new pipeline. A failed or canceled pipeline, or a conflict in the catch-up merge, stops
+    /// it with status 1; `continue`, `finish` and `land` carry on after a conflict. Before merging
+    /// it reads the forge's merge settings and refuses as `finish` does.
+    ///
+    /// With `queue` in `[publish]`, the account of a merge queue that takes the merge requests
+    /// assigned to it, `land` pauses the queue once the update's pipeline passed and the
+    /// integration branch moved, unless the merge request cannot merge anyway or the catch-up
+    /// will conflict: it records the queue's merge requests, in the order of their latest
+    /// assignment to the account, in the reference refs/git-intake/pause on the publish remote,
+    /// then takes the account's assignment from each but one the queue is landing, which it
+    /// waits for. A merge request assigned to the queue during the pause is held too. The pause
+    /// ends on every way out, SIGINT, SIGTERM and SIGHUP included: each held merge request still
+    /// open and assigned as the pause left it gets the account's assignment back, in the
+    /// recorded order, at least a second apart, and the reference goes.
+    Land {
+        /// End the pause the publish remote records, left by an interrupted run, and do nothing
+        /// else; works in any state of an update, whichever merge request the pause began for
+        #[arg(long)]
+        resume: bool,
+        /// Give up, with status 2, after this long: seconds, or a number with `s`, `m` or `h`
+        #[arg(long, value_name = "DURATION", default_value = "6h", value_parser = parse_duration)]
+        timeout: u64,
+        /// Wait this many seconds between two reads of the forge
+        #[arg(long, value_name = "SECONDS", default_value_t = 60)]
+        poll: u64,
+    },
     /// Print or pass on the update variables of a commit, read from history
     ///
     /// Sets, for COMMIT (`HEAD` by default), the `GIT_INTAKE_*` variables `verify` gives the
@@ -177,10 +214,47 @@ pub enum Command {
         #[arg(last = true, value_name = "COMMAND")]
         command: Vec<String>,
     },
+    /// Show how the update changed the downstream's changes on top of its upstream
+    ///
+    /// Compares, with `git range-diff`, two one-commit series: the tree of the update's base on
+    /// the upstream's previous target, and the tree of COMMIT (`HEAD` by default) on its target.
+    /// What the update changed in the downstream's delta shows; the upstream's changes that
+    /// merged cleanly do not. COMMIT is resolved from history as `env` resolves it, so the
+    /// command works in an update in progress, on an update's merge request head and in a merge
+    /// request pipeline. The two commits it makes are reachable from no reference. It refuses
+    /// a commit that carries no update, an update of anything but exactly one follow upstream at
+    /// the repository root, and an upstream without a previous target.
+    Delta {
+        /// The commit to compare; `HEAD` when none is given
+        #[arg(value_name = "COMMIT")]
+        rev: Option<String>,
+    },
+    /// List the files the updates on the integration branch needed resolving in
+    ///
+    /// Recomputes, from each merge's parents with `git merge-tree`, the files that conflicted in
+    /// the sync merges and catch-up merges on the integration line, including a sync merge that
+    /// lies on a catch-up merge's second parent, and prints them one per line, sorted and
+    /// without repeats. The integration tip is the publish remote's, fetched for the command, or
+    /// the local integration branch without a publish remote.
+    Conflicts {
+        /// Only the merges the integration branch received after COMMIT; its whole history
+        /// when none is given
+        #[arg(long, value_name = "COMMIT")]
+        since: Option<String>,
+        /// Keep the paths that match this glob, where `*` stays within a directory and `**`
+        /// crosses them; repeat it to keep the paths that match any of several
+        #[arg(long = "path", value_name = "GLOB")]
+        paths: Vec<String>,
+        /// Write one JSON document, with each merge, its upstream or `catch_up`, and its paths
+        #[arg(long)]
+        json: bool,
+    },
     /// Fetch every upstream and show its drift, and the update in progress
     ///
     /// A follow upstream with `tags` is compared with its newest release tag instead of its
-    /// branch tip, and shows the state `no release` while its branch has none. In merge-request
+    /// branch tip, and shows the state `no release` while its branch has none. With `--check`
+    /// and `max_conflicts`, it names the tag an update would take and predicts that tag's
+    /// conflicts. In merge-request
     /// mode it also shows the update's open merge request, and the newest one merged without the
     /// update's history.
     Status {
@@ -358,9 +432,36 @@ fn parse_upstream_target(arg: &str) -> Result<UpstreamTarget, String> {
     }
 }
 
+/// Parses a duration as seconds, or as a number followed by `s`, `m` or
+/// `h`, into seconds.
+fn parse_duration(arg: &str) -> Result<u64, String> {
+    let (number, unit) = match arg.char_indices().last() {
+        Some((at, 's')) => (&arg[..at], 1),
+        Some((at, 'm')) => (&arg[..at], 60),
+        Some((at, 'h')) => (&arg[..at], 3600),
+        _ => (arg, 1),
+    };
+    number
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(unit))
+        .ok_or_else(|| format!("'{arg}' is not a duration such as 90, 30m or 6h"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations_are_seconds_minutes_or_hours() {
+        assert_eq!(parse_duration("90"), Ok(90));
+        assert_eq!(parse_duration("90s"), Ok(90));
+        assert_eq!(parse_duration("30m"), Ok(1800));
+        assert_eq!(parse_duration("6h"), Ok(21600));
+        assert!(parse_duration("h").is_err());
+        assert!(parse_duration("1.5h").is_err());
+        assert!(parse_duration("-1").is_err());
+    }
 
     #[test]
     fn upstream_targets_split_at_the_first_equals_sign() {

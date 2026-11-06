@@ -27,6 +27,7 @@ use crate::commands::update::{
 };
 use crate::config::{self, Config};
 use crate::git::{Git, abbrev, branch_ref};
+use crate::output::say;
 use crate::port;
 use crate::repo::{Repo, bullet};
 use crate::state::{CatchUp, CatchUpStep, UPDATE_BRANCH, UpdateState};
@@ -271,7 +272,7 @@ fn merge(repo: &Repo, state: &mut UpdateState) -> Result<Option<Exit>> {
     let wt = Git::worktree(&state.worktree);
     let c = current(state)?.clone();
     let integration = state.config.integration.clone();
-    println!(
+    say!(
         "catching up with '{integration}' at {}: merging the update at {} into it",
         abbrev(&c.tip),
         abbrev(&c.head_before)
@@ -345,7 +346,7 @@ fn stop_on_conflict(repo: &Repo, state: &mut UpdateState, output: &str) -> Resul
     let c = c.clone();
     repo.save_state(state)?;
     let integration = &state.config.integration;
-    println!(
+    say!(
         "conflicts catching up with '{integration}' at {} in {}: ours is '{integration}' at {}, \
          theirs is the update at {}",
         abbrev(&c.tip),
@@ -354,13 +355,13 @@ fn stop_on_conflict(repo: &Repo, state: &mut UpdateState, output: &str) -> Resul
         abbrev(&c.head_before)
     );
     if c.conflicts.is_empty() {
-        println!(
+        say!(
             "the merge stopped without conflicted files:\n{}",
             output.trim()
         );
     }
     print_conflicted_files(&c.conflicts);
-    println!(
+    say!(
         "resolve the conflicts in {}, stage them with `git add`, then run `git intake continue`",
         state.worktree.display()
     );
@@ -445,7 +446,7 @@ pub fn conclude(repo: &Repo, state: &mut UpdateState, resolved: bool) -> Result<
     if on_update_branch(&wt)? {
         state.catch_ups.pop();
         repo.save_state(state)?;
-        println!(
+        say!(
             "the catch-up with '{integration}' at {} was given up in {}; it is no longer recorded",
             abbrev(&c.tip),
             state.worktree.display()
@@ -497,7 +498,7 @@ pub fn abandon(repo: &Repo, state: &mut UpdateState) -> Result<()> {
     }
     state.catch_ups.pop();
     repo.save_state(state)?;
-    println!(
+    say!(
         "recorded the resolutions made so far and dropped the catch-up merge with '{}' at {}",
         state.config.integration,
         abbrev(&c.tip)
@@ -595,7 +596,7 @@ fn conclude_at(repo: &Repo, state: &mut UpdateState, merge: &str, head: &str) ->
     state.verification = None;
     repo.drop_partial_run(state)?;
     repo.save_state(state)?;
-    println!(
+    say!(
         "caught up with '{integration}' at {} as {}",
         abbrev(&c.tip),
         abbrev(merge)

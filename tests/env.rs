@@ -11,7 +11,7 @@ use common::{FORK_CHECK, Fork, MERGE_REQUEST_BRANCH, Mono, checks_line, stderr, 
 /// A command that writes the tool's variables, sorted, to `$HOME/<file>`.
 fn dump(file: &str) -> String {
     format!(
-        "awk 'BEGIN {{ for (k in ENVIRON) if (k ~ /^GIT_INTAKE_/) print k \"=\" ENVIRON[k] }}' \
+        "awk 'BEGIN {{ for (k in ENVIRON) if (k ~ /^GIT_INTAKE_/ && k !~ /^GIT_INTAKE_TEST_/) print k \"=\" ENVIRON[k] }}' \
          | LC_ALL=C sort > \"$HOME/{file}\""
     )
 }
@@ -355,4 +355,198 @@ fn an_upstream_s_own_sync_records_do_not_count() {
     let wt = env.update_worktree(&f.down);
     let json = env.tool_json(&wt, &["env", "--json"], 0);
     assert_eq!(json["GIT_INTAKE_UPSTREAM_UPSTREAM_TARGET"], tip.as_str());
+}
+
+/// Gives the fork a delta of its own over the upstream in `0.txt`, `a.txt`,
+/// `b.txt` and `c.txt`, then starts an update whose upstream conflicts with
+/// it in `a.txt`, `b.txt` and `c.txt` and also changes `f.txt` and adds
+/// `u.txt` cleanly. The resolution keeps both sides in `a.txt`, drops the
+/// upstream's line in `b.txt` and takes the upstream's side in `c.txt`.
+fn resolved_update(f: &Fork) {
+    let env = &f.env;
+    let base = "1\n2\n3\n";
+    let long: String = (1..=10).map(|n| format!("x{n}\n")).collect();
+    env.push_upstream(
+        &f.up,
+        &[
+            ("0.txt", &long),
+            ("a.txt", base),
+            ("b.txt", base),
+            ("c.txt", base),
+            ("f.txt", "f\n"),
+        ],
+        "upstream: files",
+    );
+    f.tool(&["start"]).success();
+    if f.forge.is_none() {
+        f.tool(&["verify"]).success();
+    }
+    f.tool(&["finish"]).success();
+    if let Some(fake) = &f.forge {
+        common::merge_on_fake(
+            env,
+            fake,
+            common::open_number(fake),
+            common::How::FastForward,
+        );
+        env.git(&f.down, &["pull", "-q", "--ff-only", "origin", "main"]);
+    }
+    let ours: String = (1..=10).map(|n| format!("y{n}\n")).collect();
+    env.commit(
+        &f.down,
+        &[
+            ("0.txt", &ours),
+            ("a.txt", "1\nours\n3\n"),
+            ("b.txt", "1\nours\n3\n"),
+            ("c.txt", "1\nours\n3\n"),
+        ],
+        "fork: our changes",
+    );
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
+    env.push_upstream(
+        &f.up,
+        &[
+            ("a.txt", "1\ntheirs\n3\n"),
+            ("b.txt", "1\ntheirs\n3\n"),
+            ("c.txt", "1\ntheirs\n3\n"),
+            ("f.txt", "f\nmore\n"),
+            ("u.txt", "u\n"),
+        ],
+        "upstream: changes",
+    );
+    f.tool(&["start"]).code(1);
+    let wt = env.update_worktree(&f.down);
+    for (path, content) in [
+        ("a.txt", "1\nours\ntheirs\n3\n"),
+        ("b.txt", "1\nours\n3\n"),
+        ("c.txt", "1\ntheirs\n3\n"),
+    ] {
+        fs::write(wt.join(path), content).unwrap();
+    }
+    env.git(&wt, &["add", "a.txt", "b.txt", "c.txt"]);
+    f.tool(&["continue"]).success();
+}
+
+/// The output of `delta` without its header lines, which name the
+/// synthetic commits, and without blank context.
+fn compared(out: &str) -> Vec<&str> {
+    out.lines()
+        .filter(|l| !l.starts_with("1:  "))
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+#[test]
+fn delta_shows_only_what_the_update_changed_in_the_downstreams_delta() {
+    let f = Fork::new();
+    let env = &f.env;
+    resolved_update(&f);
+    let wt = env.update_worktree(&f.down);
+    let out = stdout(&env.tool(&wt, &["delta"]).success());
+    for shown in ["## a.txt ##", "## b.txt ##", "## c.txt ##"] {
+        assert!(out.contains(shown), "{shown}:\n{out}");
+    }
+    for hidden in ["## 0.txt ##", "y1", "f.txt", "u.txt", "more"] {
+        assert!(!out.contains(hidden), "{hidden}:\n{out}");
+    }
+    // The upstream's line the resolution of `b.txt` left out shows as a
+    // new difference from the upstream.
+    assert!(out.contains("\n    +-theirs\n"), "{out}");
+    // The comparison leaves no reference behind.
+    let refs = env.git(&f.down, &["for-each-ref", "--format=%(refname)"]);
+    let series = out
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    for name in refs.lines() {
+        assert!(
+            !env.is_ancestor(&f.down, series, name),
+            "{name} reaches {series}"
+        );
+    }
+    // From the main checkout, the update branch names the same commit.
+    let named = stdout(&f.tool(&["delta", "git-intake/update"]).success());
+    assert_eq!(compared(&named), compared(&out));
+}
+
+#[test]
+fn delta_reads_a_merge_requests_head_with_its_latest_catch_up() {
+    let f = Fork::merge_request();
+    let env = &f.env;
+    resolved_update(&f);
+    let wt = env.update_worktree(&f.down);
+    let before = stdout(&env.tool(&wt, &["delta"]).success());
+    f.tool(&["finish"]).success();
+    // Other work lands, and sync catches the merge request up.
+    let dir = common::forge(env, &f.publish);
+    env.git(&dir, &["pull", "-q", "--ff-only", "origin", "main"]);
+    env.commit(&dir, &[("other.txt", "o\n")], "other: lands");
+    env.git(&dir, &["push", "-q", "origin", "HEAD:main"]);
+    f.tool(&["sync"]).success();
+    let head = common::forge::branch_tip(&f.publish, MERGE_REQUEST_BRANCH).unwrap();
+    let ci = pipeline_clone(&f, &head);
+    assert!(
+        env.git(&ci, &["log", "-1", "--format=%B", "HEAD"])
+            .contains("Intake-Catch-Up")
+    );
+    let after = stdout(&env.tool(&ci, &["delta"]).success());
+    assert_eq!(compared(&after), compared(&before));
+}
+
+#[test]
+fn delta_refuses_a_commit_without_an_update() {
+    let f = Fork::new();
+    let main = f.env.rev(&f.down, "main");
+    let out = f.tool(&["delta", "main"]).code(2);
+    assert!(
+        stderr(&out).contains(&format!("{} carries no update", &main[..12])),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn delta_refuses_an_update_without_a_previous_target() {
+    // A sync merge made by hand of an upstream that shares no history with
+    // the integration branch: `start` refuses that, so nothing earlier was
+    // taken, and there is no earlier delta to compare with.
+    let env = common::Env::new();
+    let up = env.upstream("upstream", &[("u.txt", "u\n")]);
+    let down = env.work("down");
+    let config = format!(
+        "integration = \"main\"\n\n[[upstream]]\nname = \"upstream\"\nurl = {:?}\nbranch = \"main\"\nmode = \"follow\"\n",
+        up.url()
+    );
+    env.commit(
+        &down,
+        &[(".git-intake.toml", &config)],
+        "fork: configuration",
+    );
+    env.git(&down, &["fetch", "-q", &up.url(), "main"]);
+    let target = env.rev(&down, "FETCH_HEAD");
+    env.git(&down, &["checkout", "-q", "-b", "by-hand"]);
+    env.git(
+        &down,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--allow-unrelated-histories",
+            "-m",
+            &format!(
+                "sync(upstream): by hand\n\nIntake-Upstream: upstream\nIntake-Target: {target}\n"
+            ),
+            "FETCH_HEAD",
+        ],
+    );
+    let out = env.tool(&down, &["delta"]).code(2);
+    assert!(
+        stderr(&out).contains("upstream 'upstream' has no previous target before the update"),
+        "{}",
+        stderr(&out)
+    );
 }

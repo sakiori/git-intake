@@ -1,9 +1,36 @@
-//! Rendering of command results as text or as one JSON document.
+//! Rendering of command results as text or as one JSON document, and the
+//! messages the tool writes while it works.
 
-use anyhow::Result;
+use std::fmt;
+use std::io::Write;
+
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::redact::redacted;
+
+/// Writes a message line to stdout, as `println!` does, except that a
+/// stdout that is gone, a closed pipe or a terminal that hung up, loses the
+/// message instead of ending the process, so that a run still ends what it
+/// started, such as a pause of the merge queue.
+macro_rules! say {
+    ($($arg:tt)*) => {
+        $crate::output::line(&mut ::std::io::stdout(), format_args!($($arg)*))
+    };
+}
+
+/// Writes a message line to stderr, as [`say`] does to stdout.
+macro_rules! esay {
+    ($($arg:tt)*) => {
+        $crate::output::line(&mut ::std::io::stderr(), format_args!($($arg)*))
+    };
+}
+
+pub(crate) use {esay, say};
+
+pub fn line(out: &mut impl Write, args: fmt::Arguments) {
+    let _ = writeln!(out, "{args}");
+}
 
 /// A command result that has a text form; its JSON form is its serialisation.
 pub trait Render: Serialize {
@@ -13,16 +40,25 @@ pub trait Render: Serialize {
 /// Prints a result in the requested form, through [`redacted`] as every
 /// message the tool shows.
 pub fn emit<T: Render>(value: &T, json: bool) -> Result<()> {
-    if json {
-        println!("{}", redacted(&serde_json::to_string_pretty(value)?));
+    let mut text = if json {
+        redacted(&serde_json::to_string_pretty(value)?)
     } else {
-        let text = redacted(&value.render());
-        print!("{text}");
-        if !text.ends_with('\n') {
-            println!();
-        }
+        redacted(&value.render())
+    };
+    if !text.ends_with('\n') {
+        text.push('\n');
     }
-    Ok(())
+    print(&text)
+}
+
+/// Writes a command's result to stdout. Unlike a message, a result that
+/// cannot be written is an error, so that nothing reads a cut-off one as
+/// whole.
+pub fn print(text: &str) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .context("cannot write the result to stdout")
 }
 
 /// Lays out rows as left-aligned columns separated by two spaces.

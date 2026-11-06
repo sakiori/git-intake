@@ -17,6 +17,7 @@ use crate::git::{Git, abbrev};
 use crate::identity;
 use crate::integration_line;
 use crate::output::{Render, emit};
+use crate::output::{esay, say};
 use crate::redact::redacted;
 use crate::release::{self, Base, Known, Release, ReleaseTag, Remote};
 use crate::repo::Repo;
@@ -334,7 +335,7 @@ pub fn tag(repo: &Repo) -> Result<Exit> {
     if let Some(at) = tip.release() {
         return match lookup(git, publish, &at.tag.name) {
             Lookup::Known(true) => {
-                println!(
+                say!(
                     "the integration tip {} carries the published release {}; nothing to release",
                     abbrev(&remote.tip),
                     at.tag.name
@@ -342,7 +343,7 @@ pub fn tag(repo: &Repo) -> Result<Exit> {
                 Ok(Exit::Success)
             }
             Lookup::Known(false) => {
-                println!(
+                say!(
                     "the integration tip {} carries the release {}, which is not published: {}; no new tag \
                      was created",
                     abbrev(&remote.tip),
@@ -363,12 +364,12 @@ pub fn tag(repo: &Repo) -> Result<Exit> {
     if let Some(previous) = tip.previous() {
         match lookup(git, publish, &previous.tag.name) {
             Lookup::Known(true) => {}
-            Lookup::Known(false) => eprintln!(
+            Lookup::Known(false) => esay!(
                 "warning: the release {} below the tip is not published: {}",
                 previous.tag.name,
                 unpublished_advice()
             ),
-            Lookup::Hidden(why) | Lookup::Failed(why) => eprintln!(
+            Lookup::Hidden(why) | Lookup::Failed(why) => esay!(
                 "{}",
                 redacted(&format!(
                     "warning: whether the release {} below the tip is published cannot be read: {why}",
@@ -416,14 +417,14 @@ pub fn tag(repo: &Repo) -> Result<Exit> {
         );
     }
     let local = git.raw(&["update-ref", &full, &object, ""])?;
-    println!(
+    say!(
         "pushed the release tag {} at {} to '{}'",
         next.name,
         abbrev(&remote.tip),
         publish.remote
     );
     if !local.success() {
-        eprintln!(
+        esay!(
             "note: the repository already has a tag {}, which was left as it is",
             next.name
         );
@@ -644,7 +645,7 @@ pub fn version(repo: &Repo, given: Option<&str>, json: bool, dotenv: bool) -> Re
         if let Some(tag) = &report.tag {
             out.push_str(&format!("RELEASE_TAG={tag}\n"));
         }
-        print!("{}", redacted(&out));
+        crate::output::print(&redacted(&out))?;
     } else {
         emit(&report, json)?;
     }
@@ -678,10 +679,7 @@ pub fn notes(repo: &Repo, given: Option<&str>) -> Result<Exit> {
     let line = release::line(git, &commit, &synced)?;
     let releases = release::releases_on(&line, &remote.tags, &settings.labels);
     let previous = previous_release(&line, &releases, &tag, &commit);
-    print!(
-        "{}",
-        redacted(&write_notes(git, &commit, previous, &synced)?)
-    );
+    crate::output::print(&redacted(&write_notes(git, &commit, previous, &synced)?))?;
     Ok(Exit::Success)
 }
 

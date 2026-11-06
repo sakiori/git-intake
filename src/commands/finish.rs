@@ -25,6 +25,7 @@ use crate::commands::{catch_up, merge_request, verify};
 use crate::config::{PublishVia, Upstream};
 use crate::git::{Git, abbrev, branch_ref, tracking_ref};
 use crate::identity;
+use crate::output::say;
 use crate::repo::{MainWorktree, Repo, bullet};
 use crate::state::{self, Finishing, PlannedMove, Stored, UpdateState, Work};
 use crate::upstreams;
@@ -72,7 +73,7 @@ fn finish_by_push(
     }
     let finishing = match state.finishing.clone() {
         Some(f) => {
-            println!("resuming finish");
+            say!("resuming finish");
             match resume(
                 repo,
                 &mut state,
@@ -152,7 +153,7 @@ fn finish_by_push(
         // (or a resumed one): the integration branch is never pushed directly.
         Some(publish) if no_publish || publish.via == PublishVia::MergeRequest => {
             unpublished = branches.clone();
-            println!(
+            say!(
                 "not published to '{}' (advanced locally only): {}",
                 publish.remote,
                 branches.join(", ")
@@ -162,7 +163,7 @@ fn finish_by_push(
             let publish = publish.remote;
             let unpushed = not_yet_published(repo, &publish, &finishing.moves)?;
             if unpushed.is_empty() {
-                println!(
+                say!(
                     "'{publish}' already holds {}; nothing was pushed",
                     branches.join(", ")
                 );
@@ -180,10 +181,10 @@ fn finish_by_push(
                      closes the update locally. Never force-push."
                 );
             } else {
-                println!("pushed {} to '{publish}'", branches.join(", "));
+                say!("pushed {} to '{publish}'", branches.join(", "));
             }
         }
-        None => println!("no publish remote is configured; nothing was pushed"),
+        None => say!("no publish remote is configured; nothing was pushed"),
     }
     close(repo, state, unpublished)
 }
@@ -316,7 +317,7 @@ fn close_locally(
     if state.catching_up().is_some() {
         if state.worktree.exists() && wt.merge_in_progress()? {
             catch_up::abandon(repo, state)?;
-            println!(
+            say!(
                 "the update closes at the planned commit {}",
                 abbrev(&planned.new)
             );
@@ -347,13 +348,13 @@ fn close_locally(
             &format!("^{}", planned.new),
             "--",
         ])?);
-        println!(
+        say!(
             "dropped the catch-up of the update, which is not verified; the update closes at the planned commit {}. \
              The dropped commits stay in the repository until git prunes unreachable commits:",
             abbrev(&planned.new)
         );
         for c in &dropped {
-            println!("  {c}");
+            say!("  {c}");
         }
         return Ok(f);
     }
@@ -365,7 +366,7 @@ fn close_locally(
         new: head.clone(),
     };
     validate_checkouts(repo, std::slice::from_ref(&m))?;
-    println!(
+    say!(
         "lands the verified catch-up of the update, {}, instead of the planned commit {}",
         abbrev(&head),
         abbrev(&planned.new)
@@ -425,7 +426,7 @@ pub fn prepare(
     let wt = Git::worktree(&state.worktree);
     let git = &repo.git;
     if state.verified_at(&head) && git.is_ancestor(&head, tip)? {
-        println!(
+        say!(
             "'{}' at {} already contains the verified commit {}",
             state.config.integration,
             abbrev(tip),
@@ -442,7 +443,7 @@ pub fn prepare(
     if moved_on && run.caught {
         // The catch-up this run concluded took in an earlier tip: nothing
         // is verified or moved before the next run catches up again.
-        println!(
+        say!(
             "'{}' moved to {} since the catch-up merge was made; no branch moved to the update. \
              Run `git intake finish` again to catch up with it",
             state.config.integration,
@@ -471,7 +472,7 @@ pub fn prepare(
         // brings whether they pass or fail.
         announced.check_changes(repo, state, &head)?;
         if !verify::verify_head(repo, state, &head)? {
-            println!(
+            say!(
                 "verification of the catch-up merge {} failed; no branch moved to the update. Fix it on the update \
                  branch in {}, commit, and run `git intake verify`, or run `git intake finish` to verify it again",
                 abbrev(&head),
@@ -479,10 +480,10 @@ pub fn prepare(
             );
             return Ok(Ready::Stop(Exit::Negative));
         }
-        println!("verified {}", abbrev(&head));
+        say!("verified {}", abbrev(&head));
     }
     if verify && let Some(why) = recheck(repo, state)? {
-        println!(
+        say!(
             "{why} while the update was verified; no branch moved to the update. \
              Run `git intake finish` again to catch up with it"
         );
@@ -587,10 +588,11 @@ fn fetch(git: &Git, remote: &str) -> Result<()> {
         &format!("+refs/heads/*:refs/remotes/{remote}/*"),
     ])?;
     if !out.success() {
-        bail!(
+        return Err(crate::forge::Failure::unanswered(format!(
             "cannot fetch the publish remote '{remote}': {}; no branch moved",
             out.into_error()
-        );
+        ))
+        .into());
     }
     Ok(())
 }
@@ -627,7 +629,7 @@ pub fn follow_published(repo: &Repo, remote: &str, integration: &str) -> Result<
         new: published.clone(),
     };
     move_branch(repo, &m, &local, "git-intake: follow the publish remote")?;
-    println!(
+    say!(
         "fast-forwarded '{integration}' from {} to {} to match '{remote}/{integration}'",
         abbrev(&local),
         abbrev(&published)
@@ -700,7 +702,7 @@ pub fn close(repo: &Repo, mut state: UpdateState, unpublished: Vec<String>) -> R
     upstreams::release(&repo.git, &state)?;
     repo.remove_logs()?;
     repo.paths.remove(&repo.paths.state)?;
-    println!("update finished");
+    say!("update finished");
     Ok(Exit::Success)
 }
 
@@ -859,14 +861,14 @@ pub fn apply(repo: &Repo, m: &PlannedMove) -> Result<()> {
     let git = &repo.git;
     let current = git.commit(&branch_ref(&m.branch))?;
     if current.as_deref() == Some(m.new.as_str()) {
-        println!("{}: at {}", m.branch, abbrev(&m.new));
+        say!("{}: at {}", m.branch, abbrev(&m.new));
         return Ok(());
     }
     if let Some(c) = &current
         && git.is_ancestor(&m.new, c)?
     {
         // Moved on after this update's move, for example by a reconciling merge.
-        println!(
+        say!(
             "{}: at {}, which contains {}",
             m.branch,
             abbrev(c),
@@ -893,7 +895,7 @@ pub fn apply(repo: &Repo, m: &PlannedMove) -> Result<()> {
     }
     let from = current.clone().unwrap_or_default();
     move_branch(repo, m, &from, "git-intake: finish")?;
-    println!(
+    say!(
         "{}: {} -> {}",
         m.branch,
         current.as_deref().map(abbrev).unwrap_or("(new)"),
