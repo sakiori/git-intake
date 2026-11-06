@@ -170,8 +170,9 @@ impl Surroundings<'_> {
 }
 
 /// Settings that tell an unknown forge, as refusals name them.
-const SETTINGS_HINT: &str = "set `forge` (`gitlab` or `github`) and `api` (the base URL of its REST API) \
-     in the [publish] table of .git-intake.toml";
+const SETTINGS_HINT: &str = "set `forge` (`gitlab` or `github`) in the [publish] table of .git-intake.toml, \
+     and also `api` (the base URL of its REST API) when the API is not at the usual address on the remote's host, \
+     as for an SSH host alias or a relative URL root";
 
 /// The kind of forge of a publish remote on `host`: the setting `forge`,
 /// else the host, else the CI job the tool runs in when the job's server is
@@ -385,7 +386,7 @@ fn project_path(path: &str, api: &Url) -> String {
 }
 
 /// The token of a GitLab CI job.
-const JOB_TOKEN: &str = "CI_JOB_TOKEN";
+pub(super) const JOB_TOKEN: &str = "CI_JOB_TOKEN";
 
 /// Every variable a token is read from.
 pub const TOKEN_VARIABLES: &[&str] = &[

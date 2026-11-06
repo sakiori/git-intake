@@ -35,13 +35,12 @@ fn doctor_checks_the_forge_the_token_and_the_merge_settings() {
     assert_eq!(checks(&doctor, "forge_token")[0]["status"], "pass");
     let settings = checks(&doctor, "merge_settings");
     assert_eq!(settings[0]["status"], "pass");
-    // Squashing on request stays selectable: a warning, not a failure.
+    // Squashing stays optional, which the tool's own merge request does not
+    // use: a note, neither a failure nor a warning, and no advice to change it.
+    assert!(settings.iter().all(|c| c["status"] == "pass"));
     assert!(settings.iter().any(|c| {
-        c["status"] == "warn"
-            && c["detail"]
-                .as_str()
-                .unwrap()
-                .contains("squash_option `default_off`")
+        let detail = c["detail"].as_str().unwrap();
+        detail.contains("squash_option `default_off`") && !detail.contains("Do not allow")
     }));
 
     f.forge()

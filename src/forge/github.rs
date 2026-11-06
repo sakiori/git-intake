@@ -437,6 +437,7 @@ pub fn review(target: &str, repository: &Value, rules: &Value, classic: &Classic
     Review {
         refusals,
         warnings,
+        notes: Vec::new(),
         ci_paths: vec![WORKFLOWS.to_string()],
     }
 }

@@ -426,16 +426,16 @@ publish:
     - git config user.name Sakiori
     - git config user.email oss@sakiori.app
     - git remote set-url origin "$CI_PROJECT_URL.git"
-    # The runner's own git configuration, included from the clone's and from the
-    # global one, carries the job token, which may not push: a rewrite of the
-    # server's URLs into ones with the token, and a credential helper. The job
-    # drops both and answers with the release token alone, which stays in the
-    # environment.
+    # The runner's own git configuration, which the clone's includes, carries the
+    # job token, which may not push: a rewrite of the server's URLs into ones with
+    # the token, or a credential helper. The job drops it, and any global
+    # configuration, and answers the server, and no other host, with the release
+    # token alone, which stays in the environment.
     - export GIT_CONFIG_GLOBAL="$(mktemp)"
     - git config --local --unset-all include.path || true
     - git config --unset-all credential.helper || true
-    - git config --add credential.helper ''
-    - git config --add credential.helper '!f() { echo username=release-plz; echo "password=$RELEASE_PLZ_TOKEN"; }; f'
+    - git config --add "credential.$CI_SERVER_URL.helper" ''
+    - git config --add "credential.$CI_SERVER_URL.helper" '!f() { echo username=release-plz; echo "password=$RELEASE_PLZ_TOKEN"; }; f'
     - |
       case "$(git remote get-url --push origin)" in
         *@*) echo "git rewrites the push URL to carry credentials; it must reach the server without them" >&2; exit 1 ;;

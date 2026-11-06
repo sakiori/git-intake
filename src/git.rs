@@ -169,10 +169,33 @@ impl Git {
     /// failing on a non-zero exit status. The input is written from another
     /// thread so that large outputs cannot block it.
     pub fn run_with_input<S: AsRef<str>>(&self, args: &[S], input: String) -> Result<String> {
+        Ok(self.feed(self.command(args), args, input)?.checked()?)
+    }
+
+    /// The password git's credential helpers answer `url` with, or `None` when
+    /// they give none. Git asks nobody else: neither a terminal nor an askpass
+    /// program, which an empty `GIT_ASKPASS` takes the place of.
+    pub fn credential_password(&self, url: &str) -> Result<Option<String>> {
+        let args = ["credential", "fill"];
+        let mut cmd = self.command(&args);
+        cmd.env("GIT_ASKPASS", "");
+        let out = self.feed(cmd, &args, format!("url={url}\n\n"))?;
+        Ok(out
+            .success()
+            .then(|| {
+                out.stdout
+                    .lines()
+                    .find_map(|line| line.strip_prefix("password="))
+                    .map(str::to_string)
+            })
+            .flatten())
+    }
+
+    /// Runs `cmd`, the git command `args`, with `input` on its standard input.
+    fn feed<S: AsRef<str>>(&self, mut cmd: Command, args: &[S], input: String) -> Result<Output> {
         use std::io::Write;
         let owned: Vec<String> = args.iter().map(|a| a.as_ref().to_string()).collect();
-        let mut child = self
-            .command(args)
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -194,8 +217,7 @@ impl Git {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             args: owned,
-        }
-        .checked()?)
+        })
     }
 
     /// Runs git and returns stdout, failing on a non-zero exit status.

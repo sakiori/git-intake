@@ -872,14 +872,50 @@ fn locate_main_worktree(
     started_in: Option<&Path>,
     paths: &Paths,
 ) -> Result<MainWorktree> {
+    // Asked with the git directory named, not from inside it: git takes a
+    // directory it finds itself in for a repository of its own, so in a checkout
+    // of another owner its ownership check would want `safe.directory` to name
+    // `.git` and not only the checkout, which git accepted for the tool to get
+    // here.
+    let git_dir = format!("--git-dir={}", common.display());
     let repo = Git::worktree(common);
-    if repo.line(&["rev-parse", "--is-bare-repository"])? == "true" {
-        return Ok(MainWorktree::Bare);
+    // One command: a bare repository answers the first and fails on the second,
+    // and one git cannot set up, as for a `core.worktree` that is gone, neither.
+    let asked = repo.raw(&[
+        git_dir.as_str(),
+        "rev-parse",
+        "--is-bare-repository",
+        "--show-toplevel",
+    ])?;
+    let (bare, top) = asked
+        .stdout
+        .split_once('\n')
+        .unwrap_or((asked.stdout.as_str(), ""));
+    match bare {
+        "true" => return Ok(MainWorktree::Bare),
+        "" => return Err(asked.into_error().into()),
+        _ => {}
     }
-    // `core.worktree`, as a submodule's git directory sets it.
-    let top = repo.raw(&["rev-parse", "--show-toplevel"])?;
-    if top.success() {
-        return Ok(MainWorktree::At(canonical(Path::new(top.stdout.trim()))));
+    // `core.worktree`, as a submodule's git directory sets it. Without it, a
+    // named git directory has the current directory for its top, here itself.
+    let top = top.trim_end_matches('\n');
+    if !top.is_empty() {
+        let top = canonical(Path::new(top));
+        if top != common {
+            return Ok(MainWorktree::At(top));
+        }
+        // Git found from inside takes a repository for bare when `core.bare` is
+        // unset, or true where a named git directory does not read it.
+        let setting = repo.raw(&[
+            git_dir.as_str(),
+            "config",
+            "--type=bool",
+            "--get",
+            "core.bare",
+        ])?;
+        if setting.code == Some(1) || setting.stdout.trim() == "true" {
+            return Ok(MainWorktree::Bare);
+        }
     }
     // A git directory that does not name its main worktree: the tool was
     // started in it, or the update in progress recorded it. Both come before

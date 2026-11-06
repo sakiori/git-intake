@@ -898,3 +898,121 @@ fn an_update_that_brings_a_link_named_in_another_case_is_refused() {
     assert_eq!(fs::read_to_string(&kept).unwrap(), "kept\n");
     env.assert_no_update(&f.down);
 }
+
+#[test]
+fn a_checkout_of_another_owner_needs_safe_directory_for_the_checkout_alone() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    let real = |p: &Path| fs::canonicalize(p).unwrap().to_string_lossy().into_owned();
+    let down = real(&f.down);
+    // Git's own switch for its ownership check counts every repository as
+    // another owner's, so the upstream, the publish remote and the update
+    // worktree, which a job's user owns, are named too; `.git` is not.
+    for dir in [
+        format!("{down}/.worktrees/git-intake/update"),
+        real(&f.up.bare),
+        real(&f.publish),
+    ] {
+        env.git(
+            &f.down,
+            &["config", "--global", "--add", "safe.directory", &dir],
+        );
+    }
+    env.set_var("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
+    // The checkout, as the variables of the README's pipelines name it.
+    env.set_var("GIT_CONFIG_COUNT", "1");
+    env.set_var("GIT_CONFIG_KEY_0", "safe.directory");
+    env.set_var("GIT_CONFIG_VALUE_0", &down);
+    env.tool(&f.down, &["sync"]).success();
+    env.tool(&f.down, &["doctor"]).success();
+    env.unset_var("GIT_TEST_ASSUME_DIFFERENT_OWNER");
+    assert_eq!(env.rev(&f.publish, "main"), env.rev(&f.down, "main"));
+    assert!(
+        env.git(&f.down, &["log", "-1", "--format=%s", "main"])
+            .starts_with("sync(upstream):")
+    );
+}
+
+#[test]
+fn a_core_worktree_outside_the_repository_s_own_settings_moves_nothing() {
+    let f = Fork::new();
+    let env = &f.env;
+    let other = env.path("unrelated");
+    fs::create_dir(&other).unwrap();
+    env.git(&other, &["init", "-q"]);
+    env.git(
+        &other,
+        &["commit", "-q", "--allow-empty", "-m", "unrelated"],
+    );
+    env.set_var("GIT_CONFIG_COUNT", "1");
+    env.set_var("GIT_CONFIG_KEY_0", "core.worktree");
+    env.set_var("GIT_CONFIG_VALUE_0", &other.to_string_lossy());
+    env.tool(&f.down, &["status"]).success();
+}
+
+#[test]
+fn a_bare_repository_without_core_bare_stays_bare() {
+    let m = Mono::new();
+    let env = &m.env;
+    let bare = bare_downstream(&m, "mono-bare.git");
+    env.git(&bare, &["config", "--unset", "core.bare"]);
+    env.tool(&bare, &["start"]).success();
+    assert!(bare_update_worktree(&bare).is_dir());
+}
+
+#[test]
+fn core_bare_false_in_the_worktree_configuration_is_no_bare_repository() {
+    let f = Fork::new();
+    let env = &f.env;
+    env.git(&f.down, &["config", "core.repositoryformatversion", "1"]);
+    env.git(&f.down, &["config", "extensions.worktreeConfig", "true"]);
+    env.git(&f.down, &["config", "--unset", "core.bare"]);
+    env.git(&f.down, &["config", "--worktree", "core.bare", "false"]);
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    env.tool(&f.down, &["start"]).success();
+    assert!(f.down.join(".worktrees/git-intake/update").is_dir());
+}
+
+#[test]
+fn core_bare_true_from_an_include_after_false_counts_as_bare_as_git_says() {
+    let f = Fork::new();
+    let env = &f.env;
+    let include = env.path("bare.gitconfig");
+    fs::write(&include, "[core]\n\tbare = yes\n").unwrap();
+    env.git(&f.down, &["config", "core.bare", "false"]);
+    env.git(
+        &f.down,
+        &["config", "include.path", &include.to_string_lossy()],
+    );
+    let listed = env.git_output(&f.down, &["worktree", "list", "--porcelain"]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("\nbare\n"),
+        "git takes the repository for bare"
+    );
+    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    let err = stderr(&env.tool(&f.down, &["start"]).code(2));
+    assert!(err.contains("of this bare repository"), "{err}");
+    assert!(!f.down.join(".worktrees/git-intake/update").exists());
+}
+
+#[test]
+fn a_core_worktree_that_is_gone_is_said_from_a_linked_worktree() {
+    let f = Fork::new();
+    let env = &f.env;
+    let linked = env.path("linked");
+    env.git(
+        &f.down,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            &linked.to_string_lossy(),
+        ],
+    );
+    env.git(&f.down, &["config", "core.worktree", "../gone"]);
+    let err = stderr(&env.tool(&linked, &["status"]).code(2));
+    assert!(err.contains("cannot chdir"), "{err}");
+}

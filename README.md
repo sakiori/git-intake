@@ -215,8 +215,8 @@ checks = [                            # run in order by verify, each named
 [publish]                             # optional: where and how finish publishes
 remote = "origin"                     # the publish remote, a git remote of the repository
 via = "push"                          # optional: "push" (default) or "merge-request"
-# forge = "gitlab"                    # optional: "gitlab" or "github", when the URL does not tell; in push mode it names the CI files
-# api = "https://gitlab.example.com/api/v4"  # optional, merge-request mode or [release]: the forge's REST API on the remote's host
+# forge = "gitlab"                    # optional: "gitlab" or "github", when the URL does not tell, as on a forge's own domain; in push mode it names the CI files
+# api = "https://gitlab.example.com/gitlab/api/v4"  # optional, merge-request mode or [release]: the forge's REST API on the remote's host, when it is not at the usual address (see The forge)
 
 [[upstream]]
 name = "app-a"                        # unique; used on the command line, in sync records, trailers and check variables
@@ -558,17 +558,22 @@ The forge is that of the publish remote's fetch URL as git uses it, after its `u
 - **The API base** is the setting `api`, an `https` URL on the remote's own host: for an SSH host alias, the host the SSH configuration names for it (as `ssh -G` resolves it; an IP address is no alias), and for GitHub also `api.<host>`. Without the setting, in a CI job of the remote's host, it is the job's `CI_API_V4_URL` or `GITHUB_API_URL`, which must name the same host (or `api.<host>` for GitHub) and be `https` unless the job's server itself is reached by plain HTTP; otherwise `https://<host>/api/v4` for GitLab, `https://api.github.com` for github.com, `https://api.<host>` for a `ghe.com` host, and `https://<host>/api/v3` for GitHub Enterprise Server.
 - **The project** is the URL's path without credentials and `.git`, less the path the API base carries before `/api/v4` or `/api/v3`, which covers a GitLab installed under a relative URL root.
 
-An SSH host alias, or an SSH URL of a GitLab under a relative URL root, names neither the forge nor its API; set both:
+Outside a CI job of the instance, a forge on its own domain needs the setting `forge`, and nothing more when its API is at the usual address on the remote's host, over an `https` URL or a plain SSH URL alike:
 
 ```toml
 [publish]
 remote = "origin"
 via = "merge-request"
 forge = "gitlab"
+```
+
+Add `api` only where that address is wrong, which `doctor` shows by failing to reach the project. An SSH host alias does not name the host to form it from, and the URL of a GitLab under a relative URL root does not tell the root from the project's path:
+
+```toml
 api = "https://gitlab.example.com/gitlab/api/v4"
 ```
 
-A remote on a host the tool does not recognise, without these settings, is refused by the commands that need the forge, naming `forge` and `api`; so is an `api` on another host than the remote's.
+A remote on a host the tool does not recognise, without `forge`, is refused by the commands that need the forge, naming `forge` and when `api` is needed too; so is an `api` on another host than the remote's.
 
 An `https` API is reached with rustls, and its certificate is checked by the operating system's verifier, which trusts the system's certificate store (on Linux the system bundle, or the file `SSL_CERT_FILE` names), so a self-managed forge behind a private certificate authority works once its root is trusted there. The proxy of `ALL_PROXY`, `HTTPS_PROXY` or `HTTP_PROXY` is used, with `NO_PROXY`, in upper or lower case. A redirect to another host is followed without the token. GitHub requests ask for the API version `2022-11-28`, which every supported GitHub Enterprise Server release knows.
 
@@ -601,7 +606,7 @@ On **GitLab**, every field the tool reads is visible to any token that can read 
 - The merge method is *Merge commit with semi-linear history* (`rebase_merge`) or *Fast-forward merge* (`ff`). GitLab then merges only a branch that contains the target branch, so the merged tree is the tree of the head the pipeline tested. The plain *Merge commit* method is refused, even with merged results pipelines: GitLab requires the pipeline to match the merge request's head, not the current target branch, so a merged results pipeline can be outdated when the merge happens.
 - Merge trains are off: whether a train lands the commit it tested could not be confirmed, and with fast-forward or semi-linear history its refs are rebased.
 - *Enable automatic rebase prior to merge* is off (`automatic_rebase_enabled`; an instance without the setting counts as off): a rebase drops the update's merge commits. `sync` keeps the branch mergeable by catch-up merges instead.
-- *Squash commits when merging* is not *Require* (`squash_option` `always`). *Encourage* and *Allow* let the person merging tick squash, which the tool cannot prevent: the description asks not to, and `doctor` warns. GitLab Premium's per-branch squash setting is readable only through an experimental GraphQL field, so the tool does not read it; a squash that happens anyway shows as a merge request merged without its history (below).
+- *Squash commits when merging* is not *Require* (`squash_option` `always`). *Encourage* and *Allow* suit a project that squashes its other merge requests: the tool opens and rewrites the update's merge request with squashing off, which these settings respect, so it stays off unless the person merging ticks it. The description asks not to, and `doctor` notes the setting without counting it as a problem; nothing asks for *Do not allow*. GitLab Premium's per-branch squash setting is readable only through an experimental GraphQL field, so the tool does not read it; a squash that happens anyway shows as a merge request merged without its history (below).
 
 On **GitHub**, for the integration branch:
 
@@ -806,6 +811,11 @@ A scheduled job cuts the release tag; the tag's pipeline checks it, builds with 
 ```yaml
 variables:
   GIT_DEPTH: "0"        # the full history; git intake refuses a shallow clone
+  # The checkout, for an image that runs as another user than cloned it; see
+  # Running in CI, GitLab.
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: safe.directory
+  GIT_CONFIG_VALUE_0: $CI_PROJECT_DIR
 
 stages: [check, build, release]
 
@@ -814,12 +824,8 @@ release-tag:
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   script:
-    - git config user.name "Sakiori"
-    - git config user.email "oss@sakiori.app"
-    # Push with the access token in GITLAB_TOKEN instead of the job token,
-    # whose pushes start no pipeline.
-    - git remote set-url origin "$CI_SERVER_URL/$CI_PROJECT_PATH.git"
-    - git config credential.helper '!f() { echo username=oauth2; echo "password=$GITLAB_TOKEN"; }; f'
+    # Pushes with the access token in GITLAB_TOKEN; see Running in CI, GitLab.
+    - !reference [.push-with-token, script]
     - git intake release tag
 
 release-check:
@@ -935,7 +941,7 @@ While an update is in progress it also shows the step reached, the base and the 
 - Every port upstream's journal is valid and its base and its decided and taken commits that are not retired are still on its branch, naming each one that is not.
 - No git remote names an upstream's repository, with a note when the remote is the one a partial clone fetches missing objects from.
 - No journal belongs to an upstream that is missing or in follow mode.
-- In merge-request mode, the forge is recognised, a token is set and accepted, and the merge settings qualify, with a warning when squash or rebase merges stay selectable.
+- In merge-request mode, the forge is recognised, a token is set and accepted, and the merge settings qualify, with a warning when a GitHub repository leaves squash or rebase merges selectable, since a pull request cannot ask for neither, and a note when a GitLab project leaves squashing optional.
 - The main checkout is clean.
 - No merge is in progress in the main checkout.
 - The update state, if any, matches its worktree and branch.
@@ -974,7 +980,7 @@ One object: `tip`, the publish remote's integration tip; `base`, its release bas
 | --- | --- |
 | 0 | Success. |
 | 1 | A negative result: `status --check` found drift or pending port commits, an upstream could not be fetched by `status`, `log` or `branches`, a `doctor` check failed, `verify` failed, a partial run included, or `start`/`continue` stopped on conflicts or on the failed commit of a copy. `finish` stopped on the conflicts or the failed checks of a catch-up merge, or because the integration branch moved again while it made or verified one. `sync` stopped on a conflict or on failed checks, or left out a follow upstream it could not take. `release tag` found an unpublished release at the integration tip, or `release check` found a problem. An open merge request is not a negative result. |
-| 2 | An error: invalid configuration, a refused command (for example `start` with an upstream that cannot be fetched, `continue` with an invalid plan, `verify` with a check name the update does not have, `finish` on an unverified update in push mode, a head with only a partial run included, on a forge whose merge settings do not qualify or without a token, `sync` on a rewritten merge request or a declined branch, or any command in a shallow clone), a forge that rejected the token or a request, a push of the update's branch, or of a release tag, rejected because another run pushed it first, a release that breaks the order of releases or whose name the remote already has, a forge whose releases cannot be read by `release tag` or `release check`, or that hides them from `release next`, a catch-up refused because the integration branch was rewritten or its new commits change what the update means, a git failure (including a push rejected by the publish remote, after which `finish` retries the push, catching up first when the remote moved, and `finish --no-publish` closes the update locally), or invalid usage. |
+| 2 | An error: invalid configuration, a refused command (for example `start` with an upstream that cannot be fetched, `continue` with an invalid plan, `verify` with a check name the update does not have, `finish` on an unverified update in push mode, a head with only a partial run included, on a forge whose merge settings do not qualify or without a token, `sync` on a rewritten merge request or a declined branch, `sync` in merge-request mode or `release tag` in a GitLab CI job that would push with the job token, or any command in a shallow clone), a forge that rejected the token or a request, a push of the update's branch, or of a release tag, rejected because another run pushed it first, a release that breaks the order of releases or whose name the remote already has, a forge whose releases cannot be read by `release tag` or `release check`, or that hides them from `release next`, a catch-up refused because the integration branch was rewritten or its new commits change what the update means, a git failure (including a push rejected by the publish remote, after which `finish` retries the push, catching up first when the remote moved, and `finish --no-publish` closes the update locally), or invalid usage. |
 
 `env -- <command>` exits with the command's status, or with status 2 without running it when it cannot read the variables.
 
@@ -989,17 +995,36 @@ The job's clone must push with a credential whose pushes start the forge's pipel
 ```yaml
 variables:
   GIT_DEPTH: "0"        # the full history; git intake refuses a shallow clone
+  # The checkout, for an image that runs as another user than cloned it.
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: safe.directory
+  GIT_CONFIG_VALUE_0: $CI_PROJECT_DIR
+
+# Pushes with the access token in GITLAB_TOKEN instead of the job token, whose
+# pushes start no pipeline.
+.push-with-token:
+  script:
+    # Drop the runner's git configuration, which carries the job token.
+    - export GIT_CONFIG_GLOBAL="$(mktemp)"
+    - git remote set-url origin "${CI_PROJECT_URL}.git"
+    - git config --local --unset-all include.path || true
+    - git config --unset-all credential.helper || true
+    - git config user.name "Sakiori"
+    - git config user.email "oss@sakiori.app"
+    # Answer the server, and no other host, with the access token.
+    - git config --add "credential.${CI_SERVER_URL}.helper" ''
+    - git config --add "credential.${CI_SERVER_URL}.helper" '!f() { echo username=oauth2; echo "password=${GITLAB_TOKEN}"; }; f'
+    - |
+      push_url="$(git remote get-url --push origin)"
+      case "$push_url" in
+        *@*) echo "git rewrites the push URL to carry credentials; it must reach the server without them" >&2; exit 1 ;;
+      esac
 
 git-intake-sync:
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   script:
-    - git config user.name "Sakiori"
-    - git config user.email "oss@sakiori.app"
-    # Push with the access token in GITLAB_TOKEN instead of the job token,
-    # whose pushes start no pipeline.
-    - git remote set-url origin "$CI_SERVER_URL/$CI_PROJECT_PATH.git"
-    - git config credential.helper '!f() { echo username=oauth2; echo "password=$GITLAB_TOKEN"; }; f'
+    - !reference [.push-with-token, script]
     - git intake sync
 
 upstream-checks:
@@ -1008,6 +1033,20 @@ upstream-checks:
   script:
     - git intake env -- ./scripts/check.sh
 ```
+
+Each part of `.push-with-token` is needed:
+
+- The runner's own git configuration, which the clone's includes, rewrites the server's URLs into ones that carry the job token, or with its flag `FF_GIT_URLS_WITHOUT_TOKENS` answers the server with the job token through a credential helper. With the rewrite, git never asks the job's helper. The job drops that configuration whichever way the runner is set, and any global configuration, since a rewrite there can only be dropped too. An unbound helper left in a reused checkout goes as well.
+- The first, empty helper clears any helper of the system's configuration for the server, which would otherwise be asked first.
+- The helper is bound to the server's URL because a helper without one answers every host that asks. An upstream that disappeared, and answers with 401, would receive the token.
+- The guard fails the job at once when something still rewrites the URL, or git cannot read it.
+- `git remote set-url` comes before the lines with `|| true`, so that a refusal of the checkout stops the job with git's own message.
+
+The variables `GIT_CONFIG_*` serve an image that runs as another user than the one that cloned the checkout, as a non-root image does. Git refuses a repository of another owner, so every job that runs the tool needs the checkout named, not only those that push; an image that does not need it ignores it. Git reads `safe.directory` only outside the clone's own configuration, and the variables give it for the whole job without a writable home directory. The checkout is all that needs naming. An older git compares the name with the real path, so where `CI_PROJECT_DIR` holds a symbolic link, name the path it leads to.
+
+Dropping the runner's configuration also drops the certificate authority it may name. On an instance behind a private one, add `export GIT_SSL_CAINFO="$CI_SERVER_TLS_CA_FILE"`.
+
+In a GitLab CI job, `sync` in merge-request mode and `release tag` refuse with status 2 a clone that would push with the job token, at the start of every run. A schedule on which nothing has moved stays green otherwise, and a wrong setup would show only at its first real push. `sync` in push mode warns instead, since a project may let the job token push and need no pipeline from it.
 
 `GITLAB_TOKEN` is a project or group access token with the `api` scope and the Developer role, or Maintainer where the integration branch's protection requires it; a personal access token works as well. Store it as a **masked and protected** CI/CD variable. A protected variable reaches pipelines of protected branches and tags, such as the scheduled pipeline on the default branch, and the merge request pipeline that runs an update's code must not get it, which takes two settings:
 

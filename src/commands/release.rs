@@ -330,6 +330,7 @@ pub fn tag(repo: &Repo) -> Result<Exit> {
     let tip = at_tip(repo, &mut fetches, &start, &Known::default())?;
     let publish = publish_of(&tip.config)?;
     let remote = &tip.remote;
+    crate::forge::refuse_job_token_push(git, &publish.remote)?;
     if let Some(at) = tip.release() {
         return match lookup(git, publish, &at.tag.name) {
             Lookup::Known(true) => {

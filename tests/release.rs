@@ -486,6 +486,30 @@ fn release_check_reads_the_forge_with_the_job_token() {
 }
 
 #[test]
+fn release_tag_refuses_to_push_with_the_job_token() {
+    let f = forge_fork();
+    f.env.set_var("CI_JOB_TOKEN", "job-token-of-the-pipeline");
+    f.env.git(
+        &f.down,
+        &[
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            "https://gitlab-ci-token:job-token-of-the-pipeline@gitlab.example.com/team/app.git",
+        ],
+    );
+    let err = stderr(&f.tool(&["release", "tag"]).code(2));
+    assert!(
+        err.contains("would push to 'origin' with its job token")
+            && err.contains("the push URL carries it")
+            && !err.contains("job-token-of-the-pipeline"),
+        "{err}"
+    );
+    assert_eq!(f.env.git(&f.down, &["tag", "--list"]), "");
+}
+
+#[test]
 fn a_private_project_without_a_token_is_refused() {
     let f = forge_fork();
     f.tool(&["release", "tag"]).success();

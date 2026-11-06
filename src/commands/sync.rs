@@ -255,6 +255,9 @@ fn nothing_behind(plan: &Plan) {
 
 /// `sync` in push mode: starts, verifies and publishes in one run.
 fn by_push(repo: &Repo, config: Config) -> Result<Exit> {
+    if let Some(publish) = &config.publish {
+        crate::forge::warn_of_job_token_push(&repo.git, &publish.remote)?;
+    }
     let integration = config.integration.clone();
     let base = repo
         .git
@@ -318,6 +321,7 @@ fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exi
     let git = &repo.git;
     let integration = config.integration.clone();
     let remote = setting.remote.clone();
+    crate::forge::refuse_job_token_push(git, &remote)?;
     require_published(repo, &remote, &integration)?;
     let forge = connect(repo, &setting)?;
     let kind = forge.kind();

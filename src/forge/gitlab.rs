@@ -260,17 +260,19 @@ pub fn review(project: &Value) -> Review {
                 .to_string(),
         );
     }
-    let mut warnings = Vec::new();
+    let mut notes = Vec::new();
     match project.get("squash_option").and_then(Value::as_str) {
         Some("always") => refusals.push(
             "set `Squash commits when merging` to anything but `Require` (squash_option `always`): a squash drops \
              the update's merge commits, whose trailers record what it merged"
                 .to_string(),
         ),
-        Some(option @ ("default_on" | "default_off")) => warnings.push(format!(
-            "`Squash commits when merging` lets the person merging squash (squash_option `{option}`); a squashed \
-             update loses its sync records, so merge the update's merge requests without squashing, or set the \
-             option to `Do not allow`"
+        // The tool asks for squashing off on the update's merge request, and
+        // only `always` overrides that, so the project may squash its others.
+        Some(option @ ("default_on" | "default_off")) => notes.push(format!(
+            "squashing stays optional (squash_option `{option}`), which suits a project that squashes its other \
+             merge requests: the tool opens and rewrites the update's merge request with squashing off, so leave \
+             it off when merging, or the merge counts as one without the update's history"
         )),
         _ => {}
     }
@@ -289,7 +291,8 @@ pub fn review(project: &Value) -> Review {
     };
     Review {
         refusals,
-        warnings,
+        warnings: Vec::new(),
+        notes,
         ci_paths,
     }
 }
@@ -311,7 +314,6 @@ mod tests {
     fn semi_linear_history_with_required_pipelines_qualifies() {
         let r = review(&qualifying());
         assert!(r.refusals.is_empty(), "{:?}", r.refusals);
-        assert_eq!(r.warnings.len(), 1);
         assert_eq!(r.ci_paths, [".gitlab-ci.yml"]);
         let mut ff = qualifying();
         ff["merge_method"] = "ff".into();
@@ -320,8 +322,24 @@ mod tests {
         ff["automatic_rebase_enabled"] = false.into();
         ff["ci_config_path"] = "ci/pipeline.yml".into();
         let r = review(&ff);
-        assert!(r.refusals.is_empty() && r.warnings.is_empty());
+        assert!(r.refusals.is_empty() && r.warnings.is_empty() && r.notes.is_empty());
         assert_eq!(r.ci_paths, ["ci/pipeline.yml"]);
+    }
+
+    #[test]
+    fn squashing_left_to_the_person_merging_is_a_note_and_advises_no_change() {
+        for option in ["default_on", "default_off"] {
+            let mut project = qualifying();
+            project["squash_option"] = option.into();
+            let r = review(&project);
+            assert!(r.refusals.is_empty() && r.warnings.is_empty(), "{option}");
+            let [note] = r.notes.as_slice() else {
+                panic!("{option}: {:?}", r.notes);
+            };
+            assert!(note.contains(&format!("`{option}`")), "{note}");
+            assert!(note.contains("with squashing off"), "{note}");
+            assert!(!note.contains("Do not allow"), "{note}");
+        }
     }
 
     #[test]

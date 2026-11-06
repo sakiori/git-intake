@@ -512,6 +512,9 @@ fn forge_checks(repo: &Repo, config: &Config, checks: &mut Checks) {
             for refusal in review.refusals {
                 checks.add("merge_settings", None, CheckStatus::Fail, refusal);
             }
+            for note in review.notes {
+                checks.add("merge_settings", None, CheckStatus::Pass, note);
+            }
             for warning in review.warnings {
                 checks.add("merge_settings", None, CheckStatus::Warn, warning);
             }

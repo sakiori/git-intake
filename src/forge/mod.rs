@@ -108,8 +108,11 @@ pub struct Review {
     /// required pipeline tested, or each requirement the token could not
     /// confirm, with the ways to let it.
     pub refusals: Vec<String>,
-    /// Merges that stay selectable and drop the update's history.
+    /// Merges that stay selectable and drop the update's history, where the
+    /// tool cannot ask the forge not to make them.
     pub warnings: Vec<String>,
+    /// Settings worth knowing that ask for no change.
+    pub notes: Vec<String>,
     /// Where the forge reads its CI definition, relative to the repository
     /// root; a path ending in `/` is a directory.
     pub ci_paths: Vec<String>,
@@ -193,6 +196,73 @@ pub fn connect(git: &Git, publish: &Publish, access: Access) -> Result<Box<dyn F
         Kind::GitLab => Box::new(gitlab::GitLab::new(location)),
         Kind::GitHub => Box::new(github::GitHub::new(location)),
     })
+}
+
+/// Refuses, in a GitLab CI job, a clone that would push to `remote` with the
+/// job's own token. The runner configures git to, one way or another, and such
+/// a push is refused or starts no pipeline, so this is said at the start of a
+/// run, not at its first real push, which may be months of green scheduled jobs
+/// away. Outside a job it checks nothing.
+pub fn refuse_job_token_push(git: &Git, remote: &str) -> Result<()> {
+    if let Some(how) = job_token_push(git, remote)? {
+        bail!(
+            "this GitLab CI job would push to '{remote}' with its job token: {how}. The job token may not push, and \
+             where a project lets it, its pushes start no pipeline, so the first real push would fail or go untested \
+             however green the runs before it. Nothing was pushed. Drop the runner's git configuration and push \
+             with an access token, as `Running in CI` in the README shows"
+        );
+    }
+    Ok(())
+}
+
+/// Warns, in a GitLab CI job, of a clone that would push to `remote` with the
+/// job's own token, where a project may have chosen that: publication by push
+/// needs no pipeline to land.
+pub fn warn_of_job_token_push(git: &Git, remote: &str) -> Result<()> {
+    if let Some(how) = job_token_push(git, remote)? {
+        eprintln!(
+            "warning: this GitLab CI job would push to '{remote}' with its job token: {how}. That fails unless the \
+             project lets the job token push, and such a push starts no pipeline; `Running in CI` in the README \
+             shows how to push with an access token"
+        );
+    }
+    Ok(())
+}
+
+/// How a push to `remote` would use the job's own token, when it would.
+fn job_token_push(git: &Git, remote: &str) -> Result<Option<&'static str>> {
+    let Some(token) = std::env::var(locate::JOB_TOKEN)
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let urls = git.raw(&["remote", "get-url", "--push", "--all", remote])?;
+    if !urls.success() {
+        return Ok(None);
+    }
+    for url in crate::git::lines(&urls.stdout) {
+        if let Some(how) = pushes_with(git, &url, token.trim())? {
+            return Ok(Some(how));
+        }
+    }
+    Ok(None)
+}
+
+/// How a push to `url` would use `token`, when it would.
+fn pushes_with(git: &Git, url: &str, token: &str) -> Result<Option<&'static str>> {
+    let Ok(parsed) = Url::parse(url) else {
+        return Ok(None);
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Ok(None);
+    }
+    if let Some(password) = parsed.password() {
+        let password = percent_encoding::percent_decode_str(password).decode_utf8_lossy();
+        return Ok((password == token).then_some("the push URL carries it"));
+    }
+    Ok((git.credential_password(url)?.as_deref() == Some(token))
+        .then_some("git's credential helpers answer with it"))
 }
 
 /// The paths of the forge's CI definition that an update may change, as the

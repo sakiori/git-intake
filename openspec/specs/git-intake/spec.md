@@ -1651,11 +1651,19 @@ In merge-request mode `status` SHALL show the update's open merge request with i
 - **THEN** `status` names it as merged without its history, and `status --json` carries it as `merged_without_history`
 
 ### Requirement: Forge checks in doctor
-In merge-request mode `doctor` SHALL check that the forge is recognised, that a token is set and accepted, and that the merge settings qualify, failing a check that does not hold and warning when squash or rebase merges stay selectable.
+In merge-request mode `doctor` SHALL check that the forge is recognised, that a token is set and accepted, and that the merge settings qualify, failing a check that does not hold. On GitHub it SHALL warn when squash or rebase merges stay selectable. On GitLab a squash option of `default_on` or `default_off` SHALL pass, with a note that the tool opens and rewrites the update's merge request with squashing off, and SHALL NOT advise changing the option.
 
 #### Scenario: Doctor with unqualified settings
 - **WHEN** `doctor` runs in merge-request mode on a GitLab project that does not require a successful pipeline
 - **THEN** the merge settings check fails and names the setting
+
+#### Scenario: Squashing left optional on GitLab
+- **WHEN** `doctor` runs in merge-request mode on a GitLab project whose settings qualify and whose squash option is `default_on`
+- **THEN** every merge settings check passes, and one of them names the option and says that the update's merge request has squashing off
+
+#### Scenario: Squash merges selectable on GitHub
+- **WHEN** `doctor` runs in merge-request mode on a GitHub repository whose settings qualify and that allows squash merges
+- **THEN** it warns that squash merges stay selectable
 
 ### Requirement: Update waiting from an earlier release
 The next `finish` SHALL hand an update of state format 4 or 5 that waits for its merge request over to the merge request: find it through the API by its recorded number or else by its branch, say whether it is open, merged or closed, record the resolutions of a catch-up step, and remove the update worktree, branch, upstream references and state, keeping the merge request and its branch.
@@ -2117,3 +2125,37 @@ The release commands SHALL need no local integration branch. They SHALL fetch th
 #### Scenario: Detached tag checkout
 - **WHEN** `release check` runs in a CI clone with `HEAD` detached at a tag and no local integration branch
 - **THEN** it checks the tag against the publish remote's integration branch and creates no local branch
+
+### Requirement: Pushing with the CI job token
+Where `CI_JOB_TOKEN` is set, `sync` in merge-request mode and `release tag` SHALL refuse with status 2 at the start of every run, pushing nothing and changing no merge request, when a push to the publish remote would use that token. `sync` in push mode SHALL warn instead and go on, since a project may let the job token push.
+
+#### Scenario: A rewrite of the runner, with nothing to do
+- **WHEN** `sync` runs in merge-request mode in a job whose push URL carries `CI_JOB_TOKEN`, and every upstream is current
+- **THEN** it exits with status 2, says that the push URL carries the job token, pushes nothing and changes no merge request
+
+#### Scenario: A helper of the runner
+- **WHEN** `sync` runs in merge-request mode in a job whose push URL has no password, and git's credential helpers answer that URL with `CI_JOB_TOKEN`
+- **THEN** it exits with status 2 and says that the credential helpers answer with the job token
+
+#### Scenario: A credential of the job's own
+- **WHEN** the push URL carries another password, or the helpers answer with another token
+- **THEN** the run goes on, whatever user name the URL or the helper gives
+
+#### Scenario: A release tag
+- **WHEN** `release tag` runs in a job whose push URL carries `CI_JOB_TOKEN`
+- **THEN** it exits with status 2 and creates no tag
+
+#### Scenario: Push mode
+- **WHEN** `sync` runs in push mode in a job whose push URL carries `CI_JOB_TOKEN`
+- **THEN** it warns of the job token and goes on
+
+#### Scenario: Outside a job
+- **WHEN** `CI_JOB_TOKEN` is not set
+- **THEN** neither the push URL nor the credential helpers are checked
+
+### Requirement: Telling a push with the CI job token
+A push SHALL count as using the token when a push URL of the remote as git resolves it carries the token as its password, or when that URL is an `http` or `https` URL without a password and git's credential helpers answer with the token, asked without any prompt. The refusal SHALL say which of the two it found and where the README shows how to push instead, and SHALL show neither the URL nor the token.
+
+#### Scenario: A refusal shows no secret
+- **WHEN** `sync` refuses a push URL that carries `CI_JOB_TOKEN`
+- **THEN** its message shows neither that URL nor the token
