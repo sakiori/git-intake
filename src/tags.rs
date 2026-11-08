@@ -110,6 +110,11 @@ pub struct UpstreamTags {
 }
 
 impl UpstreamTags {
+    /// The commit the upstream's tag `name` points at, peeled.
+    pub fn commit(&self, name: &str) -> Option<&str> {
+        self.tags.get(name).map(String::as_str)
+    }
+
     /// Asks the upstream's URL for its tags. Returns why when it cannot be
     /// asked.
     pub fn list(git: &Git, up: &Upstream) -> Result<std::result::Result<Self, String>> {

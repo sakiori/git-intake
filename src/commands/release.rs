@@ -11,7 +11,8 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::Exit;
-use crate::config::{self, Config, Publish};
+use crate::bump::Bump;
+use crate::config::{self, Config, Publish, Versioning};
 use crate::forge::{self, ReleaseLookup};
 use crate::git::{Git, abbrev};
 use crate::identity;
@@ -19,27 +20,33 @@ use crate::integration_line;
 use crate::output::{Render, emit};
 use crate::output::{esay, say};
 use crate::redact::redacted;
-use crate::release::{self, Base, Known, Release, ReleaseTag, Remote};
+use crate::release::{self, Known, Release, ReleaseTag, Remote, SemverNext, UpstreamRelease};
 use crate::repo::Repo;
 use crate::sync_record;
+use crate::tags::UpstreamTags;
 use crate::upstreams::Fetches;
+use crate::upstreams::Recorded;
 
 /// The release state of the publish remote's integration tip, as
 /// `release next` and `status` report it.
 #[derive(Debug, Serialize)]
 pub struct ReleaseState {
     pub tip: String,
-    /// The release base of the tip.
-    pub base: String,
-    /// The tag of the upstream release the base comes from.
+    pub versioning: Versioning,
+    /// The release base of the tip under `dated`, else `null`.
+    pub base: Option<String>,
+    /// The tag of the newest upstream release the tip contains.
     pub upstream_release: String,
     /// The release at the tip, or `null`.
     pub release: Option<String>,
     /// Whether the release at the tip is published; `null` without one, or
     /// when the forge cannot be read.
     pub published: Option<bool>,
+    /// Under `semver`, the change that sets the next release; `null` when
+    /// none is due or the tip carries a release.
+    pub bump: Option<Bump>,
     /// The release a tag cut now would take, or `null` when the tip carries
-    /// one.
+    /// one or none is due.
     pub next: Option<String>,
     /// When the tip carries no release: the newest release on the
     /// downstream's line below it, when it is not published; else `null`.
@@ -48,6 +55,9 @@ pub struct ReleaseState {
     pub forge_error: Option<String>,
     #[serde(skip)]
     pub upstream: String,
+    /// The newest release below the tip, for the text of a release not due.
+    #[serde(skip)]
+    pub previous: Option<String>,
     #[serde(skip)]
     pub remote: String,
     #[serde(skip)]
@@ -57,14 +67,21 @@ pub struct ReleaseState {
 impl Render for ReleaseState {
     fn render(&self) -> String {
         let mut out = format!(
-            "integration tip  {} ({}/{})\nrelease base     {} (upstream '{}' at {})\n",
+            "integration tip  {} ({}/{})\n",
             abbrev(&self.tip),
             self.remote,
-            self.integration,
-            self.base,
-            self.upstream,
-            self.upstream_release
+            self.integration
         );
+        match &self.base {
+            Some(base) => out.push_str(&format!(
+                "release base     {base} (upstream '{}' at {})\n",
+                self.upstream, self.upstream_release
+            )),
+            None => out.push_str(&format!(
+                "upstream release {} (upstream '{}')\n",
+                self.upstream_release, self.upstream
+            )),
+        }
         if let Some(release) = &self.release {
             let state = match (self.published, &self.forge_error) {
                 (Some(true), _) => "published".to_string(),
@@ -80,8 +97,17 @@ impl Render for ReleaseState {
                 unpublished_advice()
             ));
         }
-        if let Some(next) = &self.next {
-            out.push_str(&format!("next release     {next}\n"));
+        match (&self.next, self.bump) {
+            (Some(next), Some(bump)) => out.push_str(&format!(
+                "next release     {next}, a {} change\n",
+                bump.as_str()
+            )),
+            (Some(next), None) => out.push_str(&format!("next release     {next}\n")),
+            (None, _) if self.release.is_none() => out.push_str(&format!(
+                "next release     none: {}\n",
+                nothing_due(self.previous.as_deref())
+            )),
+            (None, _) => {}
         }
         if let (None, Some(why)) = (&self.release, &self.forge_error) {
             out.push_str(&format!("cannot read the forge: {why}\n"));
@@ -94,7 +120,8 @@ impl Render for ReleaseState {
 struct AtTip {
     config: Config,
     remote: Remote,
-    base: Base,
+    upstream: UpstreamRelease,
+    tags: UpstreamTags,
     /// The downstream's line ending at the tip, newest first.
     line: Vec<String>,
     releases: Vec<Release>,
@@ -113,8 +140,9 @@ impl AtTip {
             .max_by(|a, b| a.tag.version.cmp(&b.tag.version))
     }
 
-    /// The release a tag cut now on the tip would take.
-    fn next(&self) -> Result<ReleaseTag> {
+    /// The release a tag cut now on the tip would take, with its change
+    /// under `semver`; no tag when none is due.
+    fn next(&self, git: &Git) -> Result<(Option<ReleaseTag>, Option<Bump>)> {
         if !self.on_line {
             bail!(
                 "the integration tip {} of '{}' carries no commit of the downstream's own: every upstream's last \
@@ -123,16 +151,48 @@ impl AtTip {
                 self.remote.name
             );
         }
-        let settings = self.config.release.as_ref().context("a release table")?;
-        let day = release::utc_day(release::now());
-        let next = release::next(
-            &self.releases,
-            &self.release_tags,
-            &self.base.version,
-            settings.label(),
-            day,
-        )
-        .map_err(|why| anyhow::anyhow!("{why}"))?;
+        let (settings, up) = release::settings(&self.config, "the integration tip")?;
+        let (next, bump) = match settings.versioning {
+            Versioning::Dated => {
+                let day = release::utc_day(release::now());
+                let next = release::next(
+                    &self.releases,
+                    &self.release_tags,
+                    &self.upstream.base(),
+                    settings.label(),
+                    day,
+                )
+                .map_err(|why| anyhow::anyhow!("{why}"))?;
+                (next, None)
+            }
+            Versioning::Semver => {
+                let source = release::Source {
+                    settings,
+                    up,
+                    tags: &self.tags,
+                };
+                let planned = release::semver_next(
+                    git,
+                    &source,
+                    &self.remote.tip,
+                    &self.line[1..],
+                    &self.releases,
+                    &self.upstream,
+                )?;
+                let Some(version) = planned.version else {
+                    return Ok((None, None));
+                };
+                let next = ReleaseTag::semver(version);
+                if let Some(release) = release::not_after(&next, &self.releases) {
+                    bail!(
+                        "the next release would be {}, which breaks the order of releases: {}",
+                        next.name,
+                        release::order_problem(&next, release)
+                    );
+                }
+                (next, planned.bump)
+            }
+        };
         if let Some(commit) = self.remote.tag(&next.name) {
             bail!(
                 "the next release would be {}, but '{}' already has a tag of that name at {}, which is no release \
@@ -142,7 +202,7 @@ impl AtTip {
                 abbrev(commit)
             );
         }
-        Ok(next)
+        Ok((Some(next), bump))
     }
 
     /// The newest release on the line below the tip, when the tip carries
@@ -206,21 +266,30 @@ fn at_tip(repo: &Repo, fetches: &mut Fetches, start: &Config, known: &Known) -> 
     );
     let (settings, up) = release::settings(&config, &at)?;
     let synced = release::last_synced(git, fetches, &config, &remote.tip, known)?;
-    let line = release::line(git, &remote.tip, &synced)?;
-    let releases = release::releases_on(&line, &remote.tags, &settings.labels);
-    let release_tags = release::release_tags(&remote.tags, &settings.labels);
+    let line = release::line(git, &remote.tip, &release::synced_commits(&synced))?;
+    let releases = release::releases_on(&line, &remote.tags, settings);
+    let release_tags = release::release_tags(&remote.tags, settings);
     let tags = release::upstream_tags(git, up, known)?;
-    let base = release::base_of(git, settings, up, &tags, &remote.tip)?;
+    let upstream = release::contained(git, settings, up, &tags, &remote.tip)?;
     let on_line = line.first() == Some(&remote.tip);
     Ok(AtTip {
         config,
         remote,
-        base,
+        upstream,
+        tags,
         line,
         releases,
         release_tags,
         on_line,
     })
+}
+
+/// Why a tip that carries no release takes none.
+fn nothing_due(previous: Option<&str>) -> String {
+    match previous {
+        Some(p) => format!("the commits since the release {p} ask for no release"),
+        None => "the commits of the downstream's line ask for no release".to_string(),
+    }
 }
 
 /// What an unpublished release means, and what completes it.
@@ -280,6 +349,7 @@ pub fn state(
     let mut published = None;
     let mut forge_error = None;
     let mut next = None;
+    let mut bump = None;
     let mut unpublished_previous = None;
     let release = tip.release().map(|r| r.tag.name.clone());
     match &release {
@@ -289,7 +359,9 @@ pub fn state(
             Lookup::Hidden(why) | Lookup::Failed(why) => forge_error = Some(why),
         },
         None => {
-            next = Some(tip.next()?.name);
+            let (tag, change) = tip.next(&repo.git)?;
+            next = tag.map(|t| t.name);
+            bump = change;
             if let Some(previous) = tip.previous() {
                 match lookup(&repo.git, publish, &previous.tag.name) {
                     Lookup::Known(false) => unpublished_previous = Some(previous.tag.name.clone()),
@@ -300,16 +372,22 @@ pub fn state(
             }
         }
     }
+    let versioning = release::settings(&tip.config, "the integration tip")?
+        .0
+        .versioning;
     Ok(ReleaseState {
         tip: tip.remote.tip.clone(),
-        base: tip.base.version.to_string(),
-        upstream_release: tip.base.tag.clone(),
+        versioning,
+        base: (versioning == Versioning::Dated).then(|| tip.upstream.base().to_string()),
+        upstream_release: tip.upstream.tag.clone(),
         release,
         published,
+        bump,
         next,
         unpublished_previous,
         forge_error,
-        upstream: tip.base.upstream.clone(),
+        upstream: tip.upstream.upstream.clone(),
+        previous: tip.previous().map(|p| p.tag.name.clone()),
         remote: tip.remote.name.clone(),
         integration: tip.config.integration.clone(),
     })
@@ -360,7 +438,7 @@ pub fn tag(repo: &Repo) -> Result<Exit> {
             ),
         };
     }
-    let next = tip.next()?;
+    let (next, _) = tip.next(git)?;
     if let Some(previous) = tip.previous() {
         match lookup(git, publish, &previous.tag.name) {
             Lookup::Known(true) => {}
@@ -378,8 +456,17 @@ pub fn tag(repo: &Repo) -> Result<Exit> {
             ),
         }
     }
+    let Some(next) = next else {
+        say!(
+            "the integration tip {} carries no release, and {}; nothing to release",
+            abbrev(&remote.tip),
+            nothing_due(tip.previous().map(|p| p.tag.name.as_str()))
+        );
+        return Ok(Exit::Success);
+    };
     identity::Upstreams::new(git, &tip.config.upstreams)?.refuse_push(git, &publish.remote)?;
-    let object = tag_object(git, &remote.tip, &next)?;
+    let recorded = (next.dated.is_none()).then_some(&tip.upstream);
+    let object = tag_object(git, &remote.tip, &next, recorded)?;
     let full = format!("refs/tags/{}", next.name);
     let out = git.raw(&[
         "push",
@@ -434,15 +521,25 @@ pub fn tag(repo: &Repo) -> Result<Exit> {
 
 /// Writes the annotated tag object of `tag` on `commit` with git's
 /// configured identity, without a reference to it.
-fn tag_object(git: &Git, commit: &str, tag: &ReleaseTag) -> Result<String> {
+/// A semver tag records `upstream` in trailers below the message.
+fn tag_object(
+    git: &Git,
+    commit: &str,
+    tag: &ReleaseTag,
+    upstream: Option<&UpstreamRelease>,
+) -> Result<String> {
     let tagger = git
         .line(&["var", "GIT_COMMITTER_IDENT"])
         .context("the release tag needs git's identity: set user.name and user.email")?;
-    let text = format!(
+    let mut text = format!(
         "object {commit}\ntype commit\ntag {}\ntagger {tagger}\n\nRelease {}\n",
         tag.name,
         tag.version_text()
     );
+    if let Some(upstream) = upstream {
+        text.push('\n');
+        text.push_str(&upstream.trailers());
+    }
     Ok(git.run_with_input(&["mktag"], text)?.trim().to_string())
 }
 
@@ -477,17 +574,13 @@ pub fn check(repo: &Repo, given: Option<&str>) -> Result<Exit> {
     let remote = release::fetch_remote(&mut fetches, &publish.remote, &config.integration)?;
     let known = Known::default();
     let synced = release::last_synced(git, &mut fetches, &config, &remote.tip, &known)?;
-    let line = release::line(git, &remote.tip, &synced)?;
-    let releases = release::releases_on(&line, &remote.tags, &settings.labels);
+    let line = release::line(git, &remote.tip, &release::synced_commits(&synced))?;
+    let releases = release::releases_on(&line, &remote.tags, settings);
 
     let mut problems = Vec::new();
-    let tag = ReleaseTag::parse(&name, std::slice::from_ref(&settings.labels[0]));
+    let tag = new_release_tag(&name, settings);
     if tag.is_none() {
-        problems.push(format!(
-            "'{name}' is not a release tag v<x.y.z>-{}.<YYYYMMDD>.<n> with the current label '{}'",
-            settings.label(),
-            settings.label()
-        ));
+        problems.push(not_a_release_tag(&name, settings));
     }
     match remote.tag(&name) {
         None => problems.push(format!(
@@ -512,17 +605,39 @@ pub fn check(repo: &Repo, given: Option<&str>) -> Result<Exit> {
     }
     if let Some(tag) = &tag {
         let tags = release::upstream_tags(git, up, &known)?;
-        match release::base_of(git, settings, up, &tags, &head) {
-            Ok(base) if base.version != tag.base => problems.push(format!(
-                "'{name}' carries the base {}, but the release base of {} is {} (upstream '{}' at {})",
-                tag.base,
-                abbrev(&head),
-                base.version,
-                base.upstream,
-                base.tag
-            )),
-            Ok(_) => {}
-            Err(err) => problems.push(format!("{err:#}")),
+        let source = release::Source {
+            settings,
+            up,
+            tags: &tags,
+        };
+        let recorded = remote
+            .entry(&name)
+            .and_then(|t| t.recorded.as_ref())
+            .filter(|_| tag.dated.is_none());
+        match tag_upstream(git, &source, &name, recorded, &head, true)? {
+            Err(why) => problems.push(why),
+            Ok(upstream) => match settings.versioning {
+                Versioning::Dated => {
+                    if let Some(problem) = base_problem(tag, abbrev(&head), &upstream) {
+                        problems.push(problem);
+                    }
+                }
+                Versioning::Semver => {
+                    if let Some(at) = line.iter().position(|c| *c == head) {
+                        let planned = release::semver_next(
+                            git,
+                            &source,
+                            &head,
+                            &line[at + 1..],
+                            &releases,
+                            &upstream,
+                        )?;
+                        if let Some(problem) = version_problem(tag, abbrev(&head), &planned) {
+                            problems.push(problem);
+                        }
+                    }
+                }
+            },
         }
         if let Some(other) = release::not_after(tag, &releases) {
             problems.push(release::order_problem(tag, other));
@@ -564,6 +679,92 @@ impl Render for CheckReport {
     }
 }
 
+/// A tag of the form new releases take: under `dated` with the current
+/// label, under `semver` `v<x.y.z>`.
+fn new_release_tag(name: &str, settings: &config::Release) -> Option<ReleaseTag> {
+    match settings.versioning {
+        Versioning::Dated => {
+            ReleaseTag::parse_dated(name, std::slice::from_ref(&settings.labels[0]))
+        }
+        Versioning::Semver => ReleaseTag::parse_semver(name),
+    }
+}
+
+fn not_a_release_tag(name: &str, settings: &config::Release) -> String {
+    match settings.versioning {
+        Versioning::Dated => format!(
+            "'{name}' is not a release tag v<x.y.z>-{}.<YYYYMMDD>.<n> with the current label '{}'",
+            settings.label(),
+            settings.label()
+        ),
+        Versioning::Semver => format!("'{name}' is not a release tag v<x.y.z>"),
+    }
+}
+
+/// The upstream release of the release tag `name` on `commit`: the one its
+/// annotation records, which `commit` must contain, or else the newest one
+/// `commit` contains.
+fn tag_upstream(
+    git: &Git,
+    source: &release::Source,
+    name: &str,
+    recorded: Option<&Recorded>,
+    commit: &str,
+    listed: bool,
+) -> Result<std::result::Result<UpstreamRelease, String>> {
+    Ok(match recorded {
+        Some(r) => release::recorded_release(git, source, r, commit, listed)?.map_err(|why| {
+            format!("'{name}' records an upstream release that does not hold: {why}")
+        }),
+        None => release::contained(git, source.settings, source.up, source.tags, commit)
+            .map_err(|err| format!("{err:#}")),
+    })
+}
+
+/// The upstream release a release tag's annotation records: the publish
+/// remote's tag, or else the repository's own.
+fn recorded_of(git: &Git, remote: &Remote, name: &str) -> Result<Option<Recorded>> {
+    if let Some(t) = remote.entry(name) {
+        return Ok(t.recorded.clone());
+    }
+    Ok(crate::upstreams::tag_refs(git, "refs/tags/")?
+        .into_iter()
+        .find(|t| t.name == name)
+        .and_then(|t| t.recorded))
+}
+
+/// Why a dated tag's base is not the release base of the commit `at`
+/// names.
+fn base_problem(tag: &ReleaseTag, at: &str, upstream: &UpstreamRelease) -> Option<String> {
+    let base = upstream.base();
+    let carried = tag.base()?;
+    (*carried != base).then(|| {
+        format!(
+            "'{}' carries the base {carried}, but the release base of {at} is {base} (upstream '{}' at {})",
+            tag.name, upstream.upstream, upstream.tag
+        )
+    })
+}
+
+/// Why a semver tag's version is not the one the commit `at` names takes.
+fn version_problem(tag: &ReleaseTag, at: &str, planned: &SemverNext) -> Option<String> {
+    match (&planned.version, planned.bump) {
+        (Some(v), _) if *v == tag.version => None,
+        (Some(v), Some(bump)) => Some(format!(
+            "'{}' carries the version {}, but {at} takes {v}, a {} change since {}",
+            tag.name,
+            tag.version,
+            bump.as_str(),
+            planned.since()
+        )),
+        _ => Some(format!(
+            "'{}' is on {at}, which takes no release: its commits since {} ask for none",
+            tag.name,
+            planned.since()
+        )),
+    }
+}
+
 /// The result of `release version`.
 #[derive(Serialize)]
 struct VersionReport {
@@ -571,6 +772,9 @@ struct VersionReport {
     /// The release tag, or `null` for a rehearsal.
     tag: Option<String>,
     rehearsal: bool,
+    /// Under `semver`, `<upstream>-<x.y.z>` of the newest upstream release.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream: Option<String>,
 }
 
 impl Render for VersionReport {
@@ -581,75 +785,162 @@ impl Render for VersionReport {
 
 /// `release version`.
 pub fn version(repo: &Repo, given: Option<&str>, json: bool, dotenv: bool) -> Result<Exit> {
-    let git = &repo.git;
     let config = config_at_head(repo)?;
     let head = repo.head().context("a checked-out commit")?.to_string();
-    let (settings, up) = release::settings(&config, "the checked-out commit")?;
-    let tags = release::upstream_tags(git, up, &Known::default())?;
-    let report = match named_tag(given) {
-        Some(name) => {
-            let Some(tag) = ReleaseTag::parse(&name, std::slice::from_ref(&settings.labels[0]))
-            else {
-                bail!(
-                    "'{name}' is not a release tag v<x.y.z>-{}.<YYYYMMDD>.<n> with the current label",
-                    settings.label()
-                );
-            };
-            let commit = git
-                .commit(&format!("refs/tags/{name}"))?
-                .with_context(|| format!("the repository has no tag '{name}'"))?;
-            let base = release::base_of(git, settings, up, &tags, &commit)?;
-            if base.version != tag.base {
-                bail!(
-                    "'{name}' carries the base {}, but the release base of the tagged commit {} is {} \
-                     (upstream '{}' at {})",
-                    tag.base,
-                    abbrev(&commit),
-                    base.version,
-                    base.upstream,
-                    base.tag
-                );
-            }
-            VersionReport {
-                version: tag.version_text(),
-                tag: Some(name),
-                rehearsal: false,
-            }
-        }
-        None => {
-            let base = release::base_of(git, settings, up, &tags, &head)?;
-            let at = match std::env::var("CI_PIPELINE_CREATED_AT")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-            {
-                Some(text) => text.trim().parse().with_context(|| {
-                    format!("CI_PIPELINE_CREATED_AT '{text}' is not an RFC 3339 time")
-                })?,
-                None => release::now(),
-            };
-            let mut version = base.version.clone();
-            version.pre = semver::Prerelease::new(&format!(
-                "{}.{}.0",
-                settings.label(),
-                release::utc_day(at)
-            ))?;
-            VersionReport {
-                version: version.to_string(),
-                tag: None,
-                rehearsal: true,
-            }
-        }
+    let (settings, _) = release::settings(&config, "the checked-out commit")?;
+    let report = match settings.versioning {
+        Versioning::Dated => dated_version(repo, &config, &head, given)?,
+        Versioning::Semver => semver_version(repo, &config, &head, given)?,
     };
     if dotenv {
         let mut out = format!("RELEASE_VERSION={}\n", report.version);
         if let Some(tag) = &report.tag {
             out.push_str(&format!("RELEASE_TAG={tag}\n"));
         }
+        if let Some(upstream) = &report.upstream {
+            out.push_str(&format!("RELEASE_UPSTREAM={upstream}\n"));
+        }
         crate::output::print(&redacted(&out))?;
     } else {
         emit(&report, json)?;
     }
     Ok(Exit::Success)
+}
+
+fn dated_version(
+    repo: &Repo,
+    config: &Config,
+    head: &str,
+    given: Option<&str>,
+) -> Result<VersionReport> {
+    let git = &repo.git;
+    let (settings, up) = release::settings(config, "the checked-out commit")?;
+    let tags = release::upstream_tags(git, up, &Known::default())?;
+    if let Some(name) = named_tag(given) {
+        let Some(tag) = new_release_tag(&name, settings) else {
+            bail!(
+                "'{name}' is not a release tag v<x.y.z>-{}.<YYYYMMDD>.<n> with the current label",
+                settings.label()
+            );
+        };
+        let commit = tag_commit(git, &name)?;
+        let upstream = release::contained(git, settings, up, &tags, &commit)?;
+        if let Some(problem) = base_problem(
+            &tag,
+            &format!("the tagged commit {}", abbrev(&commit)),
+            &upstream,
+        ) {
+            bail!("{problem}");
+        }
+        return Ok(VersionReport {
+            version: tag.version_text(),
+            tag: Some(name),
+            rehearsal: false,
+            upstream: None,
+        });
+    }
+    let upstream = release::contained(git, settings, up, &tags, head)?;
+    let mut version = upstream.base();
+    version.pre = semver::Prerelease::new(&format!("{}.{}.0", settings.label(), rehearsal_day()?))?;
+    Ok(VersionReport {
+        version: version.to_string(),
+        tag: None,
+        rehearsal: true,
+        upstream: None,
+    })
+}
+
+fn semver_version(
+    repo: &Repo,
+    config: &Config,
+    head: &str,
+    given: Option<&str>,
+) -> Result<VersionReport> {
+    let git = &repo.git;
+    let (settings, up) = release::settings(config, "the checked-out commit")?;
+    let publish = publish_of(config)?;
+    let name = named_tag(given);
+    let tag = match &name {
+        Some(name) => Some(
+            new_release_tag(name, settings)
+                .with_context(|| format!("'{name}' is not a release tag v<x.y.z>"))?,
+        ),
+        None => None,
+    };
+    let commit = match &name {
+        Some(name) => tag_commit(git, name)?,
+        None => head.to_string(),
+    };
+    let tags = release::upstream_tags(git, up, &Known::default())?;
+    let mut fetches = Fetches::new(repo);
+    let remote = release::fetch_remote(&mut fetches, &publish.remote, &config.integration)?;
+    let source = release::Source {
+        settings,
+        up,
+        tags: &tags,
+    };
+    let upstream = match &name {
+        Some(name) => {
+            let recorded = recorded_of(git, &remote, name)?;
+            tag_upstream(git, &source, name, recorded.as_ref(), &commit, false)?
+                .map_err(|why| anyhow::anyhow!("{why}"))?
+        }
+        None => release::contained(git, settings, up, &tags, &commit)?,
+    };
+    let synced = release::last_synced_offline(git, &mut fetches, config, &commit)?;
+    let line = release::line(git, &commit, &release::synced_commits(&synced))?;
+    let below = match line.first() {
+        Some(first) if *first == commit => &line[1..],
+        _ => &line[..],
+    };
+    let releases = release::releases_on(&line, &remote.tags, settings);
+    let planned = release::semver_next(git, &source, &commit, below, &releases, &upstream)?;
+    let report = match tag {
+        Some(tag) => {
+            let at = format!("the tagged commit {}", abbrev(&commit));
+            if let Some(problem) = version_problem(&tag, &at, &planned) {
+                bail!("{problem}");
+            }
+            VersionReport {
+                version: tag.version_text(),
+                tag: name,
+                rehearsal: false,
+                upstream: Some(upstream.label()),
+            }
+        }
+        None => {
+            let mut version = planned.version.clone().unwrap_or(planned.smallest.clone());
+            version.pre = semver::Prerelease::new(&format!("rehearsal.{}", rehearsal_day()?))?;
+            VersionReport {
+                version: version.to_string(),
+                tag: None,
+                rehearsal: true,
+                upstream: Some(upstream.label()),
+            }
+        }
+    };
+    Ok(report)
+}
+
+/// The commit the repository's tag `name` points at.
+fn tag_commit(git: &Git, name: &str) -> Result<String> {
+    git.commit(&format!("refs/tags/{name}"))?
+        .with_context(|| format!("the repository has no tag '{name}'"))
+}
+
+/// The UTC day of `CI_PIPELINE_CREATED_AT`, or else of now.
+fn rehearsal_day() -> Result<u32> {
+    let at = match std::env::var("CI_PIPELINE_CREATED_AT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        Some(text) => text
+            .trim()
+            .parse()
+            .with_context(|| format!("CI_PIPELINE_CREATED_AT '{text}' is not an RFC 3339 time"))?,
+        None => release::now(),
+    };
+    Ok(release::utc_day(at))
 }
 
 /// `release notes`.
@@ -659,10 +950,15 @@ pub fn notes(repo: &Repo, given: Option<&str>) -> Result<Exit> {
         "name the release tag to write the notes of, or run in a tag pipeline that sets CI_COMMIT_TAG",
     )?;
     let config = config_at_head(repo)?;
-    let (settings, _) = release::settings(&config, "the checked-out commit")?;
+    let (settings, up) = release::settings(&config, "the checked-out commit")?;
     let publish = publish_of(&config)?;
-    let tag = ReleaseTag::parse(&name, &settings.labels).with_context(|| {
-        format!("'{name}' is not a release tag v<x.y.z>-<label>.<YYYYMMDD>.<n>")
+    let semver = settings.versioning == Versioning::Semver;
+    let tag = ReleaseTag::parse(&name, settings).with_context(|| {
+        if semver {
+            format!("'{name}' is not a release tag v<x.y.z>")
+        } else {
+            format!("'{name}' is not a release tag v<x.y.z>-<label>.<YYYYMMDD>.<n>")
+        }
     })?;
     let mut fetches = Fetches::new(repo);
     let remote = release::fetch_remote(&mut fetches, &publish.remote, &config.integration)?;
@@ -675,12 +971,70 @@ pub fn notes(repo: &Repo, given: Option<&str>) -> Result<Exit> {
             )
         })?,
     };
-    let synced = release::last_synced(git, &mut fetches, &config, &commit, &Known::default())?;
-    let line = release::line(git, &commit, &synced)?;
-    let releases = release::releases_on(&line, &remote.tags, &settings.labels);
+    let known = Known::default();
+    let synced = release::last_synced(git, &mut fetches, &config, &commit, &known)?;
+    let synced_commits = release::synced_commits(&synced);
+    let line = release::line(git, &commit, &synced_commits)?;
+    let releases = release::releases_on(&line, &remote.tags, settings);
     let previous = previous_release(&line, &releases, &tag, &commit);
-    crate::output::print(&redacted(&write_notes(git, &commit, previous, &synced)?))?;
+    let mut notes = String::new();
+    let mut moved = None;
+    if semver {
+        let tags = release::upstream_tags(git, up, &known)?;
+        let source = release::Source {
+            settings,
+            up,
+            tags: &tags,
+        };
+        let recorded = recorded_of(git, &remote, &name)?.filter(|_| tag.dated.is_none());
+        let upstream = tag_upstream(git, &source, &name, recorded.as_ref(), &commit, false)?
+            .map_err(|why| anyhow::anyhow!("{why}"))?;
+        if let Some(p) = previous
+            && let Some((before, version)) = release::release_upstream(git, &source, p)?
+            && !crate::bump::compatible(&version, &upstream.version)
+        {
+            moved = Some(format!(
+                "- Major: upstream {} moved from {before} to {}",
+                upstream.upstream, upstream.tag
+            ));
+        }
+        let carried = synced.iter().find(|(name, _)| *name == up.name);
+        notes = carries(git, &upstream, carried.map(|(_, c)| c.as_str()))? + "\n";
+    }
+    notes.push_str(&write_notes(
+        git,
+        &commit,
+        previous,
+        &synced_commits,
+        semver,
+        moved,
+    )?);
+    crate::output::print(&redacted(&notes))?;
     Ok(Exit::Success)
+}
+
+/// The first line of semver notes: the upstream release a release carries,
+/// and how many upstream commits after it, up to `synced`.
+fn carries(git: &Git, upstream: &UpstreamRelease, synced: Option<&str>) -> Result<String> {
+    let after = match synced {
+        Some(synced) => git
+            .line(&[
+                "rev-list",
+                "--count",
+                synced,
+                &format!("^{}", upstream.commit),
+                "--",
+            ])?
+            .parse::<u64>()
+            .context("git rev-list --count prints a number")?,
+        None => 0,
+    };
+    let name = format!("{} {}", upstream.upstream, upstream.tag);
+    Ok(match after {
+        0 => format!("Carries {name}.\n"),
+        1 => format!("Carries {name} and 1 upstream commit after it.\n"),
+        n => format!("Carries {name} and {n} upstream commits after it.\n"),
+    })
 }
 
 /// The newest release before `tag` on `line`, which ends at `commit`: a
@@ -707,12 +1061,16 @@ fn previous_release<'a>(
     })
 }
 
-/// The Markdown notes of the release at `commit` after `previous`.
+/// The Markdown notes of the release at `commit` after `previous`, with
+/// the breaking changes first when `breaking_first`, led by `moved`, an
+/// incompatible upstream release.
 fn write_notes(
     git: &Git,
     commit: &str,
     previous: Option<&Release>,
     synced: &[String],
+    breaking_first: bool,
+    moved: Option<String>,
 ) -> Result<String> {
     let Some(previous) = previous else {
         return Ok("This is the first release.\n".to_string());
@@ -742,7 +1100,8 @@ fn write_notes(
             listed.push(&c.commit);
         }
     }
-    let subjects = subjects(git, &listed)?;
+    let messages = messages(git, &listed)?;
+    let mut breaking: Vec<String> = moved.into_iter().collect();
     let mut entries = Vec::new();
     for c in listed {
         match records.get(c) {
@@ -753,27 +1112,40 @@ fn write_notes(
                     .clone()
                     .unwrap_or_else(|| format!("`{}`", abbrev(&r.target)))
             )),
-            None => entries.push(format!(
-                "- {}",
-                subjects.get(c).map(String::as_str).unwrap_or_default()
-            )),
+            None => {
+                let (subject, message) = messages.get(c).cloned().unwrap_or_default();
+                match crate::bump::breaking(&message).filter(|_| breaking_first) {
+                    Some(Some(text)) => breaking.push(format!(
+                        "- {subject}\n\n  {}",
+                        text.lines().map(str::trim).collect::<Vec<_>>().join("\n  ")
+                    )),
+                    Some(None) => breaking.push(format!("- {subject}")),
+                    None => entries.push(format!("- {subject}")),
+                }
+            }
         }
     }
-    if entries.is_empty() {
-        return Ok(format!(
-            "No changes since the previous release, {}.\n",
-            previous.tag.name
-        ));
-    }
-    Ok(format!(
-        "Changes since {}:\n\n{}\n",
-        previous.tag.name,
-        entries.join("\n")
-    ))
+    let since = &previous.tag.name;
+    Ok(match (breaking.is_empty(), entries.is_empty()) {
+        (true, true) => format!("No changes since the previous release, {since}.\n"),
+        (true, false) => format!("Changes since {since}:\n\n{}\n", entries.join("\n")),
+        (false, true) => format!(
+            "Breaking changes since {since}:\n\n{}\n",
+            breaking.join("\n")
+        ),
+        (false, false) => format!(
+            "Breaking changes since {since}:\n\n{}\n\nOther changes since {since}:\n\n{}\n",
+            breaking.join("\n"),
+            entries.join("\n")
+        ),
+    })
 }
 
-/// The subject of each of `commits`.
-fn subjects(git: &Git, commits: &[&str]) -> Result<std::collections::HashMap<String, String>> {
+/// The subject and the message of each of `commits`.
+fn messages(
+    git: &Git,
+    commits: &[&str],
+) -> Result<std::collections::HashMap<String, (String, String)>> {
     if commits.is_empty() {
         return Ok(Default::default());
     }
@@ -783,16 +1155,18 @@ fn subjects(git: &Git, commits: &[&str]) -> Result<std::collections::HashMap<Str
             "log",
             "--no-walk=unsorted",
             "--stdin",
-            "--format=%H%x1f%s",
+            "-z",
+            "--format=%H%x1f%s%x1f%B",
             "--",
         ],
         input,
     )?;
     Ok(out
-        .lines()
-        .filter_map(|l| {
-            let (c, s) = l.split_once('\u{1f}')?;
-            Some((c.to_string(), s.to_string()))
+        .split('\0')
+        .filter_map(|r| {
+            let mut parts = r.trim_start_matches('\n').splitn(3, '\u{1f}');
+            let (c, s, m) = (parts.next()?, parts.next()?, parts.next()?);
+            Some((c.to_string(), (s.to_string(), m.to_string())))
         })
         .collect())
 }

@@ -313,14 +313,26 @@ pub enum Command {
     },
     /// Cut, check and version the releases of the integration branch
     ///
-    /// With a `[release]` table in the configuration, the integration branch is released as
-    /// `v<base>-<label>.<YYYYMMDD>.<n>`. `<base>` is the next patch version after the newest
-    /// release of the release upstream that the commit contains: a tag of that upstream matching
-    /// the release `tags` pattern whose name, after the pattern's literal prefix and an optional
-    /// `v` or `V`, is a semantic version without a prerelease part or build metadata. `<label>`
-    /// is the first of `labels`, `<YYYYMMDD>` the UTC day, and `<n>` one past the highest number
-    /// any tag of release form of that day took, from 1 to 99. Every release sorts after the earlier ones,
-    /// and `YYYYMMDD * 100 + n` grows with every release.
+    /// With a `[release]` table in the configuration, the integration branch is released. With
+    /// `versioning = "dated"`, the default, a release is `v<base>-<label>.<YYYYMMDD>.<n>`.
+    /// `<base>` is the next patch version after the newest release of the release upstream that
+    /// the commit contains: a tag of that upstream matching the release `tags` pattern whose name,
+    /// after the pattern's literal prefix and an optional `v` or `V`, is a semantic version
+    /// without a prerelease part or build metadata. `<label>` is the first of `labels`,
+    /// `<YYYYMMDD>` the UTC day, and `<n>` one past the highest number any tag of release form of
+    /// that day took, from 1 to 99. Every release sorts after the earlier ones, and
+    /// `YYYYMMDD * 100 + n` grows with every release.
+    ///
+    /// With `versioning = "semver"`, a release is `v<x.y.z>`, raised from the previous release
+    /// by the largest change among the commits since it, merges excluded and the upstream commits
+    /// that updates brought in included: a breaking change raises the major version, `feat` the
+    /// minor version, `fix`, `perf`, `revert` and a subject that is not a Conventional Commit the
+    /// patch version, and other types nothing. An upstream release outside the caret range of
+    /// the previous release's upstream release raises the major version. The first semver release
+    /// is 1.0.0, or the next major version above earlier releases at 1.0.0 or above; dated
+    /// releases with one of `labels` stay releases. A semver tag records the upstream release
+    /// it carries in the trailers `Intake-Upstream` and `Intake-Tag` of its annotation, which
+    /// later versions compare with.
     ///
     /// Releases count only on the downstream's line: the first-parent commits of the publish
     /// remote's integration branch that the last synced commit of no upstream contains. A
@@ -343,10 +355,11 @@ pub enum Command {
 pub enum ReleaseCommand {
     /// Show the release at the publish remote's integration tip, or the release a tag would take
     ///
-    /// Reads the configuration at the publish remote's integration tip. Shows the tip's release
-    /// base and the upstream release it comes from, and either the release at the tip and whether
-    /// it is published, or the next release and, when the newest release below the tip is not
-    /// published, that release. Changes nothing.
+    /// Reads the configuration at the publish remote's integration tip. Shows the newest
+    /// upstream release the tip contains and, with dated versions, the release base from it, and
+    /// either the release at the tip and whether it is published, or the next release, with semver
+    /// versions the change that sets it or that none is due, and, when the newest release below
+    /// the tip is not published, that release. Changes nothing.
     Next {
         /// Write one JSON object to standard output
         #[arg(long)]
@@ -361,16 +374,19 @@ pub enum ReleaseCommand {
     /// published release points at the tip, does nothing. When a release that is
     /// not published points at the tip, creates nothing and exits with status 1: its pipeline is
     /// still running or failed, and a failed release is completed by running its pipeline's
-    /// failed jobs again. Never moves, replaces or deletes a tag.
+    /// failed jobs again. With semver versions, when the commits since the previous release ask
+    /// for no release, says so and creates nothing. Never moves, replaces or deletes a tag.
     Tag,
     /// Check a release tag in its pipeline before anything is built
     ///
     /// Reads the configuration at the checked-out commit and checks TAG, or else
-    /// `CI_COMMIT_TAG`: it is of release form with the current label, the publish remote has it,
-    /// it points at the checked-out commit, that commit is on the downstream's line, the tag's
-    /// base is the commit's release base, and it sorts after every other release, by version
-    /// and by day and number. Only then does it ask the forge whether the release is published
-    /// already, which is a problem as well. Exits with status 1 when it finds a problem.
+    /// `CI_COMMIT_TAG`: it is of release form, with dated versions with the current label, the
+    /// publish remote has it, it points at the checked-out commit, that commit is on the
+    /// downstream's line, the tag's base is the commit's release base or, with semver versions,
+    /// its version is the one the commit takes, and it sorts after every other release, by
+    /// version and, with dated versions, by day and number. Only then does it ask the forge
+    /// whether the release is published already, which is a problem as well. Exits with status 1
+    /// when it finds a problem.
     Check {
         /// The release tag; `CI_COMMIT_TAG` when none is given
         #[arg(value_name = "TAG")]
@@ -379,10 +395,12 @@ pub enum ReleaseCommand {
     /// Print the version a build makes
     ///
     /// Reads the configuration at the checked-out commit. For a release tag, named by `--tag` or
-    /// `CI_COMMIT_TAG`, prints the tag's version, refusing a tag that is not of release form with
-    /// the current label or whose base is not the release base of the tagged commit. Without one,
-    /// prints the rehearsal version `<base>-<label>.<YYYYMMDD>.0` of the checked-out commit, with
-    /// the UTC day of `CI_PIPELINE_CREATED_AT`, or else of now, which no release ever takes.
+    /// `CI_COMMIT_TAG`, prints the tag's version, refusing a tag that is not of release form, with
+    /// dated versions one without the current label or the release base of the tagged commit,
+    /// with semver versions one without the version the tagged commit takes. Without one, prints
+    /// the rehearsal version of the checked-out commit, `<base>-<label>.<YYYYMMDD>.0` or with
+    /// semver versions `<next>-rehearsal.<YYYYMMDD>`, with the UTC day of `CI_PIPELINE_CREATED_AT`,
+    /// or else of now, which no release ever takes.
     Version {
         /// The release tag; `CI_COMMIT_TAG` when none is given
         #[arg(long, value_name = "TAG")]
@@ -390,8 +408,9 @@ pub enum ReleaseCommand {
         /// Write one JSON object to standard output
         #[arg(long, conflicts_with = "dotenv")]
         json: bool,
-        /// Print `RELEASE_VERSION=<version>` and, for a release tag, `RELEASE_TAG=<tag>`, for a
-        /// GitLab dotenv report or GitHub's environment file
+        /// Print `RELEASE_VERSION=<version>`, for a release tag `RELEASE_TAG=<tag>`, and with
+        /// semver versions `RELEASE_UPSTREAM=<upstream>-<x.y.z>`, for a GitLab dotenv report or
+        /// GitHub's environment file
         #[arg(long)]
         dotenv: bool,
     },
@@ -401,7 +420,8 @@ pub enum ReleaseCommand {
     /// lists, newest first, the downstream's own changes since the previous release on the
     /// integration line: each commit's subject, and each update of an upstream by its name and
     /// the upstream tag it took, or else the target's abbreviated commit. The first release says
-    /// so instead.
+    /// so instead. With semver versions, a first line names the upstream release the tag carries
+    /// and how many upstream commits after it, and breaking changes come first.
     Notes {
         /// The release tag; `CI_COMMIT_TAG` when none is given
         #[arg(value_name = "TAG")]

@@ -5,6 +5,7 @@
 // `output::print`.
 #![warn(clippy::print_stdout, clippy::print_stderr)]
 
+mod bump;
 mod cli;
 mod commands;
 mod config;

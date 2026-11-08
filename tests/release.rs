@@ -124,6 +124,8 @@ fn the_base_is_the_next_patch_after_the_newest_contained_upstream_release() {
     assert_eq!(doc["next"], format!("v0.11.1-custom.{DAY}.1"));
     assert_eq!(doc["tip"], f.env.rev(&f.publish, "main"));
     assert_eq!(doc["forge_error"], serde_json::Value::Null);
+    assert_eq!(doc["versioning"], "dated");
+    assert_eq!(doc["bump"], serde_json::Value::Null);
 }
 
 #[test]
@@ -622,6 +624,7 @@ fn release_version_gives_builds_the_version() {
     assert_eq!(doc["version"], "0.11.1-custom.20261101.2");
     assert_eq!(doc["tag"], name);
     assert_eq!(doc["rehearsal"], false);
+    assert!(doc.get("upstream").is_none(), "{doc}");
     // A tag whose base is not the commit's is refused.
     release_tag(&f, "v0.12.1-custom.20261101.3", &tip);
     let err = stderr(
@@ -904,4 +907,789 @@ fn an_unpublished_release_below_the_tip_is_shown_and_does_not_stop_the_next() {
         next_json(&f)["unpublished_previous"],
         serde_json::Value::Null
     );
+}
+
+const SEMVER: &str =
+    "\n[release]\nupstream = \"upstream\"\ntags = \"v*\"\nversioning = \"semver\"\n";
+
+/// A fork releasable under `semver`, with a feature of its own: the
+/// fixture's `fork:` commits ask for no release.
+fn semver_fork() -> Fork {
+    let f = Fork::new();
+    releasable(&f, SEMVER);
+    land(&f, "own", "feat: the fork's own feature");
+    f
+}
+
+fn semver_forge_fork() -> Fork {
+    let f = Fork::push_gitlab();
+    releasable(&f, SEMVER);
+    land(&f, "own", "feat: the fork's own feature");
+    f
+}
+
+/// Takes the publish remote's integration branch into the fork's checkout.
+fn pull(f: &Fork) {
+    f.env
+        .git(&f.down, &["pull", "-q", "--ff-only", "origin", "main"]);
+}
+
+#[test]
+fn the_first_semver_release_is_1_0_0() {
+    let f = Fork::new();
+    releasable(&f, SEMVER);
+    // The fixture's `fork:` and `upstream:` commits ask for none.
+    assert_eq!(next_json(&f)["next"], serde_json::Value::Null);
+    land(&f, "fix", "fix: a fix of the fork");
+    let doc = next_json(&f);
+    assert_eq!(doc["versioning"], "semver");
+    assert_eq!(doc["base"], serde_json::Value::Null);
+    assert_eq!(doc["upstream_release"], "v0.11.0");
+    assert_eq!(doc["bump"], "major");
+    assert_eq!(doc["next"], "v1.0.0");
+    let out = stdout(&f.tool(&["status"]).success());
+    assert!(
+        out.contains("upstream release v0.11.0 (upstream 'upstream')")
+            && out.contains("next release     v1.0.0, a major change")
+            && !out.contains("release base"),
+        "{out}"
+    );
+
+    f.tool(&["release", "tag"]).success();
+    assert_eq!(remote_tags(&f), vec!["v1.0.0".to_string()]);
+    let message = f
+        .env
+        .git(&f.publish, &["tag", "-l", "--format=%(contents)", "v1.0.0"]);
+    let released = f.env.rev(&f.up.work, "v0.11.0");
+    assert_eq!(
+        message,
+        format!(
+            "Release 1.0.0\n\nIntake-Upstream: upstream\nIntake-Target: {released}\n\
+             Intake-Tag: v0.11.0"
+        )
+    );
+    let doc = next_json(&f);
+    assert_eq!(doc["release"], "v1.0.0");
+    assert_eq!(doc["bump"], serde_json::Value::Null);
+    assert_eq!(doc["next"], serde_json::Value::Null);
+}
+
+#[test]
+fn semver_releases_follow_the_conventional_commits_since_the_previous_one() {
+    let f = semver_fork();
+    f.tool(&["release", "tag"]).success();
+    let next = |f: &Fork| {
+        let doc = next_json(f);
+        (doc["bump"].clone(), doc["next"].clone())
+    };
+    let none = (serde_json::Value::Null, serde_json::Value::Null);
+
+    land(&f, "docs", "docs: describe the widget");
+    land(
+        &f,
+        "ci",
+        "ci: cache the build\n\nBREAKING: not a footer of a breaking change",
+    );
+    assert_eq!(next(&f), none);
+    let out = stdout(&f.tool(&["release", "tag"]).success());
+    assert!(
+        out.contains("the commits since the release v1.0.0 ask for no release; nothing to release"),
+        "{out}"
+    );
+    assert_eq!(remote_tags(&f), vec!["v1.0.0".to_string()]);
+    let out = stdout(&f.tool(&["release", "next"]).success());
+    assert!(
+        out.contains(
+            "next release     none: the commits since the release v1.0.0 ask for no release"
+        ),
+        "{out}"
+    );
+    let status = f.env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["release"]["next"], serde_json::Value::Null);
+    assert_eq!(status["release"]["bump"], serde_json::Value::Null);
+
+    land(&f, "revert", "Revert \"docs: describe the widget\"");
+    assert_eq!(next(&f), ("patch".into(), "v1.0.1".into()));
+    land(&f, "fix", "fix: a fix");
+    assert_eq!(next(&f), ("patch".into(), "v1.0.1".into()));
+    land(&f, "feat", "Feat(widget): a feature");
+    assert_eq!(next(&f), ("minor".into(), "v1.1.0".into()));
+    f.tool(&["release", "tag"]).success();
+
+    land(&f, "perf", "perf: faster");
+    assert_eq!(next(&f), ("patch".into(), "v1.1.1".into()));
+    land(
+        &f,
+        "rename",
+        "refactor: rename the service\n\nBREAKING CHANGE: clients use the new name",
+    );
+    assert_eq!(next(&f), ("major".into(), "v2.0.0".into()));
+    f.tool(&["release", "tag"]).success();
+    land(&f, "bang", "chore!: drop the old protocol");
+    assert_eq!(next(&f), ("major".into(), "v3.0.0".into()));
+}
+
+#[test]
+fn semver_releases_count_the_upstream_commits_an_update_brought() {
+    let f = semver_fork();
+    f.tool(&["release", "tag"]).success();
+    f.env
+        .push_upstream(&f.up, &[("d.txt", "d\n")], "docs: upstream docs");
+    f.tool(&["sync"]).success();
+    // The update's merge is no commit of the release.
+    assert_eq!(next_json(&f)["next"], serde_json::Value::Null);
+    f.env
+        .push_upstream(&f.up, &[("w.txt", "w\n")], "feat: upstream widget");
+    f.tool(&["sync"]).success();
+    assert_eq!(next_json(&f)["next"], "v1.1.0");
+}
+
+#[test]
+fn an_incompatible_upstream_release_raises_the_major_version() {
+    let f = semver_fork();
+    f.tool(&["release", "tag"]).success();
+    let c = f.env.push_upstream(&f.up, &[("a.txt", "a\n")], "fix: a");
+    upstream_tag(&f, "v0.11.3", &c);
+    f.tool(&["sync"]).success();
+    let doc = next_json(&f);
+    assert_eq!(
+        (doc["upstream_release"].clone(), doc["next"].clone()),
+        ("v0.11.3".into(), "v1.0.1".into())
+    );
+    f.tool(&["release", "tag"]).success();
+
+    let c = f.env.push_upstream(&f.up, &[("b.txt", "b\n")], "fix: b");
+    upstream_tag(&f, "v0.12.0", &c);
+    f.tool(&["sync"]).success();
+    let doc = next_json(&f);
+    assert_eq!(
+        (doc["bump"].clone(), doc["next"].clone()),
+        ("major".into(), "v2.0.0".into())
+    );
+}
+
+#[test]
+fn dated_releases_count_before_the_first_semver_release() {
+    let f = release_fork();
+    f.tool(&["release", "tag"]).success();
+    let dated = format!("v0.11.1-custom.{DAY}.1");
+    f.reconfigure(
+        "tags = \"v*\"\n",
+        "tags = \"v*\"\nversioning = \"semver\"\n",
+    );
+    land(&f, "fix", "fix: a");
+    let doc = next_json(&f);
+    assert_eq!(
+        (doc["bump"].clone(), doc["next"].clone()),
+        ("major".into(), "v1.0.0".into())
+    );
+    f.tool(&["release", "tag"]).success();
+    assert_eq!(remote_tags(&f), vec![dated, "v1.0.0".to_string()]);
+
+    // A dated release at 1.0.0 or above.
+    let g = release_fork();
+    release_tag(&g, "v1.4.1-custom.20261031.1", &g.env.rev(&g.down, "main"));
+    g.reconfigure(
+        "tags = \"v*\"\n",
+        "tags = \"v*\"\nversioning = \"semver\"\n",
+    );
+    land(&g, "fix", "fix: a");
+    assert_eq!(next_json(&g)["next"], "v2.0.0");
+}
+
+#[test]
+fn a_plain_version_tag_is_no_dated_release() {
+    let f = release_fork();
+    release_tag(&f, "v1.0.0", &f.env.rev(&f.down, "main"));
+    let doc = next_json(&f);
+    assert_eq!(doc["versioning"], "dated");
+    assert_eq!(doc["release"], serde_json::Value::Null);
+    assert_eq!(doc["bump"], serde_json::Value::Null);
+    assert_eq!(doc["next"], format!("v0.11.1-custom.{DAY}.1"));
+}
+
+#[test]
+fn a_semver_release_below_a_higher_one_is_refused() {
+    let f = semver_fork();
+    let first = f.env.rev(&f.down, "main");
+    release_tag(&f, "v5.0.0", &first);
+    let second = land(&f, "fix", "fix: a");
+    release_tag(&f, "v1.0.0", &second);
+    land(&f, "more", "fix: b");
+    let err = stderr(&f.tool(&["release", "next"]).code(2));
+    assert!(
+        err.contains("the next release would be v1.0.1")
+            && err.contains("does not sort after the release v5.0.0"),
+        "{err}"
+    );
+}
+
+#[test]
+fn release_check_recomputes_the_version_of_a_semver_tag() {
+    let f = semver_forge_fork();
+    f.tool(&["release", "tag"]).success();
+    let env = &f.env;
+    let ci = ci_clone(&f, "v1.0.0");
+    let out = stdout(
+        &env.tool_env(&ci, &["release", "check"], &[("CI_COMMIT_TAG", "v1.0.0")])
+            .success(),
+    );
+    assert!(out.contains("v1.0.0 may be released"), "{out}");
+
+    let fix = land(&f, "fix", "fix: a");
+    release_tag(&f, "v2.0.0", &fix);
+    let out = stdout(&env.tool(&f.down, &["release", "check", "v2.0.0"]).code(1));
+    assert!(
+        out.contains(&format!(
+            "'v2.0.0' carries the version 2.0.0, but {} takes 1.0.1, a patch change since the release v1.0.0",
+            &fix[..12]
+        )),
+        "{out}"
+    );
+    let docs = land(&f, "docs", "docs: a");
+    release_tag(&f, "v2.0.1", &docs);
+    let out = stdout(&env.tool(&f.down, &["release", "check", "v2.0.1"]).code(1));
+    assert!(
+        out.contains(&format!(
+            "'v2.0.1' is on {}, which takes no release: its commits since the release v2.0.0 ask for none",
+            &docs[..12]
+        )),
+        "{out}"
+    );
+    let out = stdout(
+        &env.tool(&f.down, &["release", "check", "v2.0.2-rc.1"])
+            .code(1),
+    );
+    assert!(
+        out.contains("'v2.0.2-rc.1' is not a release tag v<x.y.z>"),
+        "{out}"
+    );
+}
+
+#[test]
+fn release_tag_warns_of_an_unpublished_release_when_nothing_is_due() {
+    let f = semver_forge_fork();
+    f.tool(&["release", "tag"]).success();
+    land(&f, "docs", "docs: a");
+    let a = f.tool(&["release", "tag"]).code(0);
+    assert!(
+        stderr(&a).contains("warning: the release v1.0.0 below the tip is not published"),
+        "{}",
+        stderr(&a)
+    );
+    assert!(stdout(&a).contains("nothing to release"), "{}", stdout(&a));
+    assert_eq!(remote_tags(&f), vec!["v1.0.0".to_string()]);
+    assert_eq!(next_json(&f)["unpublished_previous"], "v1.0.0");
+}
+
+#[test]
+fn release_version_of_a_semver_release_names_its_upstream() {
+    let f = semver_fork();
+    f.tool(&["release", "tag"]).success();
+    let env = &f.env;
+    let ci = ci_clone(&f, "v1.0.0");
+    let ci_tag = [("CI_COMMIT_TAG", "v1.0.0")];
+    let out = stdout(
+        &env.tool_env(&ci, &["release", "version"], &ci_tag)
+            .success(),
+    );
+    assert_eq!(out, "1.0.0\n");
+    let out = stdout(
+        &env.tool_env(&ci, &["release", "version", "--dotenv"], &ci_tag)
+            .success(),
+    );
+    assert_eq!(
+        out,
+        "RELEASE_VERSION=1.0.0\nRELEASE_TAG=v1.0.0\nRELEASE_UPSTREAM=upstream-0.11.0\n"
+    );
+    let a = env
+        .tool_env(&ci, &["release", "version", "--json"], &ci_tag)
+        .success();
+    let doc: serde_json::Value = serde_json::from_slice(&a.get_output().stdout).unwrap();
+    assert_eq!(doc["version"], "1.0.0");
+    assert_eq!(doc["tag"], "v1.0.0");
+    assert_eq!(doc["rehearsal"], false);
+    assert_eq!(doc["upstream"], "upstream-0.11.0");
+    // A tag whose version is not the commit's is refused.
+    release_tag(&f, "v3.0.0", &env.rev(&f.down, "main"));
+    let err = stderr(
+        &env.tool(&f.down, &["release", "version", "--tag", "v3.0.0"])
+            .code(2),
+    );
+    assert!(
+        err.contains("'v3.0.0' carries the version 3.0.0, but the tagged commit"),
+        "{err}"
+    );
+}
+
+#[test]
+fn release_version_rehearses_the_next_semver_release() {
+    let f = semver_fork();
+    f.tool(&["release", "tag"]).success();
+    let env = &f.env;
+    let created = [("CI_PIPELINE_CREATED_AT", "2026-11-01T08:15:00Z")];
+    land(&f, "docs", "docs: a");
+    let out = stdout(
+        &env.tool_env(&f.down, &["release", "version"], &created)
+            .success(),
+    );
+    assert_eq!(out, "1.0.1-rehearsal.20261101\n");
+    land(&f, "feat", "feat: a");
+    let out = stdout(
+        &env.tool_env(&f.down, &["release", "version", "--dotenv"], &created)
+            .success(),
+    );
+    assert_eq!(
+        out,
+        "RELEASE_VERSION=1.1.0-rehearsal.20261101\nRELEASE_UPSTREAM=upstream-0.11.0\n"
+    );
+}
+
+#[test]
+fn semver_notes_name_the_upstream_and_put_breaking_changes_first() {
+    let f = semver_fork();
+    let env = &f.env;
+    f.tool(&["release", "tag"]).success();
+    let out = stdout(&f.tool(&["release", "notes", "v1.0.0"]).success());
+    assert_eq!(
+        out,
+        "Carries upstream v0.11.0.\n\nThis is the first release.\n"
+    );
+
+    env.push_upstream(&f.up, &[("one.txt", "1\n")], "upstream: one");
+    let target = env.push_upstream(&f.up, &[("two.txt", "2\n")], "upstream: two");
+    f.tool(&["sync"]).success();
+    pull(&f);
+    land(&f, "fix", "fix: a");
+    land(
+        &f,
+        "protocol",
+        "feat!: speak protocol 3\n\nBREAKING CHANGE: clients need\nprotocol 3",
+    );
+    f.tool(&["release", "tag"]).success();
+    let out = stdout(&f.tool(&["release", "notes", "v2.0.0"]).success());
+    assert_eq!(
+        out,
+        format!(
+            "Carries upstream v0.11.0 and 2 upstream commits after it.\n\n\
+             Breaking changes since v1.0.0:\n\n\
+             - feat!: speak protocol 3\n\n  clients need\n  protocol 3\n\n\
+             Other changes since v1.0.0:\n\n\
+             - fix: a\n- Update upstream to `{}`\n",
+            &target[..12]
+        )
+    );
+
+    land(&f, "bang", "fix!: drop the flag");
+    f.tool(&["release", "tag"]).success();
+    let out = stdout(&f.tool(&["release", "notes", "v3.0.0"]).success());
+    assert_eq!(
+        out,
+        "Carries upstream v0.11.0 and 2 upstream commits after it.\n\n\
+         Breaking changes since v2.0.0:\n\n- fix!: drop the flag\n"
+    );
+}
+
+/// Commits `message` signed with an SSH key on the fork's integration
+/// branch, with `log.showSignature` set, and publishes it.
+fn land_signed(f: &Fork, message: &str) -> String {
+    let env = &f.env;
+    let key = env.path("signing-key");
+    if !key.exists() {
+        let out = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .output()
+            .expect("ssh-keygen runs");
+        assert!(out.status.success(), "{out:?}");
+    }
+    for (k, v) in [
+        ("log.showSignature", "true"),
+        ("gpg.format", "ssh"),
+        ("user.signingkey", &key.to_string_lossy()),
+    ] {
+        env.git(&f.down, &["config", k, v]);
+    }
+    fs::write(f.down.join("signed.txt"), message).unwrap();
+    env.git(&f.down, &["add", "signed.txt"]);
+    env.git(&f.down, &["commit", "-q", "-S", "-m", message]);
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
+    env.rev(&f.down, "main")
+}
+
+#[test]
+fn signed_commits_read_alike_whatever_log_show_signature_says() {
+    let f = release_fork();
+    let first = format!("v0.11.1-custom.{DAY}.1");
+    f.tool(&["release", "tag"]).success();
+    land_signed(&f, "feat: a signed feature");
+    f.tool(&["release", "tag"]).success();
+    let second = format!("v0.11.1-custom.{DAY}.2");
+    let out = stdout(&f.tool(&["release", "notes", &second]).success());
+    assert_eq!(
+        out,
+        format!("Changes since {first}:\n\n- feat: a signed feature\n")
+    );
+
+    let g = semver_fork();
+    g.tool(&["release", "tag"]).success();
+    land_signed(&g, "feat: a signed feature");
+    assert_eq!(next_json(&g)["next"], "v1.1.0");
+}
+
+#[test]
+fn a_late_upstream_tag_changes_no_semver_release() {
+    let f = semver_forge_fork();
+    let env = &f.env;
+    f.tool(&["release", "tag"]).success();
+    f.forge().publish_release("v1.0.0");
+    let late = env.push_upstream(&f.up, &[("u.txt", "u\n")], "fix: upstream fix");
+    f.tool(&["sync"]).success();
+    f.tool(&["release", "tag"]).success();
+    // The upstream tags a commit that v1.0.1 already contains.
+    upstream_tag(&f, "v0.12.0", &late);
+
+    let ci = ci_clone(&f, "v1.0.1");
+    let ci_tag = [("CI_COMMIT_TAG", "v1.0.1")];
+    env.tool_env(&ci, &["release", "check"], &ci_tag).success();
+    let out = stdout(
+        &env.tool_env(&ci, &["release", "version", "--dotenv"], &ci_tag)
+            .success(),
+    );
+    assert_eq!(
+        out,
+        "RELEASE_VERSION=1.0.1\nRELEASE_TAG=v1.0.1\nRELEASE_UPSTREAM=upstream-0.11.0\n"
+    );
+    let notes = stdout(&env.tool_env(&ci, &["release", "notes"], &ci_tag).success());
+    assert!(
+        notes.starts_with("Carries upstream v0.11.0 and 1 upstream commit after it.\n"),
+        "{notes}"
+    );
+
+    // The next release takes the major version the upstream release asks for.
+    pull(&f);
+    land(&f, "fix", "fix: a");
+    let doc = next_json(&f);
+    assert_eq!(
+        (doc["bump"].clone(), doc["next"].clone()),
+        ("major".into(), "v2.0.0".into())
+    );
+}
+
+#[test]
+fn release_check_refuses_a_recorded_upstream_release_the_commit_lacks() {
+    let f = semver_fork();
+    let env = &f.env;
+    let ahead = env.push_upstream(&f.up, &[("a.txt", "a\n")], "feat: ahead");
+    upstream_tag(&f, "v0.12.0", &ahead);
+    let tip = env.rev(&f.down, "main");
+    env.git(
+        &f.down,
+        &[
+            "tag",
+            "-a",
+            "-m",
+            &format!(
+                "Release 1.0.0\n\nIntake-Upstream: upstream\nIntake-Target: {ahead}\n\
+                 Intake-Tag: v0.12.0"
+            ),
+            "v1.0.0",
+            &tip,
+        ],
+    );
+    env.git(&f.down, &["push", "-q", "origin", "v1.0.0"]);
+    let out = stdout(&f.tool(&["release", "check", "v1.0.0"]).code(1));
+    assert!(
+        out.contains(&format!(
+            "'v1.0.0' records an upstream release that does not hold: {} does not contain the upstream \
+             release upstream v0.12.0 at {}",
+            &tip[..12],
+            &ahead[..12]
+        )),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_semver_tip_without_an_upstream_release_is_refused() {
+    let f = Fork::new();
+    append_config(&f, SEMVER);
+    let err = stderr(&f.tool(&["release", "next"]).code(2));
+    assert!(
+        err.contains("contains no release of upstream 'upstream'")
+            && err
+                .contains("a semver release names the newest upstream release its commit contains"),
+        "{err}"
+    );
+    let g = Fork::new();
+    append_config(&g, RELEASE);
+    let err = stderr(&g.tool(&["release", "next"]).code(2));
+    assert!(
+        err.contains("the release base comes from the newest upstream release a commit contains"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_plain_upstream_subject_is_a_patch() {
+    let f = semver_fork();
+    f.tool(&["release", "tag"]).success();
+    f.env
+        .push_upstream(&f.up, &[("w.txt", "w\n")], "Add the widget");
+    f.tool(&["sync"]).success();
+    let doc = next_json(&f);
+    assert_eq!(
+        (doc["bump"].clone(), doc["next"].clone()),
+        ("patch".into(), "v1.0.1".into())
+    );
+}
+
+#[test]
+fn a_semver_prerelease_tag_is_no_release() {
+    let f = semver_fork();
+    f.tool(&["release", "tag"]).success();
+    let fix = land(&f, "fix", "fix: a");
+    release_tag(&f, "v1.2.0-rc.1", &fix);
+    let doc = next_json(&f);
+    assert_eq!(doc["release"], serde_json::Value::Null);
+    assert_eq!(doc["next"], "v1.0.1");
+}
+
+#[test]
+fn a_lower_upstream_release_raises_the_major_version() {
+    let f = semver_fork();
+    let env = &f.env;
+    let c = env.push_upstream(&f.up, &[("a.txt", "a\n")], "fix: a");
+    upstream_tag(&f, "v0.11.3", &c);
+    f.tool(&["sync"]).success();
+    f.tool(&["release", "tag"]).success();
+    // The upstream withdraws v0.11.3; the tip's newest release is v0.11.0.
+    env.git(&f.up.work, &["push", "-q", "origin", ":refs/tags/v0.11.3"]);
+    pull(&f);
+    land(&f, "docs", "docs: a");
+    let doc = next_json(&f);
+    assert_eq!(doc["upstream_release"], "v0.11.0");
+    assert_eq!(
+        (doc["bump"].clone(), doc["next"].clone()),
+        ("major".into(), "v2.0.0".into())
+    );
+}
+
+#[test]
+fn an_incompatible_upstream_release_makes_a_major_release_of_chores() {
+    let f = semver_fork();
+    let env = &f.env;
+    f.tool(&["release", "tag"]).success();
+    let c = env.push_upstream(&f.up, &[("d.txt", "d\n")], "docs: upstream docs");
+    upstream_tag(&f, "v0.12.0", &c);
+    f.tool(&["sync"]).success();
+    let doc = next_json(&f);
+    assert_eq!(
+        (doc["bump"].clone(), doc["next"].clone()),
+        ("major".into(), "v2.0.0".into())
+    );
+    f.tool(&["release", "tag"]).success();
+    let out = stdout(&f.tool(&["release", "notes", "v2.0.0"]).success());
+    assert_eq!(
+        out,
+        "Carries upstream v0.12.0.\n\n\
+         Breaking changes since v1.0.0:\n\n\
+         - Major: upstream upstream moved from v0.11.0 to v0.12.0\n\n\
+         Other changes since v1.0.0:\n\n\
+         - Update upstream to v0.12.0\n"
+    );
+}
+
+#[test]
+fn notes_count_no_upstream_commits_without_a_last_synced_commit() {
+    let f = semver_fork();
+    let env = &f.env;
+    // The fork carries an upstream commit after v0.11.0, merged by hand
+    // without a sync record.
+    env.push_upstream(&f.up, &[("one.txt", "1\n")], "upstream: one");
+    env.git(&f.down, &["fetch", "-q", &f.up.url(), "main"]);
+    env.git(
+        &f.down,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge upstream",
+            "FETCH_HEAD",
+        ],
+    );
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
+    let out = stdout(&f.tool(&["release", "next"]).success());
+    assert!(out.contains("next release     v1.0.0"), "{out}");
+    // The upstream's branch then starts over on a history of its own, which
+    // shares no commit with the fork.
+    env.git(&f.up.work, &["switch", "-q", "--orphan", "restart"]);
+    env.commit(&f.up.work, &[("new.txt", "n\n")], "restart");
+    env.git(&f.up.work, &["push", "-q", "-f", "origin", "restart:main"]);
+    f.tool(&["release", "tag"]).success();
+    let out = stdout(&f.tool(&["release", "notes", "v1.0.0"]).success());
+    assert_eq!(
+        out,
+        "Carries upstream v0.11.0.\n\nThis is the first release.\n"
+    );
+}
+
+#[test]
+fn release_version_fetches_no_upstream_that_has_a_sync_record() {
+    let f = semver_fork();
+    let env = &f.env;
+    f.tool(&["release", "tag"]).success();
+    env.push_upstream(&f.up, &[("u.txt", "u\n")], "fix: upstream fix");
+    f.tool(&["sync"]).success();
+    pull(&f);
+    // The upstream's branch can no longer be fetched; its tags still list.
+    env.git(&f.up.bare, &["update-ref", "-d", "refs/heads/main"]);
+    let out = stdout(
+        &env.tool_env(
+            &f.down,
+            &["release", "version"],
+            &[("CI_PIPELINE_CREATED_AT", "2026-11-01T08:15:00Z")],
+        )
+        .success(),
+    );
+    assert_eq!(out, "1.0.1-rehearsal.20261101\n");
+    f.tool(&["release", "next"]).code(2);
+}
+
+#[test]
+fn a_withdrawn_or_moved_upstream_tag_changes_no_semver_release() {
+    let f = semver_forge_fork();
+    let env = &f.env;
+    let released = env.push_upstream(&f.up, &[("a.txt", "a\n")], "fix: a");
+    upstream_tag(&f, "v0.11.3", &released);
+    f.tool(&["sync"]).success();
+    f.tool(&["release", "tag"]).success();
+    let ci = ci_clone(&f, "v1.0.0");
+    let ci_tag = [("CI_COMMIT_TAG", "v1.0.0")];
+    let stable = |ci: &std::path::Path| {
+        let out = stdout(
+            &env.tool_env(ci, &["release", "version", "--dotenv"], &ci_tag)
+                .success(),
+        );
+        assert_eq!(
+            out,
+            "RELEASE_VERSION=1.0.0\nRELEASE_TAG=v1.0.0\nRELEASE_UPSTREAM=upstream-0.11.3\n"
+        );
+        let notes = stdout(&env.tool_env(ci, &["release", "notes"], &ci_tag).success());
+        assert!(notes.starts_with("Carries upstream v0.11.3.\n"), "{notes}");
+    };
+
+    // The upstream withdraws the release: the record holds.
+    env.git(&f.up.work, &["push", "-q", "origin", ":refs/tags/v0.11.3"]);
+    env.tool_env(&ci, &["release", "check"], &ci_tag).success();
+    stable(&ci);
+
+    // The upstream moves the tag elsewhere: the check names it.
+    let elsewhere = env.push_upstream(&f.up, &[("b.txt", "b\n")], "fix: b");
+    env.git(&f.up.work, &["tag", "-f", "v0.11.3", &elsewhere]);
+    env.git(&f.up.work, &["push", "-q", "-f", "origin", "v0.11.3"]);
+    let out = stdout(&env.tool_env(&ci, &["release", "check"], &ci_tag).code(1));
+    assert!(
+        out.contains(&format!(
+            "upstream 'upstream' now has v0.11.3 at {}, not at the recorded {}",
+            &elsewhere[..12],
+            &released[..12]
+        )),
+        "{out}"
+    );
+    stable(&ci);
+}
+
+#[test]
+fn a_dated_tag_s_trailers_record_nothing() {
+    let f = forge_fork();
+    let env = &f.env;
+    let ahead = env.push_upstream(&f.up, &[("a.txt", "a\n")], "feat: ahead");
+    upstream_tag(&f, "v0.12.0", &ahead);
+    let name = format!("v0.11.1-custom.{DAY}.1");
+    let tip = env.rev(&f.down, "main");
+    env.git(
+        &f.down,
+        &[
+            "tag",
+            "-a",
+            "-m",
+            &format!(
+                "Release 0.11.1\n\nIntake-Upstream: upstream\nIntake-Target: {ahead}\n\
+                 Intake-Tag: v0.12.0"
+            ),
+            &name,
+            &tip,
+        ],
+    );
+    env.git(&f.down, &["push", "-q", "origin", &name]);
+    let out = stdout(&f.tool(&["release", "check", &name]).success());
+    assert!(out.contains(&format!("{name} may be released")), "{out}");
+}
+
+#[test]
+fn release_version_reads_the_own_sync_records_of_a_fork_of_a_fork() {
+    // A follows its upstream and carries a sync record of it.
+    let a = Fork::new();
+    let env = &a.env;
+    env.set_var("GIT_INTAKE_TEST_NOW", NOW);
+    env.push_upstream(&a.up, &[("u.txt", "u\n")], "fix: upstream of a");
+    a.tool(&["sync"]).success();
+    pull(&a);
+    release_tag(&a, "v5.0.0", &env.rev(&a.down, "main"));
+
+    // B is cloned from A and follows it under the same upstream name, with
+    // no sync record of its own yet.
+    let b_publish = env.path("b-publish");
+    let b = env.path("b");
+    let root = env.path("");
+    env.git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &a.publish.to_string_lossy(),
+            &b_publish.to_string_lossy(),
+        ],
+    );
+    env.git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            &b_publish.to_string_lossy(),
+            &b.to_string_lossy(),
+        ],
+    );
+    let cfg = fs::read_to_string(b.join(".git-intake.toml"))
+        .unwrap()
+        .replace(
+            &format!("{:?}", a.up.url()),
+            &format!("{:?}", a.publish.to_string_lossy()),
+        )
+        + SEMVER;
+    env.commit(&b, &[(".git-intake.toml", &cfg)], "feat: release b");
+    env.git(&b, &["push", "-q", "origin", "main"]);
+    let created = [("CI_PIPELINE_CREATED_AT", "2026-11-01T08:15:00Z")];
+    // A's record is not B's: B's line starts above A's tip, with no release.
+    let out = stdout(
+        &env.tool_env(&b, &["release", "version"], &created)
+            .success(),
+    );
+    assert_eq!(out, "1.0.0-rehearsal.20261101\n");
+
+    // Once B syncs A, its own record leaves A's records below it out, and
+    // A's branch need not be fetched.
+    land(&a, "a2", "feat: a2");
+    env.tool(&b, &["sync"]).success();
+    env.git(&b, &["pull", "-q", "--ff-only", "origin", "main"]);
+    env.git(&a.publish, &["update-ref", "-d", "refs/heads/main"]);
+    let out = stdout(
+        &env.tool_env(&b, &["release", "version"], &created)
+            .success(),
+    );
+    assert_eq!(out, "1.0.0-rehearsal.20261101\n");
+    env.tool(&b, &["release", "next"]).code(2);
 }

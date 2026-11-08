@@ -31,6 +31,8 @@ struct RawRelease {
     upstream: String,
     tags: Option<String>,
     labels: Option<Vec<String>>,
+    /// Read as text so that an unknown scheme is named with its key.
+    versioning: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,6 +233,19 @@ pub struct Release {
     /// The label of new releases first, then the labels earlier releases
     /// took.
     pub labels: Vec<String>,
+    #[serde(default)]
+    pub versioning: Versioning,
+}
+
+/// How releases are versioned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Versioning {
+    /// `v<base>-<label>.<YYYYMMDD>.<n>`, from the upstream's version.
+    #[default]
+    Dated,
+    /// `v<x.y.z>`, from the changes since the previous release.
+    Semver,
 }
 
 impl Release {
@@ -589,6 +604,16 @@ fn parse_release(
             labels_valid = false;
         }
     }
+    let versioning = match raw.versioning.as_deref() {
+        None | Some("dated") => Some(Versioning::Dated),
+        Some("semver") => Some(Versioning::Semver),
+        Some(other) => {
+            problems.push(format!(
+                "release.versioning: '{other}' is neither \"dated\" nor \"semver\""
+            ));
+            None
+        }
+    };
     if !valid || !labels_valid {
         return None;
     }
@@ -596,6 +621,7 @@ fn parse_release(
         upstream: raw.upstream,
         tags: tags?,
         labels,
+        versioning: versioning?,
     })
 }
 
@@ -1296,6 +1322,7 @@ via = "merge-request"
                 upstream: "a".into(),
                 tags: "v*".into(),
                 labels: vec!["custom".into()],
+                versioning: Versioning::Dated,
             })
         );
         let cfg = parse(&format!(
@@ -1308,6 +1335,12 @@ via = "merge-request"
         assert_eq!(release.label(), "nightly");
         // The upstream's own `tags` stays unset: updates take its branch tip.
         assert_eq!(cfg.upstreams[0].tags, None);
+        let cfg = parse(&format!(
+            "integration = \"main\"\n{up}[publish]\nremote = \"origin\"\n[release]\nupstream = \"a\"\n\
+             versioning = \"semver\"\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.release.unwrap().versioning, Versioning::Semver);
     }
 
     #[test]
@@ -1361,6 +1394,13 @@ via = "merge-request"
             "integration = \"main\"\n{UP_A}{publish}[release]\nupstream = \"a\"\nlabel = \"x\"\n"
         ));
         assert!(e.contains("release: unknown field `label`"), "{e}");
+        let e = err(&format!(
+            "integration = \"main\"\n{UP_A}{publish}[release]\nupstream = \"a\"\ntags = \"v*\"\nversioning = \"calendar\"\n"
+        ));
+        assert!(
+            e.contains("release.versioning: 'calendar' is neither \"dated\" nor \"semver\""),
+            "{e}"
+        );
     }
 
     #[test]

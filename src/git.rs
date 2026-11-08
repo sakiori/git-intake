@@ -133,6 +133,8 @@ impl Git {
     fn command<S: AsRef<str>>(&self, args: &[S]) -> Command {
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(&self.dir);
+        // Signature checks would print into the formats the tool parses.
+        cmd.args(["-c", "log.showSignature=false"]);
         cmd.args(args.iter().map(|a| a.as_ref()));
         cmd.env("LC_ALL", "C")
             .env("GIT_TERMINAL_PROMPT", "0")

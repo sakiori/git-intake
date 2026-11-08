@@ -112,9 +112,86 @@ pub fn existing(git: &Git) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
-/// The tip of the publish remote's integration branch, and each of its tags
-/// with the commit it points at.
-pub type ReleaseRefs = (String, Vec<(String, String)>);
+/// The tip of the publish remote's integration branch, and its tags.
+pub type ReleaseRefs = (String, Vec<TagRef>);
+
+/// A tag with the commit it points at, peeled through an annotated tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagRef {
+    pub name: String,
+    pub commit: String,
+    /// The upstream release an annotated tag's trailers record.
+    pub recorded: Option<Recorded>,
+}
+
+/// The upstream release a release tag records, in the trailers of the sync
+/// record: `Intake-Upstream: <name>`, `Intake-Target: <commit>` and
+/// `Intake-Tag: <tag>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recorded {
+    pub upstream: String,
+    pub tag: String,
+    pub commit: String,
+}
+
+/// The tags under `prefix`, named without it.
+pub fn tag_refs(git: &Git, prefix: &str) -> Result<Vec<TagRef>> {
+    use crate::sync_record::{TAG_TRAILER, TARGET_TRAILER, UPSTREAM_TRAILER};
+    // One trailers placeholder alone: before git 2.47, several in a format
+    // share their `key` filters.
+    let format = "--format=%(refname)%1f%(objecttype)%1f%(objectname)%1f%(*objecttype)\
+                  %1f%(*objectname)%1f%(contents:trailers:only,unfold,key_value_separator=%x1d,\
+                  separator=%x1e)";
+    let listing = git.run(&["for-each-ref", format, prefix])?;
+    let mut found = Vec::new();
+    for line in lines(&listing) {
+        let fields: Vec<&str> = line.split('\u{1f}').collect();
+        let [name, kind, oid, peeled_kind, peeled, trailers] = fields.as_slice() else {
+            continue;
+        };
+        let (commit, annotated) = match (*kind, *peeled_kind) {
+            ("commit", _) => (oid, false),
+            ("tag", "commit") => (peeled, true),
+            _ => continue,
+        };
+        let pairs: Vec<(&str, &str)> = trailers
+            .split('\u{1e}')
+            .filter_map(|t| t.split_once('\u{1d}'))
+            .collect();
+        // The value of `key` when the annotation has it exactly once.
+        let one = |key: &str| {
+            let mut values = pairs
+                .iter()
+                .filter(|(k, _)| k.trim().eq_ignore_ascii_case(key))
+                .map(|(_, v)| v.trim());
+            match (values.next(), values.next()) {
+                (Some(v), None) if !v.is_empty() => Some(v.to_string()),
+                _ => None,
+            }
+        };
+        let recorded = match (
+            annotated,
+            one(UPSTREAM_TRAILER),
+            one(TAG_TRAILER),
+            one(TARGET_TRAILER),
+        ) {
+            (true, Some(upstream), Some(tag), Some(commit)) => Some(Recorded {
+                upstream,
+                tag,
+                commit: commit.to_ascii_lowercase(),
+            }),
+            _ => None,
+        };
+        if let Some(name) = name.strip_prefix(prefix) {
+            found.push(TagRef {
+                name: name.to_string(),
+                commit: commit.to_string(),
+                recorded,
+            });
+        }
+    }
+    Ok(found)
+}
 
 /// The fetches of one command, into a namespace under
 /// `refs/git-intake/read/` that no other command uses. The namespace is
@@ -241,27 +318,7 @@ impl<'r> Fetches<'r> {
                 "fetching branch '{integration}' from '{remote}' left no commit"
             )));
         };
-        let listing = self.git.run(&[
-            "for-each-ref",
-            "--format=%(refname)%09%(objecttype)%09%(objectname)%09%(*objecttype)%09%(*objectname)",
-            &tags,
-        ])?;
-        let mut found = Vec::new();
-        for line in lines(&listing) {
-            let fields: Vec<&str> = line.split('\t').collect();
-            let [name, kind, oid, peeled_kind, peeled] = fields.as_slice() else {
-                continue;
-            };
-            let commit = match (*kind, *peeled_kind) {
-                ("commit", _) => oid,
-                ("tag", "commit") => peeled,
-                _ => continue,
-            };
-            if let Some(name) = name.strip_prefix(&tags) {
-                found.push((name.to_string(), commit.to_string()));
-            }
-        }
-        Ok(Ok((tip, found)))
+        Ok(Ok((tip, tag_refs(self.git, &tags)?)))
     }
 
     fn fetch(&self, up: &Upstream, refspec: &str) -> Result<std::result::Result<(), String>> {
