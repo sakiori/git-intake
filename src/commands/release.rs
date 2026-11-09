@@ -772,9 +772,21 @@ struct VersionReport {
     /// The release tag, or `null` for a rehearsal.
     tag: Option<String>,
     rehearsal: bool,
-    /// Under `semver`, `<upstream>-<x.y.z>` of the newest upstream release.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    upstream: Option<String>,
+    /// Under `semver` only.
+    #[serde(flatten)]
+    semver: Option<SemverReport>,
+}
+
+/// What `release version` adds under `semver`.
+#[derive(Serialize)]
+struct SemverReport {
+    /// `<upstream>-<x.y.z>` of the newest upstream release.
+    upstream: String,
+    /// The previous release of the versioned commit, or `null`.
+    previous: Option<String>,
+    /// The change that sets the versioned commit's next release, or `null`
+    /// when it takes none.
+    bump: Option<Bump>,
 }
 
 impl Render for VersionReport {
@@ -797,8 +809,8 @@ pub fn version(repo: &Repo, given: Option<&str>, json: bool, dotenv: bool) -> Re
         if let Some(tag) = &report.tag {
             out.push_str(&format!("RELEASE_TAG={tag}\n"));
         }
-        if let Some(upstream) = &report.upstream {
-            out.push_str(&format!("RELEASE_UPSTREAM={upstream}\n"));
+        if let Some(semver) = &report.semver {
+            out.push_str(&format!("RELEASE_UPSTREAM={}\n", semver.upstream));
         }
         crate::output::print(&redacted(&out))?;
     } else {
@@ -836,7 +848,7 @@ fn dated_version(
             version: tag.version_text(),
             tag: Some(name),
             rehearsal: false,
-            upstream: None,
+            semver: None,
         });
     }
     let upstream = release::contained(git, settings, up, &tags, head)?;
@@ -846,7 +858,7 @@ fn dated_version(
         version: version.to_string(),
         tag: None,
         rehearsal: true,
-        upstream: None,
+        semver: None,
     })
 }
 
@@ -895,6 +907,11 @@ fn semver_version(
     };
     let releases = release::releases_on(&line, &remote.tags, settings);
     let planned = release::semver_next(git, &source, &commit, below, &releases, &upstream)?;
+    let semver = Some(SemverReport {
+        upstream: upstream.label(),
+        previous: planned.previous.as_ref().map(|p| p.tag.name.clone()),
+        bump: planned.bump,
+    });
     let report = match tag {
         Some(tag) => {
             let at = format!("the tagged commit {}", abbrev(&commit));
@@ -905,7 +922,7 @@ fn semver_version(
                 version: tag.version_text(),
                 tag: name,
                 rehearsal: false,
-                upstream: Some(upstream.label()),
+                semver,
             }
         }
         None => {
@@ -915,7 +932,7 @@ fn semver_version(
                 version: version.to_string(),
                 tag: None,
                 rehearsal: true,
-                upstream: Some(upstream.label()),
+                semver,
             }
         }
     };

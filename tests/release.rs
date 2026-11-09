@@ -5,7 +5,7 @@
 mod common;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use common::forge::branch_tip;
 use common::{Fork, stderr, stdout};
@@ -111,6 +111,15 @@ fn ci_clone(f: &Fork, rev: &str) -> PathBuf {
         env.git(&dir, &["remote", "set-url", "origin", &forge.remote_url()]);
     }
     dir
+}
+
+/// `release version --json` in `dir` with the variables `vars`.
+fn version_json(f: &Fork, dir: &Path, vars: &[(&str, &str)]) -> serde_json::Value {
+    let a = f
+        .env
+        .tool_env(dir, &["release", "version", "--json"], vars)
+        .success();
+    serde_json::from_slice(&a.get_output().stdout).unwrap()
 }
 
 #[test]
@@ -624,7 +633,9 @@ fn release_version_gives_builds_the_version() {
     assert_eq!(doc["version"], "0.11.1-custom.20261101.2");
     assert_eq!(doc["tag"], name);
     assert_eq!(doc["rehearsal"], false);
-    assert!(doc.get("upstream").is_none(), "{doc}");
+    for key in ["upstream", "previous", "bump"] {
+        assert!(doc.get(key).is_none(), "{doc}");
+    }
     // A tag whose base is not the commit's is refused.
     release_tag(&f, "v0.12.1-custom.20261101.3", &tip);
     let err = stderr(
@@ -661,6 +672,19 @@ fn release_version_rehearses_without_a_tag() {
         .success(),
     );
     assert_eq!(out, "RELEASE_VERSION=0.11.1-custom.20261101.0\n");
+    let doc = version_json(
+        &f,
+        &ci,
+        &[("CI_PIPELINE_CREATED_AT", "2026-11-01T08:15:00Z")],
+    );
+    assert_eq!(
+        doc,
+        serde_json::json!({
+            "version": "0.11.1-custom.20261101.0",
+            "tag": null,
+            "rehearsal": true,
+        })
+    );
 }
 
 #[test]
@@ -1210,6 +1234,8 @@ fn release_version_of_a_semver_release_names_its_upstream() {
     assert_eq!(doc["tag"], "v1.0.0");
     assert_eq!(doc["rehearsal"], false);
     assert_eq!(doc["upstream"], "upstream-0.11.0");
+    assert_eq!(doc["previous"], serde_json::Value::Null);
+    assert_eq!(doc["bump"], "major");
     // A tag whose version is not the commit's is refused.
     release_tag(&f, "v3.0.0", &env.rev(&f.down, "main"));
     let err = stderr(
@@ -1243,6 +1269,90 @@ fn release_version_rehearses_the_next_semver_release() {
         out,
         "RELEASE_VERSION=1.1.0-rehearsal.20261101\nRELEASE_UPSTREAM=upstream-0.11.0\n"
     );
+    assert_eq!(
+        version_json(&f, &f.down, &created),
+        serde_json::json!({
+            "version": "1.1.0-rehearsal.20261101",
+            "tag": null,
+            "rehearsal": true,
+            "upstream": "upstream-0.11.0",
+            "previous": "v1.0.0",
+            "bump": "minor",
+        })
+    );
+}
+
+#[test]
+fn a_semver_rehearsal_without_a_release_due_has_no_change() {
+    let f = semver_fork();
+    f.tool(&["release", "tag"]).success();
+    land(&f, "docs", "docs: a");
+    let doc = version_json(
+        &f,
+        &f.down,
+        &[("CI_PIPELINE_CREATED_AT", "2026-11-01T08:15:00Z")],
+    );
+    assert_eq!(doc["version"], "1.0.1-rehearsal.20261101");
+    assert_eq!(doc["previous"], "v1.0.0");
+    assert_eq!(doc["bump"], serde_json::Value::Null);
+}
+
+#[test]
+fn release_version_of_a_semver_tag_names_the_release_before_it_and_its_change() {
+    let f = semver_fork();
+    f.tool(&["release", "tag"]).success();
+    land(&f, "fix", "fix: a");
+    f.tool(&["release", "tag"]).success();
+    land(&f, "drop", "feat!: drop the old protocol");
+    f.tool(&["release", "tag"]).success();
+    assert_eq!(remote_tags(&f), ["v1.0.0", "v1.0.1", "v2.0.0"]);
+    // A commit landed after the tag changes nothing of it.
+    land(&f, "feat", "feat: b");
+    let ci = ci_clone(&f, "v2.0.0");
+    let doc = version_json(&f, &ci, &[("CI_COMMIT_TAG", "v2.0.0")]);
+    assert_eq!(doc["version"], "2.0.0");
+    assert_eq!(doc["tag"], "v2.0.0");
+    assert_eq!(doc["previous"], "v1.0.1");
+    assert_eq!(doc["bump"], "major");
+}
+
+#[test]
+fn release_version_of_a_line_without_releases_has_no_previous_release() {
+    let f = Fork::new();
+    releasable(&f, SEMVER);
+    let created = [("CI_PIPELINE_CREATED_AT", "2026-11-01T08:15:00Z")];
+    // The fixture's commits ask for no release.
+    let doc = version_json(&f, &f.down, &created);
+    assert_eq!(doc["version"], "1.0.0-rehearsal.20261101");
+    assert_eq!(doc["previous"], serde_json::Value::Null);
+    assert_eq!(doc["bump"], serde_json::Value::Null);
+    land(&f, "fix", "fix: a");
+    let doc = version_json(&f, &f.down, &created);
+    assert_eq!(doc["version"], "1.0.0-rehearsal.20261101");
+    assert_eq!(doc["previous"], serde_json::Value::Null);
+    assert_eq!(doc["bump"], "major");
+}
+
+#[test]
+fn the_first_semver_release_after_dated_releases_follows_the_newest_dated_one() {
+    let f = release_fork();
+    f.tool(&["release", "tag"]).success();
+    let dated = format!("v0.11.1-custom.{DAY}.1");
+    f.reconfigure(
+        "tags = \"v*\"\n",
+        "tags = \"v*\"\nversioning = \"semver\"\n",
+    );
+    land(&f, "fix", "fix: a");
+    let created = [("CI_PIPELINE_CREATED_AT", "2026-11-01T08:15:00Z")];
+    let doc = version_json(&f, &f.down, &created);
+    assert_eq!(doc["version"], "1.0.0-rehearsal.20261101");
+    assert_eq!(doc["previous"], dated.as_str());
+    assert_eq!(doc["bump"], "major");
+    f.tool(&["release", "tag"]).success();
+    let ci = ci_clone(&f, "v1.0.0");
+    let doc = version_json(&f, &ci, &[("CI_COMMIT_TAG", "v1.0.0")]);
+    assert_eq!(doc["previous"], dated.as_str());
+    assert_eq!(doc["bump"], "major");
 }
 
 #[test]
@@ -1488,6 +1598,14 @@ fn an_incompatible_upstream_release_makes_a_major_release_of_chores() {
         (doc["bump"].clone(), doc["next"].clone()),
         ("major".into(), "v2.0.0".into())
     );
+    let doc = version_json(
+        &f,
+        &f.down,
+        &[("CI_PIPELINE_CREATED_AT", "2026-11-01T08:15:00Z")],
+    );
+    assert_eq!(doc["version"], "2.0.0-rehearsal.20261101");
+    assert_eq!(doc["previous"], "v1.0.0");
+    assert_eq!(doc["bump"], "major");
     f.tool(&["release", "tag"]).success();
     let out = stdout(&f.tool(&["release", "notes", "v2.0.0"]).success());
     assert_eq!(
