@@ -24,27 +24,40 @@
 # recovery of a release that stopped. The images are pinned by digest, the
 # tools by version and checksum in .gitlab/scripts/install-tools.sh, and the
 # OpenSpec CLI with its dependencies in .gitlab/openspec. Every job but the
-# macOS builds runs on the group's x86_64 Linux runner, tagged
-# sakiori-oss-linux. Apple's SDK license permits building against the SDK
-# only on Apple hardware, so the macOS targets are built natively, with the
-# Xcode Command Line Tools, on the project's own Apple silicon runner, which
-# takes only jobs tagged git-intake-macos, runs them only for protected release
-# tags, and runs each in a fresh macOS virtual machine that is deleted after the
-# job. Every tag pipeline's release job runs only in this project: forks release
-# nothing.
+# macOS builds runs on one of the group's two x86_64 Linux runners: a
+# pipeline that GitLab runs for a protected ref, a release tag's or the
+# default branch's, on the one tagged sakiori-oss-linux-protected, which
+# takes protected refs only, and every other pipeline, merge request
+# pipelines among them, on the one tagged sakiori-oss-linux. Apple's SDK
+# license permits building against the SDK only on Apple hardware, so the
+# macOS targets are built natively, with the Xcode Command Line Tools, on the
+# project's own Apple silicon runner, which takes only jobs tagged
+# git-intake-macos, runs them only for protected release tags, and runs each
+# in a fresh macOS virtual machine that is deleted after the job. Every tag
+# pipeline's release job runs only in this project: forks release nothing.
 
 workflow:
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    # The Linux runner keeps a working copy that merge request jobs also use,
-    # so a release clones.
-    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
-      variables:
-        GIT_STRATEGY: clone
-    - if: $CI_COMMIT_TAG
+    # Merge request pipelines, release tags, the default branch's pushes and
+    # schedules, and a branch's pipelines started by hand or by the API run;
+    # no other pipeline does.
+    - if: $CI_COMMIT_TAG && $CI_COMMIT_TAG !~ /^v\d+\.\d+\.\d+$/
       when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(push|schedule)$/
-    - if: $CI_COMMIT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(web|api)$/
+    - if: $CI_COMMIT_BRANCH && $CI_PIPELINE_SOURCE !~ /^(push|schedule|web|api)$/
+      when: never
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE =~ /^(push|schedule)$/
+      when: never
+    # GitLab gives a pipeline protected runners exactly when
+    # CI_COMMIT_REF_PROTECTED is true. The protected runner runs build code,
+    # dependencies' build scripts included, beside the jobs that hold
+    # credentials, so each of its jobs clones a fresh working copy.
+    - if: $CI_COMMIT_REF_PROTECTED == "true"
+      variables:
+        LINUX_RUNNER: sakiori-oss-linux-protected
+        GIT_STRATEGY: clone
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_TAG || $CI_COMMIT_BRANCH
+      variables:
+        LINUX_RUNNER: sakiori-oss-linux
   auto_cancel:
     on_new_commit: interruptible
 
@@ -75,7 +88,7 @@ variables:
 default:
   image: $RUST_IMAGE
   tags:
-    - sakiori-oss-linux
+    - $LINUX_RUNNER
   interruptible: true
 
 # The jobs that check a change: in merge request pipelines and pipelines
@@ -84,8 +97,7 @@ default:
   stage: check
   needs: []
   rules:
-    # A new pipeline for a release tag runs the release's jobs alone; these restore
-    # caches that merge request jobs write.
+    # A new pipeline for a release tag runs the release's jobs alone.
     - if: $CI_COMMIT_TAG
       when: never
     - if: $CI_PIPELINE_SOURCE =~ /^(merge_request_event|web|api)$/
@@ -409,7 +421,6 @@ publish:
   resource_group: release-plz
   variables:
     GIT_DEPTH: 0
-    GIT_STRATEGY: clone
   before_script:
     - '[ -n "${RELEASE_PLZ_TOKEN:-}" ] || { echo "RELEASE_PLZ_TOKEN is not set; RELEASING.md describes it" >&2; exit 1; }'
     - .gitlab/scripts/install-tools.sh "$TOOLS" release-plz
