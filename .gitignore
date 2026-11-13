@@ -2,4 +2,3 @@
 /dist
 /.tools
 /.cargo
-/.gitlab/openspec/node_modules
