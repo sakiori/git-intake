@@ -7,10 +7,9 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::Exit;
-use crate::commands::merge_request::fetch_integration;
 use crate::config::{self, Config};
 use crate::drift;
-use crate::git::{Git, branch_ref};
+use crate::git::Git;
 use crate::integration_line;
 use crate::output::{Render, emit};
 use crate::repo::Repo;
@@ -158,23 +157,16 @@ pub fn by_hand(git: &Git, commit: &str, parents: &[String], path: Option<&str>) 
 }
 
 /// The configuration at the integration tip and that tip: the publish
-/// remote's integration branch, fetched for the command, or the local one
-/// without a publish remote, as `env` reads them.
+/// remote's integration branch, fetched for the command, as `env` reads
+/// them.
 fn integration(repo: &Repo) -> Result<(Config, String)> {
-    let git = &repo.git;
-    let named = repo
+    let from = repo
         .head()
-        .map(|head| repo.config_at(head))
+        .map(|head| repo.bootstrap_at(head))
         .transpose()?
         .flatten()
         .with_context(|| format!("no {} is committed at HEAD", config::FILE_NAME))?;
-    let integration = named.integration.clone();
-    let tip = match &named.publish {
-        Some(publish) => fetch_integration(git, &publish.remote, &integration)?,
-        None => git
-            .commit(&branch_ref(&integration))?
-            .with_context(|| format!("the integration branch '{integration}' does not exist"))?,
-    };
-    let config = repo.config_at(&tip)?.unwrap_or(named);
+    let tip = repo.integration_tip(&from)?;
+    let config = repo.config_at_tip(&from, &tip)?;
     Ok((config, tip))
 }

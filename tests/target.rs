@@ -51,11 +51,12 @@ fn commit_target_is_merged_published_and_shown_as_behind() {
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
     env.assert_no_update(&f.down);
-    assert_eq!(env.rev(&f.down, "main^1"), base);
-    assert_eq!(env.rev(&f.down, "main^2"), c2);
-    let msg = env.git(&f.down, &["log", "-1", "--format=%B", "main"]);
+    assert_eq!(env.rev(&f.publish, "main^1"), base);
+    assert_eq!(env.rev(&f.publish, "main^2"), c2);
+    let msg = env.git(&f.publish, &["log", "-1", "--format=%B", "main"]);
     assert!(msg.contains(&format!("Intake-Target: {c2}")), "{msg}");
-    assert_eq!(env.rev(&f.publish, "main"), env.rev(&f.down, "main"));
+    // Published, and the local `main` left where it was.
+    assert_eq!(env.rev(&f.down, "main"), base);
 
     let report = env.tool_json(&f.down, &["report", "--json"], 0);
     assert_eq!(report["upstreams"][0]["target"], c2.as_str());
@@ -83,7 +84,7 @@ fn commit_target_is_merged_published_and_shown_as_behind() {
         .stdout(contains("(1 new commit)"));
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    assert_eq!(env.rev(&f.down, "main^2"), c3);
+    assert_eq!(env.rev(&f.publish, "main^2"), c3);
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["upstreams"][0]["state"], "current");
     let report = env.tool_json(&f.down, &["report", "--json"], 0);
@@ -110,13 +111,13 @@ fn tag_target_is_the_upstream_tag_and_no_tag_is_fetched() {
         )));
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    assert_eq!(env.rev(&f.down, "main^2"), c1);
+    assert_eq!(env.rev(&f.publish, "main^2"), c1);
 
     // A lightweight tag works the same way.
     f.tool(&["start", "upstream=v1.2"]).success();
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    assert_eq!(env.rev(&f.down, "main^2"), c2);
+    assert_eq!(env.rev(&f.publish, "main^2"), c2);
 
     // Upstream tags never enter the repository.
     let tags = env.git(&f.down, &["tag", "--list"]);
@@ -270,10 +271,10 @@ fn conflict_at_a_chosen_target_resumes_and_records_that_target_after_the_tag_mov
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
     env.assert_no_update(&f.down);
-    assert_eq!(env.rev(&f.down, "main^2"), c1);
-    let msg = env.git(&f.down, &["log", "-1", "--format=%B", "main"]);
+    assert_eq!(env.rev(&f.publish, "main^2"), c1);
+    let msg = env.git(&f.publish, &["log", "-1", "--format=%B", "main"]);
     assert!(msg.contains(&format!("Intake-Target: {c1}")), "{msg}");
-    assert!(!env.is_ancestor(&f.down, &later, "main"));
+    assert!(!env.is_ancestor(&f.down, &later, &f.tip()));
     let report = env.tool_json(&f.down, &["report", "--json"], 0);
     assert_eq!(report["upstreams"][0]["rev"], "v2.0");
     assert_eq!(
@@ -293,7 +294,7 @@ fn abort_and_retry_keep_the_chosen_target() {
     f.tool(&["start", &format!("upstream={c1}")]).success();
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    assert_eq!(env.rev(&f.down, "main^2"), c1);
+    assert_eq!(env.rev(&f.publish, "main^2"), c1);
 }
 
 #[test]
@@ -317,6 +318,7 @@ fn several_upstreams_each_at_their_own_point() {
     assert_eq!(ups[0]["commits_behind"], 1);
     assert_eq!(ups[1]["last_synced"], b1.as_str());
     assert_eq!(ups[1]["state"], "current");
+    env.git(&m.down, &["pull", "-q", "--ff-only", "origin", "main"]);
     assert_eq!(
         std::fs::read_to_string(m.down.join("apps/a/a.txt")).unwrap(),
         "a1\na2\na3\na4\n"
@@ -409,7 +411,7 @@ fn revision_expression_on_the_fetched_branch_is_resolved() {
         )));
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    assert_eq!(env.rev(&f.down, "main^2"), c2);
+    assert_eq!(env.rev(&f.publish, "main^2"), c2);
 }
 
 #[test]
@@ -425,6 +427,7 @@ fn first_import_of_a_path_upstream_at_a_chosen_revision() {
         &[(".git-intake.toml", &cfg)],
         "mono: check app-a only",
     );
+    env.git(&m.down, &["push", "-q", "origin", "main"]);
     let a0 = env.rev(&m.a.work, "HEAD");
     let a1 = env.push_upstream(&m.a, &[("a.txt", "a1\na2\na3\na4\n")], "app-a: a4");
 
@@ -436,6 +439,7 @@ fn first_import_of_a_path_upstream_at_a_chosen_revision() {
     assert_eq!(status["update"]["upstreams"][0]["kind"], "import");
     m.tool(&["verify"]).success();
     m.tool(&["finish"]).success();
+    env.git(&m.down, &["pull", "-q", "--ff-only", "origin", "main"]);
     assert_eq!(
         fs::read_to_string(m.down.join("apps/a/a.txt")).unwrap(),
         "a1\na2\na3\n"

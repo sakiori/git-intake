@@ -24,19 +24,17 @@ use crate::commands::merge_request::{
     self, branch_gone, connect, named, refuse_elsewhere, requests,
 };
 use crate::commands::sync::{self, Caller};
-use crate::commands::update::require_published;
 use crate::config::{Config, Publish, PublishVia};
 use crate::drift;
 use crate::forge::{
     Account, Failure, Forge, Kind, Merge, MergeRequest, PipelineState, Queued, State, may_pass,
     not_found, patiently,
 };
-use crate::git::{Git, abbrev, branch_ref};
+use crate::git::{Git, abbrev};
 use crate::identity;
 use crate::output::{esay, say};
 use crate::pause::{self, Held, PAUSE_REF, Pause, Recorded, Started, Store, Swap, listed};
-use crate::repo::Repo;
-use crate::repo::bullet;
+use crate::repo::{Bootstrap, NamedBy, Repo, bullet};
 use crate::upstreams::Fetches;
 
 /// How `land` waits.
@@ -175,10 +173,10 @@ pub fn run(repo: &Repo, resume: bool, waits: Waits) -> Result<Exit> {
             "an update is in progress, at the step {}; next: {}, then `git intake land`{}",
             crate::commands::update::step_name(&state, &wt)?.replace('_', " "),
             crate::commands::update::next_step(&state, &wt)?,
-            match sync::configured(repo).and_then(|(config, publish)| pause::look(
+            match repo.load_config().and_then(|loaded| pause::look(
                 repo,
-                &publish,
-                &config.upstreams
+                &loaded.config.publish,
+                &loaded.config.upstreams
             )) {
                 Ok(Some(_)) =>
                     ". A pause of the merge queue is recorded; `git intake land --resume` ends it now",
@@ -186,7 +184,8 @@ pub fn run(repo: &Repo, resume: bool, waits: Waits) -> Result<Exit> {
             }
         );
     }
-    let (config, publish) = attempt(&waits, || sync::prepare(repo))?;
+    let config = attempt(&waits, || repo.load_config())?.config;
+    let publish = config.publish.clone();
     refuse_push_mode(&config, &publish)?;
     // A catch-up push needs a pipeline, and one made with the job token
     // starts none, so the queue would stand until the timeout.
@@ -298,7 +297,8 @@ pub fn run(repo: &Repo, resume: bool, waits: Waits) -> Result<Exit> {
 /// `land --resume`: ends the pause the publish remote records, whatever the
 /// clone is doing, and nothing else.
 fn end_left_behind(repo: &Repo, waits: &Waits) -> Result<Exit> {
-    let (config, publish) = sync::configured(repo)?;
+    let config = attempt(waits, || repo.load_config())?.config;
+    let publish = config.publish.clone();
     refuse_push_mode(&config, &publish)?;
     // Ending a pause needs no pipeline, and a refused push keeps the record.
     crate::forge::warn_of_job_token_push(&repo.git, &publish.remote)?;
@@ -530,9 +530,8 @@ impl Lander<'_> {
             }
         }
         // What refuses a catch-up refuses it here, with the queue still at work.
-        let (config, _) = sync::prepare(self.repo)?;
+        let config = self.repo.load_config()?.config;
         self.config = config.clone();
-        require_published(self.repo, &self.publish.remote, &config.integration)?;
         if self.account.is_some() && self.pause.is_none() {
             if let Some(status) = self.forge.merge_blocker(self.number)? {
                 bail!(
@@ -563,21 +562,17 @@ impl Lander<'_> {
             named(kind, &mr)
         );
         let mut fetches = Fetches::new(self.repo);
-        let local = git
-            .commit(&branch_ref(&config.integration))?
-            .with_context(|| {
-                format!(
-                    "the integration branch '{}' does not exist",
-                    config.integration
-                )
-            })?;
+        // Read again, as the queue may have landed merge requests meanwhile.
+        let now = self
+            .repo
+            .integration_tip(&Bootstrap::of(&config, NamedBy::Tip))?;
         match sync::sync_open(
             self.repo,
             config,
             self.forge,
             &self.publish.remote,
             mr.clone(),
-            &local,
+            &now,
             &mut fetches,
             Caller::Land,
         )? {
@@ -643,9 +638,10 @@ impl Lander<'_> {
     /// it, `None` without the branch, and the publish remote's integration
     /// tip, both fetched.
     fn positions(&self, mr: &MergeRequest) -> Result<(Option<String>, String)> {
-        let git = &self.repo.git;
         let remote = &self.publish.remote;
-        let tip = merge_request::fetch_integration(git, remote, &self.config.integration)?;
+        let tip = self
+            .repo
+            .integration_tip(&Bootstrap::of(&self.config, NamedBy::Tip))?;
         let mut fetches = Fetches::new(self.repo);
         let head = merge_request::remote_branch(self.repo, &mut fetches, remote, &mr.source)?;
         Ok((head, tip))

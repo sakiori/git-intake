@@ -15,11 +15,10 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
 use crate::Exit;
-use crate::commands::merge_request::fetch_integration;
 use crate::commands::verify::{self, Described};
 use crate::config::{self, Config, Mode};
 use crate::drift;
-use crate::git::{abbrev, branch_ref};
+use crate::git::abbrev;
 use crate::output::esay;
 use crate::repo::Repo;
 use crate::sync_record;
@@ -132,11 +131,11 @@ pub fn update_at(repo: &Repo, rev: &str) -> Result<(String, Option<Update>)> {
         .here
         .commit(rev)?
         .with_context(|| format!("'{rev}' names no commit"))?;
-    let named = match repo.config_at(&commit)? {
-        Some(config) => config,
+    let from = match repo.bootstrap_at(&commit)? {
+        Some(from) => from,
         None => repo
             .head()
-            .map(|head| repo.config_at(head))
+            .map(|head| repo.bootstrap_at(head))
             .transpose()?
             .flatten()
             .with_context(|| {
@@ -147,15 +146,9 @@ pub fn update_at(repo: &Repo, rev: &str) -> Result<(String, Option<Update>)> {
                 )
             })?,
     };
-    let integration = named.integration.clone();
-    let tip = match &named.publish {
-        Some(publish) => fetch_integration(git, &publish.remote, &integration)?,
-        None => git
-            .commit(&branch_ref(&integration))?
-            .with_context(|| format!("the integration branch '{integration}' does not exist"))?,
-    };
+    let tip = repo.integration_tip(&from)?;
     // The upstreams are those the integration tip configures.
-    let config = repo.config_at(&tip)?.unwrap_or(named);
+    let config = repo.config_at_tip(&from, &tip)?;
     if git.is_ancestor(&commit, &tip)? {
         return Ok((commit, None));
     }

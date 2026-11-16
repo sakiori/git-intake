@@ -15,18 +15,39 @@ use predicates::str::contains;
 const LEFT_REMOVED_DIRECTORY: &str =
     "note: the current directory was in the update worktree, which is now removed";
 
-/// A configuration with one upstream at the root, reached by `url`, without
-/// a publish remote.
+/// A configuration with one upstream at the root, reached by `url`,
+/// publishing by push to the remote `origin`.
 fn root_config(url: &str) -> String {
     format!(
         "integration = \"main\"\nchecks = [{{ name = \"app\", run = \"test -f {FORK_FILE}\" }}]\n\n\
+         [publish]\nremote = \"origin\"\n\n\
          [[upstream]]\nname = \"upstream\"\nurl = {url:?}\nbranch = \"main\"\n"
     )
 }
 
+/// Points the remote `origin` of `down` at a new bare repository `name` and
+/// publishes `main` there. Returns the bare repository.
+fn publish_to_bare(env: &Env, down: &Path, name: &str) -> PathBuf {
+    let publish = env.bare(name);
+    if env.git(down, &["remote"]).lines().any(|r| r == "origin") {
+        env.git(
+            down,
+            &["remote", "set-url", "origin", &publish.to_string_lossy()],
+        );
+    } else {
+        env.git(
+            down,
+            &["remote", "add", "origin", &publish.to_string_lossy()],
+        );
+    }
+    env.git(down, &["push", "-q", "origin", "main"]);
+    publish
+}
+
 /// A downstream repository `name`, cloned from the upstream at `bare`, that
-/// carries [`root_config`] with `url`. Returns its checkout.
-fn root_downstream(env: &Env, up: &Upstream, name: &str, url: &str) -> PathBuf {
+/// carries [`root_config`] with `url` and publishes to a bare repository.
+/// Returns its checkout and the publish remote's repository.
+fn root_downstream(env: &Env, up: &Upstream, name: &str, url: &str) -> (PathBuf, PathBuf) {
     let down = env.path(name);
     env.git(
         &env.path(""),
@@ -38,7 +59,8 @@ fn root_downstream(env: &Env, up: &Upstream, name: &str, url: &str) -> PathBuf {
         &[(".git-intake.toml", &root_config(url))],
         "down: add git-intake configuration",
     );
-    down
+    let publish = publish_to_bare(env, &down, &format!("{name}-publish"));
+    (down, publish)
 }
 
 /// Adds a linked worktree at `path` on a new branch from `HEAD`.
@@ -64,45 +86,44 @@ fn finish_run_from_the_update_worktree_completes() {
     m.tool(&["verify"]).success();
     let wt = env.update_worktree(&m.down);
     let verified = env.rev(&wt, "HEAD");
+    let main = env.rev(&m.down, "main");
 
     env.tool(&wt, &["finish"])
         .success()
-        .stdout(contains(
-            "no publish remote is configured; nothing was pushed",
-        ))
+        .stdout(contains(format!(
+            "pushed {} to 'origin/main'",
+            &verified[..12]
+        )))
         .stdout(contains("update finished"))
         .stderr(contains(LEFT_REMOVED_DIRECTORY));
-    assert_eq!(env.rev(&m.down, "main"), verified);
+    assert_eq!(m.tip(), verified);
+    assert_eq!(env.rev(&m.down, "main"), main, "the local main moved");
     env.assert_no_update(&m.down);
     m.tool(&["doctor"]).success();
 }
 
 #[test]
-fn push_and_no_publish_finish_run_from_the_update_worktree_complete() {
+fn push_finish_run_twice_from_the_update_worktree_completes_each_time() {
     let f = Fork::new();
     let env = &f.env;
-    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
-    f.tool(&["start"]).success();
-    f.tool(&["verify"]).success();
+    let main = env.rev(&f.down, "main");
     let wt = env.update_worktree(&f.down);
-    let verified = env.rev(&wt, "HEAD");
-    env.tool(&wt, &["finish"])
-        .success()
-        .stdout(contains("pushed main to 'origin'"))
-        .stderr(contains(LEFT_REMOVED_DIRECTORY));
-    assert_eq!(env.rev(&f.publish, "main"), verified);
-    env.assert_no_update(&f.down);
-
-    env.push_upstream(&f.up, &[("m.txt", "m\n")], "upstream: m");
-    f.tool(&["start"]).success();
-    f.tool(&["verify"]).success();
-    let verified = env.rev(&wt, "HEAD");
-    env.tool(&wt, &["finish", "--no-publish"])
-        .success()
-        .stdout(contains("update finished"))
-        .stderr(contains(LEFT_REMOVED_DIRECTORY));
-    assert_eq!(env.rev(&f.down, "main"), verified);
-    env.assert_no_update(&f.down);
+    for (file, message) in [("n.txt", "upstream: n"), ("m.txt", "upstream: m")] {
+        env.push_upstream(&f.up, &[(file, "x\n")], message);
+        f.tool(&["start"]).success();
+        f.tool(&["verify"]).success();
+        let verified = env.rev(&wt, "HEAD");
+        env.tool(&wt, &["finish"])
+            .success()
+            .stdout(contains(format!(
+                "pushed {} to 'origin/main'",
+                &verified[..12]
+            )))
+            .stderr(contains(LEFT_REMOVED_DIRECTORY));
+        assert_eq!(f.tip(), verified);
+        env.assert_no_update(&f.down);
+    }
+    assert_eq!(env.rev(&f.down, "main"), main, "the local main moved");
 }
 
 #[test]
@@ -141,7 +162,7 @@ fn abort_run_from_the_update_worktree_removes_the_update() {
 }
 
 #[test]
-fn integration_branch_in_a_linked_worktree_follows_a_finish_from_the_update_worktree() {
+fn integration_branch_checked_out_in_a_linked_worktree_is_left_alone_by_a_finish() {
     let f = Fork::new();
     let env = &f.env;
     env.git(&f.down, &["checkout", "-q", "-b", "feature"]);
@@ -150,6 +171,9 @@ fn integration_branch_in_a_linked_worktree_follows_a_finish_from_the_update_work
         &f.down,
         &["worktree", "add", "-q", &linked.to_string_lossy(), "main"],
     );
+    // Uncommitted work in that checkout stops nothing and is kept.
+    fs::write(linked.join(FORK_FILE), "edited\n").unwrap();
+    let main = env.rev(&linked, "HEAD");
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
@@ -157,9 +181,13 @@ fn integration_branch_in_a_linked_worktree_follows_a_finish_from_the_update_work
     let verified = env.rev(&wt, "HEAD");
 
     env.tool(&wt, &["finish"]).success();
-    assert_eq!(env.rev(&linked, "HEAD"), verified);
-    assert!(linked.join("n.txt").exists(), "the checkout did not follow");
-    assert!(env.git(&linked, &["status", "--porcelain"]).is_empty());
+    assert_eq!(f.tip(), verified);
+    assert_eq!(env.rev(&linked, "HEAD"), main, "the checkout moved");
+    assert!(!linked.join("n.txt").exists(), "the checkout changed");
+    assert_eq!(
+        fs::read_to_string(linked.join(FORK_FILE)).unwrap(),
+        "edited\n"
+    );
     assert_eq!(env.git(&f.down, &["branch", "--show-current"]), "feature");
 }
 
@@ -168,7 +196,8 @@ fn bare_update_worktree(git_dir: &Path) -> PathBuf {
     git_dir.join("git-intake").join("worktree")
 }
 
-/// A bare clone of `m`'s downstream at `path` in the environment.
+/// A bare clone of `m`'s downstream at `path` in the environment, whose
+/// remote `origin` is `m`'s publish remote.
 fn bare_downstream(m: &Mono, path: &str) -> PathBuf {
     let bare = m.env.path(path);
     m.env.git(
@@ -181,6 +210,10 @@ fn bare_downstream(m: &Mono, path: &str) -> PathBuf {
             &bare.to_string_lossy(),
         ],
     );
+    m.env.git(
+        &bare,
+        &["remote", "set-url", "origin", &m.publish.to_string_lossy()],
+    );
     fs::canonicalize(bare).unwrap()
 }
 
@@ -189,6 +222,7 @@ fn bare_downstream_finishes_from_the_update_worktree() {
     let m = Mono::new();
     let env = &m.env;
     let bare = bare_downstream(&m, "mono-bare.git");
+    let main = env.rev(&bare, "main");
     env.tool(&bare, &["start"]).success();
     let wt = bare_update_worktree(&bare);
     env.tool(&wt, &["verify"]).success();
@@ -197,7 +231,8 @@ fn bare_downstream_finishes_from_the_update_worktree() {
         .success()
         .stdout(contains("update finished"))
         .stderr(contains(LEFT_REMOVED_DIRECTORY));
-    assert_eq!(env.rev(&bare, "main"), verified);
+    assert_eq!(m.tip(), verified);
+    assert_eq!(env.rev(&bare, "main"), main, "the local main moved");
     assert!(!wt.exists(), "the update worktree remains");
     assert!(!env.has_rev(&bare, "refs/heads/git-intake/update"));
 }
@@ -263,19 +298,20 @@ fn update_worktree_lives_in_the_main_worktree_outside_the_git_directory() {
         "a worktree was created in the git directory"
     );
 
-    // The main checkout shows nothing of it, and doctor finds it clean.
+    // The main checkout shows nothing of it, and doctor finds the update
+    // as it should be.
     assert_eq!(
         env.git(&f.down, &["status", "--porcelain", "--untracked-files=all"]),
         ""
     );
     let doctor = env.tool_json(&f.down, &["doctor", "--json"], 0);
-    let clean = doctor["checks"]
+    let state = doctor["checks"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|c| c["check"] == "main_checkout_clean")
-        .expect("main checkout check");
-    assert_eq!(clean["status"], "pass", "{clean}");
+        .find(|c| c["check"] == "update_state")
+        .expect("update state check");
+    assert_eq!(state["status"], "pass", "{state}");
 
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
@@ -356,14 +392,10 @@ fn start_leaves_the_exclude_file_alone_when_the_update_worktree_is_ignored() {
 fn relative_remote_urls_mean_the_same_from_every_worktree() {
     let m = Mono::new();
     let env = &m.env;
-    let cfg = common::mono_config(&m.a, &m.b, "")
+    let cfg = common::mono_config(&m.a, &m.b, common::PUBLISH_BY_PUSH)
         .replace(&format!("{:?}", m.a.url()), "\"../app-a.git\"")
         .replace(&format!("{:?}", m.b.url()), "\"../app-b.git\"");
-    env.commit(
-        &m.down,
-        &[(".git-intake.toml", &cfg)],
-        "mono: relative urls",
-    );
+    m.land(&[(".git-intake.toml", &cfg)], "mono: relative urls");
     // A linked worktree one level deeper than the main checkout.
     let linked = env.path("nested").join("side");
     add_worktree(env, &m.down, "side", &linked);
@@ -371,7 +403,11 @@ fn relative_remote_urls_mean_the_same_from_every_worktree() {
         .success()
         .stdout(contains("app-a: queued"))
         .stdout(contains("app-b: queued"));
-    assert_eq!(env.git(&m.down, &["remote"]), "", "no remote was added");
+    assert_eq!(
+        env.git(&m.down, &["remote"]),
+        "origin",
+        "a remote was added"
+    );
     let held = env.rev(&m.down, "refs/git-intake/upstreams/app-a");
 
     // From the update worktree, status fetches the relative URLs as the
@@ -414,7 +450,7 @@ fn submodule_downstream() -> (Env, Upstream, PathBuf) {
     let up = env.upstream("upstream", &[(FORK_FILE, "one\n")]);
     // `super/sub` reaches the upstream at `../../upstream.git`; the
     // submodule's git directory, `super/.git/modules/sub`, does not.
-    let src = root_downstream(&env, &up, "down-src", "../../upstream.git");
+    let (src, publish) = root_downstream(&env, &up, "down-src", "../../upstream.git");
     let sup = env.work("super");
     env.commit(&sup, &[("README.md", "super\n")], "super: initial");
     env.git(
@@ -431,6 +467,11 @@ fn submodule_downstream() -> (Env, Upstream, PathBuf) {
     );
     let sub = sup.join("sub");
     env.git(&sub, &["checkout", "-q", "main"]);
+    // The submodule publishes where its source does.
+    env.git(
+        &sub,
+        &["remote", "set-url", "origin", &publish.to_string_lossy()],
+    );
     (env, up, sub)
 }
 
@@ -447,11 +488,14 @@ fn submodule_downstream_resolves_relative_urls_from_its_checkout() {
     assert_eq!(status["upstreams"][0]["tip"], m.as_str());
     env.tool(&wt, &["verify"]).success();
     let verified = env.rev(&wt, "HEAD");
+    let main = env.rev(&sub, "main");
     env.tool(&wt, &["finish"])
         .success()
         .stderr(contains(LEFT_REMOVED_DIRECTORY));
-    assert_eq!(env.rev(&sub, "main"), verified);
-    assert!(sub.join("n.txt").exists(), "the checkout did not follow");
+    let published = env.git(&sub, &["remote", "get-url", "origin"]);
+    assert_eq!(env.rev(Path::new(&published), "main"), verified);
+    assert_eq!(env.rev(&sub, "main"), main, "the local main moved");
+    assert!(!sub.join("n.txt").exists(), "the checkout changed");
     env.tool(&sub, &["doctor"]).success();
 }
 
@@ -545,8 +589,8 @@ fn worktrees_directory_that_is_a_symbolic_link_is_refused_before_anything_change
 
 /// A downstream whose git directory lies outside its checkout, at `git_dir`
 /// in the environment, with its upstream reached by a URL relative to the
-/// checkout. Returns the environment, the upstream, the checkout and the git
-/// directory.
+/// checkout, publishing to a bare repository. Returns the environment, the
+/// upstream, the checkout and the git directory.
 fn separate_git_dir_downstream(git_dir: &str) -> (Env, Upstream, PathBuf, PathBuf) {
     let env = Env::new();
     let up = env.upstream("upstream", &[(FORK_FILE, "one\n")]);
@@ -572,6 +616,7 @@ fn separate_git_dir_downstream(git_dir: &str) -> (Env, Upstream, PathBuf, PathBu
         &[(".git-intake.toml", &root_config("../upstream.git"))],
         "down: add git-intake configuration",
     );
+    publish_to_bare(&env, &down, "publish");
     let git_dir = fs::canonicalize(git_dir).unwrap();
     (env, up, down, git_dir)
 }
@@ -593,11 +638,13 @@ fn update_from_checkout_and_update_worktree(env: &Env, up: &Upstream, down: &Pat
     assert_eq!(status["upstreams"][0]["tip"], m.as_str());
     env.tool(&wt, &["verify"]).success();
     let verified = env.rev(&wt, "HEAD");
+    let main = env.rev(down, "main");
     env.tool(&wt, &["finish"])
         .success()
         .stderr(contains(LEFT_REMOVED_DIRECTORY));
-    assert_eq!(env.rev(down, "main"), verified);
-    assert!(down.join("n.txt").exists(), "the checkout did not follow");
+    assert_eq!(env.rev(&env.path("publish.git"), "main"), verified);
+    assert_eq!(env.rev(down, "main"), main, "the local main moved");
+    assert!(!down.join("n.txt").exists(), "the checkout changed");
     assert!(env.git(down, &["status", "--porcelain"]).is_empty());
     env.tool(down, &["doctor"]).success();
 }
@@ -705,6 +752,7 @@ fn unreadable_state_stops_finish_from_the_update_worktree() {
         stderr(&finish)
     );
     assert_eq!(env.rev(&down, "main"), main);
+    assert_eq!(env.rev(&env.path("publish.git"), "main"), main);
 }
 
 #[test]
@@ -716,25 +764,21 @@ fn separate_git_dir_main_worktree_unknown_from_a_linked_worktree_is_named() {
     let reason = "the main worktree cannot be located from here";
     let start = env.tool(&linked, &["start"]).code(2);
     assert!(stderr(&start).contains(reason), "{}", stderr(&start));
-    // Nothing is wrong with the repository, so doctor only warns about the
-    // main checkout. The relative URL resolves against the git directory
-    // from here, where it reaches no upstream, so the fetch check fails.
+    // The publish remote's URL is absolute, so doctor reads the integration
+    // tip from here; the upstream's URL is relative and resolves against the
+    // git directory, where it reaches no upstream, so the fetch check fails.
     let doctor = env.tool_json(&linked, &["doctor", "--json"], 1);
-    let fetch = doctor["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["check"] == "fetch")
-        .expect("fetch check");
-    assert_eq!(fetch["status"], "fail");
-    let check = doctor["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["check"] == "main_checkout_clean")
-        .expect("main checkout check");
-    assert_eq!(check["status"], "warn");
-    assert!(check["detail"].as_str().unwrap().contains(reason));
+    let check = |name: &str| {
+        doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["check"] == name)
+            .unwrap_or_else(|| panic!("no {name} check: {doctor}"))
+            .clone()
+    };
+    assert_eq!(check("publish_remote")["status"], "pass");
+    assert_eq!(check("fetch")["status"], "fail");
 }
 
 /// A directory outside the checkout with a file at `git-intake/update`,
@@ -749,7 +793,7 @@ fn outside_directory(env: &Env) -> (PathBuf, PathBuf) {
 }
 
 #[test]
-fn an_update_that_brings_a_worktrees_link_is_refused_before_any_branch_moves() {
+fn an_update_that_brings_a_worktrees_link_touches_nothing_outside_the_repository() {
     let f = Fork::new();
     let env = &f.env;
     let (victim, kept) = outside_directory(env);
@@ -758,42 +802,18 @@ fn an_update_that_brings_a_worktrees_link_is_refused_before_any_branch_moves() {
     let main = env.rev(&f.down, "main");
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
-    for args in [&["finish"][..], &["finish", "--no-publish"]] {
-        let err = stderr(&f.tool(args).code(2));
-        assert!(err.contains("'.worktrees'"), "{err}");
-        assert!(err.contains("symbolic link"), "{err}");
-        assert!(err.contains(".worktrees/git-intake/update"), "{err}");
-        assert_eq!(env.rev(&f.down, "main"), main);
-        assert_eq!(env.rev(&f.publish, "main"), main);
-    }
-    assert!(
-        fs::symlink_metadata(f.down.join(".worktrees"))
-            .unwrap()
-            .is_dir()
-    );
-    f.tool(&["abort"]).success();
-    assert_eq!(fs::read_to_string(&kept).unwrap(), "kept\n");
-    env.assert_no_update(&f.down);
-}
-
-#[test]
-fn an_update_that_brings_a_file_at_the_update_worktree_is_refused_before_any_branch_moves() {
-    let f = Fork::new();
-    let env = &f.env;
-    env.push_upstream(
-        &f.up,
-        &[(".worktrees/git-intake/update", "not a worktree\n")],
-        "upstream: a file where the update worktree lies",
-    );
-    let main = env.rev(&f.down, "main");
-    f.tool(&["start"]).success();
-    f.tool(&["verify"]).success();
-    let err = stderr(&f.tool(&["finish"]).code(2));
-    assert!(err.contains("'.worktrees/git-intake/update'"), "{err}");
+    let verified = env.rev(&env.update_worktree(&f.down), "HEAD");
+    // No checkout follows the integration branch, so the tree it publishes
+    // never reaches the main checkout.
+    f.tool(&["finish"]).success();
+    assert_eq!(f.tip(), verified);
     assert_eq!(env.rev(&f.down, "main"), main);
-    assert_eq!(env.rev(&f.publish, "main"), main);
-    assert!(env.update_worktree(&f.down).join(FORK_FILE).exists());
-    f.tool(&["abort"]).success();
+    assert!(
+        fs::symlink_metadata(f.down.join(".worktrees")).is_err(),
+        "the main checkout holds .worktrees"
+    );
+    assert_eq!(fs::read_to_string(&kept).unwrap(), "kept\n");
+    assert_eq!(fs::read_dir(victim.join("git-intake")).unwrap().count(), 1);
     env.assert_no_update(&f.down);
 }
 
@@ -801,16 +821,9 @@ fn an_update_that_brings_a_file_at_the_update_worktree_is_refused_before_any_bra
 fn cleanup_leaves_an_unregistered_update_worktree_reached_through_a_link() {
     let f = Fork::new();
     let env = &f.env;
-    // The publish remote rejects the push, so that `finish` stays in its
-    // finishing step with the integration branch moved.
-    let hook = f.publish.join("hooks").join("pre-receive");
-    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
-    f.tool(&["finish"]).code(2);
 
     // `.worktrees` is now a link to a directory elsewhere, and git no
     // longer registers the update worktree.
@@ -819,8 +832,8 @@ fn cleanup_leaves_an_unregistered_update_worktree_reached_through_a_link() {
     std::os::unix::fs::symlink(&victim, f.down.join(".worktrees")).unwrap();
     env.git(&f.down, &["worktree", "prune", "--expire", "now"]);
 
-    let finish = f.tool(&["finish", "--no-publish"]).success();
-    let err = stderr(&finish);
+    let abort = f.tool(&["abort"]).success();
+    let err = stderr(&abort);
     assert!(err.contains("left"), "{err}");
     assert!(err.contains(".worktrees/git-intake/update"), "{err}");
     assert!(err.contains("symbolic link"), "{err}");
@@ -876,30 +889,6 @@ fn a_directory_git_does_not_register_at_the_update_worktree_is_left_and_named() 
 }
 
 #[test]
-fn an_update_that_brings_a_link_named_in_another_case_is_refused() {
-    let f = Fork::new();
-    let env = &f.env;
-    let (victim, kept) = outside_directory(env);
-    // `git-intake` with the Kelvin sign, which a case-insensitive file
-    // system takes for the same name.
-    let dir = f.up.work.join(".worktrees");
-    fs::create_dir_all(&dir).unwrap();
-    std::os::unix::fs::symlink(victim.join("git-intake"), dir.join("git-inta\u{212A}e")).unwrap();
-    env.push_upstream(&f.up, &[], "upstream: link git-intake in another case");
-    let main = env.rev(&f.down, "main");
-    f.tool(&["start"]).success();
-    f.tool(&["verify"]).success();
-    let err = stderr(&f.tool(&["finish"]).code(2));
-    assert!(err.contains("git-inta\u{212A}e"), "{err}");
-    assert!(err.contains("symbolic link"), "{err}");
-    assert_eq!(env.rev(&f.down, "main"), main);
-    assert_eq!(env.rev(&f.publish, "main"), main);
-    f.tool(&["abort"]).success();
-    assert_eq!(fs::read_to_string(&kept).unwrap(), "kept\n");
-    env.assert_no_update(&f.down);
-}
-
-#[test]
 fn a_checkout_of_another_owner_needs_safe_directory_for_the_checkout_alone() {
     let f = Fork::new();
     let env = &f.env;
@@ -924,12 +913,13 @@ fn a_checkout_of_another_owner_needs_safe_directory_for_the_checkout_alone() {
     env.set_var("GIT_CONFIG_COUNT", "1");
     env.set_var("GIT_CONFIG_KEY_0", "safe.directory");
     env.set_var("GIT_CONFIG_VALUE_0", &down);
+    let main = env.rev(&f.down, "main");
     env.tool(&f.down, &["sync"]).success();
     env.tool(&f.down, &["doctor"]).success();
     env.unset_var("GIT_TEST_ASSUME_DIFFERENT_OWNER");
-    assert_eq!(env.rev(&f.publish, "main"), env.rev(&f.down, "main"));
+    assert_eq!(env.rev(&f.down, "main"), main);
     assert!(
-        env.git(&f.down, &["log", "-1", "--format=%s", "main"])
+        env.git(&f.publish, &["log", "-1", "--format=%s", "main"])
             .starts_with("sync(upstream):")
     );
 }

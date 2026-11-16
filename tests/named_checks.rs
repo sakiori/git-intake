@@ -149,14 +149,12 @@ fn only_one_check_runs_with_the_install_command_and_does_not_verify() {
     );
 
     // A head with only a partial run is not published.
-    for args in [&["finish"][..], &["finish", "--no-publish"]] {
-        let err = stderr(&f.tool(args).code(2));
-        assert!(
-            err.contains("has only a partial run, which left out 'lint'"),
-            "{err}"
-        );
-        assert!(err.contains("run `git intake verify`"), "{err}");
-    }
+    let err = stderr(&f.tool(&["finish"]).code(2));
+    assert!(
+        err.contains("has only a partial run, which left out 'lint'"),
+        "{err}"
+    );
+    assert!(err.contains("run `git intake verify`"), "{err}");
     assert_eq!(env.rev(&f.down, "main"), main);
     assert_eq!(env.rev(&f.publish, "main"), published);
     assert!(ran(&f).is_empty());

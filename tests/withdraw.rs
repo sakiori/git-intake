@@ -277,10 +277,16 @@ fn finish_hands_over_an_update_whose_merge_request_was_merged() {
     let out = stdout(&f.tool(&["finish"]).success());
     assert!(out.contains("which is merged"), "{out}");
     env.assert_no_update(&f.down);
+    // The next update starts from the publish remote's integration branch,
+    // which holds the merged update.
+    let main = env.rev(&f.down, "main");
     f.tool(&["start"])
         .success()
-        .stdout(predicates::str::contains("fast-forwarded 'main'"));
-    assert!(env.is_ancestor(&f.down, &head, "main"));
+        .stdout(predicates::str::contains(
+            "every selected upstream is current",
+        ));
+    assert!(env.is_ancestor(&f.publish, &head, "main"));
+    assert_eq!(env.rev(&f.down, "main"), main);
 }
 
 #[test]
@@ -370,7 +376,7 @@ fn abort_withdraws_a_waiting_update_while_the_checks_are_plain_commands() {
     assert_eq!(fs::read_to_string(&path).unwrap(), recorded);
 
     let out = stdout(&f.tool(&["abort", "--merge-request"]).success());
-    assert!(out.contains("update aborted; 'main' is unchanged"), "{out}");
+    assert!(out.contains("update aborted"), "{out}");
     assert!(out.contains("closed merge request !1"), "{out}");
     assert_eq!(branch_tip(&f.publish, MERGE_REQUEST_BRANCH), None);
     env.assert_no_update(&f.down);

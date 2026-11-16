@@ -51,15 +51,19 @@ fn full_cycle_merges_verifies_and_publishes() {
     assert!(logs.join("install.log").exists());
     assert!(logs.join("check-app.log").exists());
 
-    f.tool(&["finish"])
-        .success()
-        .stdout(contains("pushed main to 'origin'"));
+    let finish = f.tool(&["finish"]).success();
     env.assert_no_update(&f.down);
 
-    let main = env.rev(&f.down, "main");
-    assert_eq!(env.rev(&f.down, "main^1"), base);
-    assert_eq!(env.rev(&f.down, "main^2"), t1);
-    let msg = env.git(&f.down, &["log", "-1", "--format=%B", "main"]);
+    // Published without force to the publish remote's integration branch.
+    let main = f.tip();
+    assert!(
+        stdout(&finish).contains(&format!("pushed {} to 'origin/main'", &main[..12])),
+        "{}",
+        stdout(&finish)
+    );
+    assert_eq!(env.rev(&f.publish, "main^1"), base);
+    assert_eq!(env.rev(&f.publish, "main^2"), t1);
+    let msg = env.git(&f.publish, &["log", "-1", "--format=%B", "main"]);
     assert!(
         msg.starts_with(&format!(
             "sync(upstream): merge upstream/main at {}",
@@ -69,12 +73,11 @@ fn full_cycle_merges_verifies_and_publishes() {
     );
     assert!(msg.contains("Intake-Upstream: upstream"), "{msg}");
     assert!(msg.contains(&format!("Intake-Target: {t1}")), "{msg}");
-    assert!(!env.is_ancestor(&f.down, &t2, "main"));
-    // The main checkout followed the fast-forward.
-    assert!(f.down.join("new.txt").exists());
+    assert!(!env.is_ancestor(&f.publish, &t2, "main"));
+    // The local `main` and the main checkout stay as they were.
+    assert_eq!(env.rev(&f.down, "main"), base);
+    assert!(!f.down.join("new.txt").exists());
     assert!(env.git(&f.down, &["status", "--porcelain"]).is_empty());
-    // Published without force.
-    assert_eq!(env.rev(&f.publish, "main"), main);
     // The upstream received nothing, and no remote or branch of it exists.
     assert_eq!(env.rev(&f.up.bare, "main"), t2);
     assert_eq!(env.git(&f.down, &["remote"]), "origin");
@@ -128,15 +131,21 @@ fn start_refusals() {
         .code(2)
         .stderr(contains("unknown upstream 'nope'"));
 
-    std::fs::write(f.down.join(FORK_FILE), "dirty\n").unwrap();
-    f.tool(&["start"])
-        .code(2)
-        .stderr(contains("the main checkout has uncommitted changes"));
-    env.git(&f.down, &["checkout", "--", FORK_FILE]);
+    // A publish remote that cannot be fetched refuses with git's reason.
+    env.git(&f.down, &["remote", "set-url", "origin", "../nowhere.git"]);
+    f.tool(&["start"]).code(2).stderr(contains(
+        "cannot fetch the integration branch 'main' from the publish remote 'origin'",
+    ));
+    env.assert_no_update(&f.down);
+    env.git(
+        &f.down,
+        &["remote", "set-url", "origin", &f.publish.to_string_lossy()],
+    );
 
-    // Someone published to the integration branch first, and it holds a
-    // commit of its own: the two diverged.
-    let base = env.rev(&f.down, "main");
+    // Someone published to the integration branch, and the local `main`
+    // holds a commit of its own: the update starts from the publish
+    // remote's tip, and neither a local commit nor uncommitted changes in
+    // the main checkout stand in the way.
     let other = env.path("other");
     env.git(
         &env.path(""),
@@ -150,21 +159,16 @@ fn start_refusals() {
     let theirs = env.commit(&other, &[("other.txt", "o\n")], "other: change");
     env.git(&other, &["push", "-q", "origin", "main"]);
     let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local");
-    f.tool(&["start"]).code(2).stderr(contains(
-        "'main' and 'origin/main' have diverged: 'main' lacks 1 commit of 'origin/main', which lacks 1 of 'main'",
-    ));
+    std::fs::write(f.down.join(FORK_FILE), "dirty\n").unwrap();
+    f.tool(&["start"]).success();
     assert_eq!(env.rev(&f.down, "main"), local);
-    env.assert_no_update(&f.down);
-
-    // Strictly behind: `start` fast-forwards it and starts from there.
-    env.git(&f.down, &["reset", "-q", "--hard", &base]);
-    f.tool(&["start"]).success().stdout(contains(format!(
-        "fast-forwarded 'main' from {} to {} to match 'origin/main'",
-        &base[..12],
-        &theirs[..12]
-    )));
-    assert_eq!(env.rev(&f.down, "main"), theirs);
-    assert!(f.down.join("other.txt").exists());
+    assert_eq!(
+        fs::read_to_string(f.down.join(FORK_FILE)).unwrap(),
+        "dirty\n"
+    );
+    let wt = env.update_worktree(&f.down);
+    assert!(wt.join("other.txt").exists());
+    assert!(!wt.join("local.txt").exists());
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["update"]["base"], theirs.as_str());
     f.tool(&["start"])
@@ -173,7 +177,7 @@ fn start_refusals() {
 }
 
 #[test]
-fn start_reads_the_configuration_again_after_a_fast_forward() {
+fn start_reads_the_configuration_at_the_publish_remote_s_tip() {
     let f = Fork::new();
     let env = &f.env;
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
@@ -187,27 +191,32 @@ fn start_reads_the_configuration_again_after_a_fast_forward() {
             &other.to_string_lossy(),
         ],
     );
-    // The new tip adds a check.
+    // The new tip changes the check; the local `main` keeps the older
+    // configuration.
     let cfg = fs::read_to_string(other.join(".git-intake.toml"))
         .unwrap()
         .replace("run = \"test -f app.txt\"", "run = \"test -f n.txt\"");
     env.commit(&other, &[(".git-intake.toml", &cfg)], "other: check n");
     env.git(&other, &["push", "-q", "origin", "main"]);
+    let local = env.rev(&f.down, "main");
     f.tool(&["start"]).success();
     f.tool(&["verify"])
         .success()
         .stdout(contains("passed   app"));
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["checks"][0]["run"], "test -f n.txt");
     f.tool(&["abort"]).success();
+    assert_eq!(env.rev(&f.down, "main"), local);
 
-    // A new tip that names another publish remote: the fast-forward is kept,
-    // and the update is not started.
+    // A new tip that names another publish remote than the configuration at
+    // HEAD: the update is not started, and both are named.
     let mirror = env.bare("mirror");
     env.git(
         &f.down,
         &["remote", "add", "mirror", &mirror.to_string_lossy()],
     );
     let cfg = cfg.replace("remote = \"origin\"", "remote = \"mirror\"");
-    let moved = env.commit(
+    env.commit(
         &other,
         &[(".git-intake.toml", &cfg)],
         "other: publish elsewhere",
@@ -216,11 +225,12 @@ fn start_reads_the_configuration_again_after_a_fast_forward() {
     let err = stderr(&f.tool(&["start"]).code(2));
     assert!(
         err.contains(
-            "names 'mirror' as the publish remote instead of 'origin'; the fast-forward is kept"
+            "names 'main' as the integration branch and 'mirror' as the publish remote, but the \
+             .git-intake.toml at HEAD names 'main' and 'origin'"
         ),
         "{err}"
     );
-    assert_eq!(env.rev(&f.down, "main"), moved);
+    assert_eq!(env.rev(&f.down, "main"), local);
     env.assert_no_update(&f.down);
 }
 
@@ -240,7 +250,11 @@ fn commit_after_verify_blocks_finish() {
     assert_eq!(status["update"]["step"], "merged");
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    assert!(f.down.join("fix.txt").exists());
+    assert!(
+        env.git(&f.publish, &["ls-tree", "--name-only", "main"])
+            .lines()
+            .any(|l| l == "fix.txt")
+    );
 }
 
 #[test]
@@ -466,8 +480,19 @@ fn stacked_downstream_branch_follows_another_fork() {
     );
     env.git(&stacked, &["checkout", "-q", "-b", "develop"]);
     env.git(&stacked, &["remote", "remove", "upstream"]);
+    let stacked_publish = env.bare("stacked-publish");
+    env.git(
+        &stacked,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &stacked_publish.to_string_lossy(),
+        ],
+    );
     let config = format!(
-        "integration = \"develop\"\nchecks = [{{ name = \"app\", run = \"test -f app.txt\" }}]\n\n[[upstream]]\nname = \"upstream\"\nurl = {:?}\nbranch = \"main\"\n",
+        "integration = \"develop\"\nchecks = [{{ name = \"app\", run = \"test -f app.txt\" }}]\n\n\
+         [publish]\nremote = \"origin\"\n\n[[upstream]]\nname = \"upstream\"\nurl = {:?}\nbranch = \"main\"\n",
         f.publish.to_string_lossy()
     );
     env.commit(
@@ -475,6 +500,7 @@ fn stacked_downstream_branch_follows_another_fork() {
         &[(".git-intake.toml", &config)],
         "stacked: configuration",
     );
+    env.git(&stacked, &["push", "-q", "origin", "develop"]);
 
     // The stacked line starts from the base fork's line, which carries the
     // base fork's own sync record under the same upstream name. That record
@@ -511,9 +537,8 @@ fn stacked_downstream_branch_follows_another_fork() {
     assert_eq!(status["upstreams"][0]["state"], "current");
 
     // The base fork moves on.
-    env.commit(&f.down, &[("fork-feature.txt", "f\n")], "fork: feature");
-    env.git(&f.down, &["push", "-q", "origin", "main"]);
-    let fork_tip = env.rev(&f.down, "main");
+    f.pull();
+    let fork_tip = f.land(&[("fork-feature.txt", "f\n")], "fork: feature");
     let status = env.tool_json(&stacked, &["status", "--json"], 0);
     let up = &status["upstreams"][0];
     assert_eq!(up["last_synced"], cloned_tip.as_str());
@@ -535,8 +560,8 @@ fn stacked_downstream_branch_follows_another_fork() {
     env.tool(&stacked, &["verify"]).success();
     env.tool(&stacked, &["finish"])
         .success()
-        .stdout(contains("nothing was pushed"));
-    assert_eq!(env.rev(&stacked, "develop^2"), fork_tip);
+        .stdout(contains("pushed"));
+    assert_eq!(env.rev(&stacked_publish, "develop^2"), fork_tip);
     let status = env.tool_json(&stacked, &["status", "--json"], 0);
     assert_eq!(status["upstreams"][0]["last_synced"], fork_tip.as_str());
     assert_eq!(status["upstreams"][0]["state"], "current");
@@ -547,7 +572,7 @@ fn stacked_downstream_branch_follows_another_fork() {
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    let fork_tip2 = env.rev(&f.down, "main");
+    let fork_tip2 = f.tip();
     let status = env.tool_json(&stacked, &["status", "--json"], 0);
     assert_eq!(status["upstreams"][0]["last_synced"], fork_tip.as_str());
     assert_eq!(status["upstreams"][0]["state"], "behind");
@@ -663,7 +688,10 @@ fn abort_removes_logs_and_the_update_references() {
 
     let abort = f.tool(&["abort"]).success();
     let out = stdout(&abort);
-    assert!(out.contains("update aborted; 'main' is unchanged"), "{out}");
+    assert!(
+        out.contains("update aborted; abort changed nothing on the publish remote"),
+        "{out}"
+    );
     assert!(out.contains("removed logs"), "{out}");
     assert!(
         out.contains("removed reference refs/git-intake/upstreams/upstream"),
@@ -693,6 +721,9 @@ fn a_stopped_follow_update_keeps_its_target_through_garbage_collection() {
         env.rev(&f.down, "refs/git-intake/upstreams/upstream"),
         target
     );
+    // The local `main` is deleted: nothing of the update needs it.
+    env.git(&f.down, &["checkout", "-q", "--detach"]);
+    env.git(&f.down, &["branch", "-q", "-D", "main"]);
 
     // The upstream disappears and the repository is garbage-collected: the target stays, and continue,
     // verify and finish never fetch.
@@ -708,7 +739,9 @@ fn a_stopped_follow_update_keeps_its_target_through_garbage_collection() {
         .stdout(contains("upstream: merged as"));
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    assert_eq!(env.rev(&f.down, "main^2"), target);
+    assert_eq!(f.tip(), env.rev(&f.publish, "main"));
+    assert_eq!(env.rev(&f.publish, "main^2"), target);
+    assert!(!env.has_rev(&f.down, "refs/heads/main"));
     env.assert_no_update(&f.down);
 }
 
@@ -760,6 +793,7 @@ fn a_record_merged_from_a_branch_counts_one_level_deep() {
             "feature",
         ],
     );
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     let up = &status["upstreams"][0];
     assert_eq!(up["last_synced"], t1.as_str());
@@ -795,6 +829,7 @@ fn a_record_merged_from_a_branch_counts_one_level_deep() {
             "outer",
         ],
     );
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     let up = &status["upstreams"][0];
     assert_eq!(up["last_synced"], t1.as_str());
@@ -841,6 +876,7 @@ fn an_older_record_merged_later_never_moves_the_upstream_back() {
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
+    f.pull();
     env.git(
         &f.down,
         &[
@@ -852,6 +888,7 @@ fn an_older_record_merged_later_never_moves_the_upstream_back() {
             "stale",
         ],
     );
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
 
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     let up = &status["upstreams"][0];

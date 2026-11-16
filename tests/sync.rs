@@ -80,15 +80,18 @@ fn a_scheduled_sync_opens_the_merge_request() {
 }
 
 #[test]
-fn a_clean_ci_clone_gets_its_integration_branch() {
+fn a_clean_ci_clone_needs_no_integration_branch() {
     let f = Fork::merge_request();
     let env = &f.env;
     behind(&f);
     let ci = ci_clone(&f, "ci");
     let out = stdout(&env.tool(&ci, &["sync"]).success());
-    assert!(out.contains("created 'main' at"), "{out}");
     assert!(out.contains("opened merge request !1"), "{out}");
-    assert_eq!(env.rev(&ci, "main"), env.rev(&f.publish, "main"));
+    // The integration branch is read from the publish remote; no local one
+    // is created.
+    assert!(!env.has_rev(&ci, "refs/heads/main"));
+    let head = on_remote(&f, MERGE_REQUEST_BRANCH).expect("the update's branch");
+    assert!(env.is_ancestor(&f.publish, &f.tip(), &head));
 }
 
 #[test]
@@ -118,21 +121,25 @@ fn sync_needs_a_publication_setting() {
     let f = Fork::new();
     f.reconfigure("[publish]\nremote = \"origin\"\nvia = \"push\"\n", "");
     let err = stderr(&f.tool(&["sync"]).code(2));
-    assert!(err.contains("has no [publish] setting"), "{err}");
+    assert!(
+        err.contains("a [publish] table naming the publish remote is required"),
+        "{err}"
+    );
 }
 
 #[test]
-fn unpublished_local_commits_are_refused() {
+fn local_commits_never_ride_along_in_the_merge_request() {
     let f = Fork::merge_request();
     let env = &f.env;
     behind(&f);
-    env.commit(&f.down, &[("local.txt", "l\n")], "fork: not published");
-    let err = stderr(&f.tool(&["sync"]).code(2));
-    assert!(
-        err.contains("'main' holds 1 commit that 'origin/main' lacks"),
-        "{err}"
-    );
-    assert!(f.forge().changes().is_empty());
+    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: not published");
+    let out = stdout(&f.tool(&["sync"]).success());
+    assert!(out.contains("opened merge request !1"), "{out}");
+    let head = on_remote(&f, MERGE_REQUEST_BRANCH).expect("the update's branch");
+    assert!(env.is_ancestor(&f.publish, &f.tip(), &head));
+    assert!(!env.has_rev(&f.publish, &format!("{local}^{{commit}}")));
+    // The local `main` is neither published nor moved.
+    assert_eq!(env.rev(&f.down, "main"), local);
     env.assert_no_update(&f.down);
 }
 
@@ -933,10 +940,13 @@ fn push_mode_sync_verifies_and_publishes() {
     let f = Fork::new();
     let env = &f.env;
     let target = env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    let main = env.rev(&f.down, "main");
     let out = stdout(&f.tool(&["sync"]).success());
     assert!(out.contains("passed   app"), "{out}");
-    assert!(out.contains("pushed main to 'origin'"), "{out}");
+    assert!(out.contains("to 'origin/main'"), "{out}");
     assert!(env.is_ancestor(&f.publish, &target, "main"));
+    // The verified update is pushed; the local `main` stays where it was.
+    assert_eq!(env.rev(&f.down, "main"), main);
     env.assert_no_update(&f.down);
 }
 

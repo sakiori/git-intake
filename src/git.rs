@@ -389,11 +389,6 @@ pub fn branch_ref(branch: &str) -> String {
     format!("refs/heads/{branch}")
 }
 
-/// A full ref name for a remote-tracking branch.
-pub fn tracking_ref(remote: &str, branch: &str) -> String {
-    format!("refs/remotes/{remote}/{branch}")
-}
-
 /// The first twelve characters of a commit id, for display. A revision a
 /// user named may be shown the same way, so the cut falls between characters.
 pub fn abbrev(oid: &str) -> &str {

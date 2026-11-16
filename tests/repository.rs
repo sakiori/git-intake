@@ -3,8 +3,13 @@
 
 mod common;
 
-use common::{Fork, MERGE_REQUEST_BRANCH, Mono, mono_config, stderr, stdout};
+use common::{Fork, MERGE_REQUEST_BRANCH, Mono, PUBLISH_BY_PUSH, mono_config, stderr, stdout};
 use predicates::str::contains;
+
+/// The configuration of `m`, which publishes by push to `origin`.
+fn mono_cfg(m: &Mono) -> String {
+    mono_config(&m.a, &m.b, PUBLISH_BY_PUSH)
+}
 
 /// The release of the binary under test.
 const RELEASE: &str = env!("CARGO_PKG_VERSION");
@@ -13,12 +18,19 @@ const RELEASE: &str = env!("CARGO_PKG_VERSION");
 fn status_shows_configuration_values() {
     let f = Fork::new();
     let out = stdout(&f.tool(&["status"]).success());
-    assert!(out.contains("integration: main at"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "integration: main on 'origin' at {}",
+            &f.tip()[..12]
+        )),
+        "{out}"
+    );
     assert!(out.contains("publish: origin (via push)"), "{out}");
     assert!(out.contains("install: true"), "{out}");
     assert!(out.contains("checks:\n  app: test -f app.txt"), "{out}");
     let json = f.env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(json["integration"], "main");
+    assert_eq!(json["integration_tip"], f.tip().as_str());
     assert_eq!(json["publish"], "origin");
     assert_eq!(json["publish_via"], "push");
     assert_eq!(json["install"], "true");
@@ -66,7 +78,10 @@ fn uncommitted_configuration_edit_is_ignored_with_a_notice() {
         .replace("test -f app.txt", "edited check");
     std::fs::write(&path, edited).unwrap();
     let status = f.tool(&["status"]).success();
-    assert!(stderr(&status).contains("the working copy of .git-intake.toml differs from the version committed on 'main'; using the committed version"));
+    assert!(stderr(&status).contains(
+        "the working copy of .git-intake.toml differs from the version committed at 'origin/main'; using the \
+         committed version"
+    ));
     assert!(stdout(&status).contains("test -f app.txt"));
     assert!(!stdout(&status).contains("edited check"));
     let json = f.env.tool_json(&f.down, &["status", "--json"], 0);
@@ -96,6 +111,25 @@ fn configuration_is_read_from_the_integration_tip() {
         json["checks"],
         serde_json::json!([{"name": "app", "run": "test -f app.txt"}])
     );
+    // Nor does a commit on the local integration branch that was never
+    // published: the integration tip is the publish remote's.
+    env.git(&f.down, &["checkout", "-q", "main"]);
+    let local = env.commit(
+        &f.down,
+        &[(".git-intake.toml", &cfg)],
+        "main: unpublished config",
+    );
+    let json = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(
+        json["checks"],
+        serde_json::json!([{"name": "app", "run": "test -f app.txt"}])
+    );
+    assert_ne!(json["integration_tip"], local.as_str());
+    assert_eq!(
+        env.rev(&f.down, "main"),
+        local,
+        "the local branch is untouched"
+    );
 }
 
 #[test]
@@ -103,43 +137,63 @@ fn invalid_configuration_is_refused() {
     let m = Mono::new();
     let env = &m.env;
 
-    let unknown = mono_config(&m.a, &m.b, "").replace("checks =", "squash = true\nchecks =");
-    env.commit(
-        &m.down,
-        &[(".git-intake.toml", &unknown)],
-        "bad: unknown key",
-    );
+    let unknown = mono_cfg(&m).replace("checks =", "squash = true\nchecks =");
+    m.land(&[(".git-intake.toml", &unknown)], "bad: unknown key");
     m.tool(&["status"])
         .code(2)
         .stderr(contains("unknown field `squash`"));
 
-    let nested = mono_config(&m.a, &m.b, "").replace("path = \"apps/b\"", "path = \"apps/a/b\"");
-    env.commit(&m.down, &[(".git-intake.toml", &nested)], "bad: nested");
+    let nested = mono_cfg(&m).replace("path = \"apps/b\"", "path = \"apps/a/b\"");
+    m.land(&[(".git-intake.toml", &nested)], "bad: nested");
     m.tool(&["start"]).code(2).stderr(contains(
         "upstream 'app-b' path 'apps/a/b' lies inside upstream 'app-a' path 'apps/a'",
     ));
 
-    let dup = mono_config(&m.a, &m.b, "").replace(&m.b.url(), &m.a.url());
-    env.commit(&m.down, &[(".git-intake.toml", &dup)], "bad: shared source");
+    let dup = mono_cfg(&m).replace(&m.b.url(), &m.a.url());
+    m.land(&[(".git-intake.toml", &dup)], "bad: shared source");
     m.tool(&["branches"]).code(2).stderr(contains(format!(
         "2 upstreams share the URL '{}' and the branch 'main'",
         m.a.url()
     )));
 
-    let root = mono_config(&m.a, &m.b, "").replace("path = \"apps/b\"\n", "");
-    env.commit(
-        &m.down,
-        &[(".git-intake.toml", &root)],
-        "bad: root with others",
-    );
+    let root = mono_cfg(&m).replace("path = \"apps/b\"\n", "");
+    m.land(&[(".git-intake.toml", &root)], "bad: root with others");
     m.tool(&["log"])
         .code(2)
         .stderr(contains("upstream 'app-b' has no path (the repository root) and cannot share the repository with 'app-a'"));
 
     let doctor = env.tool_json(&m.down, &["doctor", "--json"], 1);
     assert_eq!(doctor["healthy"], false);
-    assert_eq!(doctor["checks"][0]["check"], "configuration");
-    assert_eq!(doctor["checks"][0]["status"], "fail");
+    let configuration: Vec<&serde_json::Value> = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["check"] == "configuration")
+        .collect();
+    assert_eq!(configuration.len(), 1, "{doctor}");
+    assert_eq!(configuration[0]["status"], "fail");
+
+    // A configuration without a publish remote is refused at HEAD, where the
+    // tool looks for the remote to read the integration branch from.
+    let unpublished = mono_config(&m.a, &m.b, "");
+    env.commit(
+        &m.down,
+        &[(".git-intake.toml", &unpublished)],
+        "bad: no publish remote",
+    );
+    let err = stderr(&m.tool(&["status"]).code(2));
+    assert!(
+        err.contains(
+            "the .git-intake.toml at HEAD does not tell where to read the integration tip from: \
+             invalid .git-intake.toml:"
+        ),
+        "{err}"
+    );
+    assert!(
+        err.contains("publish: a [publish] table naming the publish remote is required"),
+        "{err}"
+    );
+    assert!(err.contains("remote = \"origin\""), "{err}");
 
     std::fs::remove_file(m.down.join(".git-intake.toml")).unwrap();
     env.git(&m.down, &["commit", "-q", "-am", "remove config"]);
@@ -156,8 +210,7 @@ fn publish_setting_is_a_table_with_a_mode() {
 
     let string_form = committed.replace("[publish]\nremote = \"origin\"\nvia = \"push\"\n", "");
     let string_form = format!("publish = \"origin\"\n{string_form}");
-    env.commit(
-        &f.down,
+    f.land(
         &[(".git-intake.toml", &string_form)],
         "bad: publish as a string",
     );
@@ -170,8 +223,7 @@ fn publish_setting_is_a_table_with_a_mode() {
     assert!(err.contains("placed after the top-level keys"), "{err}");
 
     let unknown = committed.replace("via = \"push\"", "via = \"pull-request\"");
-    env.commit(
-        &f.down,
+    f.land(
         &[(".git-intake.toml", &unknown)],
         "bad: unknown publication mode",
     );
@@ -180,11 +232,7 @@ fn publish_setting_is_a_table_with_a_mode() {
     ));
 
     let default = committed.replace("via = \"push\"\n", "");
-    env.commit(
-        &f.down,
-        &[(".git-intake.toml", &default)],
-        "publish by default mode",
-    );
+    f.land(&[(".git-intake.toml", &default)], "publish by default mode");
     let json = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(json["publish"], "origin");
     assert_eq!(json["publish_via"], "push");
@@ -196,15 +244,11 @@ fn removed_and_invalid_upstream_settings_are_refused() {
     let env = &m.env;
 
     // A configuration of the previous release: a remote and a mirror.
-    let old = mono_config(&m.a, &m.b, "").replace(
+    let old = mono_cfg(&m).replace(
         &format!("url = {:?}\n", m.a.url()),
         "remote = \"app-a\"\nmirror = \"mirror-a\"\n",
     );
-    env.commit(
-        &m.down,
-        &[(".git-intake.toml", &old)],
-        "old: remote and mirror",
-    );
+    m.land(&[(".git-intake.toml", &old)], "old: remote and mirror");
     let err = stderr(&m.tool(&["status"]).code(2));
     assert!(
         err.contains(
@@ -220,16 +264,14 @@ fn removed_and_invalid_upstream_settings_are_refused() {
         "{err}"
     );
 
-    let no_url = mono_config(&m.a, &m.b, "").replace(&format!("url = {:?}\n", m.b.url()), "");
-    env.commit(&m.down, &[(".git-intake.toml", &no_url)], "bad: no url");
+    let no_url = mono_cfg(&m).replace(&format!("url = {:?}\n", m.b.url()), "");
+    m.land(&[(".git-intake.toml", &no_url)], "bad: no url");
     m.tool(&["start"])
         .code(2)
         .stderr(contains("upstream 'app-b': `url` is required"));
 
-    let port_path = mono_config(&m.a, &m.b, "")
-        .replace("path = \"apps/b\"", "path = \"apps/b\"\nmode = \"port\"");
-    env.commit(
-        &m.down,
+    let port_path = mono_cfg(&m).replace("path = \"apps/b\"", "path = \"apps/b\"\nmode = \"port\"");
+    m.land(
         &[(".git-intake.toml", &port_path)],
         "bad: port under a path",
     );
@@ -237,9 +279,8 @@ fn removed_and_invalid_upstream_settings_are_refused() {
         "upstream 'app-b': an upstream in `port` mode is taken at the repository root and cannot have a path",
     ));
 
-    let bad_name = mono_config(&m.a, &m.b, "").replace("name = \"app-b\"", "name = \"app.lock\"");
-    env.commit(
-        &m.down,
+    let bad_name = mono_cfg(&m).replace("name = \"app-b\"", "name = \"app.lock\"");
+    m.land(
         &[(".git-intake.toml", &bad_name)],
         "bad: a name git cannot use",
     );
@@ -253,6 +294,25 @@ fn removed_and_invalid_upstream_settings_are_refused() {
 fn publish_remote_at_an_upstream_url_is_refused() {
     let f = Fork::new();
     let env = &f.env;
+    // Pushing to the upstream's repository counts.
+    env.git(
+        &f.down,
+        &[
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "origin",
+            &f.up.url(),
+        ],
+    );
+    f.tool(&["start"])
+        .code(2)
+        .stderr(contains("publish remote 'origin' has the URL"));
+    env.assert_no_update(&f.down);
+    env.git(&f.down, &["config", "--unset-all", "remote.origin.pushurl"]);
+    f.tool(&["status"]).success();
+    // So does fetching from it, where the integration branch is read.
     env.git(&f.down, &["remote", "set-url", "origin", &f.up.url()]);
     let err = stderr(&f.tool(&["status"]).code(2));
     assert!(
@@ -272,26 +332,6 @@ fn publish_remote_at_an_upstream_url_is_refused() {
     f.tool(&["status"]).code(2).stderr(contains(
         "has the URL ../upstream.git/, which names the repository of upstream 'upstream'",
     ));
-    // Pushing to the upstream's repository counts as well.
-    env.git(
-        &f.down,
-        &["remote", "set-url", "origin", &f.publish.to_string_lossy()],
-    );
-    f.tool(&["status"]).success();
-    env.git(
-        &f.down,
-        &[
-            "remote",
-            "set-url",
-            "--add",
-            "--push",
-            "origin",
-            &f.up.url(),
-        ],
-    );
-    f.tool(&["start"])
-        .code(2)
-        .stderr(contains("publish remote 'origin' has the URL"));
     env.assert_no_update(&f.down);
 }
 
@@ -340,27 +380,6 @@ fn hosted_urls_naming_the_same_repository_count_as_one() {
         &f.down,
         &[
             "remote",
-            "set-url",
-            "origin",
-            "https://example.com/team/upstream/",
-        ],
-    );
-    f.tool(&["status"]).code(2).stderr(contains(
-        "which names the repository of upstream 'upstream'",
-    ));
-    env.git(
-        &f.down,
-        &[
-            "remote",
-            "set-url",
-            "origin",
-            "https://example.com/team/other.git",
-        ],
-    );
-    env.git(
-        &f.down,
-        &[
-            "remote",
             "add",
             "mirror",
             "https://EXAMPLE.com/team/upstream",
@@ -388,6 +407,20 @@ fn hosted_urls_naming_the_same_repository_count_as_one() {
         ),
         "{doctor}"
     );
+    // The publish remote may not name it either.
+    env.git(&f.down, &["remote", "remove", "mirror"]);
+    env.git(
+        &f.down,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.com/team/upstream/",
+        ],
+    );
+    f.tool(&["status"]).code(2).stderr(contains(
+        "which names the repository of upstream 'upstream'",
+    ));
 }
 
 #[test]
@@ -450,8 +483,8 @@ fn one_unreachable_upstream_is_unavailable_and_start_creates_nothing() {
     let m = Mono::new();
     let env = &m.env;
     let gone = env.path("gone.git");
-    let cfg = mono_config(&m.a, &m.b, "").replace(&m.b.url(), &gone.to_string_lossy());
-    env.commit(&m.down, &[(".git-intake.toml", &cfg)], "mono: b moved");
+    let cfg = mono_cfg(&m).replace(&m.b.url(), &gone.to_string_lossy());
+    m.land(&[(".git-intake.toml", &cfg)], "mono: b moved");
 
     let status = env.tool_json(&m.down, &["status", "--json"], 1);
     assert_eq!(status["upstreams"][0]["state"], "not_imported");
@@ -484,6 +517,8 @@ fn reading_commands_leave_no_reference_remote_or_branch_behind() {
     m.import_all();
     env.push_upstream(&m.a, &[("x.txt", "x\n")], "app-a: x");
     let refs_before = env.git(&m.down, &["for-each-ref", "--format=%(refname)"]);
+    let remotes_before = env.git(&m.down, &["remote"]);
+    let main_before = env.rev(&m.down, "main");
     for args in [
         vec!["status"],
         vec!["status", "--check"],
@@ -497,7 +532,12 @@ fn reading_commands_leave_no_reference_remote_or_branch_behind() {
             refs_before,
             "{args:?} left references behind"
         );
-        assert_eq!(env.git(&m.down, &["remote"]), "", "{args:?} added a remote");
+        assert_eq!(
+            env.git(&m.down, &["remote"]),
+            remotes_before,
+            "{args:?} changed the remotes"
+        );
+        assert_eq!(env.rev(&m.down, "main"), main_before, "{args:?} moved main");
     }
 }
 
@@ -509,7 +549,14 @@ fn doctor_healthy_and_dropped_upstream() {
     let healthy = m.tool(&["doctor"]).success();
     let out = stdout(&healthy);
     assert!(
-        out.contains("[pass] the configuration on 'main' is valid"),
+        out.contains(&format!(
+            "[pass] the integration branch 'main' of the publish remote 'origin' was fetched at {}",
+            &m.tip()[..12]
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("[pass] the configuration at 'origin/main' is valid"),
         "{out}"
     );
     assert!(
@@ -536,27 +583,19 @@ fn doctor_healthy_and_dropped_upstream() {
         "{out}"
     );
     assert!(out.contains("[pass] app-b: last synced commit"), "{out}");
-    assert!(
-        out.contains("[pass] the main checkout has no uncommitted changes"),
-        "{out}"
-    );
-    assert!(
-        out.contains("[pass] no merge is in progress in the main checkout"),
-        "{out}"
-    );
     assert!(out.contains("[pass] no update is in progress"), "{out}");
     assert!(out.contains("all checks passed"), "{out}");
     assert!(!out.contains("FAIL"), "{out}");
     env.assert_no_update(&m.down);
 
     // app-b is dropped from the configuration.
-    let cfg = mono_config(&m.a, &m.b, "");
+    // The local branch lags the published imports until it is pulled.
+    env.git(&m.down, &["pull", "-q", "--ff-only", "origin", "main"]);
+    let cfg = mono_cfg(&m);
     let cut = cfg.find("\n[[upstream]]\nname = \"app-b\"").unwrap();
-    env.commit(
-        &m.down,
-        &[(".git-intake.toml", &cfg[..cut])],
-        "mono: drop app-b",
-    );
+    let publish = cfg.find("\n[publish]").unwrap();
+    let cfg = format!("{}{}", &cfg[..cut], &cfg[publish..]);
+    m.land(&[(".git-intake.toml", &cfg)], "mono: drop app-b");
     let json = env.tool_json(&m.down, &["doctor", "--json"], 0);
     let dropped: Vec<&serde_json::Value> = json["checks"]
         .as_array()
@@ -573,18 +612,22 @@ fn doctor_healthy_and_dropped_upstream() {
 }
 
 #[test]
-fn doctor_fails_on_dirty_checkout_and_inconsistent_state() {
+fn doctor_fails_on_an_inconsistent_state_and_ignores_the_main_checkout() {
     let m = Mono::new();
     let env = &m.env;
     m.import_all();
+    // The main checkout is the user's: its changes concern neither doctor
+    // nor start, which works in a worktree of its own.
     std::fs::write(m.down.join("README.md"), "changed\n").unwrap();
-    m.tool(&["doctor"]).code(1).stdout(contains(
-        "[FAIL] the main checkout has uncommitted changes: README.md",
-    ));
-    env.git(&m.down, &["checkout", "--", "README.md"]);
+    let doctor = stdout(&m.tool(&["doctor"]).success());
+    assert!(!doctor.contains("main checkout"), "{doctor}");
 
     env.push_upstream(&m.a, &[("x.txt", "x\n")], "app-a: x");
     m.tool(&["start"]).success();
+    assert_eq!(
+        std::fs::read_to_string(m.down.join("README.md")).unwrap(),
+        "changed\n"
+    );
     m.tool(&["doctor"]).success().stdout(contains(
         "[pass] the update in progress matches its worktree and branch",
     ));
@@ -597,6 +640,48 @@ fn doctor_fails_on_dirty_checkout_and_inconsistent_state() {
     m.tool(&["abort"]).success();
     env.assert_no_update(&m.down);
     m.tool(&["doctor"]).success();
+}
+
+#[test]
+fn doctor_reports_an_unreachable_publish_remote_and_skips_what_needs_the_tip() {
+    let m = Mono::new();
+    let env = &m.env;
+    m.import_all();
+    let gone = env.path("gone.git");
+    env.git(
+        &m.down,
+        &["remote", "set-url", "origin", &gone.to_string_lossy()],
+    );
+    let doctor = env.tool_json(&m.down, &["doctor", "--json"], 1);
+    let checks = doctor["checks"].as_array().unwrap();
+    let named = |name: &str| -> Vec<&serde_json::Value> {
+        checks.iter().filter(|c| c["check"] == name).collect()
+    };
+    let remote = named("publish_remote");
+    assert_eq!(remote.len(), 1, "{doctor}");
+    assert_eq!(remote[0]["status"], "fail");
+    let detail = remote[0]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(
+            "cannot fetch the integration branch 'main' from the publish remote 'origin'"
+        ),
+        "{detail}"
+    );
+    assert!(detail.contains("were not checked"), "{detail}");
+    for skipped in ["configuration", "fetch", "stale_journal", "remote"] {
+        assert!(named(skipped).is_empty(), "{skipped}: {doctor}");
+    }
+    assert_eq!(named("references")[0]["status"], "pass");
+    // The update branch is the tool's own, so its remains are looked for
+    // without the integration tip.
+    assert_eq!(named("update_state")[0]["status"], "pass");
+    // Every other command refuses with git's reason.
+    let err = stderr(&m.tool(&["status"]).code(2));
+    assert!(
+        err.contains("cannot fetch the integration branch 'main' from the publish remote 'origin'"),
+        "{err}"
+    );
+    env.assert_no_update(&m.down);
 }
 
 #[test]
@@ -693,7 +778,7 @@ fn state_files_of_another_format_are_named_or_ignored() {
         assert!(
             err.contains(&format!(
                 "the update in progress was started by a release that keeps its state in format 2; \
-                 this release (git-intake {RELEASE}) understands format 6. Finish or abort the update with a release that keeps format 2 (git-intake v0.2.0 to v0.2.2), then start it again with this release"
+                 this release (git-intake {RELEASE}) understands format 7. Finish or abort the update with a release that keeps format 2 (git-intake v0.2.0 to v0.2.2), then start it again with this release"
             )),
             "{args:?}: {err}"
         );
@@ -748,7 +833,7 @@ fn state_of_an_earlier_release_that_does_not_wait_is_refused() {
             assert!(
                 err.contains(&format!(
                     "the update in progress was started by a release (git-intake 0.3.6) that keeps its state in \
-                     format {version}; this release (git-intake {RELEASE}) understands format 6. {advice}"
+                     format {version}; this release (git-intake {RELEASE}) understands format 7. {advice}"
                 )),
                 "{version} {args:?}: {err}"
             );
@@ -787,7 +872,7 @@ fn state_of_a_newer_or_unknown_format_is_refused() {
         assert!(
             err.contains(&format!(
                 "the update in progress was started by a release (git-intake 9.9.9) that keeps its state in format 99; \
-                 this release (git-intake {RELEASE}) understands format 6, an older one"
+                 this release (git-intake {RELEASE}) understands format 7, an older one"
             )),
             "{args:?}: {err}"
         );
@@ -805,7 +890,7 @@ fn state_of_a_newer_or_unknown_format_is_refused() {
         let err = stderr(&f.tool(args).code(2));
         assert!(
             err.contains(&format!(
-                "names no state format; this release (git-intake {RELEASE}) understands format 6"
+                "names no state format; this release (git-intake {RELEASE}) understands format 7"
             )),
             "{args:?}: {err}"
         );
@@ -1103,6 +1188,7 @@ fn finish_never_pushes_to_an_upstream_under_another_url() {
         f.tool(&["start"]).success();
         f.tool(&["verify"]).success();
         let main = f.env.rev(&f.down, "main");
+        let published = f.tip();
         // The remote changes once the update is under way, after the
         // configuration was read.
         alias.apply(&f);
@@ -1117,6 +1203,7 @@ fn finish_never_pushes_to_an_upstream_under_another_url() {
         );
         assert!(!err.contains("s3cret"), "{alias:?}: {err}");
         assert_eq!(f.env.rev(&f.down, "main"), main, "{alias:?}");
+        assert_eq!(f.tip(), published, "{alias:?}");
         assert_upstream_untouched(&f, &tip, alias);
     }
 }
@@ -1187,6 +1274,8 @@ fn a_git_command_that_cannot_start_is_named_without_credentials() {
 #[test]
 fn an_upstream_url_with_credentials_is_refused_without_showing_them() {
     let f = Fork::new();
+    let path = f.down.join(".git-intake.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
     for (url, shown) in [
         (
             "https://user:s3cret@example.com/upstream.git",
@@ -1201,13 +1290,10 @@ fn an_upstream_url_with_credentials_is_refused_without_showing_them() {
             "ssh://deploy@example.com/upstream.git",
         ),
     ] {
-        let path = f.down.join(".git-intake.toml");
-        let committed = std::fs::read_to_string(&path).unwrap();
-        let at = committed.find("url = ").unwrap();
-        let end = at + committed[at..].find('\n').unwrap();
-        let config = format!("{}url = {url:?}{}", &committed[..at], &committed[end..]);
-        f.env.commit(
-            &f.down,
+        let at = original.find("url = ").unwrap();
+        let end = at + original[at..].find('\n').unwrap();
+        let config = format!("{}url = {url:?}{}", &original[..at], &original[end..]);
+        f.land(
             &[(".git-intake.toml", &config)],
             "fork: an upstream URL with credentials",
         );
@@ -1221,7 +1307,7 @@ fn an_upstream_url_with_credentials_is_refused_without_showing_them() {
             "s3cret",
             &[&["status"], &["status", "--json"], &["doctor", "--json"]],
         );
-        f.env.git(&f.down, &["reset", "-q", "--hard", "HEAD~1"]);
+        f.land(&[(".git-intake.toml", &original)], "fork: restore the URL");
     }
     // The user of an SSH URL names an account, not a credential.
     f.reconfigure(

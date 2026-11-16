@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::Exit;
@@ -12,15 +12,15 @@ use crate::commands::update::{
     blocking_prefix, described, limited, next_step, no_release, plural, step_name,
     unrelated_content,
 };
-use crate::config::{Check, Config, Mode, PublishVia, Upstream};
+use crate::config::{Check, Mode, PublishVia, Upstream};
 use crate::drift::{self, Drift, DriftState, SyncSource};
-use crate::git::{Git, abbrev, branch_ref};
+use crate::git::{Git, abbrev};
 use crate::output::{Render, emit, table};
 use crate::port::{self, OffLine, Standing, Verb};
 use crate::repo::Repo;
 use crate::state::{
-    CheckOutcome, ConflictFile, CopyStep, MergeKind, Stored, UpdateState, UpstreamStep, Waiting,
-    Work,
+    CheckOutcome, ConflictFile, CopyStep, MergeKind, Stored, UPDATE_BRANCH, UpdateState,
+    UpstreamStep, Waiting, Work,
 };
 use crate::sync_record::{self, Record};
 use crate::tags::{TagPattern, UpstreamTags};
@@ -29,11 +29,13 @@ use crate::upstreams::Fetches;
 #[derive(Serialize)]
 pub struct StatusDoc {
     pub integration: String,
+    /// The integration tip: the publish remote's integration branch, as
+    /// `status` fetched it.
     pub integration_tip: String,
     /// The publish remote.
-    pub publish: Option<String>,
-    /// `push` or `merge_request`; `null` without a publish remote.
-    pub publish_via: Option<String>,
+    pub publish: String,
+    /// `push` or `merge_request`.
+    pub publish_via: String,
     /// Merge-request mode: `replace_after` as the configuration writes it,
     /// or `null`.
     pub replace_after: Option<String>,
@@ -228,8 +230,6 @@ pub struct UpdateView {
     /// The last run that left out some of the checks, which never verifies
     /// the update, or `null`.
     pub partial_run: Option<PartialRunView>,
-    /// The error of the last rejected push while finishing, if any.
-    pub publish_error: Option<String>,
     /// The merge request an earlier release left the update waiting for.
     pub merge_request: Option<MergeRequestView>,
     /// The merge request whose update `sync` carried on, for an update it
@@ -338,14 +338,7 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     let loaded = repo.load_config()?;
     let config = &loaded.config;
     let git = &repo.git;
-    let tip = git
-        .commit(&branch_ref(&config.integration))?
-        .with_context(|| {
-            format!(
-                "the integration branch '{}' does not exist",
-                config.integration
-            )
-        })?;
+    let tip = loaded.tip.clone();
 
     let mut fetches = Fetches::new(repo);
     let mut fetched = Vec::new();
@@ -377,18 +370,14 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     }
     let fetch_failed = fetched.iter().any(|f| f.is_err());
     let tips: Vec<String> = fetched.iter().filter_map(|f| f.clone().ok()).collect();
-    let compared = match check {
-        true => tip_start_updates_from(git, config, &tip),
-        false => tip.clone(),
-    };
-    let latest = sync_record::latest(git, &sync_record::records(git, &compared, &tips)?)?;
+    let latest = sync_record::latest(git, &sync_record::records(git, &tip, &tips)?)?;
     let mut upstreams = Vec::new();
     for ((up, fetched), tags) in config.upstreams.iter().zip(&fetched).zip(&tag_lists) {
         let fetched = fetched.as_deref().map_err(String::as_str);
         let last = latest.get(&up.name);
         upstreams.push(match up.mode {
-            Mode::Follow => follow_status(git, &compared, up, last, fetched, tags.as_ref(), check)?,
-            Mode::Port => port_status(git, &compared, up, last, fetched, &tips),
+            Mode::Follow => follow_status(git, &tip, up, last, fetched, tags.as_ref(), check)?,
+            Mode::Port => port_status(git, &tip, up, last, fetched, &tips),
         });
     }
     drop(fetches);
@@ -400,9 +389,8 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     let mut pause_error = None;
     let mut forge_error = None;
     let mut term = "merge request";
-    if let Some(publish) = &config.publish
-        && publish.via == PublishVia::MergeRequest
-    {
+    let publish = &config.publish;
+    if publish.via == PublishVia::MergeRequest {
         match crate::pause::look(repo, publish, &config.upstreams) {
             Ok(recorded) => {
                 pause = recorded.map(|r| PauseView {
@@ -416,20 +404,13 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
             }
             Err(err) => pause_error = Some(format!("{err:#}")),
         }
-        // The merge request is judged against the integration branch it
-        // goes into, the publish remote's, which the local one may lag.
-        let read = merge_request::fetch_integration(git, &publish.remote, &config.integration)
-            .and_then(|remote_tip| {
-                let o = merge_request::overview(repo, publish, &config.integration, &remote_tip)?;
-                Ok((remote_tip, o))
-            });
-        match read {
-            Ok((remote_tip, o)) => {
+        match merge_request::overview(repo, config, &tip) {
+            Ok(o) => {
                 term = o.kind.term();
                 if let Some(open) = o.open {
                     merge_request = Some(OpenRequestView {
                         current: git.object_exists(&open.head)?
-                            && git.is_ancestor(&remote_tip, &open.head)?,
+                            && git.is_ancestor(&tip, &open.head)?,
                         reference: o.kind.reference(open.number),
                         number: open.number,
                         url: open.url,
@@ -446,7 +427,8 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
         }
     }
     let (release, release_error) = if config.release.is_some() {
-        match release::state(repo, config, &known, false) {
+        let from = crate::repo::Bootstrap::of(config, crate::repo::NamedBy::Tip);
+        match release::state(repo, &from, &known, false) {
             Ok(state) => (Some(state), None),
             Err(err) => (None, Some(format!("{err:#}"))),
         }
@@ -464,15 +446,12 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     let doc = StatusDoc {
         integration: config.integration.clone(),
         integration_tip: tip,
-        publish: config.publish.as_ref().map(|p| p.remote.clone()),
-        publish_via: config
-            .publish
-            .as_ref()
-            .map(|p| p.via.as_str().replace('-', "_")),
+        publish: config.publish.remote.clone(),
+        publish_via: config.publish.via.as_str().replace('-', "_"),
         replace_after: config
             .publish
+            .replace_after
             .as_ref()
-            .and_then(|p| p.replace_after.as_ref())
             .map(|a| a.text().to_string()),
         install: config.install.clone(),
         checks: config.checks.clone(),
@@ -496,19 +475,6 @@ pub fn run(repo: &Repo, check: bool, json: bool) -> Result<Exit> {
     } else {
         Exit::Success
     })
-}
-
-/// The integration tip an update would start from: the publish remote's when
-/// the local branch lags it, as `start` fast-forwards it first, and the local
-/// tip otherwise, also when the remote cannot be read.
-fn tip_start_updates_from(git: &Git, config: &Config, tip: &str) -> String {
-    let Some(publish) = &config.publish else {
-        return tip.to_string();
-    };
-    match merge_request::fetch_integration(git, &publish.remote, &config.integration) {
-        Ok(remote) if git.is_ancestor(tip, &remote).unwrap_or(false) => remote,
-        _ => tip.to_string(),
-    }
 }
 
 fn follow_status(
@@ -686,7 +652,7 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
         step: step.to_string(),
         base: state.base.clone(),
         start_base: state.start_base().to_string(),
-        branch: state.branch.clone(),
+        branch: UPDATE_BRANCH.to_string(),
         worktree: state.worktree.clone(),
         upstreams: state
             .upstreams
@@ -759,7 +725,6 @@ pub fn update_view(state: &UpdateState) -> Result<UpdateView> {
             left_out: p.left_out.clone(),
             passed: p.run.passed,
         }),
-        publish_error: state.finishing.as_ref().and_then(|f| f.push_error.clone()),
         merge_request: None,
         carried_from: state.carried_from.as_ref().map(|c| CarriedView {
             number: c.number,
@@ -795,7 +760,6 @@ fn waiting_view(w: &Waiting) -> UpdateView {
         checks: Vec::new(),
         verified_commit: None,
         partial_run: None,
-        publish_error: None,
         merge_request: Some(MergeRequestView {
             number: w.merge_request.number,
             remote: w.merge_request.remote.clone(),
@@ -823,21 +787,20 @@ fn shown(oid: &Option<String>, tag: &Option<String>) -> String {
 
 fn config_lines(doc: &StatusDoc, out: &mut String) {
     out.push_str(&format!(
-        "integration: {} at {}\n",
+        "integration: {} on '{}' at {}\n",
         doc.integration,
+        doc.publish,
         abbrev(&doc.integration_tip)
     ));
-    match (&doc.publish, &doc.publish_via) {
-        (Some(remote), Some(via)) => out.push_str(&format!(
-            "publish: {remote} (via {}{})\n",
-            via.replace('_', " "),
-            doc.replace_after
-                .as_deref()
-                .map(|a| format!(", replacing an untouched {} after {a}", doc.term))
-                .unwrap_or_default()
-        )),
-        _ => out.push_str("publish: none\n"),
-    }
+    out.push_str(&format!(
+        "publish: {} (via {}{})\n",
+        doc.publish,
+        doc.publish_via.replace('_', " "),
+        doc.replace_after
+            .as_deref()
+            .map(|a| format!(", replacing an untouched {} after {a}", doc.term))
+            .unwrap_or_default()
+    ));
     out.push_str(&format!(
         "install: {}\n",
         doc.install.as_deref().unwrap_or("none")
@@ -1145,9 +1108,6 @@ pub fn render_update(u: &UpdateView) -> String {
             outcomes.join(", "),
             p.left_out.join(", ")
         ));
-    }
-    if let Some(e) = &u.publish_error {
-        out.push_str(&format!("  publish rejected: {e}\n"));
     }
     out.push_str(&format!("  next: {}\n", u.next));
     out

@@ -660,7 +660,8 @@ mod tests {
             .map(|t| format!("tags = \"{t}\"\n{extra}"))
             .unwrap_or_default();
         crate::config::parse(&format!(
-            "integration = \"main\"\n[[upstream]]\nname = \"a\"\nurl = \"https://example.com/a.git\"\n\
+            "integration = \"main\"\n[publish]\nremote = \"origin\"\nvia = \"merge-request\"\n\
+             [[upstream]]\nname = \"a\"\nurl = \"https://example.com/a.git\"\n\
              branch = \"main\"\npath = \"apps/a\"\n{tags}[[upstream]]\nname = \"b\"\n\
              url = \"https://example.com/b.git\"\nbranch = \"main\"\npath = \"apps/b\"\n"
         ))

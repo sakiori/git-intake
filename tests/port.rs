@@ -59,8 +59,11 @@ fn write_plan(f: &Fork, lines: &[(&str, &str, &str)]) {
     fs::write(plan_path(f), text).unwrap();
 }
 
+/// The journal at `rev` of the publish remote, where the integration
+/// branch is.
 fn journal_at(f: &Fork, rev: &str) -> String {
-    f.env.git(&f.down, &["show", &format!("{rev}:{JOURNAL}")])
+    f.env
+        .git(&f.publish, &["show", &format!("{rev}:{JOURNAL}")])
 }
 
 /// The upstream commit a copy names as taken.
@@ -202,7 +205,7 @@ fn plan_is_written_edited_and_carried_out() {
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
     env.assert_no_update(&f.down);
-    assert_eq!(env.rev(&f.down, "main"), head);
+    assert_eq!(env.rev(&f.down, "main"), base, "the local `main` stays");
     assert_eq!(env.rev(&f.publish, "main"), head);
     assert_eq!(journal_at(&f, "main"), journal.trim_end());
 
@@ -607,6 +610,7 @@ fn switching_from_follow_to_port_starts_the_journal_at_the_last_merge() {
     f.tool(&["start", &format!("upstream={}", c[0])]).success();
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
+    f.pull();
     f.reconfigure("mode = \"follow\"", "mode = \"port\"");
 
     let up = port_status(&f, 0);
@@ -629,6 +633,7 @@ fn switching_from_follow_to_port_starts_the_journal_at_the_last_merge() {
     assert_eq!(log["upstreams"][0]["commits"][0]["commit"], c[2].as_str());
 
     // Back in follow mode the journal no longer means anything.
+    f.pull();
     f.reconfigure("mode = \"port\"", "mode = \"follow\"");
     let doctor = stdout(&f.tool(&["doctor"]).code(1));
     assert!(
@@ -644,8 +649,13 @@ fn a_port_without_shared_history_needs_a_journal_written_by_hand() {
     let env = common::Env::new();
     let up = env.upstream("upstream", &[("u.txt", "u\n")]);
     let down = env.work("product");
+    let publish = env.bare("product-publish");
+    env.git(
+        &down,
+        &["remote", "add", "origin", &publish.to_string_lossy()],
+    );
     let cfg = format!(
-        "integration = \"main\"\n\n[[upstream]]\nname = \"upstream\"\nurl = {:?}\nbranch = \"main\"\nmode = \"port\"\n",
+        "integration = \"main\"\n\n[publish]\nremote = \"origin\"\n\n[[upstream]]\nname = \"upstream\"\nurl = {:?}\nbranch = \"main\"\nmode = \"port\"\n",
         up.url()
     );
     env.commit(
@@ -653,6 +663,7 @@ fn a_port_without_shared_history_needs_a_journal_written_by_hand() {
         &[(".git-intake.toml", &cfg)],
         "product: configuration",
     );
+    env.git(&down, &["push", "-q", "origin", "main"]);
     let err = stderr(&env.tool(&down, &["start"]).code(2));
     assert!(
         err.contains("write the journal .git-intake/upstream.toml by hand, with the upstream commit the port starts from as its `base`"),
@@ -683,6 +694,7 @@ fn a_port_without_shared_history_needs_a_journal_written_by_hand() {
         &[(JOURNAL, &format!("base = \"{root}\"\n"))],
         "product: start the port",
     );
+    env.git(&down, &["push", "-q", "origin", "main"]);
     let status = env.tool_json(&down, &["status", "--json"], 0);
     assert_eq!(status["upstreams"][0]["pending"], 1);
     assert_eq!(status["upstreams"][0]["journal"], true);
@@ -706,7 +718,8 @@ fn journal_and_history_edited_by_hand_count() {
     let rest = &journal[cut + 1..];
     let second = rest[1..].find("[[decision]]").unwrap() + 1;
     let edited = format!("{}\n{}", &journal[..cut], &rest[second..]);
-    env.commit(&f.down, &[(JOURNAL, &edited)], "fork: reconsider change 1");
+    f.pull();
+    f.land(&[(JOURNAL, &edited)], "fork: reconsider change 1");
     let log = env.tool_json(&f.down, &["log", "--json"], 0);
     let pending: Vec<&str> = log["upstreams"][0]["commits"]
         .as_array()
@@ -732,6 +745,7 @@ fn journal_and_history_edited_by_hand_count() {
             &format!("Intake-Taken: {}", c[2]),
         ],
     );
+    env.git(&f.down, &["push", "-q", "origin", "main"]);
     let up = port_status(&f, 0);
     assert_eq!(up["taken"], 1);
     assert_eq!(up["decided"], 1);
@@ -788,8 +802,7 @@ fn an_invalid_journal_is_refused_by_name() {
     let env = &f.env;
     let c = upstream_commits(&f, 1);
     let base = env.rev(&f.up.bare, "main~1");
-    env.commit(
-        &f.down,
+    f.land(
         &[(
             JOURNAL,
             &format!(
@@ -817,8 +830,7 @@ fn an_invalid_journal_is_refused_by_name() {
         .stdout(contains("invalid journal"));
 
     // A commit decided twice.
-    env.commit(
-        &f.down,
+    f.land(
         &[(
             JOURNAL,
             &format!(
@@ -940,8 +952,7 @@ fn doctor_reports_stray_references_and_journals_of_no_upstream() {
     env.git(&f.down, &["update-ref", "-d", left]);
     f.tool(&["doctor"]).success();
 
-    env.commit(
-        &f.down,
+    f.land(
         &[(".git-intake/gone.toml", "base = \"x\"\n")],
         "fork: stale journal",
     );
@@ -1111,11 +1122,8 @@ fn retiring_commits_recovers_a_rewritten_port_upstream() {
             c[1].to_uppercase()
         ),
     );
-    env.commit(
-        &f.down,
-        &[(JOURNAL, &journal)],
-        "fork: retire the rewritten commits",
-    );
+    f.pull();
+    f.land(&[(JOURNAL, &journal)], "fork: retire the rewritten commits");
     let up = port_status(&f, 0);
     assert_eq!(up["state"], "pending");
     assert_eq!(up["taken"], 0);
@@ -1173,13 +1181,14 @@ fn retiring_commits_recovers_a_rewritten_port_upstream() {
     let start = journal.find("retired = [").unwrap();
     let end = start + journal[start..].find("]\n").unwrap() + 2;
     let retired_only = format!("{}{retired}{}", &journal[..start], &journal[end..]);
-    env.commit(&f.down, &[(JOURNAL, &retired_only)], "fork: retire again");
+    f.pull();
+    f.land(&[(JOURNAL, &retired_only)], "fork: retire again");
     assert_eq!(port_status(&f, 0)["state"], "rewritten");
     let moved = retired_only.replace(
         &format!("base = \"{base}\""),
         &format!("base = \"{}\"", root[0]),
     );
-    env.commit(&f.down, &[(JOURNAL, &moved)], "fork: move the base");
+    f.land(&[(JOURNAL, &moved)], "fork: move the base");
     let up = port_status(&f, 0);
     assert_eq!(up["state"], "pending");
     assert_eq!(up["base"], root[0].as_str());
@@ -1669,8 +1678,7 @@ fn a_catch_up_refuses_a_changed_journal() {
     f.tool(&["continue"]).success();
     f.tool(&["verify"]).success();
     let verified = env.rev(&env.update_worktree(&f.down), "HEAD");
-    env.commit(
-        &f.down,
+    let tip = f.land(
         &[(JOURNAL, "# written by hand\n")],
         "fork: edit the journal",
     );
@@ -1682,4 +1690,5 @@ fn a_catch_up_refuses_a_changed_journal() {
     );
     assert!(err.contains("Run `git intake abort`"), "{err}");
     assert_eq!(env.rev(&env.update_worktree(&f.down), "HEAD"), verified);
+    assert_eq!(f.tip(), tip, "nothing was pushed");
 }

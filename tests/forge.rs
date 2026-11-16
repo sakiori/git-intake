@@ -175,17 +175,20 @@ fn start_refuses_while_the_merge_request_is_open() {
 }
 
 #[test]
-fn start_refuses_unpublished_local_commits_in_merge_request_mode() {
+fn local_commits_on_main_never_ride_along_in_merge_request_mode() {
     let f = Fork::merge_request();
+    let env = &f.env;
     behind(&f);
-    f.env
-        .commit(&f.down, &[("local.txt", "l\n")], "fork: local");
-    let err = stderr(&f.tool(&["start"]).code(2));
-    assert!(
-        err.contains("'main' holds 1 commit that 'origin/main' lacks"),
-        "{err}"
-    );
-    f.env.assert_no_update(&f.down);
+    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local");
+    let tip = f.tip();
+    f.tool(&["start"]).success();
+    f.tool(&["finish"]).success();
+    // The update starts from the publish remote's integration branch, so
+    // the merge request carries none of the local commits.
+    let head = common::forge::branch_tip(&f.publish, MERGE_REQUEST_BRANCH).unwrap();
+    assert!(env.is_ancestor(&f.publish, &tip, &head));
+    assert!(!env.has_rev(&f.publish, &format!("{local}^{{commit}}")));
+    assert_eq!(env.rev(&f.down, "main"), local);
 }
 
 #[test]
@@ -261,6 +264,12 @@ fn the_forge_is_that_of_the_url_git_uses() {
     // the configured URL is on the forge's host.
     let g = Fork::merge_request();
     let elsewhere = g.env.bare("elsewhere");
+    // The rewritten URL holds the integration branch, which every command
+    // reads before it reaches the forge.
+    g.env.git(
+        &g.down,
+        &["push", "-q", &elsewhere.to_string_lossy(), "main"],
+    );
     g.env.git(
         &g.down,
         &[

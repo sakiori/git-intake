@@ -196,20 +196,33 @@ pub fn tag_refs(git: &Git, prefix: &str) -> Result<Vec<TagRef>> {
 /// The fetches of one command, into a namespace under
 /// `refs/git-intake/read/` that no other command uses. The namespace is
 /// removed when this is dropped, whatever the command's outcome.
-pub struct Fetches<'r> {
-    git: &'r Git,
+pub struct Fetches {
+    git: Git,
     namespace: String,
+    /// Whether anything was fetched into the namespace, which then has to be
+    /// removed.
+    used: bool,
 }
 
-impl<'r> Fetches<'r> {
-    pub fn new(repo: &'r Repo) -> Self {
+impl Fetches {
+    pub fn new(repo: &Repo) -> Self {
+        Self::with(&repo.git)
+    }
+
+    /// Fetches through `git`, a handle bound to the main worktree or the git
+    /// directory, as [`Repo::git`] is.
+    pub fn with(git: &Git) -> Self {
+        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
+        // One command may hold several namespaces at once.
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
-            git: &repo.git,
-            namespace: format!("{READ_PREFIX}{}-{nanos:x}/", std::process::id()),
+            git: git.clone(),
+            namespace: format!("{READ_PREFIX}{}-{nanos:x}-{n}/", std::process::id()),
+            used: false,
         }
     }
 
@@ -299,6 +312,7 @@ impl<'r> Fetches<'r> {
     ) -> Result<std::result::Result<ReleaseRefs, String>> {
         let head = format!("{}release/{remote}/head", self.namespace);
         let tags = format!("{}release/{remote}/tags/", self.namespace);
+        self.used = true;
         let out = self.git.raw(&[
             "fetch",
             "--quiet",
@@ -318,14 +332,19 @@ impl<'r> Fetches<'r> {
                 "fetching branch '{integration}' from '{remote}' left no commit"
             )));
         };
-        Ok(Ok((tip, tag_refs(self.git, &tags)?)))
+        Ok(Ok((tip, tag_refs(&self.git, &tags)?)))
     }
 
-    fn fetch(&self, up: &Upstream, refspec: &str) -> Result<std::result::Result<(), String>> {
+    fn fetch(&mut self, up: &Upstream, refspec: &str) -> Result<std::result::Result<(), String>> {
         self.fetch_from(&up.url, refspec)
     }
 
-    fn fetch_from(&self, source: &str, refspec: &str) -> Result<std::result::Result<(), String>> {
+    fn fetch_from(
+        &mut self,
+        source: &str,
+        refspec: &str,
+    ) -> Result<std::result::Result<(), String>> {
+        self.used = true;
         let out = self.git.raw(&[
             "fetch",
             "--quiet",
@@ -346,6 +365,9 @@ impl<'r> Fetches<'r> {
     }
 
     fn clean_up(&self) -> Result<()> {
+        if !self.used {
+            return Ok(());
+        }
         let refs =
             lines(
                 &self
@@ -360,7 +382,7 @@ impl<'r> Fetches<'r> {
     }
 }
 
-impl Drop for Fetches<'_> {
+impl Drop for Fetches {
     fn drop(&mut self) {
         if let Err(err) = self.clean_up() {
             esay!(

@@ -5,9 +5,9 @@ mod common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use common::{Env, FORK_FILE, Fork, Mono, stderr, stdout};
+use common::{Env, FORK_FILE, Fork, Mono, PUBLISH_BY_PUSH, stderr, stdout};
 use predicates::str::contains;
 
 fn hook(repo: &Path, name: &str, body: &str) {
@@ -16,6 +16,27 @@ fn hook(repo: &Path, name: &str, body: &str) {
     let path = dir.join(name);
     fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Adds a bare repository as the publish remote `origin` of `down` and
+/// publishes its `main` there; returns the bare repository.
+fn publish_remote(env: &Env, down: &Path) -> PathBuf {
+    let bare = env.bare("publish");
+    env.git(down, &["remote", "add", "origin", &bare.to_string_lossy()]);
+    env.git(down, &["push", "-q", "origin", "main"]);
+    bare
+}
+
+/// Publishes the local `main` of `repo`, as work landing on the integration
+/// branch does.
+fn push(env: &Env, repo: &Path) {
+    env.git(repo, &["push", "-q", "origin", "HEAD:main"]);
+}
+
+/// Brings the local `main` of `repo` up to date with the publish remote's,
+/// as a person does before working on it; the tool never needs it.
+fn pull(env: &Env, repo: &Path) {
+    env.git(repo, &["pull", "-q", "--ff-only", "origin", "main"]);
 }
 
 fn edit_state(repo: &Path, f: impl FnOnce(&mut serde_json::Value)) {
@@ -71,9 +92,10 @@ fn merge_without_its_sync_record_is_not_counted() {
 fn git_directory_path_segment_is_rejected() {
     let m = Mono::new();
     let env = &m.env;
-    let cfg =
-        common::mono_config(&m.a, &m.b, "").replace("path = \"apps/a\"", "path = \"vendor/.Git\"");
+    let cfg = common::mono_config(&m.a, &m.b, PUBLISH_BY_PUSH)
+        .replace("path = \"apps/a\"", "path = \"vendor/.Git\"");
     env.commit(&m.down, &[(".git-intake.toml", &cfg)], "bad: .git path");
+    push(env, &m.down);
     m.tool(&["status"]).code(2).stderr(contains(
         "path 'vendor/.Git': the path may not contain a '.git' segment",
     ));
@@ -83,11 +105,7 @@ fn git_directory_path_segment_is_rejected() {
 fn import_refuses_to_replace_a_file_on_the_path() {
     let m = Mono::new();
     let env = &m.env;
-    env.commit(
-        &m.down,
-        &[("apps", "a file, not a directory\n")],
-        "mono: apps file",
-    );
+    m.land(&[("apps", "a file, not a directory\n")], "mono: apps file");
     m.tool(&["start"]).code(2).stderr(contains(
         "'apps' is a file on the integration branch; importing under 'apps/a' would replace it",
     ));
@@ -111,11 +129,8 @@ fn finish_never_moves_integration_backwards_or_without_targets() {
     let env = &f.env;
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
-    let base = env.rev(&f.down, "main");
+    let base = f.tip();
     let wt = env.update_worktree(&f.down);
-    // With the integration branch not checked out, finish moves it with
-    // update-ref, which does not itself insist on a fast-forward.
-    env.git(&f.down, &["checkout", "-q", "--detach"]);
 
     // A verified head that does not contain the base.
     env.git(&wt, &["reset", "-q", "--hard", "HEAD^1^"]);
@@ -125,7 +140,8 @@ fn finish_never_moves_integration_backwards_or_without_targets() {
     f.tool(&["finish"])
         .code(2)
         .stderr(contains("does not contain the base"));
-    assert_eq!(env.rev(&f.down, "main"), base);
+    assert_eq!(f.tip(), base, "nothing was pushed");
+    assert_eq!(env.rev(&f.down, "main"), base, "no local branch moved");
 
     // A verified head that contains the base but not the target.
     env.git(&wt, &["reset", "-q", "--hard", &base]);
@@ -134,35 +150,37 @@ fn finish_never_moves_integration_backwards_or_without_targets() {
     f.tool(&["finish"]).code(2).stderr(contains(
         "does not contain the targets, copies or journal commits of",
     ));
-    assert_eq!(env.rev(&f.down, "main"), base);
+    assert_eq!(f.tip(), base, "nothing was pushed");
+    assert_eq!(env.rev(&f.down, "main"), base, "no local branch moved");
 }
 
 #[test]
-fn finish_validates_every_checkout_before_moving_anything() {
+fn the_main_checkout_is_neither_required_clean_nor_changed() {
     let f = Fork::new();
     let env = &f.env;
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
+    let base = f.tip();
+    // An uncommitted change and an untracked file the update also brings.
+    fs::write(f.down.join(FORK_FILE), "mine\n").unwrap();
+    fs::write(f.down.join("n.txt"), "mine\n").unwrap();
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
-    let base = env.rev(&f.down, "main");
-
-    // An untracked file the fast-forward of the main checkout would overwrite.
-    fs::write(f.down.join("n.txt"), "mine\n").unwrap();
+    let head = env.rev(&env.update_worktree(&f.down), "HEAD");
     f.tool(&["finish"])
-        .code(2)
-        .stderr(contains("'main' is checked out in"))
-        .stderr(contains("cannot follow the fast-forward"));
-    assert_eq!(env.rev(&f.down, "main"), base, "nothing moved");
-    assert_eq!(env.rev(&f.publish, "main"), base, "nothing published");
-
-    fs::remove_file(f.down.join("n.txt")).unwrap();
-    f.tool(&["finish"]).success();
-    assert_eq!(fs::read_to_string(f.down.join("n.txt")).unwrap(), "n\n");
+        .success()
+        .stdout(contains(format!("pushed {} to 'origin/main'", &head[..12])));
+    assert_eq!(f.tip(), head);
+    assert_eq!(env.rev(&f.down, "main"), base, "the local main stays");
+    assert_eq!(
+        fs::read_to_string(f.down.join(FORK_FILE)).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(fs::read_to_string(f.down.join("n.txt")).unwrap(), "mine\n");
     env.assert_no_update(&f.down);
 }
 
 #[test]
-fn interrupted_finish_resumes_and_blocks_abort() {
+fn a_finish_interrupted_after_its_push_completes_the_update() {
     let f = Fork::new();
     let env = &f.env;
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
@@ -171,37 +189,26 @@ fn interrupted_finish_resumes_and_blocks_abort() {
     let base = env.rev(&f.down, "main");
     let head = env.rev(&env.update_worktree(&f.down), "HEAD");
 
-    // finish planned its move and moved the integration branch, then stopped.
-    edit_state(&f.down, |s| {
-        s["finishing"] = serde_json::json!({
-            "moves": [{"branch": "main", "old": base, "new": head}],
-            "push_error": null,
-        });
-    });
-    env.git(&f.down, &["merge", "-q", "--ff-only", &head]);
-
+    // finish pushed the verified commit, then stopped before cleaning up.
+    env.git(
+        &f.down,
+        &["push", "-q", "origin", &format!("{head}:refs/heads/main")],
+    );
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
-    assert_eq!(status["update"]["step"], "finishing");
+    assert_eq!(status["update"]["step"], "verified");
     assert_eq!(status["update"]["next"], "git intake finish");
-    f.tool(&["status"])
-        .success()
-        .stdout(contains("update in progress: finishing"));
-    f.tool(&["abort"])
-        .code(2)
-        .stderr(contains("`finish` has already moved main"));
-    f.tool(&["continue"])
-        .code(2)
-        .stderr(contains("`finish` is in progress"));
-    f.tool(&["verify"])
-        .code(2)
-        .stderr(contains("`finish` is in progress"));
 
     f.tool(&["finish"])
         .success()
-        .stdout(contains("resuming finish"))
-        .stdout(contains(format!("main: at {}", &head[..12])))
-        .stdout(contains("pushed main to 'origin'"));
-    assert_eq!(env.rev(&f.publish, "main"), head);
+        .stdout(contains(format!(
+            "'origin/main' at {} already contains the verified commit {}",
+            &head[..12],
+            &head[..12]
+        )))
+        .stdout(contains("nothing was pushed"))
+        .stdout(contains("update finished"));
+    assert_eq!(f.tip(), head);
+    assert_eq!(env.rev(&f.down, "main"), base, "no local branch moved");
     env.assert_no_update(&f.down);
 }
 
@@ -214,7 +221,7 @@ fn merge_log_configuration_does_not_break_the_record() {
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    let msg = env.git(&f.down, &["log", "-1", "--format=%B", "main"]);
+    let msg = env.git(&f.publish, &["log", "-1", "--format=%B", "main"]);
     // The record's trailers end the message, with no shortlog after them.
     assert!(
         msg.trim_end().ends_with(&format!(
@@ -262,10 +269,11 @@ fn template_pair() -> (Env, common::Upstream, std::path::PathBuf) {
     env.git(&down, &["remote", "remove", "origin"]);
     let up = common::Upstream { bare, work };
     let cfg = format!(
-        "integration = \"main\"\nchecks = [{{ name = \"a\", run = \"test -f apps/a/a.txt\" }}]\n\n[[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n",
+        "integration = \"main\"\nchecks = [{{ name = \"a\", run = \"test -f apps/a/a.txt\" }}]\n\n[[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n{PUBLISH_BY_PUSH}",
         up.url()
     );
     env.commit(&down, &[(".git-intake.toml", &cfg)], "mono: configuration");
+    publish_remote(&env, &down);
     (env, up, down)
 }
 
@@ -281,6 +289,7 @@ fn upstream_sharing_a_template_ancestor_is_imported() {
     env.tool(&down, &["start"]).success();
     env.tool(&down, &["verify"]).success();
     env.tool(&down, &["finish"]).success();
+    pull(&env, &down);
     assert!(down.join("apps/a/a.txt").exists());
     assert!(down.join("apps/a/template.txt").exists());
     let status = env.tool_json(&down, &["status", "--json"], 0);
@@ -293,8 +302,10 @@ fn imported_path_removed_downstream_is_refused() {
     env.tool(&down, &["start"]).success();
     env.tool(&down, &["verify"]).success();
     env.tool(&down, &["finish"]).success();
+    pull(&env, &down);
     env.git(&down, &["rm", "-q", "-r", "apps/a"]);
     env.git(&down, &["commit", "-q", "-m", "mono: remove apps/a"]);
+    push(&env, &down);
     env.push_upstream(&up, &[("b.txt", "b\n")], "app-a: more");
     env.tool(&down, &["start"]).code(2).stderr(contains(
         "was imported before, but path 'apps/a' was removed on the integration branch",
@@ -409,17 +420,28 @@ fn reject_pushes(bare: &Path) {
 }
 
 #[test]
-fn rerun_finish_publishes_only_the_planned_commits() {
+fn a_rejected_push_is_made_again_with_only_the_verified_commit() {
     let f = Fork::new();
     let env = &f.env;
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
-    let planned = env.rev(&env.update_worktree(&f.down), "HEAD");
+    let verified = env.rev(&env.update_worktree(&f.down), "HEAD");
+    let published = f.tip();
 
     reject_pushes(&f.publish);
-    f.tool(&["finish"]).code(2).stderr(contains("was rejected"));
-    // A local commit lands on the integration branch while finishing.
+    f.tool(&["finish"])
+        .code(2)
+        .stderr(contains(format!(
+            "pushing {} to 'origin/main' was rejected",
+            &verified[..12]
+        )))
+        .stderr(contains("Nothing was published, and the update is kept"))
+        .stderr(contains("Run `git intake finish` again"));
+    assert_eq!(f.tip(), published, "nothing was published");
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["step"], "verified");
+    // A local commit lands on the local main meanwhile.
     let local = env.commit(
         &f.down,
         &[("local.txt", "unverified\n")],
@@ -427,18 +449,11 @@ fn rerun_finish_publishes_only_the_planned_commits() {
     );
     fs::remove_file(f.publish.join("hooks/pre-receive")).unwrap();
 
-    f.tool(&["finish"])
-        .success()
-        .stdout(contains(format!(
-            "main: at {}, which contains",
-            &local[..12]
-        )))
-        .stdout(contains("pushed main to 'origin'"));
-    assert_eq!(
-        env.rev(&f.publish, "main"),
-        planned,
-        "only the planned commit is published"
-    );
+    f.tool(&["finish"]).success().stdout(contains(format!(
+        "pushed {} to 'origin/main'",
+        &verified[..12]
+    )));
+    assert_eq!(f.tip(), verified, "only the verified commit is published");
     assert_eq!(
         env.rev(&f.down, "main"),
         local,
@@ -448,59 +463,29 @@ fn rerun_finish_publishes_only_the_planned_commits() {
 }
 
 #[test]
-fn finish_no_publish_closes_an_update_the_remote_always_rejects() {
+fn an_update_the_remote_always_rejects_is_kept_until_abort() {
     let f = Fork::new();
     let env = &f.env;
     env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
-    let planned = env.rev(&env.update_worktree(&f.down), "HEAD");
-    let published = env.rev(&f.publish, "main");
+    let published = f.tip();
+    let local = env.rev(&f.down, "main");
 
     reject_pushes(&f.publish);
     f.tool(&["finish"])
         .code(2)
-        .stderr(contains("finish --no-publish"));
-    f.tool(&["finish"]).code(2);
-    f.tool(&["finish", "--no-publish"])
-        .success()
-        .stdout(contains(
-            "not published to 'origin' (advanced locally only): main",
-        ))
-        .stdout(contains("update finished"));
-    assert_eq!(env.rev(&f.down, "main"), planned);
-    assert_eq!(
-        env.rev(&f.publish, "main"),
-        published,
-        "the remote is unchanged"
-    );
+        .stderr(contains("`git intake abort` ends the update"));
+    f.tool(&["finish"]).code(2).stderr(contains("was rejected"));
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["step"], "verified");
+    f.tool(&["abort"]).success().stdout(contains(
+        "update aborted; abort changed nothing on the publish remote",
+    ));
+    assert_eq!(f.tip(), published, "the remote is unchanged");
+    assert_eq!(env.rev(&f.down, "main"), local, "no local branch moved");
     env.assert_no_update(&f.down);
-    let report = env.tool_json(&f.down, &["report", "--json"], 0);
-    assert_eq!(report["in_progress"], false);
-    assert_eq!(report["unpublished"], serde_json::json!(["main"]));
-    f.tool(&["report"])
-        .success()
-        .stdout(contains("not published (advanced locally only): main"));
-}
-
-#[test]
-fn finish_no_publish_works_before_any_push_attempt() {
-    let f = Fork::new();
-    let env = &f.env;
-    env.push_upstream(&f.up, &[("n.txt", "n\n")], "upstream: n");
-    f.tool(&["start"]).success();
-    f.tool(&["finish", "--no-publish"])
-        .code(2)
-        .stderr(contains("not verified"));
-    f.tool(&["verify"]).success();
-    let planned = env.rev(&env.update_worktree(&f.down), "HEAD");
-    let published = env.rev(&f.publish, "main");
-    f.tool(&["finish", "--no-publish"])
-        .success()
-        .stdout(contains("not published to 'origin'"));
-    assert_eq!(env.rev(&f.down, "main"), planned);
-    assert_eq!(env.rev(&f.publish, "main"), published);
-    env.assert_no_update(&f.down);
+    f.tool(&["finish", "--no-publish"]).code(2);
 }
 
 #[test]
@@ -509,10 +494,11 @@ fn path_imported_by_subtree_add_is_adopted() {
     let up = env.upstream("app-a", &[("a.txt", "a1\na2\n")]);
     let down = env.work("mono");
     let cfg = format!(
-        "integration = \"main\"\nchecks = [{{ name = \"a\", run = \"test -f apps/a/a.txt\" }}]\n\n[[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n",
+        "integration = \"main\"\nchecks = [{{ name = \"a\", run = \"test -f apps/a/a.txt\" }}]\n\n[[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n{PUBLISH_BY_PUSH}",
         up.url()
     );
     env.commit(&down, &[(".git-intake.toml", &cfg)], "mono: configuration");
+    publish_remote(&env, &down);
     let first = fetch_branch(&env, &down, &up);
     // What `git subtree add --prefix=apps/a` does: no sync record.
     env.git(
@@ -529,6 +515,7 @@ fn path_imported_by_subtree_add_is_adopted() {
     );
     env.git(&down, &["read-tree", "--prefix=apps/a/", "-u", &first]);
     env.git(&down, &["commit", "-q", "-m", "Add 'apps/a/' from app-a"]);
+    push(&env, &down);
 
     let status = env.tool_json(&down, &["status", "--json"], 0);
     let u = &status["upstreams"][0];
@@ -555,6 +542,7 @@ fn path_imported_by_subtree_add_is_adopted() {
     env.tool(&down, &["start"]).success();
     env.tool(&down, &["verify"]).success();
     env.tool(&down, &["finish"]).success();
+    pull(&env, &down);
     assert_eq!(
         fs::read_to_string(down.join("apps/a/a.txt")).unwrap(),
         "a1\na2-up\n"
@@ -606,7 +594,9 @@ struct Twins {
     env: Env,
     a: common::Upstream,
     b: common::Upstream,
-    down: std::path::PathBuf,
+    down: PathBuf,
+    /// The publish remote's repository.
+    publish: PathBuf,
 }
 
 fn twins() -> Twins {
@@ -644,12 +634,19 @@ fn twins() -> Twins {
     let cfg = format!(
         "integration = \"main\"\n\n\
          [[upstream]]\nname = \"app-a\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/a\"\n\n\
-         [[upstream]]\nname = \"app-b\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/b\"\n",
+         [[upstream]]\nname = \"app-b\"\nurl = {:?}\nbranch = \"main\"\npath = \"apps/b\"\n{PUBLISH_BY_PUSH}",
         a.url(),
         b.url()
     );
     env.commit(&down, &[(".git-intake.toml", &cfg)], "mono: configuration");
-    Twins { env, a, b, down }
+    let publish = publish_remote(&env, &down);
+    Twins {
+        env,
+        a,
+        b,
+        down,
+        publish,
+    }
 }
 
 fn assert_b_unrelated(t: &Twins) {
@@ -686,6 +683,7 @@ fn ancestry_shared_only_through_a_template_is_not_an_import() {
         &[("apps/b/own.txt", "the monorepo's own code\n")],
         "mono: own apps/b",
     );
+    push(env, &t.down);
 
     // Before app-a is imported.
     assert_b_unrelated(&t);
@@ -694,6 +692,7 @@ fn ancestry_shared_only_through_a_template_is_not_an_import() {
     env.tool(&t.down, &["start", "app-a"]).success();
     env.tool(&t.down, &["verify"]).success();
     env.tool(&t.down, &["finish"]).success();
+    pull(env, &t.down);
     assert!(t.down.join("apps/a/template.txt").exists());
     assert_b_unrelated(&t);
     assert_eq!(
@@ -709,6 +708,7 @@ fn subtree_add_import_sharing_a_template_is_adopted() {
     env.tool(&t.down, &["start", "app-a"]).success();
     env.tool(&t.down, &["verify"]).success();
     env.tool(&t.down, &["finish"]).success();
+    pull(env, &t.down);
     // app-b imported by other means, as `git subtree add` does.
     let b1 = fetch_branch(env, &t.down, &t.b);
     env.git(
@@ -725,6 +725,7 @@ fn subtree_add_import_sharing_a_template_is_adopted() {
     );
     env.git(&t.down, &["read-tree", "--prefix=apps/b/", "-u", &b1]);
     env.git(&t.down, &["commit", "-q", "-m", "Add 'apps/b/' from app-b"]);
+    push(env, &t.down);
 
     let status = env.tool_json(&t.down, &["status", "--json"], 0);
     let b = &status["upstreams"][1];
@@ -739,6 +740,7 @@ fn subtree_add_import_sharing_a_template_is_adopted() {
     env.tool(&t.down, &["start"]).success();
     env.tool(&t.down, &["verify"]).success();
     env.tool(&t.down, &["finish"]).success();
+    pull(env, &t.down);
     assert_eq!(
         fs::read_to_string(t.down.join("apps/b/app-b.txt")).unwrap(),
         "own\nmore\n"
@@ -762,6 +764,7 @@ fn unusual_file_names_are_listed_once_and_raw() {
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
+    f.pull();
     env.commit(
         &f.down,
         &[(names[0], "1\nfork\n3\n"), (names[1], "1\nfork\n3\n")],
@@ -901,18 +904,20 @@ fn unrelated_path_is_refused_whichever_upstreams_are_fetched() {
         &[("apps/b/own.txt", "the monorepo's own code\n")],
         "mono: own apps/b",
     );
+    push(env, &t.down);
     env.tool(&t.down, &["start", "app-a"]).success();
     env.tool(&t.down, &["verify"]).success();
     env.tool(&t.down, &["finish"]).success();
 
-    // A fresh clone in which only app-b has been fetched.
+    // A fresh clone of the publish remote, in which only app-b has been
+    // fetched.
     let clone = env.path("clone");
     env.git(
         &env.path(""),
         &[
             "clone",
             "-q",
-            &t.down.to_string_lossy(),
+            &t.publish.to_string_lossy(),
             &clone.to_string_lossy(),
         ],
     );
@@ -934,6 +939,7 @@ fn import_without_record_survives_another_upstream_merging_it() {
     let env = &t.env;
     let a1 = fetch_branch(env, &t.down, &t.a);
     subtree_add(env, &t.down, "apps/a", &a1);
+    push(env, &t.down);
     env.tool(&t.down, &["start", "app-b"]).success();
     env.tool(&t.down, &["verify"]).success();
     env.tool(&t.down, &["finish"]).success();
@@ -964,6 +970,7 @@ fn import_without_record_survives_another_upstream_merging_it() {
     env.tool(&t.down, &["start", "app-a"]).success();
     env.tool(&t.down, &["verify"]).success();
     env.tool(&t.down, &["finish"]).success();
+    pull(env, &t.down);
     assert_eq!(
         fs::read_to_string(t.down.join("apps/a/app-a.txt")).unwrap(),
         "own\nmore\n"
@@ -990,6 +997,7 @@ fn subtree_pull_merge_without_record_is_the_newest_sync() {
         fs::read_to_string(t.down.join("apps/a/app-a.txt")).unwrap(),
         "own\n2\n"
     );
+    push(env, &t.down);
 
     let status = env.tool_json(&t.down, &["status", "--json"], 0);
     let a = &status["upstreams"][0];
@@ -1037,9 +1045,11 @@ fn synced_upstream_with_removed_path_is_reported_as_path_removed() {
     // With a sync record.
     let m = Mono::new();
     m.import_all();
+    pull(&m.env, &m.down);
     m.env.git(&m.down, &["rm", "-q", "-r", "apps/a"]);
     m.env
         .git(&m.down, &["commit", "-q", "-m", "mono: remove apps/a"]);
+    push(&m.env, &m.down);
     assert_path_removed(&m.env, &m.down, 0, "record");
     let status = m.env.tool_json(&m.down, &["status", "--json"], 0);
     assert_eq!(status["upstreams"][1]["state"], "current");
@@ -1051,6 +1061,7 @@ fn synced_upstream_with_removed_path_is_reported_as_path_removed() {
     t.env.git(&t.down, &["rm", "-q", "-r", "apps/a"]);
     t.env
         .git(&t.down, &["commit", "-q", "-m", "mono: remove apps/a"]);
+    push(&t.env, &t.down);
     assert_path_removed(&t.env, &t.down, 0, "history");
 }
 
@@ -1074,6 +1085,7 @@ fn path_imported_on_a_branch_merged_with_a_merge_commit_is_adopted() {
             "import",
         ],
     );
+    push(env, &m.down);
 
     let status = env.tool_json(&m.down, &["status", "--json"], 0);
     let u = &status["upstreams"][0];

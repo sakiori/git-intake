@@ -51,7 +51,7 @@ fn follow_upstream_names_the_base_head_target_and_previous_commit() {
 
     // First update: the fork shares the upstream's first commit.
     let t1 = env.push_upstream(&f.up, &[("new.txt", "x\n")], "upstream: new");
-    let base = env.rev(&f.down, "main");
+    let base = f.tip();
     f.tool(&["start"]).success();
     let head = env.rev(&env.update_worktree(&f.down), "HEAD");
     // Values inherited from the caller's environment are not passed on.
@@ -89,7 +89,7 @@ fn follow_upstream_names_the_base_head_target_and_previous_commit() {
 
     // Second update: the previous commit is the last target.
     let t2 = env.push_upstream(&f.up, &[(FORK_FILE, "one\n")], "upstream: shorter");
-    let base = env.rev(&f.down, "main");
+    let base = f.tip();
     f.tool(&["start"]).success();
     let head = env.rev(&env.update_worktree(&f.down), "HEAD");
     f.tool(&["verify"]).success();
@@ -114,7 +114,7 @@ fn follow_target_named_by_a_revision_is_not_the_fetched_tip() {
     let initial = env.rev(&f.up.bare, "main");
     let t1 = env.push_upstream(&f.up, &[("one.txt", "1\n")], "upstream: one");
     let tip = env.push_upstream(&f.up, &[("two.txt", "2\n")], "upstream: two");
-    let base = env.rev(&f.down, "main");
+    let base = f.tip();
     f.tool(&["start", &format!("upstream={t1}")]).success();
     let head = env.rev(&env.update_worktree(&f.down), "HEAD");
     f.tool(&["verify"]).success();
@@ -140,11 +140,10 @@ fn follow_target_named_by_a_revision_is_not_the_fetched_tip() {
 fn every_queued_upstream_gets_its_own_variables() {
     let m = Mono::new();
     let env = &m.env;
-    m.env.commit(
-        &m.down,
+    m.land(
         &[(
             ".git-intake.toml",
-            &common::mono_config(&m.a, &m.b, "").replace(
+            &common::mono_config(&m.a, &m.b, common::PUBLISH_BY_PUSH).replace(
                 "checks = [",
                 &format!(
                     "checks = [{{ name = \"env\", run = {:?} }}, {{ name = \"reachable\", run = {:?} }}, ",
@@ -159,7 +158,7 @@ fn every_queued_upstream_gets_its_own_variables() {
     // A first import has no previous commit.
     let a1 = env.rev(&m.a.bare, "main");
     let b1 = env.rev(&m.b.bare, "main");
-    let base = env.rev(&m.down, "main");
+    let base = m.tip();
     m.tool(&["start"]).success();
     let head = env.rev(&env.update_worktree(&m.down), "HEAD");
     m.tool(&["verify"]).success();
@@ -180,7 +179,7 @@ fn every_queued_upstream_gets_its_own_variables() {
 
     // Only the upstreams the update takes are named, in queue order.
     let b2 = env.push_upstream(&m.b, &[("b.txt", "b1\n")], "app-b: shorter");
-    let base = env.rev(&m.down, "main");
+    let base = m.tip();
     m.tool(&["start"]).success();
     let head = env.rev(&env.update_worktree(&m.down), "HEAD");
     m.tool(&["verify"]).success();
@@ -215,7 +214,7 @@ fn port_upstream_names_the_newest_commit_it_takes_or_decides() {
             )
         })
         .collect();
-    let base = env.rev(&f.down, "main");
+    let base = f.tip();
     f.tool(&["start"]).success();
     let plan = env.intake_dir(&f.down).join("plan");
     fs::write(
@@ -249,11 +248,11 @@ fn port_upstream_names_the_newest_commit_it_takes_or_decides() {
 #[test]
 fn upstream_names_that_share_variables_are_refused() {
     let m = Mono::new();
-    m.env.commit(
-        &m.down,
+    m.land(
         &[(
             ".git-intake.toml",
-            &common::mono_config(&m.a, &m.b, "").replace("name = \"app-b\"", "name = \"APP.a\""),
+            &common::mono_config(&m.a, &m.b, common::PUBLISH_BY_PUSH)
+                .replace("name = \"app-b\"", "name = \"APP.a\""),
         )],
         "mono: clashing names",
     );
@@ -279,13 +278,13 @@ fn a_catch_up_names_the_tip_it_caught_up_with_as_the_base() {
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
     let before = dumped(env, "check-env");
-    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
+    let landed = f.land(&[("local.txt", "l\n")], "fork: work landed meanwhile");
 
     f.tool(&["finish"]).success();
-    let merge = env.rev(&f.down, "main");
+    let merge = f.tip();
     let after = dumped(env, "check-env");
     assert!(
-        after.contains(&format!("GIT_INTAKE_BASE={local}")),
+        after.contains(&format!("GIT_INTAKE_BASE={landed}")),
         "{after:?}"
     );
     assert!(

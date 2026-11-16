@@ -23,8 +23,6 @@ pub struct ReportDoc {
     /// which upstream ranges and the repository's own changes are measured
     /// from.
     pub base: String,
-    /// Branches `finish --no-publish` advanced locally without publishing.
-    pub unpublished: Vec<String>,
     pub upstreams: Vec<UpstreamReport>,
     /// The catch-up merges with the integration branch, oldest first.
     pub catch_ups: Vec<CatchUpReport>,
@@ -219,11 +217,6 @@ fn build(git: &Git, state: &UpdateState, in_progress: bool) -> Result<ReportDoc>
         in_progress,
         integration: state.config.integration.clone(),
         base: state.start_base().to_string(),
-        unpublished: state
-            .finishing
-            .as_ref()
-            .map(|f| f.unpublished.clone())
-            .unwrap_or_default(),
         upstreams,
         catch_ups,
         carried_from: state.carried_from.as_ref().map(|c| c.url.clone()),
@@ -424,12 +417,6 @@ impl Render for ReportDoc {
             out.push_str(&format!(
                 "carried on from {url}: what its history holds is shown; the conflicts of the steps taken before \
                  it was carried on are not known\n"
-            ));
-        }
-        if !self.unpublished.is_empty() {
-            out.push_str(&format!(
-                "not published (advanced locally only): {}\n",
-                self.unpublished.join(", ")
             ));
         }
         for u in &self.upstreams {

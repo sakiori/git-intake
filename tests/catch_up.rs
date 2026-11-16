@@ -1,6 +1,7 @@
 //! Catching up with a moved integration branch: a catch-up merge takes the
-//! new integration tip into the update, `finish` verifies and publishes it,
-//! and the update branch only moves forward.
+//! publish remote's new integration tip into the update, `finish` verifies
+//! and publishes it, and the update branch only moves forward. No local
+//! branch but the update branch moves.
 
 mod common;
 
@@ -50,10 +51,17 @@ fn land(f: &Fork, files: &[(&str, &str)], message: &str) -> String {
     c
 }
 
+/// The parents of `rev`, read in the downstream, or on the publish remote
+/// for a commit the downstream does not have.
 fn parents(f: &Fork, rev: &str) -> Vec<String> {
-    f.env
-        .git(&f.down, &["rev-list", "--parents", "-n", "1", rev])
-        .split_whitespace()
+    let args = ["rev-list", "--parents", "-n", "1", rev];
+    let out = f.env.git_output(&f.down, &args);
+    let line = if out.status.success() {
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    } else {
+        f.env.git(&f.publish, &args)
+    };
+    line.split_whitespace()
         .skip(1)
         .map(str::to_string)
         .collect()
@@ -96,39 +104,46 @@ fn conflicting(f: &Fork) -> String {
 }
 
 #[test]
-fn finish_catches_up_with_a_local_commit_and_publishes() {
+fn finish_catches_up_with_work_landed_on_the_remote_and_publishes() {
     let f = Fork::new();
     let env = &f.env;
-    let base = env.rev(&f.down, "main");
+    let base = f.tip();
     let (verified, target) = verify_update(&f);
     let before: Vec<String> = env
         .git(&f.down, &["rev-list", "git-intake/update"])
         .lines()
         .map(str::to_string)
         .collect();
-    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
+    let theirs = land(&f, &[("other.txt", "o\n")], "other: lands first");
 
     let out = stdout(&f.tool(&["finish"]).success());
     assert!(
         out.contains(&format!(
             "catching up with 'main' at {}: merging the update at {} into it",
-            &local[..12],
+            &theirs[..12],
             &verified[..12]
         )),
         "{out}"
     );
     assert!(out.contains("caught up with 'main' at"), "{out}");
     assert!(out.contains("passed   app"), "{out}");
-    assert!(out.contains("pushed main to 'origin'"), "{out}");
-    let merge = env.rev(&f.down, "main");
-    assert_eq!(parents(&f, &merge), [local.clone(), verified.clone()]);
+    let merge = f.tip();
+    assert!(
+        out.contains(&format!("pushed {} to 'origin/main'", &merge[..12])),
+        "{out}"
+    );
+    assert_eq!(parents(&f, &merge), [theirs.clone(), verified.clone()]);
     assert!(message(&f, &merge).contains(TRAILER));
-    assert_eq!(env.rev(&f.publish, "main"), merge);
     // Every commit of the update branch stays as it was.
     for c in &before {
         assert!(env.is_ancestor(&f.down, c, &merge), "{c}");
     }
-    assert!(f.down.join("n.txt").exists() && f.down.join("local.txt").exists());
+    for file in ["n.txt", "other.txt"] {
+        assert!(env.has_rev(&f.down, &format!("{merge}:{file}")), "{file}");
+    }
+    // The local integration branch and the main checkout stay as they were.
+    assert_eq!(env.rev(&f.down, "main"), base);
+    assert!(!f.down.join("n.txt").exists());
     env.assert_no_update(&f.down);
 
     // The update counts as merged straight in.
@@ -139,7 +154,7 @@ fn finish_catches_up_with_a_local_commit_and_publishes() {
     assert_eq!(up["last_synced_source"], "record");
     let report = env.tool_json(&f.down, &["report", "--json"], 0);
     assert_eq!(report["base"], base.as_str());
-    assert_eq!(report["catch_ups"][0]["tip"], local.as_str());
+    assert_eq!(report["catch_ups"][0]["tip"], theirs.as_str());
     assert_eq!(report["catch_ups"][0]["merge_commit"], merge.as_str());
 }
 
@@ -171,8 +186,8 @@ fn resolutions_and_fixes_made_by_hand_are_kept() {
     let other_work = land(&f, &[("other.txt", "o\n")], "other: lands first");
 
     f.tool(&["finish"]).success();
-    let merge = env.rev(&f.down, "main");
-    assert_eq!(env.rev(&f.down, "main^1"), other_work);
+    let merge = f.tip();
+    assert_eq!(env.rev(&f.down, &format!("{merge}^1")), other_work);
     assert!(message(&f, &merge).contains(TRAILER));
     let show = |path: &str| env.git(&f.down, &["show", &format!("{merge}:{path}")]);
     assert_eq!(show(FORK_FILE), "one\nTWO-both\nthree");
@@ -185,23 +200,13 @@ fn resolutions_and_fixes_made_by_hand_are_kept() {
 fn a_conflicting_catch_up_stops_and_continue_concludes_it() {
     let f = Fork::new();
     let env = &f.env;
-    let base = env.rev(&f.down, "main");
+    let base = f.tip();
     let (verified, target) = verify_update(&f);
     let theirs = conflicting(&f);
-    let published = env.rev(&f.publish, "main");
 
-    // `finish` brings the local branch up to date, which is not a move of
-    // its own, and stops on the conflict.
+    // `finish` stops on the conflict, and nothing moves but the update.
     let stopped = f.tool(&["finish"]).code(1);
     let out = stdout(&stopped);
-    assert!(
-        out.contains(&format!(
-            "fast-forwarded 'main' from {} to {} to match 'origin/main'",
-            &base[..12],
-            &theirs[..12]
-        )),
-        "{out}"
-    );
     assert!(
         out.contains(&format!(
             "ours is 'main' at {}, theirs is the update at {}",
@@ -212,8 +217,8 @@ fn a_conflicting_catch_up_stops_and_continue_concludes_it() {
     );
     assert!(out.contains("n.txt  (unresolved)"), "{out}");
     assert!(out.contains("run `git intake continue`"), "{out}");
-    assert_eq!(env.rev(&f.down, "main"), theirs);
-    assert_eq!(env.rev(&f.publish, "main"), published);
+    assert_eq!(env.rev(&f.down, "main"), base);
+    assert_eq!(f.tip(), theirs);
     assert_eq!(env.rev(&f.down, "git-intake/update"), verified);
 
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
@@ -295,8 +300,8 @@ fn a_conflicting_catch_up_stops_and_continue_concludes_it() {
     let out = stdout(&f.tool(&["finish"]).success());
     assert!(out.contains(&format!("verified {}", &merge[..12])), "{out}");
     assert!(!out.contains("catching up"), "{out}");
-    assert_eq!(env.rev(&f.publish, "main"), merge);
-    assert_eq!(env.rev(&f.down, "main"), merge);
+    assert_eq!(f.tip(), merge);
+    assert_eq!(env.rev(&f.down, "main"), base);
     env.assert_no_update(&f.down);
 }
 
@@ -305,14 +310,17 @@ fn failed_checks_after_a_catch_up_leave_it_unverified() {
     let f = Fork::with_checks(&[("unbroken", "test ! -f breaks.txt")]);
     let env = &f.env;
     let (verified, _) = verify_update(&f);
-    let local = env.commit(&f.down, &[("breaks.txt", "b\n")], "fork: breaks");
+    let theirs = land(&f, &[("breaks.txt", "b\n")], "other: breaks");
 
     let out = stdout(&f.tool(&["finish"]).code(1));
     assert!(out.contains("FAILED   unbroken"), "{out}");
-    assert!(out.contains("verification of the catch-up merge"), "{out}");
+    assert!(
+        out.contains("verification of the catch-up merge") && out.contains("nothing was pushed"),
+        "{out}"
+    );
     let merge = env.rev(&f.down, "git-intake/update");
-    assert_eq!(parents(&f, &merge), [local.clone(), verified]);
-    assert_eq!(env.rev(&f.down, "main"), local);
+    assert_eq!(parents(&f, &merge), [theirs.clone(), verified]);
+    assert_eq!(f.tip(), theirs);
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["update"]["step"], "catch_up");
     assert_eq!(status["update"]["verified_commit"], serde_json::Value::Null);
@@ -321,58 +329,58 @@ fn failed_checks_after_a_catch_up_leave_it_unverified() {
     let wt = env.update_worktree(&f.down);
     env.git(&wt, &["rm", "-q", "breaks.txt"]);
     env.git(&wt, &["commit", "-q", "-m", "fork: fix"]);
+    let fix = env.rev(&wt, "HEAD");
     f.tool(&["finish"])
         .code(2)
         .stderr(contains("run `git intake verify` for the new commit"));
-    assert_eq!(env.rev(&f.down, "main"), local);
+    assert_eq!(f.tip(), theirs);
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    assert_eq!(env.rev(&f.publish, "main"), env.rev(&f.down, "main"));
-    assert_eq!(env.rev(&f.down, "main^1"), merge);
+    assert_eq!(f.tip(), fix);
+    assert_eq!(env.rev(&f.publish, "main^1"), merge);
 }
 
 #[test]
 fn a_move_during_verification_stops_and_the_next_finish_catches_up_again() {
-    // The check lands a commit on the integration branch once, while
-    // `finish` verifies the first catch-up merge.
+    // The check lands a commit on the publish remote's integration branch
+    // once, while `finish` verifies the first catch-up merge.
     let f = Fork::with_checks(&[
         FORK_CHECK,
         (
             "meanwhile",
             "if [ -f \"$HOME/move\" ]; then rm \"$HOME/move\"; \
-         git -C \"$(cat \"$HOME/down\")\" commit -q --allow-empty -m 'fork: meanwhile'; fi",
+         git -C \"$(cat \"$HOME/other\")\" commit -q --allow-empty -m 'other: meanwhile' && \
+         git -C \"$(cat \"$HOME/other\")\" push -q origin HEAD:main; fi",
         ),
     ]);
     let env = &f.env;
+    let (verified, target) = verify_update(&f);
+    let first = land(&f, &[("other.txt", "o\n")], "other: lands first");
     fs::write(
-        env.path("home").join("down"),
-        f.down.to_string_lossy().as_bytes(),
+        env.path("home").join("other"),
+        other(&f).to_string_lossy().as_bytes(),
     )
     .unwrap();
-    let (verified, target) = verify_update(&f);
-    let first = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
     fs::write(env.path("home").join("move"), "").unwrap();
 
     let out = stdout(&f.tool(&["finish"]).code(1));
     assert!(
-        out.contains("while the update was verified; no branch moved to the update"),
+        out.contains("while the update was verified; nothing was pushed"),
         "{out}"
     );
     assert!(out.contains("Run `git intake finish` again"), "{out}");
     let caught = env.rev(&f.down, "git-intake/update");
     assert_eq!(parents(&f, &caught), [first.clone(), verified.clone()]);
-    let meanwhile = env.rev(&f.down, "main");
+    let meanwhile = f.tip();
     assert_eq!(parents(&f, &meanwhile), std::slice::from_ref(&first));
-    assert_eq!(env.rev(&f.publish, "main"), env.rev(&f.down, "main~2"));
 
     // The next run catches up once more: the update branch only moved
     // forward, and the second catch-up merge has the first as its second
     // parent.
     f.tool(&["finish"]).success();
-    let second = env.rev(&f.down, "main");
+    let second = f.tip();
     assert_eq!(parents(&f, &second), [meanwhile, caught.clone()]);
     assert!(message(&f, &second).contains(TRAILER));
-    assert_eq!(env.rev(&f.publish, "main"), second);
 
     // An update that caught up twice counts as merged straight in.
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
@@ -388,70 +396,69 @@ fn a_move_during_verification_stops_and_the_next_finish_catches_up_again() {
 fn an_integration_branch_that_holds_the_update_needs_no_catch_up() {
     let f = Fork::new();
     let env = &f.env;
+    let base = f.tip();
     let (verified, _) = verify_update(&f);
     // The integration branch was moved to the verified commit, and past it,
     // by other means.
-    env.git(&f.down, &["merge", "-q", "--ff-only", "git-intake/update"]);
-    let past = env.commit(&f.down, &[("later.txt", "l\n")], "fork: later work");
+    env.git(&f.down, &["push", "-q", "origin", "git-intake/update:main"]);
+    let past = land(&f, &[("later.txt", "l\n")], "other: later work");
 
     let out = stdout(&f.tool(&["finish"]).success());
     assert!(!out.contains("catching up"), "{out}");
     assert!(
         out.contains(&format!(
-            "already contains the verified commit {}",
+            "'origin/main' at {} already contains the verified commit {}",
+            &past[..12],
             &verified[..12]
         )),
         "{out}"
     );
-    assert_eq!(env.rev(&f.publish, "main"), verified);
-    assert_eq!(env.rev(&f.down, "main"), past);
+    assert!(out.contains("nothing was pushed"), "{out}");
+    assert_eq!(f.tip(), past);
+    assert_eq!(env.rev(&f.down, "main"), base);
     env.assert_no_update(&f.down);
 }
 
 #[test]
-fn a_moved_publish_remote_is_followed_caught_up_with_and_published() {
+fn finish_needs_no_local_integration_branch_and_creates_none() {
+    let f = Fork::new();
+    let env = &f.env;
+    let (verified, _) = verify_update(&f);
+    env.git(&f.down, &["checkout", "-q", "--detach"]);
+    env.git(&f.down, &["branch", "-q", "-D", "main"]);
+    let theirs = land(&f, &[("other.txt", "o\n")], "other: published first");
+
+    f.tool(&["finish"]).success();
+    let merge = f.tip();
+    assert_eq!(parents(&f, &merge), [theirs, verified]);
+    assert!(!env.has_rev(&f.down, "refs/heads/main"));
+    env.assert_no_update(&f.down);
+}
+
+#[test]
+fn local_commits_on_main_are_neither_read_nor_published() {
     let f = Fork::new();
     let env = &f.env;
     let (verified, _) = verify_update(&f);
     let theirs = land(&f, &[("other.txt", "o\n")], "other: published first");
+    // The local `main` holds a commit the publish remote never received.
+    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
 
-    let out = stdout(&f.tool(&["finish"]).success());
-    assert!(out.contains("fast-forwarded 'main' from"), "{out}");
-    assert!(out.contains("pushed main to 'origin'"), "{out}");
-    let merge = env.rev(&f.publish, "main");
+    f.tool(&["finish"]).success();
+    let merge = f.tip();
     assert_eq!(parents(&f, &merge), [theirs, verified]);
-    assert_eq!(env.rev(&f.down, "main"), merge);
+    assert!(!env.is_ancestor(&f.down, &local, &merge));
+    assert_eq!(env.rev(&f.down, "main"), local);
     env.assert_no_update(&f.down);
 }
 
 #[test]
-fn a_local_branch_diverged_from_the_remote_is_refused() {
+fn an_unreachable_publish_remote_is_refused_and_finish_runs_again_once_it_answers() {
     let f = Fork::new();
     let env = &f.env;
-    verify_update(&f);
-    land(&f, &[("other.txt", "o\n")], "other: published first");
-    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
-
-    let err = stderr(&f.tool(&["finish"]).code(2));
-    assert!(
-        err.contains("'main' and 'origin/main' have diverged: 'main' lacks 1 commit of 'origin/main', which lacks 1 of 'main'"),
-        "{err}"
-    );
-    assert!(
-        err.contains("The local commits must be published or reconciled first"),
-        "{err}"
-    );
-    assert_eq!(env.rev(&f.down, "main"), local);
-    let status = env.tool_json(&f.down, &["status", "--json"], 0);
-    assert_eq!(status["update"]["step"], "verified");
-}
-
-#[test]
-fn an_unreachable_publish_remote_is_refused_and_no_publish_closes_locally() {
-    let f = Fork::new();
-    let env = &f.env;
-    let base = env.rev(&f.down, "main");
+    let base = f.tip();
     let (verified, _) = verify_update(&f);
+    let url = env.git(&f.down, &["remote", "get-url", "origin"]);
     env.git(
         &f.down,
         &[
@@ -463,67 +470,83 @@ fn an_unreachable_publish_remote_is_refused_and_no_publish_closes_locally() {
     );
     let err = stderr(&f.tool(&["finish"]).code(2));
     assert!(
-        err.contains("cannot fetch the publish remote 'origin'"),
+        err.contains("cannot fetch the integration branch 'main' from the publish remote 'origin'"),
         "{err}"
     );
-    assert_eq!(env.rev(&f.down, "main"), base);
+    assert_eq!(f.tip(), base);
+    assert_eq!(
+        read_state(&f.down)["verification"]["commit"],
+        verified.as_str()
+    );
 
-    // Without fetching, a local commit is all there is to catch up with.
-    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
-    f.tool(&["finish", "--no-publish"])
-        .success()
-        .stdout(contains(
-            "not published to 'origin' (advanced locally only): main",
-        ));
-    assert_eq!(parents(&f, "main"), [local, verified]);
+    env.git(&f.down, &["remote", "set-url", "origin", &url]);
+    f.tool(&["finish"]).success();
+    assert_eq!(f.tip(), verified);
+    assert_eq!(env.rev(&f.down, "main"), base);
     env.assert_no_update(&f.down);
 }
 
 #[test]
-fn a_push_rejected_after_the_move_is_caught_up_on_the_next_finish() {
+fn a_rejected_push_publishes_nothing_and_the_next_finish_catches_up() {
     let f = Fork::new();
     let env = &f.env;
-    let base = env.rev(&f.down, "main");
+    let base = f.tip();
     let (verified, _) = verify_update(&f);
     reject_pushes(&f);
     f.tool(&["finish"])
         .code(2)
-        .stderr(contains("pushing to 'origin' was rejected"))
+        .stderr(contains(format!(
+            "pushing {} to 'origin/main' was rejected",
+            &verified[..12]
+        )))
         .stderr(contains(
             "catches up with it, verifies the result and pushes that",
-        ));
-    assert_eq!(env.rev(&f.down, "main"), verified);
+        ))
+        .stderr(contains("`git intake abort` ends the update"));
+    assert_eq!(f.tip(), base);
+    assert_eq!(env.rev(&f.down, "main"), base);
+    let status = env.tool_json(&f.down, &["status", "--json"], 0);
+    assert_eq!(status["update"]["step"], "verified");
     accept_pushes(&f);
     let theirs = land(&f, &[("other.txt", "o\n")], "other: published meanwhile");
-    f.tool(&["start"]).code(2).stderr(contains(
-        "`git intake finish --no-publish` to close it locally",
-    ));
-    f.tool(&["abort"])
+    f.tool(&["start"])
         .code(2)
-        .stderr(contains("`finish` has already moved main"));
+        .stderr(contains("an update is already in progress"));
 
     let out = stdout(&f.tool(&["finish"]).success());
-    assert!(out.contains("resuming finish"), "{out}");
     assert!(
         out.contains(&format!("catching up with 'main' at {}", &theirs[..12])),
         "{out}"
     );
-    let merge = env.rev(&f.publish, "main");
+    let merge = f.tip();
     assert!(
-        out.contains(&format!("main: {} -> {}", &verified[..12], &merge[..12])),
+        out.contains(&format!("pushed {} to 'origin/main'", &merge[..12])),
         "{out}"
     );
     assert_eq!(parents(&f, &merge), [theirs, verified]);
-    assert_eq!(env.rev(&f.down, "main"), merge);
-    assert!(env.is_ancestor(&f.down, &base, &merge));
+    assert_eq!(env.rev(&f.down, "main"), base);
     env.assert_no_update(&f.down);
 }
 
 #[test]
-fn abort_after_the_move_is_refused_and_no_publish_closes_at_the_planned_commit() {
+fn a_rejected_push_retried_unchanged_publishes_the_verified_commit() {
+    let f = Fork::new();
+    let (verified, _) = verify_update(&f);
+    reject_pushes(&f);
+    f.tool(&["finish"]).code(2);
+    accept_pushes(&f);
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(!out.contains("catching up"), "{out}");
+    assert_eq!(f.tip(), verified);
+    f.env.assert_no_update(&f.down);
+}
+
+#[test]
+fn abort_after_a_rejected_push_publishes_nothing_and_records_resolutions() {
     let f = Fork::new();
     let env = &f.env;
-    let (verified, _) = verify_update(&f);
+    let base = f.tip();
+    verify_update(&f);
     reject_pushes(&f);
     f.tool(&["finish"]).code(2);
     accept_pushes(&f);
@@ -534,23 +557,15 @@ fn abort_after_the_move_is_refused_and_no_publish_closes_at_the_planned_commit()
         .stdout(contains("n.txt  (unresolved)"));
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["update"]["step"], "catch_up_conflict");
-    let err = stderr(&f.tool(&["abort"]).code(2));
-    assert!(err.contains("Run `git intake finish`"), "{err}");
-    assert!(err.contains("`git intake finish --no-publish`"), "{err}");
 
-    // A resolution made so far is recorded before the merge is dropped.
+    // A resolution made so far is recorded before the update is removed.
     let wt = env.update_worktree(&f.down);
     fs::write(wt.join("n.txt"), "both\n").unwrap();
-    f.tool(&["finish", "--no-publish"])
-        .success()
-        .stdout(contains(
-            "recorded the resolutions made so far and dropped the catch-up merge",
-        ))
-        .stdout(contains(
-            "not published to 'origin' (advanced locally only): main",
-        ));
-    assert_eq!(env.rev(&f.down, "main"), verified);
-    assert_eq!(env.rev(&f.publish, "main"), theirs);
+    f.tool(&["abort"]).success().stdout(contains(
+        "update aborted; abort changed nothing on the publish remote",
+    ));
+    assert_eq!(f.tip(), theirs);
+    assert_eq!(env.rev(&f.down, "main"), base);
     env.assert_no_update(&f.down);
     let cache = f.down.join(".git").join("rr-cache");
     let recorded = fs::read_dir(&cache)
@@ -559,105 +574,44 @@ fn abort_after_the_move_is_refused_and_no_publish_closes_at_the_planned_commit()
     assert!(recorded, "no resolution recorded in {}", cache.display());
 }
 
-/// An update whose push was rejected, and whose catch-up from the finishing
-/// step with a conflicting remote commit was resolved and concluded by
-/// `continue`. Returns the planned commit and the catch-up merge.
-fn concluded_after_a_rejected_push(f: &Fork) -> (String, String) {
-    let env = &f.env;
-    let (verified, _) = verify_update(f);
-    reject_pushes(f);
-    f.tool(&["finish"]).code(2);
-    accept_pushes(f);
-    conflicting(f);
-    f.tool(&["finish"]).code(1);
-    let wt = env.update_worktree(&f.down);
-    fs::write(wt.join("n.txt"), "both\n").unwrap();
-    env.git(&wt, &["add", "n.txt"]);
-    f.tool(&["continue"]).success();
-    (verified, env.rev(&wt, "HEAD"))
-}
-
 #[test]
-fn no_publish_lands_a_verified_catch_up_of_the_finishing_step_locally() {
+fn a_remote_that_received_the_verified_commit_completes_the_update() {
     let f = Fork::new();
     let env = &f.env;
-    // The update also changes the pipeline, which the landing names.
-    f.reconfigure("via = \"push\"", "via = \"push\"\nforge = \"gitlab\"");
-    env.push_upstream(
-        &f.up,
-        &[(".gitlab-ci.yml", "test:\n  script: [make]\n")],
-        "upstream: ci",
-    );
-    let (verified, merge) = concluded_after_a_rejected_push(&f);
-    f.tool(&["verify"]).success();
-    let out = stdout(&f.tool(&["finish", "--no-publish"]).success());
-    assert!(
-        out.contains("lands the verified catch-up of the update"),
-        "{out}"
-    );
-    assert_eq!(out.matches(CI_NOTICE).count(), 1, "{out}");
-    assert_eq!(env.rev(&f.down, "main"), merge);
-    assert!(env.is_ancestor(&f.down, &verified, "main"));
-    env.assert_no_update(&f.down);
-}
-
-#[test]
-fn no_publish_drops_an_unverified_catch_up_of_the_finishing_step() {
-    let f = Fork::new();
-    let env = &f.env;
-    let (verified, merge) = concluded_after_a_rejected_push(&f);
-    let out = stdout(&f.tool(&["finish", "--no-publish"]).success());
-    assert!(
-        out.contains("dropped the catch-up of the update, which is not verified"),
-        "{out}"
-    );
-    // The dropped commit is named, so that it can still be found.
-    assert!(out.contains(&format!("  {} ", &merge[..7])), "{out}");
-    assert_eq!(env.rev(&f.down, "main"), verified);
-    assert!(env.has_rev(&f.down, &merge));
-    env.assert_no_update(&f.down);
-}
-
-#[test]
-fn a_remote_that_received_the_planned_commit_completes_the_update() {
-    let f = Fork::new();
-    let env = &f.env;
-    let (verified, _) = concluded_after_a_rejected_push(&f);
-    // Another clone merges the planned commit, sync record and all, into the
-    // remote's integration branch.
-    let dir = other(&f);
-    env.git(&dir, &["fetch", "-q", &f.down.to_string_lossy(), "main"]);
-    env.git(
-        &dir,
-        &["merge", "-q", "--no-edit", "-X", "ours", "FETCH_HEAD"],
-    );
-    env.git(&dir, &["push", "-q", "origin", "HEAD:main"]);
-    let published = env.rev(&f.publish, "main");
-
-    let out = stdout(&f.tool(&["finish"]).success());
-    assert!(out.contains("'origin' already holds main"), "{out}");
-    assert_eq!(env.rev(&f.down, "main"), verified);
-    assert_eq!(env.rev(&f.publish, "main"), published);
-    env.assert_no_update(&f.down);
-}
-
-#[test]
-fn a_local_commit_and_a_rejected_push_make_no_catch_up() {
-    let f = Fork::new();
-    let env = &f.env;
+    let base = f.tip();
     let (verified, _) = verify_update(&f);
     reject_pushes(&f);
     f.tool(&["finish"]).code(2);
     accept_pushes(&f);
-    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
-    let theirs = land(&f, &[("other.txt", "o\n")], "other: published meanwhile");
+    // Another clone merges the verified commit, sync record and all, into
+    // the remote's integration branch.
+    land(&f, &[("other.txt", "o\n")], "other: lands first");
+    let dir = other(&f);
+    env.git(
+        &dir,
+        &[
+            "fetch",
+            "-q",
+            &f.down.to_string_lossy(),
+            "git-intake/update",
+        ],
+    );
+    env.git(&dir, &["merge", "-q", "--no-edit", "FETCH_HEAD"]);
+    env.git(&dir, &["push", "-q", "origin", "HEAD:main"]);
+    let published = f.tip();
 
-    let err = stderr(&f.tool(&["finish"]).code(2));
-    assert!(err.contains("the update makes no catch-up merge"), "{err}");
-    assert!(err.contains("`git intake finish --no-publish`"), "{err}");
-    assert_eq!(env.rev(&f.down, "main"), local);
-    assert_eq!(env.rev(&f.publish, "main"), theirs);
-    assert_eq!(env.rev(&f.down, "git-intake/update"), verified);
+    let out = stdout(&f.tool(&["finish"]).success());
+    assert!(
+        out.contains(&format!(
+            "already contains the verified commit {}",
+            &verified[..12]
+        )),
+        "{out}"
+    );
+    assert!(out.contains("nothing was pushed"), "{out}");
+    assert_eq!(f.tip(), published);
+    assert_eq!(env.rev(&f.down, "main"), base);
+    env.assert_no_update(&f.down);
 }
 
 #[test]
@@ -673,9 +627,14 @@ fn a_rewritten_integration_branch_is_refused() {
     let rewritten = env.rev(&f.down, "main");
 
     let err = stderr(&f.tool(&["finish"]).code(2));
-    assert!(err.contains("'main' was rewritten"), "{err}");
+    assert!(
+        err.contains("'origin/main' was rewritten: its tip")
+            && err.contains("does not contain the update's base"),
+        "{err}"
+    );
+    assert!(err.contains("Nothing was merged or pushed"), "{err}");
     assert!(err.contains("Run `git intake abort`"), "{err}");
-    assert_eq!(env.rev(&f.down, "main"), rewritten);
+    assert_eq!(f.tip(), rewritten);
     assert_eq!(env.rev(&f.down, "git-intake/update"), verified);
     assert!(
         read_state(&f.down)["catch_ups"]
@@ -867,19 +826,20 @@ fn an_update_branch_moved_meanwhile_is_not_moved() {
 fn abort_in_the_catch_up_step_records_the_resolutions_made_by_hand() {
     let f = Fork::new();
     let env = &f.env;
+    let base = f.tip();
     verify_update(&f);
     let theirs = conflicting(&f);
     f.tool(&["finish"]).code(1);
     let wt = env.update_worktree(&f.down);
     fs::write(wt.join("n.txt"), "both\n").unwrap();
 
-    f.tool(&["abort"])
-        .success()
-        .stdout(contains("update aborted; 'main' is unchanged"));
+    f.tool(&["abort"]).success().stdout(contains(
+        "update aborted; abort changed nothing on the publish remote",
+    ));
     env.assert_no_update(&f.down);
-    // The integration branch stays where the last fast-forward to the
-    // publish remote left it.
-    assert_eq!(env.rev(&f.down, "main"), theirs);
+    // Nothing moved on the publish remote, nor locally.
+    assert_eq!(f.tip(), theirs);
+    assert_eq!(env.rev(&f.down, "main"), base);
 
     // Started again on the new tip, the same conflict takes the resolution.
     let out = stdout(&f.tool(&["start"]).code(1));
@@ -926,7 +886,7 @@ fn a_catch_up_given_up_by_hand_is_dropped() {
     f.tool(&["verify"]).success();
     // A fresh catch-up takes the tip in.
     f.tool(&["finish"]).success();
-    assert_eq!(parents(&f, "main"), [theirs, fix.clone()]);
+    assert_eq!(parents(&f, &f.tip()), [theirs, fix.clone()]);
     assert!(env.is_ancestor(&f.down, &verified, &fix));
 }
 
@@ -977,7 +937,7 @@ fn a_concluded_catch_up_is_the_runs_only_catch_up() {
     );
 
     f.tool(&["finish"]).success();
-    assert_eq!(parents(&f, "main"), [again, merge]);
+    assert_eq!(parents(&f, &f.tip()), [again, merge]);
 }
 
 #[test]
@@ -1026,10 +986,11 @@ fn an_interruption_before_the_checkout_leaves_a_fresh_catch_up() {
     let f = Fork::new();
     let env = &f.env;
     let (verified, _) = verify_update(&f);
-    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
+    // Landed from the downstream, which therefore holds the tip's commit.
+    let local = f.land(&[("local.txt", "l\n")], "fork: local work");
     record_catch_up(&f, &local, &verified);
     f.tool(&["finish"]).success();
-    assert_eq!(parents(&f, "main"), [local, verified]);
+    assert_eq!(parents(&f, &f.tip()), [local, verified]);
     let report = env.tool_json(&f.down, &["report", "--json"], 0);
     assert_eq!(report["catch_ups"].as_array().unwrap().len(), 1);
 }
@@ -1039,14 +1000,15 @@ fn an_interruption_after_the_checkout_merges_again() {
     let f = Fork::new();
     let env = &f.env;
     let (verified, _) = verify_update(&f);
-    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
+    // Landed from the downstream, which therefore holds the tip's commit.
+    let local = f.land(&[("local.txt", "l\n")], "fork: local work");
     record_catch_up(&f, &local, &verified);
     let wt = env.update_worktree(&f.down);
     env.git(&wt, &["checkout", "-q", "--detach", &local]);
     let status = env.tool_json(&f.down, &["status", "--json"], 0);
     assert_eq!(status["update"]["step"], "catch_up");
     f.tool(&["finish"]).success();
-    let merge = env.rev(&f.down, "main");
+    let merge = f.tip();
     assert_eq!(parents(&f, &merge), [local, verified]);
     assert!(message(&f, &merge).contains(TRAILER));
 }
@@ -1056,7 +1018,8 @@ fn an_interruption_after_the_branch_moved_attaches_the_worktree() {
     let f = Fork::new();
     let env = &f.env;
     let (verified, _) = verify_update(&f);
-    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
+    // Landed from the downstream, which therefore holds the tip's commit.
+    let local = f.land(&[("local.txt", "l\n")], "fork: local work");
     record_catch_up(&f, &local, &verified);
     let wt = env.update_worktree(&f.down);
     env.git(&wt, &["checkout", "-q", "--detach", &local]);
@@ -1142,21 +1105,29 @@ fn a_copy_of_a_queued_upstream_is_refused() {
 }
 
 #[test]
-fn a_rewound_local_integration_branch_is_refused_as_rewritten() {
+fn a_publish_remote_rewound_below_the_base_is_refused_as_rewritten() {
     let f = Fork::new();
     let env = &f.env;
-    let published = env.rev(&f.publish, "main");
-    // An unpublished local commit, which the update's base holds, is
-    // removed from the integration branch after `verify`.
-    let local = env.commit(&f.down, &[("local.txt", "l\n")], "fork: local work");
+    // A commit landed on the remote, which the update's base holds, is
+    // removed from it after `verify`.
+    let landed = land(&f, &[("landed.txt", "l\n")], "other: landed");
     let (verified, _) = verify_update(&f);
-    env.git(&f.down, &["reset", "-q", "--hard", "HEAD~1"]);
+    env.git(
+        &f.publish,
+        &["update-ref", "refs/heads/main", &format!("{landed}~1")],
+    );
+    let rewound = f.tip();
 
     let err = stderr(&f.tool(&["finish"]).code(2));
-    assert!(err.contains("'main' was rewritten"), "{err}");
-    assert_eq!(env.rev(&f.publish, "main"), published);
-    assert!(!env.is_ancestor(&f.publish, &local, "main"));
+    assert!(err.contains("'origin/main' was rewritten"), "{err}");
+    assert_eq!(f.tip(), rewound);
     assert_eq!(env.rev(&f.down, "git-intake/update"), verified);
+    assert!(
+        read_state(&f.down)["catch_ups"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// A catch-up stopped on a conflict, resolved and committed by hand while
@@ -1226,9 +1197,9 @@ fn a_remote_rewound_after_a_rejected_push_is_refused_as_rewritten() {
 
     let err = stderr(&f.tool(&["finish"]).code(2));
     assert!(err.contains("'origin/main' was rewritten"), "{err}");
-    assert!(err.contains("`git intake finish --no-publish`"), "{err}");
-    assert_eq!(env.rev(&f.publish, "main"), older);
-    assert_eq!(env.rev(&f.down, "main"), verified);
+    assert!(err.contains("Run `git intake abort`"), "{err}");
+    assert_eq!(f.tip(), older);
+    assert_eq!(env.rev(&f.down, "git-intake/update"), verified);
 }
 
 const CI_NOTICE: &str = "the update changes its own checks: `.gitlab-ci.yml`; the checks that verify it are \
@@ -1255,7 +1226,6 @@ fn a_catch_up_after_a_rejected_push_names_the_update_s_own_checks() {
     // The resumed finish catches up and publishes another head, and names
     // the change again, once, before it verifies the catch-up merge.
     let out = stdout(&f.tool(&["finish"]).success());
-    assert!(out.contains("resuming finish"), "{out}");
     assert_eq!(out.matches(CI_NOTICE).count(), 1, "{out}");
     let verifying = out
         .find("verifying")
@@ -1301,11 +1271,10 @@ fn conflicts_lists_the_files_updates_resolved_beneath_catch_up_merges() {
     f.tool(&["start"]).success();
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
-    let before = env.rev(&f.down, "main");
+    let before = f.tip();
     // The update conflicts in `src/ui/a.tsx`, and its catch-up merge in
     // `src/server/b.ts`.
-    env.commit(&f.down, &[("src/ui/a.tsx", "1\nours\n3\n")], "fork: a");
-    env.git(&f.down, &["push", "-q", "origin", "main"]);
+    land(&f, &[("src/ui/a.tsx", "1\nours\n3\n")], "fork: a");
     env.push_upstream(
         &f.up,
         &[
@@ -1326,9 +1295,9 @@ fn conflicts_lists_the_files_updates_resolved_beneath_catch_up_merges() {
     env.git(&wt, &["add", "src/server/b.ts"]);
     f.tool(&["continue"]).success();
     f.tool(&["finish"]).success();
-    let merge = env.rev(&f.down, "main");
+    let merge = f.tip();
     assert!(message(&f, &merge).contains(TRAILER));
-    let sync = env.rev(&f.down, "main^2");
+    let sync = env.rev(&f.publish, "main^2");
     assert!(message(&f, &sync).contains("Intake-Upstream: upstream"));
 
     let out = stdout(&f.tool(&["conflicts"]).success());
@@ -1354,8 +1323,8 @@ fn conflicts_lists_the_files_updates_resolved_beneath_catch_up_merges() {
     assert_eq!(out, "src/server/b.ts\nsrc/ui/a.tsx\n");
 
     // Nothing landed after the tip.
-    let out = stdout(&f.tool(&["conflicts", "--since", "main"]).success());
+    let out = stdout(&f.tool(&["conflicts", "--since", &merge]).success());
     assert_eq!(out, "");
-    let doc = env.tool_json(&f.down, &["conflicts", "--since", "main", "--json"], 0);
+    let doc = env.tool_json(&f.down, &["conflicts", "--since", &merge, "--json"], 0);
     assert_eq!(doc["merges"], serde_json::json!([]));
 }

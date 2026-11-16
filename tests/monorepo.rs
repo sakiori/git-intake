@@ -2,8 +2,33 @@
 
 mod common;
 
-use common::{How, Mono, merge_on_fake, mono_config, open_number, stdout};
+use common::{How, Mono, PUBLISH_BY_PUSH, merge_on_fake, mono_config, open_number, stdout};
 use predicates::str::contains;
+
+/// The file `path` at the integration tip, the publish remote's `main`.
+fn at_tip(m: &Mono, path: &str) -> Option<String> {
+    let out = m
+        .env
+        .git_output(&m.publish, &["show", &format!("main:{path}")]);
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A monorepo with both upstreams imported, its local `main` brought up to
+/// date with the publish remote's, as a person works on it.
+fn imported() -> Mono {
+    let m = Mono::new();
+    m.import_all();
+    pull(&m);
+    m
+}
+
+/// Brings the local `main` up to date with the publish remote's.
+fn pull(m: &Mono) {
+    m.env
+        .git(&m.down, &["pull", "-q", "--ff-only", "origin", "main"]);
+}
 
 #[test]
 fn first_import_keeps_full_history_under_each_path() {
@@ -18,7 +43,7 @@ fn first_import_keeps_full_history_under_each_path() {
     let out = stdout(&start);
     assert!(out.contains("app-a: queued at"), "{out}");
     assert!(out.contains("app-b: queued at"), "{out}");
-    assert_eq!(env.git(&m.down, &["remote"]), "");
+    assert_eq!(env.git(&m.down, &["remote"]), "origin");
 
     let wt = env.update_worktree(&m.down);
     assert_eq!(
@@ -30,26 +55,23 @@ fn first_import_keeps_full_history_under_each_path() {
     assert_eq!(env.rev(&wt, "HEAD^2"), b_tip);
 
     m.tool(&["verify"]).success();
-    m.tool(&["finish"]).success().stdout(contains(
-        "no publish remote is configured; nothing was pushed",
-    ));
+    m.tool(&["finish"])
+        .success()
+        .stdout(contains("to 'origin/main'"));
     env.assert_no_update(&m.down);
+    // The local `main` stays where it was.
+    assert_eq!(env.rev(&m.down, "main"), base);
+    assert!(!m.down.join("apps").exists());
 
-    assert_eq!(
-        std::fs::read_to_string(m.down.join("apps/a/a.txt")).unwrap(),
-        "a1\na2\na3\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(m.down.join("apps/b/b.txt")).unwrap(),
-        "b1\nb2\nb3\n"
-    );
-    assert!(!m.down.join("a.txt").exists());
+    assert_eq!(at_tip(&m, "apps/a/a.txt").unwrap(), "a1\na2\na3\n");
+    assert_eq!(at_tip(&m, "apps/b/b.txt").unwrap(), "b1\nb2\nb3\n");
+    assert!(at_tip(&m, "a.txt").is_none());
     assert!(
-        env.is_ancestor(&m.down, &a_tip, "main"),
+        env.is_ancestor(&m.publish, &a_tip, "main"),
         "upstream history is kept"
     );
-    assert!(env.is_ancestor(&m.down, &b_tip, "main"));
-    let subject = env.git(&m.down, &["log", "-1", "--format=%s", "main^1"]);
+    assert!(env.is_ancestor(&m.publish, &b_tip, "main"));
+    let subject = env.git(&m.publish, &["log", "-1", "--format=%s", "main^1"]);
     assert!(
         subject.starts_with("sync(app-a): merge app-a/main at "),
         "{subject}"
@@ -73,15 +95,10 @@ fn first_import_keeps_full_history_under_each_path() {
 
 #[test]
 fn later_update_merges_under_path_and_skips_unchanged() {
-    let m = Mono::new();
+    let m = imported();
     let env = &m.env;
-    m.import_all();
     // The monorepo adapts the imported code; the upstream changes elsewhere in the same file.
-    env.commit(
-        &m.down,
-        &[("apps/a/a.txt", "a1-mono\na2\na3\n")],
-        "mono: adapt a",
-    );
+    m.land(&[("apps/a/a.txt", "a1-mono\na2\na3\n")], "mono: adapt a");
     let a2 = env.push_upstream(
         &m.a,
         &[("a.txt", "a1\na2\na3-up\n"), ("extra.txt", "e\n")],
@@ -96,13 +113,10 @@ fn later_update_merges_under_path_and_skips_unchanged() {
     m.tool(&["verify"]).success();
     m.tool(&["finish"]).success();
 
-    assert_eq!(
-        std::fs::read_to_string(m.down.join("apps/a/a.txt")).unwrap(),
-        "a1-mono\na2\na3-up\n"
-    );
-    assert!(m.down.join("apps/a/extra.txt").exists());
-    assert!(!m.down.join("extra.txt").exists());
-    assert_eq!(env.rev(&m.down, "main^2"), a2);
+    assert_eq!(at_tip(&m, "apps/a/a.txt").unwrap(), "a1-mono\na2\na3-up\n");
+    assert!(at_tip(&m, "apps/a/extra.txt").is_some());
+    assert!(at_tip(&m, "extra.txt").is_none());
+    assert_eq!(env.rev(&m.publish, "main^2"), a2);
     let report = env.tool_json(&m.down, &["report", "--json"], 0);
     let u = &report["upstreams"][0];
     assert_eq!(u["name"], "app-a");
@@ -114,14 +128,9 @@ fn later_update_merges_under_path_and_skips_unchanged() {
 
 #[test]
 fn conflict_then_continue_merges_the_next_upstream() {
-    let m = Mono::new();
+    let m = imported();
     let env = &m.env;
-    m.import_all();
-    env.commit(
-        &m.down,
-        &[("apps/a/a.txt", "a1\na2-mono\na3\n")],
-        "mono: change a2",
-    );
+    m.land(&[("apps/a/a.txt", "a1\na2-mono\na3\n")], "mono: change a2");
     env.push_upstream(&m.a, &[("a.txt", "a1\na2-up\na3\n")], "app-a: change a2");
     let b2 = env.push_upstream(&m.b, &[("b2.txt", "b\n")], "app-b: add b2");
 
@@ -162,28 +171,21 @@ fn conflict_then_continue_merges_the_next_upstream() {
         .stdout(contains("next: git intake verify"));
     m.tool(&["verify"]).success();
     m.tool(&["finish"]).success();
-    assert_eq!(
-        std::fs::read_to_string(m.down.join("apps/a/a.txt")).unwrap(),
-        "a1\na2-both\na3\n"
-    );
-    assert_eq!(env.rev(&m.down, "main^2"), b2);
-    assert!(m.down.join("apps/b/b2.txt").exists());
-    let msg = env.git(&m.down, &["log", "-1", "--format=%B", "main^1"]);
+    assert_eq!(at_tip(&m, "apps/a/a.txt").unwrap(), "a1\na2-both\na3\n");
+    assert_eq!(env.rev(&m.publish, "main^2"), b2);
+    assert!(at_tip(&m, "apps/b/b2.txt").is_some());
+    let msg = env.git(&m.publish, &["log", "-1", "--format=%B", "main^1"]);
     assert!(msg.contains("Intake-Upstream: app-a"), "{msg}");
 }
 
 #[test]
 fn abort_restores_everything() {
-    let m = Mono::new();
+    let m = imported();
     let env = &m.env;
-    m.import_all();
-    env.commit(
-        &m.down,
-        &[("apps/a/a.txt", "a1\na2-mono\na3\n")],
-        "mono: change a2",
-    );
+    m.land(&[("apps/a/a.txt", "a1\na2-mono\na3\n")], "mono: change a2");
     env.push_upstream(&m.a, &[("a.txt", "a1\na2-up\na3\n")], "app-a: change a2");
     let main = env.rev(&m.down, "main");
+    let tip = m.tip();
 
     m.tool(&["start"]).code(1);
     m.tool(&["abort"])
@@ -194,10 +196,13 @@ fn abort_restores_everything() {
         .stdout(contains(
             "removed reference refs/git-intake/upstreams/app-a",
         ))
-        .stdout(contains("update aborted; 'main' is unchanged"));
+        .stdout(contains(
+            "update aborted; abort changed nothing on the publish remote",
+        ));
     env.assert_no_update(&m.down);
     assert!(!env.intake_dir(&m.down).join("logs").exists());
     assert_eq!(env.rev(&m.down, "main"), main);
+    assert_eq!(m.tip(), tip);
     assert!(env.git(&m.down, &["status", "--porcelain"]).is_empty());
     m.tool(&["abort"])
         .success()
@@ -211,8 +216,7 @@ fn abort_restores_everything() {
 fn path_with_unrelated_content_is_refused() {
     let m = Mono::new();
     let env = &m.env;
-    env.commit(
-        &m.down,
+    m.land(
         &[("apps/b/local.txt", "mine\n")],
         "mono: unrelated content at apps/b",
     );
@@ -250,11 +254,10 @@ fn status_reports_three_upstreams_with_counts() {
     let env = &m.env;
     let c = env.upstream("app-c", &[("c.txt", "c\n")]);
     let extra = format!(
-        "\n[[upstream]]\nname = \"app-c\"\nurl = {:?}\nbranch = \"main\"\npath = \"libs/c\"\n",
+        "\n[[upstream]]\nname = \"app-c\"\nurl = {:?}\nbranch = \"main\"\npath = \"libs/c\"\n{PUBLISH_BY_PUSH}",
         c.url()
     );
-    env.commit(
-        &m.down,
+    m.land(
         &[(".git-intake.toml", &mono_config(&m.a, &m.b, &extra))],
         "mono: add app-c",
     );
@@ -291,14 +294,9 @@ fn status_reports_three_upstreams_with_counts() {
 
 #[test]
 fn status_check_predicts_conflicts_under_a_path() {
-    let m = Mono::new();
+    let m = imported();
     let env = &m.env;
-    m.import_all();
-    env.commit(
-        &m.down,
-        &[("apps/a/a.txt", "a1\na2-mono\na3\n")],
-        "mono: change a2",
-    );
+    m.land(&[("apps/a/a.txt", "a1\na2-mono\na3\n")], "mono: change a2");
     env.push_upstream(&m.a, &[("a.txt", "a1\na2-up\na3\n")], "app-a: change a2");
     let json = env.tool_json(&m.down, &["status", "--check", "--json"], 1);
     assert_eq!(json["upstreams"][0]["state"], "behind");
@@ -381,20 +379,22 @@ fn log_lists_pending_commits() {
 fn paths_imported_through_a_merge_request_merged_with_a_merge_commit_stay_imported() {
     let m = Mono::merge_request();
     let env = &m.env;
-    let publish = m.publish.clone().unwrap();
+    let publish = m.publish.clone();
     let a_tip = env.rev(&m.a.bare, "main");
     let b_tip = env.rev(&m.b.bare, "main");
     m.tool(&["start"]).success();
     let commit = env.rev(&env.update_worktree(&m.down), "HEAD");
     m.tool(&["finish"]).success();
     let fake = m.forge.as_ref().unwrap();
+    let local = env.rev(&m.down, "main");
     merge_on_fake(env, fake, open_number(fake), How::MergeCommit);
-    // The next `start` brings the local integration branch up to date.
+    // The next `start` reads the merged integration branch on the publish
+    // remote, and leaves the local `main` where it was.
     m.tool(&["start"])
         .success()
         .stdout(contains("every selected upstream is current"));
-    assert_eq!(env.rev(&m.down, "main"), env.rev(&publish, "main"));
-    assert_eq!(env.rev(&m.down, "main^2"), commit);
+    assert_eq!(env.rev(&m.down, "main"), local);
+    assert_eq!(env.rev(&publish, "main^2"), commit);
 
     let status = env.tool_json(&m.down, &["status", "--json"], 0);
     for (i, tip) in [&a_tip, &b_tip].iter().enumerate() {

@@ -21,8 +21,10 @@ fn upstream_tag(f: &Fork, tag: &str, commit: &str) {
     f.env.git(&f.up.work, &["push", "-q", "origin", tag]);
 }
 
-/// Appends `text` to the fork's configuration and publishes it.
+/// Appends `text` to the fork's configuration and publishes it, from a
+/// local `main` brought up to date with the publish remote's first.
 fn append_config(f: &Fork, text: &str) -> String {
+    f.pull();
     let path = f.down.join(".git-intake.toml");
     let cfg = fs::read_to_string(&path).unwrap() + text;
     let c = f.env.commit(
@@ -58,8 +60,10 @@ fn forge_fork() -> Fork {
     f
 }
 
-/// Commits on the fork's integration branch and publishes it.
+/// Commits on the fork's integration branch and publishes it, from a local
+/// `main` brought up to date with the publish remote's first.
 fn land(f: &Fork, name: &str, message: &str) -> String {
+    f.pull();
     let c = f
         .env
         .commit(&f.down, &[(&format!("{name}.txt"), "x\n")], message);
@@ -239,6 +243,7 @@ fn an_upstream_that_does_not_follow_is_refused() {
         + "\n[release]\nupstream = \"upstream\"\ntags = \"v*\"\n";
     f.env
         .commit(&f.down, &[(".git-intake.toml", &cfg)], "fork: release");
+    f.env.git(&f.down, &["push", "-q", "origin", "main"]);
     let err = stderr(&f.tool(&["status"]).code(2));
     assert!(err.contains("release.upstream"), "{err}");
 }
@@ -1598,6 +1603,8 @@ fn an_incompatible_upstream_release_makes_a_major_release_of_chores() {
         (doc["bump"].clone(), doc["next"].clone()),
         ("major".into(), "v2.0.0".into())
     );
+    // `release version` reads the checked-out commit: the published one.
+    f.pull();
     let doc = version_json(
         &f,
         &f.down,

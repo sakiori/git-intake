@@ -2,8 +2,8 @@
 //! integration branch.
 //!
 //! The commands act on the publish remote, never on local branches: they
-//! fetch its integration branch and tags into references of their own, so
-//! that a CI clone without a local integration branch serves as well.
+//! fetch its integration branch and tags into references of their own, as
+//! every command reads the integration branch.
 
 use std::collections::HashSet;
 
@@ -21,7 +21,7 @@ use crate::output::{Render, emit};
 use crate::output::{esay, say};
 use crate::redact::redacted;
 use crate::release::{self, Known, Release, ReleaseTag, Remote, SemverNext, UpstreamRelease};
-use crate::repo::Repo;
+use crate::repo::{Bootstrap, Repo};
 use crate::sync_record;
 use crate::tags::UpstreamTags;
 use crate::upstreams::Fetches;
@@ -230,39 +230,18 @@ fn config_at_head(repo: &Repo) -> Result<Config> {
     })
 }
 
-fn publish_of(config: &Config) -> Result<&Publish> {
-    config
-        .publish
-        .as_ref()
-        .context("releases are cut on the publish remote; configure it in a [publish] table")
-}
-
-/// Fetches the publish remote that `start` names and reads its integration
-/// tip, with the configuration committed there.
-fn at_tip(repo: &Repo, fetches: &mut Fetches, start: &Config, known: &Known) -> Result<AtTip> {
+/// Fetches the integration tip, where `from` says, with the publish
+/// remote's tags, and reads the configuration committed there, refusing as
+/// every command does one that names another integration branch or publish
+/// remote.
+fn at_tip(repo: &Repo, fetches: &mut Fetches, from: &Bootstrap, known: &Known) -> Result<AtTip> {
     let git = &repo.git;
-    let publish = publish_of(start)?;
-    let remote = release::fetch_remote(fetches, &publish.remote, &start.integration)?;
-    let config = repo.config_at(&remote.tip)?.with_context(|| {
-        format!(
-            "no {} is committed at the tip of '{}' on '{}'",
-            config::FILE_NAME,
-            start.integration,
-            publish.remote
-        )
-    })?;
-    if config.integration != start.integration {
-        bail!(
-            "the {} at the tip of '{}' on '{}' names '{}' as the integration branch",
-            config::FILE_NAME,
-            start.integration,
-            publish.remote,
-            config.integration
-        );
-    }
+    repo.require_fetchable(from)?;
+    let remote = release::fetch_remote(fetches, &from.remote, &from.integration)?;
+    let config = repo.config_at_tip(from, &remote.tip)?;
     let at = format!(
         "the tip of '{}' on '{}'",
-        config.integration, publish.remote
+        config.integration, config.publish.remote
     );
     let (settings, up) = release::settings(&config, &at)?;
     let synced = release::last_synced(git, fetches, &config, &remote.tip, known)?;
@@ -339,13 +318,13 @@ fn lookup(git: &Git, publish: &Publish, tag: &str) -> Lookup {
 /// release commands is refused only when `refuse_hidden`.
 pub fn state(
     repo: &Repo,
-    start: &Config,
+    from: &Bootstrap,
     known: &Known,
     refuse_hidden: bool,
 ) -> Result<ReleaseState> {
     let mut fetches = Fetches::new(repo);
-    let tip = at_tip(repo, &mut fetches, start, known)?;
-    let publish = publish_of(&tip.config)?;
+    let tip = at_tip(repo, &mut fetches, from, known)?;
+    let publish = &tip.config.publish;
     let mut published = None;
     let mut forge_error = None;
     let mut next = None;
@@ -395,8 +374,7 @@ pub fn state(
 
 /// `release next`.
 pub fn next(repo: &Repo, json: bool) -> Result<Exit> {
-    let start = config_at_head(repo)?;
-    let state = state(repo, &start, &Known::default(), true)?;
+    let state = state(repo, &repo.bootstrap()?, &Known::default(), true)?;
     emit(&state, json)?;
     Ok(Exit::Success)
 }
@@ -404,10 +382,9 @@ pub fn next(repo: &Repo, json: bool) -> Result<Exit> {
 /// `release tag`.
 pub fn tag(repo: &Repo) -> Result<Exit> {
     let git = &repo.git;
-    let start = config_at_head(repo)?;
     let mut fetches = Fetches::new(repo);
-    let tip = at_tip(repo, &mut fetches, &start, &Known::default())?;
-    let publish = publish_of(&tip.config)?;
+    let tip = at_tip(repo, &mut fetches, &repo.bootstrap()?, &Known::default())?;
+    let publish = &tip.config.publish;
     let remote = &tip.remote;
     crate::forge::refuse_job_token_push(git, &publish.remote)?;
     if let Some(at) = tip.release() {
@@ -569,7 +546,7 @@ pub fn check(repo: &Repo, given: Option<&str>) -> Result<Exit> {
     let config = config_at_head(repo)?;
     let head = repo.head().context("a checked-out commit")?.to_string();
     let (settings, up) = release::settings(&config, "the checked-out commit")?;
-    let publish = publish_of(&config)?;
+    let publish = &config.publish;
     let mut fetches = Fetches::new(repo);
     let remote = release::fetch_remote(&mut fetches, &publish.remote, &config.integration)?;
     let known = Known::default();
@@ -870,7 +847,7 @@ fn semver_version(
 ) -> Result<VersionReport> {
     let git = &repo.git;
     let (settings, up) = release::settings(config, "the checked-out commit")?;
-    let publish = publish_of(config)?;
+    let publish = &config.publish;
     let name = named_tag(given);
     let tag = match &name {
         Some(name) => Some(
@@ -968,7 +945,7 @@ pub fn notes(repo: &Repo, given: Option<&str>) -> Result<Exit> {
     )?;
     let config = config_at_head(repo)?;
     let (settings, up) = release::settings(&config, "the checked-out commit")?;
-    let publish = publish_of(&config)?;
+    let publish = &config.publish;
     let semver = settings.versioning == Versioning::Semver;
     let tag = ReleaseTag::parse(&name, settings).with_context(|| {
         if semver {

@@ -43,23 +43,17 @@ fn output_path(repo: &Repo) -> std::path::PathBuf {
 pub enum Advice<'a> {
     /// The update can be aborted.
     Abort,
-    /// `finish` has moved the integration branch, so the update can only be
-    /// closed at the planned commit.
-    NoPublish,
     /// `sync` carried on the update of the open merge request this names.
     Sync(&'a str),
 }
 
 impl Advice<'_> {
-    fn text(self, state: &UpdateState, remote: &str) -> String {
+    fn text(self, state: &UpdateState) -> String {
         let integration = &state.config.integration;
+        let remote = &state.config.publish.remote;
         match self {
             Advice::Abort => {
                 "Run `git intake abort`, then `git intake start` to plan the update from the new history".to_string()
-            }
-            Advice::NoPublish => {
-                "Run `git intake finish --no-publish` to close the update at the planned commit without publishing it"
-                    .to_string()
             }
             Advice::Sync(request) => format!(
                 "The {request} keeps its head. Withdraw it with `git intake abort --merge-request`, which declines its \
@@ -71,36 +65,19 @@ impl Advice<'_> {
     }
 }
 
-/// Refuses, naming what to do instead, when the update cannot take `tip` in
-/// by a catch-up merge: `tip` does not contain the base, or the commits it
-/// adds change what the update means. `remote` says that `tip` is the
-/// publish remote's.
-pub fn require_possible(
-    repo: &Repo,
-    state: &UpdateState,
-    tip: &str,
-    advice: Advice,
-    remote: bool,
-) -> Result<()> {
+/// Refuses, naming what to do instead, when the update cannot take the
+/// integration tip `tip` in by a catch-up merge: `tip` does not contain the
+/// base, so the publish remote's integration branch was rewritten, or the
+/// commits it adds change what the update means.
+pub fn require_possible(repo: &Repo, state: &UpdateState, tip: &str, advice: Advice) -> Result<()> {
     let git = &repo.git;
     let integration = &state.config.integration;
-    let publish = state
-        .config
-        .publish
-        .as_ref()
-        .map(|p| p.remote.as_str())
-        .unwrap_or_default();
-    let way_on = advice.text(state, publish);
-    if remote && let Some(unpublished) = unpublished(repo, state, tip)? {
-        bail!(
-            "{}",
-            unpublished_refusal(state, publish, tip, &unpublished, advice)
-        );
-    }
+    let remote = &state.config.publish.remote;
+    let way_on = advice.text(state);
     if !git.is_ancestor(&state.base, tip)? {
         bail!(
-            "'{integration}' was rewritten: its tip {} does not contain the update's base {}, so the update \
-             cannot catch up with it. Nothing was merged and no branch moved. {way_on}",
+            "'{remote}/{integration}' was rewritten: its tip {} does not contain the update's base {}, so the \
+             update cannot catch up with it. Nothing was merged or pushed. {way_on}",
             abbrev(tip),
             abbrev(&state.base)
         );
@@ -130,63 +107,12 @@ pub fn require_possible(
     if !problems.is_empty() {
         bail!(
             "cannot catch up with '{integration}' at {}: the commits it adds change what the update means:\n{}\n\
-             Nothing was merged and no branch moved. {way_on}",
+             Nothing was merged or pushed. {way_on}",
             abbrev(tip),
             bullet(&problems)
         );
     }
     Ok(())
-}
-
-/// The commits of the base that the publish remote's integration tip `tip`
-/// lacks, when it moved forward from the tip the update last took and
-/// lacks the base only because the base holds commits of the local
-/// integration branch that were never published; `None` otherwise.
-pub fn unpublished(repo: &Repo, state: &UpdateState, tip: &str) -> Result<Option<Vec<String>>> {
-    let git = &repo.git;
-    let Some(seen) = &state.remote_tip else {
-        return Ok(None);
-    };
-    if git.is_ancestor(&state.base, tip)? || !git.is_ancestor(seen, tip)? {
-        return Ok(None);
-    }
-    Ok(Some(crate::git::lines(&git.run(&[
-        "log",
-        "--format=%h %s",
-        &state.base,
-        &format!("^{tip}"),
-        "--",
-    ])?)))
-}
-
-/// Why the update cannot take in the publish remote's new tip `tip`, which
-/// lacks the `unpublished` local commits of the base.
-pub fn unpublished_refusal(
-    state: &UpdateState,
-    remote: &str,
-    tip: &str,
-    unpublished: &[String],
-    advice: Advice,
-) -> String {
-    let integration = &state.config.integration;
-    let advice = match advice {
-        Advice::NoPublish => "Run `git intake finish --no-publish` to close the update locally, publish or reconcile those commits \
-         with the remote's work, and publish the result through a new update"
-            .to_string(),
-        Advice::Abort => format!(
-            "Run `git intake abort`, publish those commits or reconcile '{integration}' with '{remote}/{integration}', \
-             then run `git intake start` again"
-        ),
-        Advice::Sync(_) => advice.text(state, remote),
-    };
-    format!(
-        "'{remote}/{integration}' moved to {}, but the update's base {} holds commits of '{integration}' that were \
-         never published, and the remote's new work does not contain them:\n{}\n\
-         The update carries them, so it cannot catch up with the remote. Nothing was merged and no branch moved. {advice}",
-        abbrev(tip),
-        abbrev(&state.base),
-        bullet(unpublished)
-    )
 }
 
 /// How the configuration at `tip` differs from the update's in anything but
@@ -241,9 +167,10 @@ pub fn run(repo: &Repo, state: &mut UpdateState, tip: &str) -> Result<Option<Exi
     let head_before = wt.line(&["rev-parse", "HEAD"])?;
     if repo.git.commit(&branch_ref(UPDATE_BRANCH))?.as_deref() != Some(head_before.as_str()) {
         bail!(
-            "the update worktree {} is not at the head of '{UPDATE_BRANCH}'; check the branch out there, \
+            "the update worktree {} is not at the head of '{}'; check the branch out there, \
              then run `git intake finish` again",
-            state.worktree.display()
+            state.worktree.display(),
+            UPDATE_BRANCH
         );
     }
     if repo.git.is_ancestor(&head_before, tip)? {
@@ -462,11 +389,12 @@ pub fn conclude(repo: &Repo, state: &mut UpdateState, resolved: bool) -> Result<
     }
     bail!(
         "the catch-up merge with '{integration}' at {} is no longer in progress in {}, and no commit there merges \
-         {} into it. Point '{UPDATE_BRANCH}' at the commit to keep with `git branch -f`, check it out there and \
+         {} into it. Point '{}' at the commit to keep with `git branch -f`, check it out there and \
          run `git intake continue`, or run `git intake abort`",
         abbrev(&c.tip),
         state.worktree.display(),
-        abbrev(&c.head_before)
+        abbrev(&c.head_before),
+        UPDATE_BRANCH
     )
 }
 
@@ -482,28 +410,6 @@ pub fn conclude_for_finish(
         Concluded::Nothing | Concluded::Dropped => Ok(false),
         Concluded::Stopped(exit) => Err(exit),
     })
-}
-
-/// Gives up the catch-up merge in progress, as `finish --no-publish` does in
-/// the finishing step: the resolutions made so far are recorded, so that a
-/// later merge reapplies them, and the merge is no longer recorded.
-pub fn abandon(repo: &Repo, state: &mut UpdateState) -> Result<()> {
-    let Some(c) = state.catching_up().cloned() else {
-        return Ok(());
-    };
-    let wt = Git::worktree(&state.worktree);
-    if state.worktree.exists() && wt.merge_in_progress()? {
-        wt.run(&["rerere"])?;
-        wt.run(&["merge", "--abort"])?;
-    }
-    state.catch_ups.pop();
-    repo.save_state(state)?;
-    say!(
-        "recorded the resolutions made so far and dropped the catch-up merge with '{}' at {}",
-        state.config.integration,
-        abbrev(&c.tip)
-    );
-    Ok(())
 }
 
 /// Whether the worktree has the update branch checked out.
@@ -552,7 +458,8 @@ fn conclude_at(repo: &Repo, state: &mut UpdateState, merge: &str, head: &str) ->
     let c = current(state)?.clone();
     let integration = state.config.integration.clone();
     let git = &repo.git;
-    let full = branch_ref(UPDATE_BRANCH);
+    let update = UPDATE_BRANCH;
+    let full = branch_ref(update);
     let branch = git.commit(&full)?;
     if branch.as_deref() != Some(head) {
         let out = git.raw(&[
@@ -566,8 +473,8 @@ fn conclude_at(repo: &Repo, state: &mut UpdateState, merge: &str, head: &str) ->
         if !out.success() {
             let now = git.commit(&full)?;
             bail!(
-                "'{UPDATE_BRANCH}' is at {}, no longer at {} where the catch-up with '{integration}' at {} started, \
-                 so it was not moved to {}. No branch moved. Move '{UPDATE_BRANCH}' back to {} \
+                "'{update}' is at {}, no longer at {} where the catch-up with '{integration}' at {} started, \
+                 so it was not moved to {}. No branch moved. Move '{update}' back to {} \
                  and run `git intake continue`, or run `git intake abort`",
                 now.as_deref().map(abbrev).unwrap_or("nothing"),
                 abbrev(&c.head_before),
@@ -579,7 +486,7 @@ fn conclude_at(repo: &Repo, state: &mut UpdateState, merge: &str, head: &str) ->
     }
     let wt = Git::worktree(&state.worktree);
     if !on_update_branch(&wt)? {
-        wt.run(&["checkout", "--quiet", UPDATE_BRANCH])?;
+        wt.run(&["checkout", "--quiet", update])?;
     }
     if let Some(Ok(merged)) = git
         .show_file(merge, config::FILE_NAME)?

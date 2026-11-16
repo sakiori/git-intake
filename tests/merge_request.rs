@@ -615,12 +615,15 @@ fn merged_and_the_next_update() {
         let env = &f.env;
         let (head, target) = started(&f);
         f.tool(&["finish"]).success();
+        let main = env.rev(&f.down, "main");
         merge_on_fake(env, f.forge(), open_number(f.forge()), how);
+        // The next update reads the merged integration branch from the
+        // publish remote, and the local `main` stays where it was.
         f.tool(&["start"])
             .success()
-            .stdout(contains("fast-forwarded 'main'"))
             .stdout(contains("every selected upstream is current"));
-        assert!(env.is_ancestor(&f.down, &head, "main"));
+        assert!(env.is_ancestor(&f.publish, &head, "main"));
+        assert_eq!(env.rev(&f.down, "main"), main);
         let status = env.tool_json(&f.down, &["status", "--json"], 0);
         assert_eq!(status["upstreams"][0]["last_synced"], target.as_str());
         assert_eq!(status["upstreams"][0]["state"], "current");
@@ -681,23 +684,6 @@ fn a_branch_left_by_a_closed_merge_request_is_deleted_first() {
     assert!(out.contains("deleting it"), "{out}");
     assert!(out.contains("opened pull request #2"), "{out}");
     assert_eq!(on_remote(&f, MERGE_REQUEST_BRANCH), Some(head));
-}
-
-#[test]
-fn no_publish_closes_the_verified_update_locally() {
-    let f = Fork::merge_request();
-    let env = &f.env;
-    let (head, _) = started(&f);
-    let err = stderr(&f.tool(&["finish", "--no-publish"]).code(2));
-    assert!(err.contains("the update is not verified"), "{err}");
-    f.tool(&["verify"]).success();
-    f.tool(&["finish", "--no-publish"])
-        .success()
-        .stdout(contains(
-            "not published to 'origin' (advanced locally only): main",
-        ));
-    assert_eq!(env.rev(&f.down, "main"), head);
-    nothing_published(&f);
 }
 
 /// A repository the publish remote pushes to while it is still fetched from
@@ -3271,23 +3257,6 @@ fn land_goes_on_when_the_branch_moves_during_the_catch_up() {
     assert!(f.env.is_ancestor(&f.publish, &later, "main"));
     assert!(f.env.is_ancestor(&f.publish, &other, "main"));
     assert_eq!(fake.mr(q[0]).assignees, [BOT]);
-}
-
-#[test]
-fn land_refuses_an_unpublished_integration_branch_before_it_pauses() {
-    let (f, number, _, q) = queued_fork(1);
-    let fake = f.forge();
-    fake.assign(q[0], BOT);
-    on_main(&f, &[("other.txt", "o\n")], "main");
-    f.env
-        .git(&f.down, &["pull", "-q", "--ff-only", "origin", "main"]);
-    f.env
-        .commit(&f.down, &[("local.txt", "l\n")], "fork: unpublished");
-    let err = stderr(&land(&f, &[]).code(2));
-    assert!(err.contains("that 'origin/main' lacks"), "{err}");
-    assert!(reassigned(&f).is_empty());
-    assert!(recorded(&f).is_none());
-    assert_eq!(fake.mr(number).state, "open");
 }
 
 #[test]

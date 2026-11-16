@@ -10,13 +10,13 @@ use crate::commands::merge_request;
 use crate::commands::update::unrelated_content;
 use crate::config::{Config, Mode, PublishVia, Upstream};
 use crate::drift::adopted_base;
-use crate::git::{Git, abbrev, branch_ref, lines};
+use crate::git::{Git, abbrev, lines};
 use crate::identity;
 use crate::output::{Render, emit};
 use crate::pause;
 use crate::port::{self, Standing};
 use crate::redact::redacted;
-use crate::repo::{MainWorktree, Repo};
+use crate::repo::Repo;
 use crate::state::{CatchUpStep, Stored, UPDATE_BRANCH, UpstreamStep, Work};
 use crate::sync_record::{self, Record};
 use crate::upstreams::{self, Fetches, REFS_PREFIX};
@@ -69,29 +69,16 @@ impl Checks {
 
 pub fn run(repo: &Repo, json: bool) -> Result<Exit> {
     let mut checks = Checks(Vec::new());
-    let loaded = repo.load_config();
-    match &loaded {
-        Ok(loaded) => checks.add(
-            "configuration",
-            None,
-            CheckStatus::Pass,
-            format!(
-                "the configuration on '{}' is valid",
-                loaded.config.integration
-            ),
-        ),
-        Err(err) => checks.add("configuration", None, CheckStatus::Fail, format!("{err:#}")),
-    }
     // Before this command fetches anything of its own.
     reference_checks(repo, &mut checks)?;
-    if let Ok(loaded) = &loaded {
-        upstream_checks(repo, &loaded.config, &mut checks)?;
-        remote_checks(repo, &loaded.config, &mut checks)?;
-        journal_checks(repo, &loaded.config, &mut checks)?;
-        pause_checks(repo, &loaded.config, &mut checks);
-        forge_checks(repo, &loaded.config, &mut checks);
+    let loaded = configuration_checks(repo, &mut checks);
+    if let Some((config, tip)) = &loaded {
+        upstream_checks(repo, config, tip, &mut checks)?;
+        remote_checks(repo, config, &mut checks)?;
+        journal_checks(repo, config, tip, &mut checks)?;
+        pause_checks(repo, config, &mut checks);
+        forge_checks(repo, config, &mut checks);
     }
-    checkout_checks(repo, &mut checks)?;
     state_checks(repo, &mut checks)?;
 
     let healthy = checks.0.iter().all(|c| c.status != CheckStatus::Fail);
@@ -107,6 +94,66 @@ pub fn run(repo: &Repo, json: bool) -> Result<Exit> {
     } else {
         Exit::Negative
     })
+}
+
+/// Fetches the integration tip and checks the configuration committed
+/// there. A publish remote that cannot be fetched is a finding of its own,
+/// and the checks that need the tip are skipped. Returns the configuration
+/// and the tip when both can be read.
+fn configuration_checks(repo: &Repo, checks: &mut Checks) -> Option<(Config, String)> {
+    let from = match repo.bootstrap() {
+        Ok(from) => from,
+        Err(err) => {
+            checks.add("configuration", None, CheckStatus::Fail, format!("{err:#}"));
+            return None;
+        }
+    };
+    let tip = match repo.integration_tip(&from) {
+        Ok(tip) => {
+            checks.add(
+                "publish_remote",
+                None,
+                CheckStatus::Pass,
+                format!(
+                    "the integration branch '{}' of the publish remote '{}' was fetched at {}",
+                    from.integration,
+                    from.remote,
+                    abbrev(&tip)
+                ),
+            );
+            tip
+        }
+        Err(err) => {
+            checks.add(
+                "publish_remote",
+                None,
+                CheckStatus::Fail,
+                format!(
+                    "{err:#}; the configuration, the upstreams, the history and the forge, which are read at the \
+                     integration tip, were not checked"
+                ),
+            );
+            return None;
+        }
+    };
+    match repo.config_at_tip(&from, &tip) {
+        Ok(config) => {
+            checks.add(
+                "configuration",
+                None,
+                CheckStatus::Pass,
+                format!(
+                    "the configuration at '{}/{}' is valid",
+                    from.remote, from.integration
+                ),
+            );
+            Some((config, tip))
+        }
+        Err(err) => {
+            checks.add("configuration", None, CheckStatus::Fail, format!("{err:#}"));
+            None
+        }
+    }
 }
 
 /// The references the update in progress holds, and references under
@@ -213,27 +260,20 @@ fn reference_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
     Ok(())
 }
 
-fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<()> {
+fn upstream_checks(
+    repo: &Repo,
+    config: &Config,
+    integration: &str,
+    checks: &mut Checks,
+) -> Result<()> {
     let git = &repo.git;
-    let Some(integration) = git.commit(&branch_ref(&config.integration))? else {
-        checks.add(
-            "integration_branch",
-            None,
-            CheckStatus::Fail,
-            format!(
-                "the integration branch '{}' does not exist",
-                config.integration
-            ),
-        );
-        return Ok(());
-    };
     let mut fetches = Fetches::new(repo);
     let mut fetched = Vec::new();
     for up in &config.upstreams {
         fetched.push(fetches.upstream(up)?);
     }
     let tips: Vec<String> = fetched.iter().filter_map(|f| f.clone().ok()).collect();
-    let records = sync_record::records(git, &integration, &tips)?;
+    let records = sync_record::records(git, integration, &tips)?;
     let latest = sync_record::latest(git, &records)?;
     for (up, fetched) in config.upstreams.iter().zip(&fetched) {
         let name = Some(up.name.as_str());
@@ -258,8 +298,8 @@ fn upstream_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<
         let tip = fetched.as_ref().ok();
         let record = latest.get(&up.name);
         match up.mode {
-            Mode::Follow => follow_checks(git, config, &integration, up, record, tip, checks)?,
-            Mode::Port => port_checks(git, &integration, up, record, tip, &tips, checks),
+            Mode::Follow => follow_checks(git, config, integration, up, record, tip, checks)?,
+            Mode::Port => port_checks(git, integration, up, record, tip, &tips, checks),
         }
     }
     drop(fetches);
@@ -452,13 +492,10 @@ fn port_checks(
 /// In merge-request mode: whether the publish remote records a pause of the
 /// merge queue, which leaves merge requests out of it until it ends.
 fn pause_checks(repo: &Repo, config: &Config, checks: &mut Checks) {
-    let Some(publish) = config
-        .publish
-        .as_ref()
-        .filter(|p| p.via == PublishVia::MergeRequest)
-    else {
+    let publish = &config.publish;
+    if publish.via != PublishVia::MergeRequest {
         return;
-    };
+    }
     match pause::look(repo, publish, &config.upstreams) {
         Ok(Some(r)) => checks.add(
             "merge_queue_pause",
@@ -486,13 +523,10 @@ fn pause_checks(repo: &Repo, config: &Config, checks: &mut Checks) {
 /// accepted, and the merge settings guarantee that only a tree the required
 /// pipeline tested is merged.
 fn forge_checks(repo: &Repo, config: &Config, checks: &mut Checks) {
-    let Some(publish) = config
-        .publish
-        .as_ref()
-        .filter(|p| p.via == PublishVia::MergeRequest)
-    else {
+    let publish = &config.publish;
+    if publish.via != PublishVia::MergeRequest {
         return;
-    };
+    }
     let forge = match merge_request::connect(repo, publish) {
         Ok(forge) => forge,
         Err(err) => {
@@ -632,16 +666,19 @@ fn remote_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<()
     Ok(())
 }
 
-/// Journals on the integration branch that belong to no port upstream.
-fn journal_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<()> {
+/// Journals at the integration tip `integration` that belong to no port
+/// upstream.
+fn journal_checks(
+    repo: &Repo,
+    config: &Config,
+    integration: &str,
+    checks: &mut Checks,
+) -> Result<()> {
     let git = &repo.git;
-    let Some(integration) = git.commit(&branch_ref(&config.integration))? else {
-        return Ok(());
-    };
     let listed = lines(&git.run(&[
         "ls-tree",
         "--name-only",
-        &integration,
+        integration,
         &format!("{}/", port::JOURNAL_DIR),
     ])?);
     let mut stale = false;
@@ -674,51 +711,8 @@ fn journal_checks(repo: &Repo, config: &Config, checks: &mut Checks) -> Result<(
     Ok(())
 }
 
-fn checkout_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
-    let main = match repo.main_worktree() {
-        MainWorktree::Bare => return Ok(()),
-        MainWorktree::At(main) => main.clone(),
-        // Nothing is wrong with the repository; the checks need to run in
-        // the main worktree.
-        MainWorktree::Unknown => {
-            checks.add(
-                "main_checkout_clean",
-                None,
-                CheckStatus::Warn,
-                format!("not checked: {}", repo.unknown_main_worktree()),
-            );
-            return Ok(());
-        }
-    };
-    let git = Git::worktree(&main);
-    let changes = git.tracked_changes()?;
-    checks.pass_or_fail(
-        "main_checkout_clean",
-        None,
-        changes.is_empty(),
-        if changes.is_empty() {
-            "the main checkout has no uncommitted changes".to_string()
-        } else {
-            format!(
-                "the main checkout has uncommitted changes: {}",
-                changes.join(", ")
-            )
-        },
-    );
-    let merging = git.merge_in_progress()?;
-    checks.pass_or_fail(
-        "no_merge_in_progress",
-        None,
-        !merging,
-        if merging {
-            "a merge is in progress in the main checkout".to_string()
-        } else {
-            "no merge is in progress in the main checkout".to_string()
-        },
-    );
-    Ok(())
-}
-
+/// The update in progress against its worktree and branch, or without one,
+/// the remains of an interrupted update.
 fn state_checks(repo: &Repo, checks: &mut Checks) -> Result<()> {
     let registered = match repo.update_worktree_registered() {
         Ok(registered) => registered,

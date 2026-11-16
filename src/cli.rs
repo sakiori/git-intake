@@ -19,7 +19,9 @@ use clap::{Parser, Subcommand};
         gets published, and the integration branch moves only by fast-forward. With a [release] \
         table, the release commands cut, check and version releases of the integration branch \
         whose versions name the upstream release they carry. The repository describes itself in a \
-        .git-intake.toml committed on its integration branch.",
+        .git-intake.toml committed on its integration branch, which names the publish remote: the \
+        integration branch is always read from that remote, fetched by every command, and no local \
+        integration branch is read, created or moved.",
     after_long_help = "Exit status: 0 on success; 1 on a negative result (drift found by status --check, \
         a failed doctor check, a failed verify, an upstream that status, log or branches could not \
         fetch, a stop on conflicts or on the failed commit of a copy, failed checks in finish or \
@@ -39,8 +41,10 @@ pub struct Cli {
 pub enum Command {
     /// Start an update: fix targets and merge, or plan the commits to port
     ///
-    /// First brings the integration branch up to date with the publish remote's when it is strictly
-    /// behind it, by fast-forward, and refuses when the two have diverged.
+    /// Fetches the publish remote's integration branch, whose tip becomes the update's base, and
+    /// reads the configuration there. The update branch `git-intake/update` is created at the base
+    /// in the worktree `.worktrees/git-intake/update`; no other branch and no file of the main
+    /// checkout changes.
     ///
     /// Fetches the selected upstreams. A follow upstream gets a fixed target: its fetched branch
     /// tip, or, with `tags` in its configuration, the newest release tag on that branch: of the
@@ -70,10 +74,10 @@ pub enum Command {
     Continue,
     /// Remove the update worktree, branch, plan, references, logs and state
     ///
-    /// Leaves the integration branch where `start`, or the last fast-forward to the publish remote,
-    /// left it, and is refused once `finish` has moved it. Never closes a merge request: with no
-    /// update in progress in merge-request mode, it names the update's open merge request, which
-    /// `--merge-request` withdraws.
+    /// Works at any step: nothing of an update is published before `finish` pushes it, and what it
+    /// pushed stays published. Never closes a merge request: with no update in progress in
+    /// merge-request mode, it names the update's open merge request, which `--merge-request`
+    /// withdraws.
     Abort {
         /// Also withdraw the update's merge request through the forge: close it, and delete the
         /// update's branch on each push URL while it points at the commit read
@@ -113,20 +117,23 @@ pub enum Command {
     },
     /// Publish the update by push or as a merge request, and complete it
     ///
-    /// When the integration branch moved past the update's base, `finish` first catches up: it
-    /// merges the update into the new tip with a merge commit that carries an `Intake-Catch-Up`
-    /// trailer. It makes at most one catch-up merge per run; a conflict stops it for `continue`.
+    /// Fetches the publish remote's integration branch. When it moved past the update's base,
+    /// `finish` first catches up: it merges the update into the new tip with a merge commit that
+    /// carries an `Intake-Catch-Up` trailer. It makes at most one catch-up merge per run; a
+    /// conflict stops it for `continue`. A tip that does not contain the base was rewritten, and
+    /// `finish` refuses it.
     ///
     /// With `via = "push"`, `finish` requires a verified update, which a partial run of `verify`
-    /// does not make, and verifies a catch-up merge itself, running every check. It fetches the publish remote, fast-forwards a local integration branch strictly
-    /// behind it, fast-forwards the integration branch to the verified commit, then pushes it
-    /// without force.
+    /// does not make, and verifies a catch-up merge itself, running every check. It then pushes
+    /// exactly the verified commit to the publish remote's integration branch, without force, and
+    /// moves no local branch. A rejected push publishes nothing and keeps the update; `finish` run
+    /// again pushes again, or catches up first when the remote moved.
     ///
     /// With `via = "merge-request"`, `finish` requires no local verification: the merge request's
     /// pipeline verifies the update. It reads the forge's merge settings and refuses a project
     /// that does not merge only a tree its required pipeline tested, catches up with the publish
     /// remote's integration branch without running the checks, pushes the update head without
-    /// force to the branch `git-intake/update`, opens the merge request through the forge's API,
+    /// force to the branch `git-intake/update` on the publish remote, opens the merge request through the forge's API,
     /// or rewrites the title and description of the open one, and removes the local update: the
     /// merge request carries it from then on. No local branch moves. The forge's token comes from
     /// `GITLAB_TOKEN`, or `GH_TOKEN` or `GITHUB_TOKEN` (`GH_ENTERPRISE_TOKEN` or
@@ -134,20 +141,13 @@ pub enum Command {
     ///
     /// An update an earlier release left waiting for its merge request is handed over to the
     /// merge request instead.
-    Finish {
-        /// Complete only the local moves and close the update without fetching or pushing; a
-        /// catch-up takes in only the local integration branch, and after a rejected push the
-        /// update lands a verified catch-up merge, or closes at the planned commit after dropping
-        /// an unverified or conflicted one
-        #[arg(long)]
-        no_publish: bool,
-    },
+    Finish,
     /// Take the follow upstreams in without local state, as a scheduled CI job does
     ///
-    /// Brings the local integration branch up to date with the publish remote's, creating it when
-    /// missing. In merge-request mode, with the update's merge request open, it catches the merge
-    /// request up with the integration branch when that moved, by a catch-up merge pushed without
-    /// force, and otherwise changes nothing; with `replace_after`, it replaces an untouched merge
+    /// Reads the integration branch from the publish remote, as every command does, and creates or
+    /// moves no local branch but the update's. In merge-request mode, with the update's merge
+    /// request open, it catches the merge request up with the integration branch when that moved,
+    /// by a catch-up merge pushed without force, and otherwise changes nothing; with `replace_after`, it replaces an untouched merge
     /// request open that long with a new one when an upstream with `tags` published a newer release,
     /// unless a pause of the merge queue is recorded. Without an open merge request it starts an update
     /// of every follow upstream the integration branch lacks the target of and publishes it as `finish`
@@ -195,8 +195,8 @@ pub enum Command {
     /// Sets, for COMMIT (`HEAD` by default), the `GIT_INTAKE_*` variables `verify` gives the
     /// checks, read from history alone, so that a merge request pipeline gives its checks what
     /// `verify` gives them locally. The integration tip is the publish remote's, fetched for the
-    /// command, or the local integration branch without a publish remote. A commit the
-    /// integration branch contains, or that carries no update, gets no variable.
+    /// command. A commit the integration branch contains, or that carries no update, gets no
+    /// variable.
     ///
     /// Prints one `export` line per variable by default; `--dotenv` prints `NAME=value` lines
     /// for a GitLab dotenv report or GitHub's environment file; `--json` one JSON object. With a
@@ -236,8 +236,7 @@ pub enum Command {
     /// Recomputes, from each merge's parents with `git merge-tree`, the files that conflicted in
     /// the sync merges and catch-up merges on the integration line, including a sync merge that
     /// lies on a catch-up merge's second parent, and prints them one per line, sorted and
-    /// without repeats. The integration tip is the publish remote's, fetched for the command, or
-    /// the local integration branch without a publish remote.
+    /// without repeats. The integration tip is the publish remote's, fetched for the command.
     Conflicts {
         /// Only the merges the integration branch received after COMMIT; its whole history
         /// when none is given
@@ -342,8 +341,7 @@ pub enum Command {
     /// GitHub with the variables `finish` reads; without a token they ask without credentials.
     ///
     /// The commands fetch the publish remote's integration branch and tags into references of
-    /// their own; they need no local integration branch and change no local branch or tag, except
-    /// the tag `release tag` creates.
+    /// their own, and change no local branch or tag, except the tag `release tag` creates.
     Release {
         #[command(subcommand)]
         command: ReleaseCommand,

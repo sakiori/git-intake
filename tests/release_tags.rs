@@ -41,11 +41,17 @@ fn tip_message(f: &Fork) -> String {
     f.env.git(&f.down, &["log", "-1", "--format=%B", "main"]) + "\n"
 }
 
+/// An update cycle; the local `main` then follows the publish remote, as
+/// a person pulls it to read and change it.
 fn cycle(f: &Fork, args: &[&str]) {
+    let main = f.env.rev(&f.down, "main");
     f.tool(args).success();
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
     f.env.assert_no_update(&f.down);
+    // `finish` published the update and left the local `main` alone.
+    assert_eq!(f.env.rev(&f.down, "main"), main);
+    f.pull();
 }
 
 #[test]
@@ -90,6 +96,7 @@ fn start_takes_the_newest_release_tag_on_the_branch() {
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
     env.assert_no_update(&f.down);
+    f.pull();
 
     assert_eq!(env.rev(&f.down, "main^2"), c2);
     let msg = tip_message(&f);
@@ -302,12 +309,35 @@ fn the_release_tags_of_a_port_upstream_are_refused() {
     ));
 }
 
+/// The git commands `status --json` runs, with its document.
+fn traced_status(f: &Fork, name: &str) -> (serde_json::Value, String) {
+    let trace = f.env.path(name);
+    let trace_path = trace.to_string_lossy().into_owned();
+    let assert = f
+        .env
+        .tool_env(
+            &f.down,
+            &["status", "--json"],
+            &[("GIT_TRACE", &trace_path)],
+        )
+        .success();
+    let status = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    (status, std::fs::read_to_string(&trace).unwrap())
+}
+
+fn git_commands(log: &str) -> usize {
+    log.lines()
+        .filter(|l| l.contains("trace: built-in: git "))
+        .count()
+}
+
 #[test]
 fn releases_outside_the_branch_cost_no_git_command_each() {
     let f = release_fork();
     let env = &f.env;
     let c1 = push(&f, "c1");
     tag(&f, "v0.1.0", &c1);
+    let (_, before) = traced_status(&f, "git-trace-before");
     // Forty newer releases on a branch the upstream's main branch lacks,
     // so their commits are never fetched.
     env.git(&f.up.work, &["switch", "-q", "-c", "maint", &c1]);
@@ -322,23 +352,14 @@ fn releases_outside_the_branch_cost_no_git_command_each() {
     env.git(&f.up.work, &["push", "-q", "origin", "maint", "--tags"]);
     env.git(&f.up.work, &["switch", "-q", "main"]);
 
-    let trace = env.path("git-trace");
-    let trace_path = trace.to_string_lossy().into_owned();
-    let assert = env
-        .tool_env(
-            &f.down,
-            &["status", "--json"],
-            &[("GIT_TRACE", &trace_path)],
-        )
-        .success();
-    let status: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    let (status, log) = traced_status(&f, "git-trace");
     assert_eq!(status["upstreams"][0]["release_tag"], "v0.1.0");
-    let log = std::fs::read_to_string(&trace).unwrap();
-    let commands = log
-        .lines()
-        .filter(|l| l.contains("trace: built-in: git "))
-        .count();
-    assert!(commands < 40, "{commands} git commands:\n{log}");
+    // The forty releases add next to nothing to what one release costs.
+    let (without, with) = (git_commands(&before), git_commands(&log));
+    assert!(
+        with <= without + 2,
+        "{with} git commands with the releases, {without} without:\n{log}"
+    );
     let ancestry = log.lines().filter(|l| l.contains("--is-ancestor")).count();
     assert!(ancestry <= 2, "{ancestry} ancestry checks:\n{log}");
 }
@@ -364,6 +385,7 @@ fn prerelease_tags_count_as_targets_when_the_upstream_says_so() {
     )));
     f.tool(&["verify"]).success();
     f.tool(&["finish"]).success();
+    f.pull();
     assert_eq!(env.rev(&f.down, "main^2"), c2);
     let msg = tip_message(&f);
     assert!(

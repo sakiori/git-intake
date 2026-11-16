@@ -2,13 +2,13 @@
 
 use std::collections::HashSet;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::Exit;
 use crate::commands::update::plural;
 use crate::config::Mode;
-use crate::git::{branch_ref, lines};
+use crate::git::lines;
 use crate::output::{Render, emit};
 use crate::repo::Repo;
 use crate::sync_record;
@@ -45,17 +45,11 @@ pub struct UnmergedBranch {
 /// Fetches every branch of the selected upstreams for this command only, and
 /// counts what each holds that the integration branch lacks.
 pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
-    let config = repo.load_config()?.config;
+    let loaded = repo.load_config()?;
+    let config = loaded.config;
+    let integration = loaded.tip;
     let selected = config.select(names)?;
     let git = &repo.git;
-    let integration = git
-        .commit(&branch_ref(&config.integration))?
-        .with_context(|| {
-            format!(
-                "the integration branch '{}' does not exist",
-                config.integration
-            )
-        })?;
     let mut fetches = Fetches::new(repo);
     let mut upstreams = Vec::new();
     for up in selected {

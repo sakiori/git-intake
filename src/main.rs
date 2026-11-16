@@ -63,7 +63,7 @@ fn run(command: Command) -> anyhow::Result<Exit> {
         Command::Continue => commands::update::resume(&repo),
         Command::Abort { merge_request } => commands::update::abort(&repo, merge_request),
         Command::Verify { only, skip } => commands::verify::run(&repo, &only, &skip),
-        Command::Finish { no_publish } => commands::finish::run(&repo, no_publish),
+        Command::Finish => commands::finish::run(&repo),
         Command::Sync => commands::sync::run(&repo),
         Command::Land {
             resume,

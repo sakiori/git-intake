@@ -1,13 +1,13 @@
 //! `log`: upstream commits the integration branch does not contain, or for a
 //! port upstream, the commits still to decide on.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::Exit;
 use crate::commands::update::{no_release, plural};
 use crate::config::Mode;
-use crate::git::{abbrev, branch_ref};
+use crate::git::abbrev;
 use crate::output::{Render, emit};
 use crate::port::{self, Standing};
 use crate::repo::Repo;
@@ -50,17 +50,11 @@ pub struct LogCommit {
 }
 
 pub fn run(repo: &Repo, names: &[String], json: bool) -> Result<Exit> {
-    let config = repo.load_config()?.config;
+    let loaded = repo.load_config()?;
+    let config = loaded.config;
+    let integration = loaded.tip;
     let selected = config.select(names)?;
     let git = &repo.git;
-    let integration = git
-        .commit(&branch_ref(&config.integration))?
-        .with_context(|| {
-            format!(
-                "the integration branch '{}' does not exist",
-                config.integration
-            )
-        })?;
     let mut fetches = Fetches::new(repo);
     let mut fetched = Vec::new();
     for up in &selected {

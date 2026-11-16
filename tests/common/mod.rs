@@ -417,6 +417,8 @@ impl Env {
 pub fn as_earlier_release(state: &mut serde_json::Value, version: u64, release: &str) {
     state["version"] = version.into();
     state["release"] = release.into();
+    // Earlier releases recorded the update branch.
+    state["branch"] = MERGE_REQUEST_BRANCH.into();
     let checks: Vec<serde_json::Value> = state["config"]["checks"]
         .as_array()
         .map(|c| c.iter().map(|c| c["run"].clone()).collect())
@@ -607,6 +609,28 @@ impl Fork {
         self.env.tool(&self.down, args)
     }
 
+    /// The integration tip: where the publish remote's integration branch
+    /// is.
+    pub fn tip(&self) -> String {
+        self.env.rev(&self.publish, "main")
+    }
+
+    /// Commits to the local `main` and publishes it, as work landing on the
+    /// integration branch does; returns the commit id.
+    pub fn land(&self, files: &[(&str, &str)], message: &str) -> String {
+        let c = self.env.commit(&self.down, files, message);
+        self.env
+            .git(&self.down, &["push", "-q", "origin", "HEAD:main"]);
+        c
+    }
+
+    /// Brings the local `main` up to date with the publish remote's, as a
+    /// person does before working on it; the tool never needs it.
+    pub fn pull(&self) {
+        self.env
+            .git(&self.down, &["pull", "-q", "--ff-only", "origin", "main"]);
+    }
+
     /// The fake forge of a fork in merge-request mode.
     pub fn forge(&self) -> &forge::FakeForge {
         self.forge.as_ref().expect("a fork in merge-request mode")
@@ -752,58 +776,85 @@ pub fn open_number(fake: &forge::FakeForge) -> u64 {
 }
 
 /// A monorepo with path upstreams `app-a` at `apps/a` and `app-b` at
-/// `apps/b`, not yet imported, and no publish remote unless built by
-/// [`Mono::merge_request`].
+/// `apps/b`, not yet imported, publishing by push to a bare repository
+/// added as the remote `origin`, unless built by [`Mono::merge_request`].
 pub struct Mono {
     pub env: Env,
     pub a: Upstream,
     pub b: Upstream,
     pub down: PathBuf,
-    pub publish: Option<PathBuf>,
+    /// The publish remote's repository.
+    pub publish: PathBuf,
     pub forge: Option<forge::FakeForge>,
 }
 
+/// The publication setting of a configuration that publishes by push to
+/// the remote `origin`.
+pub const PUBLISH_BY_PUSH: &str = "\n[publish]\nremote = \"origin\"\n";
+
 impl Mono {
     pub fn new() -> Self {
-        Self::build("")
+        let env = Env::new();
+        let publish = env.bare("publish");
+        Self::build(env, publish, None, PUBLISH_BY_PUSH)
     }
 
     /// A monorepo that publishes through merge requests to the remote
     /// `origin`, on a GitLab as in [`Fork::merge_request`].
     pub fn merge_request() -> Self {
-        let mut m = Self::build("\n[publish]\nremote = \"origin\"\nvia = \"merge-request\"\n");
-        let publish = m.env.served(&format!("{}/{}", forge::OWNER, forge::REPO));
+        let env = Env::new();
+        let publish = env.served(&format!("{}/{}", forge::OWNER, forge::REPO));
         let fake = forge::FakeForge::gitlab(&publish);
-        m.env
-            .git(&m.down, &["remote", "add", "origin", &fake.remote_url()]);
         for (k, v) in fake.job_vars() {
-            m.env.set_var(&k, &v);
+            env.set_var(&k, &v);
         }
-        m.env.git(&m.down, &["push", "-q", "origin", "main"]);
-        m.publish = Some(publish);
-        m.forge = Some(fake);
-        m
+        Self::build(
+            env,
+            publish,
+            Some(fake),
+            "\n[publish]\nremote = \"origin\"\nvia = \"merge-request\"\n",
+        )
     }
 
-    fn build(extra: &str) -> Self {
-        let env = Env::new();
+    fn build(env: Env, publish: PathBuf, fake: Option<forge::FakeForge>, extra: &str) -> Self {
         let a = env.upstream("app-a", &[("a.txt", "a1\na2\na3\n")]);
         let b = env.upstream("app-b", &[("b.txt", "b1\nb2\nb3\n")]);
         let down = env.work("mono");
+        let url = match &fake {
+            Some(fake) => fake.remote_url(),
+            None => publish.to_string_lossy().into_owned(),
+        };
+        env.git(&down, &["remote", "add", "origin", &url]);
         let config = mono_config(&a, &b, extra);
         env.commit(
             &down,
             &[("README.md", "monorepo\n"), (".git-intake.toml", &config)],
             "mono: initial layout",
         );
+        env.git(&down, &["push", "-q", "origin", "main"]);
         Self {
             env,
             a,
             b,
             down,
-            publish: None,
-            forge: None,
+            publish,
+            forge: fake,
         }
+    }
+
+    /// The integration tip: where the publish remote's integration branch
+    /// is.
+    pub fn tip(&self) -> String {
+        self.env.rev(&self.publish, "main")
+    }
+
+    /// Commits to the local `main` and publishes it, as work landing on the
+    /// integration branch does; returns the commit id.
+    pub fn land(&self, files: &[(&str, &str)], message: &str) -> String {
+        let c = self.env.commit(&self.down, files, message);
+        self.env
+            .git(&self.down, &["push", "-q", "origin", "HEAD:main"]);
+        c
     }
 
     pub fn tool(&self, args: &[&str]) -> Assert {
@@ -818,6 +869,8 @@ impl Mono {
     }
 }
 
+/// The configuration of a monorepo with the upstreams `a` and `b`, and
+/// `extra`, which carries its publication setting.
 pub fn mono_config(a: &Upstream, b: &Upstream, extra: &str) -> String {
     format!(
         "integration = \"main\"\nchecks = [{{ name = \"a\", run = \"test -f apps/a/a.txt\" }}, \

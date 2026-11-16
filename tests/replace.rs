@@ -1221,7 +1221,7 @@ fn merge_settings_that_refuse_the_publication_close_nothing() {
 /// Lands a commit on the publish remote's integration branch of a
 /// monorepo; returns it.
 fn land_mono(m: &Mono, files: &[(&str, &str)], message: &str) -> String {
-    let dir = common::forge(&m.env, m.publish.as_ref().unwrap());
+    let dir = common::forge(&m.env, &m.publish);
     let c = m.env.commit(&dir, files, message);
     m.env.git(&dir, &["push", "-q", "origin", "HEAD:main"]);
     c

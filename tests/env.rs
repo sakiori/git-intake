@@ -268,7 +268,7 @@ fn an_unreachable_publish_remote_sets_no_variable() {
             .code(2),
     );
     assert!(
-        err.contains("cannot fetch 'main' from the publish remote 'origin'"),
+        err.contains("cannot fetch the integration branch 'main' from the publish remote 'origin'"),
         "{err}"
     );
     assert!(!marker.exists(), "the command ran");
@@ -389,8 +389,10 @@ fn resolved_update(f: &Fork) {
             common::open_number(fake),
             common::How::FastForward,
         );
-        env.git(&f.down, &["pull", "-q", "--ff-only", "origin", "main"]);
     }
+    // The update landed on the publish remote; the local `main` follows it
+    // only when a person pulls.
+    f.pull();
     let ours: String = (1..=10).map(|n| format!("y{n}\n")).collect();
     env.commit(
         &f.down,
@@ -516,9 +518,14 @@ fn delta_refuses_an_update_without_a_previous_target() {
     // taken, and there is no earlier delta to compare with.
     let env = common::Env::new();
     let up = env.upstream("upstream", &[("u.txt", "u\n")]);
+    let publish = env.bare("publish");
     let down = env.work("down");
+    env.git(
+        &down,
+        &["remote", "add", "origin", &publish.to_string_lossy()],
+    );
     let config = format!(
-        "integration = \"main\"\n\n[[upstream]]\nname = \"upstream\"\nurl = {:?}\nbranch = \"main\"\nmode = \"follow\"\n",
+        "integration = \"main\"\n\n[publish]\nremote = \"origin\"\n\n[[upstream]]\nname = \"upstream\"\nurl = {:?}\nbranch = \"main\"\nmode = \"follow\"\n",
         up.url()
     );
     env.commit(
@@ -526,6 +533,7 @@ fn delta_refuses_an_update_without_a_previous_target() {
         &[(".git-intake.toml", &config)],
         "fork: configuration",
     );
+    env.git(&down, &["push", "-q", "origin", "main"]);
     env.git(&down, &["fetch", "-q", &up.url(), "main"]);
     let target = env.rev(&down, "FETCH_HEAD");
     env.git(&down, &["checkout", "-q", "-b", "by-hand"]);

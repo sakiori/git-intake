@@ -1,16 +1,17 @@
 //! The repository the tool runs in: its common git directory, worktrees,
-//! cleanliness, and the committed configuration.
+//! the integration tip, and the configuration committed there.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Config};
-use crate::git::{Git, branch_ref};
+use crate::git::{Git, abbrev, branch_ref};
 use crate::output::esay;
 use crate::state::{self, Paths, Stored, UpdateState};
+use crate::upstreams::Fetches;
 
 pub struct Repo {
     /// Runs every repository-wide git command. It is bound to the main
@@ -28,11 +29,9 @@ pub struct Repo {
     /// The repository's common git directory.
     common: PathBuf,
     main: MainWorktree,
-    /// Where `start` places the update worktree: [`state::UPDATE_WORKTREE`]
-    /// in the main worktree, [`state::BARE_UPDATE_WORKTREE`] in the git
-    /// directory of a bare repository, or `None` when the main worktree
-    /// cannot be located.
-    placed_worktree: Option<PathBuf>,
+    /// The fetches of the integration tip, into references of the tool's
+    /// own that last as long as the command.
+    tips: RefCell<Fetches>,
     /// The top of the worktree the tool was started in.
     toplevel: Option<PathBuf>,
     /// The commit at `HEAD` of the worktree the tool was started in.
@@ -67,10 +66,65 @@ pub struct Worktree {
     pub branch: Option<String>,
 }
 
-/// The configuration and whether the working copy differs from it.
+/// The configuration at the integration tip, that tip, and whether the
+/// working copy differs from the configuration.
 pub struct Loaded {
     pub config: Config,
+    /// The integration tip: the publish remote's integration branch, as this
+    /// command fetched it.
+    pub tip: String,
     pub working_copy_differs: bool,
+}
+
+/// Where the integration tip is fetched from, before any configuration at
+/// that tip can be read: the publish remote and its integration branch, as
+/// the update in progress or a committed configuration names them, with the
+/// name and URL of each upstream that configuration names, which the
+/// publish remote may not be fetched from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bootstrap {
+    pub remote: String,
+    pub integration: String,
+    pub upstreams: Vec<(String, String)>,
+    pub named_by: NamedBy,
+}
+
+impl Bootstrap {
+    /// Where the configuration `config`, named by `named_by`, says the
+    /// integration tip is.
+    pub fn of(config: &Config, named_by: NamedBy) -> Self {
+        Self {
+            remote: config.publish.remote.clone(),
+            integration: config.integration.clone(),
+            upstreams: config
+                .upstreams
+                .iter()
+                .map(|u| (u.name.clone(), u.url.clone()))
+                .collect(),
+            named_by,
+        }
+    }
+}
+
+/// What named the publish remote and the integration branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedBy {
+    /// The update in progress, which recorded them at `start`.
+    Update,
+    /// The configuration committed at a commit, shown as given.
+    Commit(String),
+    /// The configuration read at the integration tip earlier in the command.
+    Tip,
+}
+
+impl std::fmt::Display for NamedBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NamedBy::Update => f.write_str("the update in progress"),
+            NamedBy::Commit(at) => write!(f, "the {} at {at}", config::FILE_NAME),
+            NamedBy::Tip => write!(f, "the {} at the integration tip", config::FILE_NAME),
+        }
+    }
 }
 
 impl Repo {
@@ -99,18 +153,15 @@ impl Repo {
             MainWorktree::At(dir) => dir.clone(),
             MainWorktree::Bare | MainWorktree::Unknown => common.clone(),
         };
-        let placed_worktree = match &main {
-            MainWorktree::At(dir) => Some(dir.join(state::UPDATE_WORKTREE)),
-            MainWorktree::Bare => Some(common.join(state::BARE_UPDATE_WORKTREE)),
-            MainWorktree::Unknown => None,
-        };
+        let git = Git::worktree(anchor);
+        let tips = RefCell::new(Fetches::with(&git));
         Ok(Self {
-            git: Git::worktree(anchor),
+            git,
             here,
             paths,
             common,
             main,
-            placed_worktree,
+            tips,
             toplevel,
             head,
             left_removed_directory: Cell::new(false),
@@ -137,10 +188,190 @@ impl Repo {
             None => Ok(None),
             Some(text) => {
                 let config = config::parse(&text)?;
-                self.refuse_publishing_to_an_upstream(&config)?;
+                let upstreams = crate::identity::Upstreams::new(&self.git, &config.upstreams)?;
+                let which = format!("invalid {} on '{}'", config::FILE_NAME, config.integration);
+                self.refuse_publishing_to_an_upstream(&config.publish.remote, &upstreams, &which)?;
                 Ok(Some(config))
             }
         }
+    }
+
+    /// The integration tip: fetches the publish remote's integration branch,
+    /// where `from` says, into a reference of the tool's own, which lasts as
+    /// long as the command, and returns the commit it is at. Every call
+    /// fetches again, so that a command that waits or verifies reads where
+    /// the branch is now. Refuses, fetching nothing, a publish remote that
+    /// names the repository of one of `from`'s upstreams, and refuses with
+    /// git's reason when the fetch fails.
+    pub fn integration_tip(&self, from: &Bootstrap) -> Result<String> {
+        self.require_fetchable(from)?;
+        let (remote, integration) = (&from.remote, &from.integration);
+        match self
+            .tips
+            .borrow_mut()
+            .remote_branch(remote, integration)?
+        {
+            Ok(tip) => Ok(tip),
+            Err(why) => Err(crate::forge::Failure::unanswered(format!(
+                "cannot fetch the integration branch '{integration}' from the publish remote '{remote}': {why}"
+            ))
+            .into()),
+        }
+    }
+
+    /// Refuses, before anything is fetched from it, a publish remote that
+    /// does not exist, or that names the repository of one of `from`'s
+    /// upstreams.
+    pub fn require_fetchable(&self, from: &Bootstrap) -> Result<()> {
+        let (remote, integration) = (&from.remote, &from.integration);
+        if self.git.remote_url(remote)?.is_none() {
+            bail!(
+                "the publish remote '{remote}' does not exist; add the remote that holds the integration branch \
+                 '{integration}' with `git remote add {remote} <url>`"
+            );
+        }
+        let upstreams = crate::identity::Upstreams::named(&self.git, from.upstreams.clone())?;
+        let which = match &from.named_by {
+            NamedBy::Update => {
+                "the publish remote the update in progress names is refused".to_string()
+            }
+            NamedBy::Commit(at) => format!("invalid {} at {at}", config::FILE_NAME),
+            NamedBy::Tip => format!("invalid {} at the integration tip", config::FILE_NAME),
+        };
+        self.refuse_publishing_to_an_upstream(remote, &upstreams, &which)
+    }
+
+    /// Where the integration tip is fetched from: the update in progress,
+    /// else the configuration committed at `HEAD`.
+    pub fn bootstrap(&self) -> Result<Bootstrap> {
+        match self.stored()? {
+            Some(Stored::Update(state)) => Ok(Bootstrap::of(&state.config, NamedBy::Update)),
+            // An earlier release recorded no upstream's URL: they are taken
+            // from the configuration at HEAD, read without validating it,
+            // since it may be in a form this release refuses.
+            Some(Stored::Waiting(w)) => match &w.publish {
+                Some(publish) => Ok(Bootstrap {
+                    remote: publish.remote.clone(),
+                    integration: w.integration.clone(),
+                    upstreams: self.upstream_urls_at_head()?,
+                    named_by: NamedBy::Update,
+                }),
+                None => bail!(
+                    "the update in progress names no publish remote; {}",
+                    w.next()
+                ),
+            },
+            None => {
+                let head = self.head.as_deref().with_context(|| {
+                    format!(
+                        "HEAD names no commit, so no {} names the publish remote; run the tool in a checkout of \
+                         a branch that carries the configuration",
+                        config::FILE_NAME
+                    )
+                })?;
+                self.bootstrap_at(head)?.with_context(|| {
+                    format!(
+                        "no {} is committed at HEAD; run the tool in a checkout of a branch that carries the \
+                         configuration",
+                        config::FILE_NAME
+                    )
+                })
+            }
+        }
+    }
+
+    /// The name and URL of each upstream of the configuration committed at
+    /// `HEAD`, read without validating it; none when `HEAD` has no
+    /// configuration that reads as TOML.
+    fn upstream_urls_at_head(&self) -> Result<Vec<(String, String)>> {
+        let Some(head) = &self.head else {
+            return Ok(Vec::new());
+        };
+        Ok(match self.git.show_file(head, config::FILE_NAME)? {
+            Some(text) => toml::from_str::<toml::Table>(&text)
+                .map(|table| upstream_urls(&table))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        })
+    }
+
+    /// The publish remote, the integration branch and the upstreams the
+    /// configuration committed at `rev` names, read without validating the
+    /// rest, or `None` when `rev` has no configuration. The configuration at
+    /// the integration tip is the one validated and used. When the
+    /// integration branch or the publish remote cannot be read, the problems
+    /// validation finds are named.
+    pub fn bootstrap_at(&self, rev: &str) -> Result<Option<Bootstrap>> {
+        let Some(text) = self.git.show_file(rev, config::FILE_NAME)? else {
+            return Ok(None);
+        };
+        let at = if self.head.as_deref() == Some(rev) {
+            "HEAD".to_string()
+        } else {
+            abbrev(rev).to_string()
+        };
+        let unnamed = || -> anyhow::Error {
+            let why = "does not tell where to read the integration tip from";
+            match config::parse(&text) {
+                Err(err) => err.context(format!("the {} at {at} {why}", config::FILE_NAME)),
+                Ok(_) => anyhow::anyhow!("the {} at {at} {why}", config::FILE_NAME),
+            }
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+            return Err(unnamed());
+        };
+        let named = |value: Option<&toml::Value>| {
+            value
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let integration = named(table.get("integration"));
+        let remote = named(table.get("publish").and_then(|p| p.get("remote")));
+        let (Some(integration), Some(remote)) = (integration, remote) else {
+            return Err(unnamed());
+        };
+        Ok(Some(Bootstrap {
+            remote,
+            integration,
+            upstreams: upstream_urls(&table),
+            named_by: NamedBy::Commit(at),
+        }))
+    }
+
+    /// The configuration committed at the integration tip `tip`, fetched
+    /// from where `from` says. Refuses when there is none, when it is
+    /// invalid, or when it names another integration branch or publish
+    /// remote than `from`.
+    pub fn config_at_tip(&self, from: &Bootstrap, tip: &str) -> Result<Config> {
+        let shown = format!("'{}/{}'", from.remote, from.integration);
+        let config = self.config_at(tip)?.with_context(|| {
+            format!(
+                "no {} is committed at the integration tip {shown} ({})",
+                config::FILE_NAME,
+                abbrev(tip)
+            )
+        })?;
+        if config.integration != from.integration || config.publish.remote != from.remote {
+            bail!(
+                "the {} at the integration tip {shown} ({}) names '{}' as the integration branch and '{}' as the \
+                 publish remote, but {} names '{}' and '{}'. {}",
+                config::FILE_NAME,
+                abbrev(tip),
+                config.integration,
+                config.publish.remote,
+                from.named_by,
+                from.integration,
+                from.remote,
+                if from.named_by == NamedBy::Update {
+                    "Finish or abort the update, then run the command again in a checkout of the new configuration"
+                } else {
+                    "Run the command in a checkout of a commit that carries the configuration of the integration tip"
+                }
+            );
+        }
+        Ok(config)
     }
 
     /// The commit at `HEAD` of the worktree the tool was started in.
@@ -217,11 +448,6 @@ impl Repo {
         Ok(list)
     }
 
-    /// Where the main worktree is.
-    pub fn main_worktree(&self) -> &MainWorktree {
-        &self.main
-    }
-
     /// The main checkout, unless the repository is bare. Refuses when it
     /// cannot be located.
     pub fn main_checkout(&self) -> Result<Option<PathBuf>> {
@@ -241,23 +467,16 @@ impl Repo {
         )
     }
 
-    /// Worktrees that have `branch` checked out. Refuses when the main
-    /// worktree has it checked out but cannot be located.
-    pub fn checkouts_of(&self, branch: &str) -> Result<Vec<PathBuf>> {
-        let list = self.worktrees()?;
-        if self.main == MainWorktree::Unknown
-            && list.first().and_then(|w| w.branch.as_deref()) == Some(branch)
-        {
-            bail!(
-                "'{branch}' is checked out in the main worktree, and {}",
-                self.unknown_main_worktree()
-            );
+    /// Where `start` places the update worktree: [`state::UPDATE_WORKTREE`]
+    /// in the main worktree, [`state::BARE_UPDATE_WORKTREE`] in the git
+    /// directory of a bare repository, or `None` when the main worktree
+    /// cannot be located.
+    fn placement(&self) -> Option<PathBuf> {
+        match &self.main {
+            MainWorktree::At(dir) => Some(dir.join(state::UPDATE_WORKTREE)),
+            MainWorktree::Bare => Some(self.common.join(state::BARE_UPDATE_WORKTREE)),
+            MainWorktree::Unknown => None,
         }
-        Ok(list
-            .into_iter()
-            .filter(|w| w.branch.as_deref() == Some(branch))
-            .map(|w| w.path)
-            .collect())
     }
 
     /// The update worktree: the one the update in progress records, else the
@@ -297,7 +516,7 @@ impl Repo {
                 Resolved::Foreign(w.path)
             });
         }
-        Ok(Resolved::Update(self.placed_worktree.clone()))
+        Ok(Resolved::Update(self.placement()))
     }
 
     /// Whether `wt` is [`state::UPDATE_WORKTREE`] in the main worktree. The
@@ -322,7 +541,7 @@ impl Repo {
     /// at a path containing `/.git`, which compilers, bundlers and watchers
     /// ignore, so checks run there would not see the tree as it is.
     pub fn place_update_worktree(&self) -> Result<PathBuf> {
-        let Some(wt) = &self.placed_worktree else {
+        let Some(wt) = self.placement() else {
             bail!("{}", self.unknown_main_worktree());
         };
         match &self.main {
@@ -354,7 +573,7 @@ impl Repo {
             ),
             MainWorktree::Bare | MainWorktree::Unknown => {}
         }
-        Ok(wt.clone())
+        Ok(wt)
     }
 
     /// Keeps the update worktree out of the main checkout's status: unless it
@@ -414,151 +633,70 @@ impl Repo {
             .is_some())
     }
 
-    /// Refuses when the main checkout or a checkout of the integration branch
-    /// has uncommitted changes to tracked files.
-    pub fn require_clean(&self, integration: &str) -> Result<()> {
-        let mut dirs: Vec<PathBuf> = self.main_checkout()?.into_iter().collect();
-        for dir in self.checkouts_of(integration)? {
-            if !dirs.contains(&dir) {
-                dirs.push(dir);
-            }
-        }
-        for dir in dirs {
-            let changes = Git::worktree(&dir).tracked_changes()?;
-            if !changes.is_empty() {
-                bail!(
-                    "{} has uncommitted changes; commit or stash them first:\n{}",
-                    self.describe_checkout(&dir, integration)?,
-                    bullet(&changes)
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn describe_checkout(&self, dir: &Path, integration: &str) -> Result<String> {
-        let main = self.main_checkout()?;
-        if main.as_deref() == Some(dir) {
-            Ok("the main checkout".to_string())
-        } else {
-            Ok(format!(
-                "the checkout of integration branch '{integration}' at {}",
-                dir.display()
-            ))
-        }
-    }
-
-    /// Finds the integration branch: from the update in progress, else from
-    /// the configuration committed at HEAD.
-    fn integration_branch(&self) -> Result<String> {
-        if let Some(stored) = self.stored()? {
-            return Ok(stored.integration().to_string());
-        }
-        let committed = match &self.head {
-            Some(head) => self.git.show_file(head, config::FILE_NAME)?,
-            None => None,
-        };
-        let Some(text) = committed else {
-            bail!(
-                "no {} is committed at HEAD; run the tool from a checkout of the integration branch",
-                config::FILE_NAME
-            );
-        };
-        let table: toml::Table = toml::from_str(&text).map_err(|e| {
-            anyhow::anyhow!("invalid {} at HEAD: {}", config::FILE_NAME, e.message())
-        })?;
-        match table.get("integration").and_then(|v| v.as_str()) {
-            Some(b) if !b.trim().is_empty() => Ok(b.trim().to_string()),
-            _ => bail!(
-                "invalid {} at HEAD: `integration` is missing",
-                config::FILE_NAME
-            ),
-        }
-    }
-
-    /// The name and URL of each upstream of the configuration committed on
-    /// `integration`, read without validating the rest, as for an update of
-    /// an earlier release whose configuration this release may refuse.
-    pub fn committed_upstream_urls(&self, integration: &str) -> Result<Vec<(String, String)>> {
+    /// The name and URL of each upstream of the configuration committed at
+    /// the integration tip `tip`, read without validating the rest, as for
+    /// an update of an earlier release whose configuration this release may
+    /// refuse.
+    pub fn committed_upstream_urls(&self, tip: &str) -> Result<Vec<(String, String)>> {
         let text = self
             .git
-            .show_file(&branch_ref(integration), config::FILE_NAME)?
+            .show_file(tip, config::FILE_NAME)?
             .with_context(|| {
                 format!(
-                    "no {} is committed on '{integration}', so the upstreams' URLs are unknown",
-                    config::FILE_NAME
+                    "no {} is committed at the integration tip {}, so the upstreams' URLs are unknown",
+                    config::FILE_NAME,
+                    abbrev(tip)
                 )
             })?;
         let table: toml::Table = toml::from_str(&text).map_err(|e| {
             anyhow::anyhow!(
-                "invalid {} on '{integration}', so the upstreams' URLs are unknown: {}",
+                "invalid {} at the integration tip {}, so the upstreams' URLs are unknown: {}",
                 config::FILE_NAME,
+                abbrev(tip),
                 e.message()
             )
         })?;
-        Ok(table
-            .get("upstream")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|up| {
-                let name = up.get("name")?.as_str()?.to_string();
-                let url = up.get("url")?.as_str()?.to_string();
-                Some((name, url))
-            })
-            .collect())
+        Ok(upstream_urls(&table))
     }
 
-    /// Reads and validates the configuration committed on the integration
-    /// branch tip. A working copy that differs is reported on stderr.
+    /// Fetches the integration tip where [`Self::bootstrap`] says, and reads
+    /// and validates the configuration committed there. A working copy that
+    /// differs is reported on stderr.
     pub fn load_config(&self) -> Result<Loaded> {
-        let integration = self.integration_branch()?;
-        let rev = branch_ref(&integration);
-        if self.git.commit(&rev)?.is_none() {
-            bail!("the integration branch '{integration}' does not exist");
-        }
-        let Some(text) = self.git.show_file(&rev, config::FILE_NAME)? else {
-            bail!(
-                "no {} is committed on the integration branch '{integration}'",
-                config::FILE_NAME
-            );
-        };
-        let config = config::parse(&text)?;
-        self.refuse_publishing_to_an_upstream(&config)?;
-        if config.integration != integration {
-            bail!(
-                "the {} committed on '{integration}' names '{}' as the integration branch",
-                config::FILE_NAME,
-                config.integration
-            );
-        }
-        let working_copy_differs = self.working_copy_differs(&text)?;
+        let from = self.bootstrap()?;
+        let tip = self.integration_tip(&from)?;
+        let config = self.config_at_tip(&from, &tip)?;
+        let working_copy_differs = self.working_copy_differs(&tip)?;
         if working_copy_differs {
             esay!(
-                "note: the working copy of {} differs from the version committed on '{integration}'; using the committed version",
-                config::FILE_NAME
+                "note: the working copy of {} differs from the version committed at '{}/{}'; using the committed version",
+                config::FILE_NAME,
+                from.remote,
+                from.integration
             );
         }
         Ok(Loaded {
             config,
+            tip,
             working_copy_differs,
         })
     }
 
-    /// The tool never pushes to an upstream: a publish remote fetched from
-    /// or pushed to a URL that names an upstream's repository, as git
-    /// resolves both, is refused.
-    fn refuse_publishing_to_an_upstream(&self, config: &Config) -> Result<()> {
-        let Some(publish) = &config.publish else {
-            return Ok(());
-        };
-        let upstreams = crate::identity::Upstreams::new(&self.git, &config.upstreams)?;
+    /// The tool never pushes to an upstream: a publish remote `remote`
+    /// fetched from or pushed to a URL that names the repository of one of
+    /// `upstreams`, as git resolves both, is refused, the refusal starting
+    /// with `which`.
+    fn refuse_publishing_to_an_upstream(
+        &self,
+        remote: &str,
+        upstreams: &crate::identity::Upstreams,
+        which: &str,
+    ) -> Result<()> {
         let mut problems = Vec::new();
-        for (place, up) in upstreams.named_by_remote(&self.git, &publish.remote)? {
+        for (place, up) in upstreams.named_by_remote(&self.git, remote)? {
             problems.push(format!(
-                "publish remote '{}' has the URL {}, which names the repository of upstream '{}' ({}); \
+                "publish remote '{remote}' has the URL {}, which names the repository of upstream '{}' ({}); \
                  the tool never pushes to an upstream",
-                publish.remote,
                 place.shown(),
                 up.name,
                 crate::redact::redacted(&up.url)
@@ -566,9 +704,7 @@ impl Repo {
         }
         if !problems.is_empty() {
             bail!(
-                "invalid {} on '{}':\n{}",
-                config::FILE_NAME,
-                config.integration,
+                "{which}:\n{}",
                 problems
                     .iter()
                     .map(|p| format!("  - {p}"))
@@ -579,17 +715,25 @@ impl Repo {
         Ok(())
     }
 
-    fn working_copy_differs(&self, committed: &str) -> Result<bool> {
+    /// Whether the configuration in the working copy the tool was started
+    /// in differs from the one committed at `tip`. The update worktree holds
+    /// the update's own configuration, which is not compared.
+    fn working_copy_differs(&self, tip: &str) -> Result<bool> {
         let Some(top) = &self.toplevel else {
             return Ok(false);
         };
-        if self.started_in_update_worktree()? {
+        if let Some(stored) = self.stored().ok().flatten()
+            && *top == canonical(stored.worktree())
+        {
             return Ok(false);
         }
-        Ok(match fs::read_to_string(top.join(config::FILE_NAME)) {
-            Ok(text) => text != committed,
-            Err(_) => false,
-        })
+        let committed = self.git.show_file(tip, config::FILE_NAME)?;
+        Ok(
+            match (fs::read_to_string(top.join(config::FILE_NAME)), committed) {
+                (Ok(text), Some(committed)) => text != committed,
+                _ => false,
+            },
+        )
     }
 
     /// Removes the update worktree and branch if they exist. Resolutions made
@@ -616,12 +760,12 @@ impl Repo {
     /// refused, and nothing is removed. A directory git does not register is
     /// left where it is, and said so, unless it is empty.
     pub fn remove_update_worktree(&self) -> Result<Vec<String>> {
-        let started_inside = self.started_in_update_worktree()?;
         let mut removed = Vec::new();
         let Some(wt) = self.update_worktree()? else {
             self.git.run(&["worktree", "prune"])?;
             return Ok(removed);
         };
+        let started_inside = self.toplevel.as_deref() == Some(canonical(&wt).as_path());
         let unplaced = self.unplaced(&wt)?;
         if self.update_worktree_registered()? {
             if let Some(why) = &unplaced {
@@ -751,88 +895,12 @@ impl Repo {
             && lines.next().map(|l| canonical(Path::new(l))) == Some(canonical(wt)))
     }
 
-    /// What the tree of `rev`, checked out in the main worktree, would put
-    /// where the update worktree is placed: `.worktrees` or
-    /// `.worktrees/git-intake` as anything but a directory, which would
-    /// replace the directory holding the update worktree, or anything at
-    /// [`state::UPDATE_WORKTREE`] itself. Names are compared under full
-    /// Unicode case folding whatever `core.ignoreCase` says, as a file
-    /// system or directory that ignores case would take them for the same
-    /// name. `None` when nothing collides.
-    pub fn placement_collision(&self, rev: &str) -> Result<Option<String>> {
-        let parts: Vec<&str> = state::UPDATE_WORKTREE.split('/').collect();
-        self.collision_below(&format!("{rev}^{{tree}}"), &parts, "")
-    }
-
-    /// [`Self::placement_collision`] in `tree`, at `path`, for the rest
-    /// `parts` of the placement.
-    fn collision_below(&self, tree: &str, parts: &[&str], path: &str) -> Result<Option<String>> {
-        let Some((part, rest)) = parts.split_first() else {
-            return Ok(None);
-        };
-        let listing = self.git.run(&["ls-tree", "-z", "--end-of-options", tree])?;
-        let wanted = unicase::UniCase::unicode(*part);
-        // `<mode> SP <type> SP <object> TAB <name>`
-        for entry in listing.split('\0') {
-            let Some((meta, name)) = entry.split_once('\t') else {
-                continue;
-            };
-            if unicase::UniCase::unicode(name) != wanted {
-                continue;
-            }
-            let meta: Vec<&str> = meta.split(' ').collect();
-            let at = if path.is_empty() {
-                name.to_string()
-            } else {
-                format!("{path}/{name}")
-            };
-            let kind = match meta.as_slice() {
-                ["120000", ..] => "a symbolic link",
-                ["160000", ..] => "a submodule",
-                [_, "tree", _] => "a directory",
-                _ => "a file",
-            };
-            if rest.is_empty() {
-                return Ok(Some(format!(
-                    "it has {kind} at '{at}', where the tool keeps the update worktree"
-                )));
-            }
-            match meta.as_slice() {
-                [_, "tree", oid] => {
-                    if let Some(found) = self.collision_below(oid, rest, &at)? {
-                        return Ok(Some(found));
-                    }
-                }
-                _ => {
-                    return Ok(Some(format!(
-                        "it has '{at}' as {kind}, where the tool keeps the update worktree, at {} in the main \
-                         worktree; checked out there, it would replace the directory that holds the worktree",
-                        state::UPDATE_WORKTREE
-                    )));
-                }
-            }
-        }
-        Ok(None)
-    }
-
     /// Notes that the command removed the update worktree it was started in.
     /// Printed once the command's own output is complete.
     pub fn note_removed_directory(&self) {
         if self.left_removed_directory.get() {
             esay!("note: the current directory was in the update worktree, which is now removed");
         }
-    }
-
-    /// Whether the tool was started in the update worktree.
-    /// A user's worktree on the update branch is not the update worktree.
-    fn started_in_update_worktree(&self) -> Result<bool> {
-        let Some(top) = &self.toplevel else {
-            return Ok(false);
-        };
-        Ok(match self.resolve_update_worktree()? {
-            Resolved::Update(wt) => wt.is_some_and(|wt| *top == canonical(&wt)),
-            Resolved::Foreign(_) => false,
-        })
     }
 
     /// Removes the plan of a port update, if any.
@@ -1003,6 +1071,22 @@ fn parse_worktrees(out: &str) -> Vec<Worktree> {
 /// Canonical form of a path when it exists, the path itself otherwise.
 pub fn canonical(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The name and URL of each upstream of a configuration read as a table,
+/// without validating anything.
+fn upstream_urls(table: &toml::Table) -> Vec<(String, String)> {
+    table
+        .get("upstream")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|up| {
+            let name = up.get("name")?.as_str()?.to_string();
+            let url = up.get("url")?.as_str()?.to_string();
+            Some((name, url))
+        })
+        .collect()
 }
 
 /// Indented list for messages.

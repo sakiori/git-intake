@@ -19,12 +19,12 @@ use crate::commands::{catch_up, finish, sync};
 use crate::config::{self, Config, Publish};
 use crate::description::{self, Content, Targets};
 use crate::forge::{self, Failure, Forge, Kind, MergeRequest, State, may_pass};
-use crate::git::{Git, abbrev, branch_ref, split_z, tracking_ref};
+use crate::git::{Git, abbrev, branch_ref, split_z};
 use crate::identity;
 use crate::output::say;
 use crate::port::Verb;
 use crate::redact::redacted;
-use crate::repo::{Repo, bullet};
+use crate::repo::{Bootstrap, NamedBy, Repo, bullet};
 use crate::state::{
     CopyStep, EarlierMergeRequest, MergeKind, UPDATE_BRANCH, UpdateState, Waiting, Work,
 };
@@ -36,12 +36,11 @@ use crate::upstreams::{self, Fetches};
 /// `git-intake/update-<commit>`.
 const EARLIER_BRANCH_PREFIX: &str = "git-intake/update-";
 
-/// Whether the update's merge requests may come from `branch`.
-fn is_update_branch(branch: &str) -> bool {
-    branch == UPDATE_BRANCH
-        || branch
-            .strip_prefix(EARLIER_BRANCH_PREFIX)
-            .is_some_and(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_hexdigit()))
+/// Whether `branch` is one an earlier release published an update on.
+fn is_earlier_branch(branch: &str) -> bool {
+    branch
+        .strip_prefix(EARLIER_BRANCH_PREFIX)
+        .is_some_and(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Reaches the forge of the publish remote, refusing when it cannot.
@@ -72,8 +71,9 @@ impl Requests {
     }
 }
 
-/// Lists the update's merge requests: those from `git-intake/update`, from
-/// the branches of earlier releases on the publish remote, and from `also`.
+/// Lists the update's merge requests into `integration`: those from
+/// `git-intake/update`, from the branches of earlier releases on the publish
+/// remote, and from `also`.
 pub fn requests(
     repo: &Repo,
     forge: &dyn Forge,
@@ -136,7 +136,7 @@ fn earlier_branches(git: &Git, remote: &str) -> Result<Vec<String>> {
         .lines()
         .filter_map(|l| l.split_once('\t'))
         .filter_map(|(_, name)| name.trim().strip_prefix("refs/heads/"))
-        .filter(|b| is_update_branch(b) && *b != UPDATE_BRANCH)
+        .filter(|b| is_earlier_branch(b))
         .map(str::to_string)
         .collect())
 }
@@ -479,10 +479,10 @@ pub struct Announced(Vec<String>);
 
 impl Announced {
     /// Names the changes the update makes, from its base to `head`, to its
-    /// own checks, when `finish` or `sync` verifies or moves the integration
-    /// branch itself: before checks run on `head`, and before the branch moves
-    /// to it, with or without `--no-publish`, as publication through a merge
-    /// request names them. Each head is named once per run. The CI
+    /// own checks, when `finish` or `sync` verifies or pushes the update
+    /// itself: before checks run on `head`, and before it is pushed to the
+    /// integration branch, as publication through a merge request names
+    /// them. Each head is named once per run. The CI
     /// definition counts when the tool can tell the forge without its API.
     pub fn check_changes(&mut self, repo: &Repo, state: &UpdateState, head: &str) -> Result<()> {
         if self.0.iter().any(|h| h == head) {
@@ -496,10 +496,7 @@ impl Announced {
 /// Names the changes the update makes, from its base to `head`, to its own
 /// checks; [`Announced`] calls it once per head.
 fn announce_check_changes(repo: &Repo, state: &UpdateState, head: &str) -> Result<()> {
-    let ci_paths = match &state.config.publish {
-        Some(publish) => crate::forge::ci_paths_without_api(&repo.git, publish)?,
-        None => Vec::new(),
-    };
+    let ci_paths = crate::forge::ci_paths_without_api(&repo.git, &state.config.publish)?;
     let changes = check_changes(&repo.git, state, head, &ci_paths)?;
     if !changes.is_empty() {
         say!(
@@ -976,7 +973,7 @@ pub fn withdraw(
 /// cannot be read.
 pub fn publication(repo: &Repo, recorded: Option<&Publish>) -> Option<Publish> {
     match repo.load_config() {
-        Ok(loaded) => loaded.config.publish,
+        Ok(loaded) => Some(loaded.config.publish),
         Err(_) => recorded.cloned(),
     }
 }
@@ -1106,11 +1103,7 @@ pub fn require_startable(repo: &Repo, publish: &Publish, integration: &str) -> R
 /// request and ends the local update.
 pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
     require_worktree(repo, &state)?;
-    let setting = state
-        .config
-        .publish
-        .clone()
-        .context("no publish remote is configured")?;
+    let setting = state.config.publish.clone();
     let integration = state.config.integration.clone();
     let remote = setting.remote.clone();
     let forge = connect(repo, &setting)?;
@@ -1121,7 +1114,7 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
         Err(exit) => return Ok(exit),
     };
     let mut head = require_publishable(&state)?;
-    let tip = fetch_integration(&repo.git, &remote, &integration)?;
+    let tip = repo.integration_tip(&Bootstrap::of(&state.config, NamedBy::Update))?;
     if repo.git.is_ancestor(&head, &tip)? {
         say!(
             "'{remote}/{integration}' at {} already contains the update head {}: the update already landed. \
@@ -1129,7 +1122,7 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
             abbrev(&tip),
             abbrev(&head)
         );
-        return finish::close(repo, state, Vec::new());
+        return finish::close(repo, state);
     }
     let carried_branch: Vec<String> = state
         .carried_from
@@ -1216,7 +1209,7 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
             }
         }
     }
-    if !repo.git.is_ancestor(&tip, &state.base)? {
+    if tip != state.base {
         if caught {
             say!(
                 "'{remote}/{integration}' moved to {} since the catch-up merge was made; nothing was pushed. Run \
@@ -1225,8 +1218,7 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
             );
             return Ok(Exit::Negative);
         }
-        catch_up::require_possible(repo, &state, &tip, catch_up::Advice::Abort, true)?;
-        state.remote_tip = Some(tip.clone());
+        catch_up::require_possible(repo, &state, &tip, catch_up::Advice::Abort)?;
         if let Some(exit) = catch_up::run(repo, &mut state, &tip)? {
             return Ok(exit);
         }
@@ -1278,7 +1270,7 @@ pub fn finish(repo: &Repo, mut state: UpdateState) -> Result<Exit> {
         }
     };
     drop(fetches);
-    let exit = finish::close(repo, state, Vec::new())?;
+    let exit = finish::close(repo, state)?;
     say!(
         "the {term} carries the update from now on: {}",
         named(kind, &mr)
@@ -1320,35 +1312,6 @@ pub fn require_publishable(state: &UpdateState) -> Result<String> {
     wt.line(&["rev-parse", "HEAD"])
 }
 
-/// Fetches the publish remote's integration branch into its tracking ref and
-/// returns its tip, refusing with git's reason when that fails.
-pub fn fetch_integration(git: &Git, remote: &str, integration: &str) -> Result<String> {
-    if git.remote_url(remote)?.is_none() {
-        bail!("the publish remote '{remote}' does not exist");
-    }
-    let out = git.raw(&[
-        "fetch",
-        "--quiet",
-        "--no-tags",
-        "--refmap=",
-        remote,
-        &format!(
-            "+{}:{}",
-            branch_ref(integration),
-            tracking_ref(remote, integration)
-        ),
-    ])?;
-    if !out.success() {
-        return Err(Failure::unanswered(format!(
-            "cannot fetch '{integration}' from the publish remote '{remote}': {}",
-            out.into_error()
-        ))
-        .into());
-    }
-    git.commit(&tracking_ref(remote, integration))?
-        .with_context(|| format!("'{remote}' has no branch '{integration}'"))
-}
-
 /// The update's open merge request for `status`: the forge's kind, the
 /// merge request, and the newest one merged without its history.
 pub struct Overview {
@@ -1357,10 +1320,18 @@ pub struct Overview {
     pub merged_without_history: Option<MergeRequest>,
 }
 
-/// Reads what `status` shows of the forge.
-pub fn overview(repo: &Repo, publish: &Publish, integration: &str, tip: &str) -> Result<Overview> {
+/// Reads what `status` shows of the forge, against the integration tip
+/// `tip`.
+pub fn overview(repo: &Repo, config: &Config, tip: &str) -> Result<Overview> {
+    let publish = &config.publish;
     let forge = connect(repo, publish)?;
-    let reqs = requests(repo, forge.as_ref(), &publish.remote, integration, &[])?;
+    let reqs = requests(
+        repo,
+        forge.as_ref(),
+        &publish.remote,
+        &config.integration,
+        &[],
+    )?;
     let mut without_history = None;
     if let Some(merged) = reqs.latest_merged()
         && merged_without_history(&repo.git, merged, tip)?
@@ -1472,7 +1443,14 @@ mod tests {
     fn config(install: Option<&str>, checks: &[(&str, &str)]) -> Config {
         Config {
             integration: "main".into(),
-            publish: None,
+            publish: config::Publish {
+                remote: "origin".into(),
+                via: config::PublishVia::MergeRequest,
+                forge: None,
+                api: None,
+                queue: None,
+                replace_after: None,
+            },
             install: install.map(str::to_string),
             checks: checks
                 .iter()
@@ -1544,11 +1522,11 @@ mod tests {
 
     #[test]
     fn update_branches_are_recognised() {
-        assert!(is_update_branch("git-intake/update"));
-        assert!(is_update_branch("git-intake/update-0123abcdef01"));
-        assert!(!is_update_branch("git-intake/update-"));
-        assert!(!is_update_branch("git-intake/update-fix"));
-        assert!(!is_update_branch("feature/git-intake/update"));
+        assert!(!is_earlier_branch("git-intake/update"));
+        assert!(is_earlier_branch("git-intake/update-0123abcdef01"));
+        assert!(!is_earlier_branch("git-intake/update-"));
+        assert!(!is_earlier_branch("git-intake/update-fix"));
+        assert!(!is_earlier_branch("feature/git-intake/update"));
     }
 
     #[test]

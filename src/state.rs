@@ -10,19 +10,22 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Config, Publish};
 use crate::port::Verb;
 
-/// The branch an update is built on.
+/// The branch an update is built on, and pushed to for its merge request.
 pub const UPDATE_BRANCH: &str = "git-intake/update";
 
-/// Version 6: the configuration an update records carries named checks,
-/// and an update records a partial run of its checks beside its
-/// verification. Version 5: an update catches up with a moved integration
-/// branch and keeps the base it started from. Version 4: the update
-/// worktree lives in the main worktree, at [`UPDATE_WORKTREE`], instead of
+/// Version 7: the integration tip is the publish remote's integration
+/// branch, which `finish` pushes to without moving any local branch, so an
+/// update records no planned move, and the publish remote is required.
+/// Version 6: the configuration an update records carries named checks, and
+/// an update records a partial run of its checks beside its verification.
+/// Version 5: an update catches up with a moved integration branch and keeps
+/// the base it started from. Version 4: the update worktree lives in the
+/// main worktree, at [`UPDATE_WORKTREE`], instead of
 /// in the git directory. Version 3 fetched upstreams by URL into references
 /// the update holds, dropped mirror branches, and took an upstream in
 /// `follow` or `port` mode. Version 2 made the publication setting a table
 /// and let an update wait for its merge request.
-const STATE_VERSION: u32 = 6;
+const STATE_VERSION: u32 = 7;
 
 /// The formats whose update this release still reads when it waits for its
 /// merge request, only to hand it over or abort it; see [`Waiting`].
@@ -39,7 +42,8 @@ const FORMAT_RELEASES: &[(u64, &str)] = &[
     (3, "v0.3.0 to v0.3.1"),
     (4, "v0.3.2 to v0.3.5, also carried on by v0.3.6"),
     (5, "v0.3.6"),
-    (6, "from v0.3.7"),
+    (6, "v0.3.7 to v0.5.3"),
+    (7, "from v0.6.0"),
 ];
 
 /// The format whose update an earlier release carries over with `migrate`,
@@ -473,27 +477,6 @@ pub struct CatchUp {
     pub conflicts: Vec<ConflictFile>,
 }
 
-/// One branch move planned by `finish`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlannedMove {
-    pub branch: String,
-    /// Value before `finish`; `None` when the branch is created.
-    pub old: Option<String>,
-    pub new: String,
-}
-
-/// Progress of `finish`, persisted before any ref moves so that an
-/// interrupted or rejected `finish` can be run again.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Finishing {
-    pub moves: Vec<PlannedMove>,
-    /// The error of the last rejected or failed push, if any.
-    pub push_error: Option<String>,
-    /// Branches `finish --no-publish` advanced locally without publishing.
-    #[serde(default)]
-    pub unpublished: Vec<String>,
-}
-
 /// The merge request an update of an earlier release waits for. Releases
 /// with state formats 4 and 5 kept an update alive after `finish` opened its
 /// merge request; this release hands such an update over to its merge
@@ -573,7 +556,6 @@ pub struct UpdateState {
     /// The integration tip at `start`, which upstream ranges and the
     /// repository's own changes are measured from.
     pub start_base: String,
-    pub branch: String,
     pub worktree: PathBuf,
     pub upstreams: Vec<QueuedUpstream>,
     /// The last full run of the checks; only it verifies the update.
@@ -582,9 +564,6 @@ pub struct UpdateState {
     /// verification; see [`PartialRun`].
     #[serde(default)]
     pub partial_run: Option<PartialRun>,
-    /// Set once `finish` has planned its ref moves.
-    #[serde(default)]
-    pub finishing: Option<Finishing>,
     /// The merge request whose update `sync` carried on, for an update it
     /// carried on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -597,11 +576,6 @@ pub struct UpdateState {
     /// in progress.
     #[serde(default)]
     pub catch_ups: Vec<CatchUp>,
-    /// The publish remote's integration tip as the update last took it:
-    /// at `start`, when `finish` fetched it, or when the update caught up
-    /// with it. A remote branch that no longer contains it was rewritten.
-    #[serde(default)]
-    pub remote_tip: Option<String>,
     /// Set once `finish` completed.
     pub finished: bool,
     /// The main worktree as `start` found it. Git cannot locate a main
@@ -625,16 +599,13 @@ impl UpdateState {
             config,
             start_base: base.clone(),
             base,
-            branch: UPDATE_BRANCH.to_string(),
             worktree,
             upstreams,
             verification: None,
             partial_run: None,
-            finishing: None,
             carried_from: None,
             published_head: None,
             catch_ups: Vec::new(),
-            remote_tip: None,
             finished: false,
             main_worktree: None,
         }
@@ -717,14 +688,6 @@ impl Stored {
                 .iter()
                 .map(|(name, tip)| (crate::upstreams::upstream_ref(name), tip.clone()))
                 .collect(),
-        }
-    }
-
-    /// The integration branch of the update.
-    pub fn integration(&self) -> &str {
-        match self {
-            Stored::Update(s) => &s.config.integration,
-            Stored::Waiting(w) => &w.integration,
         }
     }
 }
@@ -916,10 +879,7 @@ pub fn release_warning(state: &UpdateState) -> Option<String> {
     if started == RELEASE || state.release_warned.as_deref() == Some(RELEASE) {
         return None;
     }
-    let advice = if state.finishing.is_none()
-        && state.carried_from.is_none()
-        && state.published_head.is_none()
-    {
+    let advice = if state.carried_from.is_none() && state.published_head.is_none() {
         " To use one release throughout, run `git intake abort` and start the update again."
     } else {
         ""
@@ -975,7 +935,7 @@ mod tests {
 
     fn config() -> Config {
         config::parse(
-            "integration = \"main\"\n[[upstream]]\nname = \"up\"\nurl = \"../up.git\"\nbranch = \"main\"\n",
+            "integration = \"main\"\n[publish]\nremote = \"origin\"\n[[upstream]]\nname = \"up\"\nurl = \"../up.git\"\nbranch = \"main\"\n",
         )
         .unwrap()
     }
@@ -1070,7 +1030,7 @@ mod tests {
             save(&path, &state).unwrap();
             let written: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-            assert_eq!(written["version"], 6);
+            assert_eq!(written["version"], 7);
             assert_eq!(
                 written["partial_run"]["left_out"],
                 serde_json::json!(["test"])
@@ -1158,6 +1118,8 @@ mod tests {
     fn earlier(state: &UpdateState, version: u64) -> serde_json::Value {
         let mut value = serde_json::to_value(state).unwrap();
         value["version"] = version.into();
+        // Earlier releases recorded the update branch.
+        value["branch"] = UPDATE_BRANCH.into();
         value["config"]["checks"] = serde_json::json!(["make lint", "make test"]);
         value["verification"] = serde_json::json!({
             "commit": "b".repeat(40),
@@ -1194,14 +1156,14 @@ mod tests {
                 }),
             }],
         );
-        state.config.publish = Some(Publish {
+        state.config.publish = Publish {
             remote: "origin".into(),
             via: crate::config::PublishVia::MergeRequest,
             forge: None,
             api: None,
             queue: None,
             replace_after: None,
-        });
+        };
         state.release = Some("0.3.5".into());
         for version in [4, 5] {
             let mut value = earlier(&state, version);
@@ -1227,7 +1189,7 @@ mod tests {
                 panic!("format {version} not read as waiting");
             };
             assert_eq!(w.integration, "main");
-            assert_eq!(w.publish, state.config.publish);
+            assert_eq!(w.publish.as_ref(), Some(&state.config.publish));
             assert_eq!(w.upstreams, [("up".to_string(), "c".repeat(40))]);
             assert_eq!(w.merge_request.branch, "git-intake/update-bbbbbbbbbbbb");
             assert_eq!(w.merge_request.number, None);
@@ -1266,7 +1228,7 @@ mod tests {
             assert!(
                 err.contains(&format!(
                     "started by a release (git-intake 0.3.6) that keeps its state in format {version}; \
-                     this release (git-intake {RELEASE}) understands format 6. Finish or abort the update with {releases}, \
+                     this release (git-intake {RELEASE}) understands format 7. Finish or abort the update with {releases}, \
                      then start it again with this release"
                 )),
                 "{err}"
@@ -1285,7 +1247,7 @@ mod tests {
         let err = format!("{:#}", load(&path).unwrap_err());
         assert!(
             err.contains(&format!(
-                "keeps its state in format 3; this release (git-intake {RELEASE}) understands format 6. \
+                "keeps its state in format 3; this release (git-intake {RELEASE}) understands format 7. \
                  Finish or abort the update with a release that keeps format 3 (git-intake v0.3.0 to v0.3.1), \
                  or carry it over with `git intake migrate` of git-intake v0.3.6 and finish or abort it with that release"
             )),
@@ -1305,7 +1267,7 @@ mod tests {
         let err = format!("{:#}", load(&path).unwrap_err());
         assert!(
             err.contains(&format!(
-                "keeps its state in format 2; this release (git-intake {RELEASE}) understands format 6"
+                "keeps its state in format 2; this release (git-intake {RELEASE}) understands format 7"
             )),
             "{err}"
         );
@@ -1335,16 +1297,16 @@ mod tests {
     fn a_state_of_a_newer_format_names_its_release() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        fs::write(&path, r#"{"version": 7, "release": "0.4.0"}"#).unwrap();
+        fs::write(&path, r#"{"version": 8, "release": "0.4.0"}"#).unwrap();
         let err = format!("{:#}", load(&path).unwrap_err());
         assert!(
             err.contains(
-                "started by a release (git-intake 0.4.0) that keeps its state in format 7"
+                "started by a release (git-intake 0.4.0) that keeps its state in format 8"
             ),
             "{err}"
         );
         assert!(
-            err.contains("with that release or a later one that understands format 7"),
+            err.contains("with that release or a later one that understands format 8"),
             "{err}"
         );
     }
@@ -1361,12 +1323,9 @@ mod tests {
             "{warning}"
         );
         assert!(warning.contains("`git intake abort`"), "{warning}");
-        // Once `finish` began, starting over is not advised.
-        state.finishing = Some(Finishing {
-            moves: Vec::new(),
-            push_error: None,
-            unpublished: Vec::new(),
-        });
+        // Once `finish` pushed the update's branch, starting over is not
+        // advised.
+        state.published_head = Some("c".repeat(40));
         assert!(!release_warning(&state).unwrap().contains("abort"));
         // A release warns once.
         state.release_warned = Some(RELEASE.to_string());

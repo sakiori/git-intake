@@ -24,23 +24,22 @@ use anyhow::{Context, Result, bail};
 use crate::Exit;
 use crate::commands::catch_up::{self, Advice};
 use crate::commands::merge_request::{
-    self, Branch, Publication, Published, classify, connect, delete_branch, fetch_integration,
-    merged_without_history, named, publish, refuse_elsewhere, remote_branch, requests,
-    require_publishable, unknown_branch,
+    self, Branch, Publication, Published, classify, connect, delete_branch, merged_without_history,
+    named, publish, refuse_elsewhere, remote_branch, requests, require_publishable, unknown_branch,
 };
 use crate::commands::update::{
     self, Advanced, Fetched, OnConflict, Queued, advance, begin, plural, queue_follow,
-    refuse_leftovers, require_published, step_name,
+    refuse_leftovers, step_name,
 };
 use crate::commands::{env, finish, replace, verify};
-use crate::config::{Config, Mode, Publish, PublishVia};
+use crate::config::{Config, Mode, PublishVia};
 use crate::description::{self, Targets};
 use crate::forge::{Failure, Forge, MergeRequest, State, patiently};
-use crate::git::{Git, abbrev, branch_ref};
+use crate::git::{Git, abbrev};
 use crate::output::{esay, say};
 use crate::pause::{self, Paused};
 use crate::port::{self, Standing, Verb};
-use crate::repo::Repo;
+use crate::repo::{Loaded, Repo};
 use crate::state::{
     CarriedMergeRequest, CopyStep, FollowMerge, MergeKind, PlannedCommit, PortPlan, QueuedUpstream,
     UPDATE_BRANCH, UpdateState, UpstreamStep, Work,
@@ -108,82 +107,23 @@ pub fn run(repo: &Repo) -> Result<Exit> {
             update::next_step(&state, &wt)?
         );
     }
-    let (config, publish) = patiently(ATTEMPTS, retry_gap(), || prepare(repo))?;
-    match publish.via {
+    let loaded = patiently(ATTEMPTS, retry_gap(), || repo.load_config())?;
+    match loaded.config.publish.via {
         // A run that verified an update leaves it in progress, so only the
         // run through a merge request, which leaves nothing, can go again.
-        PublishVia::Push => by_push(repo, config),
-        PublishVia::MergeRequest => patiently(ATTEMPTS, retry_gap(), || {
-            by_merge_request(repo, config.clone(), publish.clone())
-        }),
+        PublishVia::Push => by_push(repo, loaded),
+        PublishVia::MergeRequest => {
+            let mut loaded = Some(loaded);
+            patiently(ATTEMPTS, retry_gap(), || {
+                // A run made again reads the integration tip again.
+                let loaded = match loaded.take() {
+                    Some(loaded) => loaded,
+                    None => repo.load_config()?,
+                };
+                by_merge_request(repo, loaded)
+            })
+        }
     }
-}
-
-/// The configuration committed at HEAD and its publish setting, which
-/// `sync` and `land` need.
-pub fn configured(repo: &Repo) -> Result<(Config, Publish)> {
-    let head = repo
-        .head()
-        .context("HEAD names no commit; run the command in a checkout of the integration branch")?;
-    let at_head = repo.config_at(head)?.with_context(|| {
-        format!(
-            "no {} is committed at HEAD; run the command in a checkout of the integration branch",
-            crate::config::FILE_NAME
-        )
-    })?;
-    let publish = at_head.publish.clone().with_context(|| {
-        format!(
-            "the command works through the publish remote, but the {} at HEAD has no [publish] setting; add one \
-             naming the publish remote",
-            crate::config::FILE_NAME
-        )
-    })?;
-    Ok((at_head, publish))
-}
-
-/// Brings the local integration branch up to date with the publish
-/// remote's, as `start` does, creating it when it is missing, and reads the
-/// configuration again at its tip.
-pub fn prepare(repo: &Repo) -> Result<(Config, Publish)> {
-    let (at_head, publish) = configured(repo)?;
-    let integration = at_head.integration.clone();
-    let git = &repo.git;
-    if git.commit(&branch_ref(&integration))?.is_none() {
-        let tip = fetch_integration(git, &publish.remote, &integration)?;
-        git.run(&[
-            "update-ref",
-            "-m",
-            "git-intake: sync",
-            &branch_ref(&integration),
-            &tip,
-            "",
-        ])?;
-        say!(
-            "created '{integration}' at {} from '{}/{integration}'",
-            abbrev(&tip),
-            publish.remote
-        );
-    } else {
-        repo.require_clean(&integration)?;
-        finish::follow_published(repo, &publish.remote, &integration)?;
-    }
-    let config = repo.load_config()?.config;
-    let reread = config.publish.clone().with_context(|| {
-        format!(
-            "the {} at the tip of '{integration}' has no [publish] setting, which the command needs",
-            crate::config::FILE_NAME
-        )
-    })?;
-    if reread.remote != publish.remote {
-        bail!(
-            "the {} at the tip of '{integration}' names '{}' as the publish remote instead of '{}'; run the \
-             command again to use that configuration",
-            crate::config::FILE_NAME,
-            reread.remote,
-            publish.remote
-        );
-    }
-    Ok((config, reread))
 }
 
 /// The follow upstreams an update would take in, against the integration
@@ -329,15 +269,11 @@ fn nothing_behind(plan: &Plan) {
 }
 
 /// `sync` in push mode: starts, verifies and publishes in one run.
-fn by_push(repo: &Repo, config: Config) -> Result<Exit> {
-    if let Some(publish) = &config.publish {
-        crate::forge::warn_of_job_token_push(&repo.git, &publish.remote)?;
-    }
-    let integration = config.integration.clone();
-    let base = repo
-        .git
-        .commit(&branch_ref(&integration))?
-        .with_context(|| format!("the integration branch '{integration}' does not exist"))?;
+fn by_push(repo: &Repo, loaded: Loaded) -> Result<Exit> {
+    let Loaded {
+        config, tip: base, ..
+    } = loaded;
+    crate::forge::warn_of_job_token_push(&repo.git, &config.publish.remote)?;
     let mut fetches = Fetches::new(repo);
     let plan = plan(repo, &config, &base, &mut fetches, true)?;
     if plan.queue.is_empty() {
@@ -375,7 +311,7 @@ fn by_push(repo: &Repo, config: Config) -> Result<Exit> {
             Err(err)
         }
         Ok(Some(stop)) => Ok(stop),
-        Ok(None) => Ok(match finish::run_announced(repo, false, &mut announced)? {
+        Ok(None) => Ok(match finish::run_announced(repo, &mut announced)? {
             Exit::Success => exit,
             other => other,
         }),
@@ -392,19 +328,17 @@ fn stopped_on_conflict() -> Exit {
 }
 
 /// `sync` in merge-request mode.
-fn by_merge_request(repo: &Repo, config: Config, setting: Publish) -> Result<Exit> {
+fn by_merge_request(repo: &Repo, loaded: Loaded) -> Result<Exit> {
     let git = &repo.git;
+    let Loaded { config, tip, .. } = loaded;
+    let setting = config.publish.clone();
     let integration = config.integration.clone();
     let remote = setting.remote.clone();
     crate::forge::refuse_job_token_push(git, &remote)?;
-    require_published(repo, &remote, &integration)?;
     let paused = pause::warn_if_on(repo, &setting, &config.upstreams);
     let forge = connect(repo, &setting)?;
     let kind = forge.kind();
     let term = kind.term();
-    let tip = git
-        .commit(&branch_ref(&integration))?
-        .with_context(|| format!("the integration branch '{integration}' does not exist"))?;
     let reqs = requests(repo, forge.as_ref(), &remote, &integration, &[])?;
     refuse_elsewhere(kind, &reqs, &integration)?;
     let mut fetches = Fetches::new(repo);
@@ -624,7 +558,7 @@ fn worse(a: Exit, b: Exit) -> Exit {
 fn conclude(repo: &Repo, state: &UpdateState, published: Published) -> Result<Exit> {
     match published {
         Published::Done(_) => {
-            finish::close(repo, state.clone(), Vec::new())?;
+            finish::close(repo, state.clone())?;
             Ok(Exit::Success)
         }
         Published::Stopped(stop) => {
@@ -683,10 +617,7 @@ pub fn sync_open(
     let mut exit = Exit::Success;
     let mut planned = None;
     if let Caller::Sync(paused) = caller
-        && let Some(after) = config
-            .publish
-            .as_ref()
-            .and_then(|p| p.replace_after.clone())
+        && let Some(after) = config.publish.replace_after.clone()
     {
         let open_mr = replace::Open {
             mr: &open,
@@ -792,8 +723,8 @@ enum Replaced {
 /// takes `releases`: merges it locally without the install command or the
 /// checks, reads the merge request and the integration branch again, closes
 /// the merge request with a description that records no targets, deletes
-/// its branch while it is at `head`, and publishes the update from
-/// `git-intake/update` as a new merge request.
+/// its branch while it is at `head`, and publishes the update from the
+/// update branch as a new merge request.
 #[allow(clippy::too_many_arguments)]
 fn replace_merge_request(
     repo: &Repo,
@@ -952,13 +883,13 @@ fn carry_and_publish(
         url: m.url.clone(),
         branch: m.source.clone(),
     });
-    let mut state = carry_on(repo, config, history, head, &base, tip, worktree, carried)?;
+    let mut state = carry_on(repo, config, history, head, &base, worktree, carried)?;
     let request = open
         .map(|m| named(kind, m))
         .unwrap_or_else(|| format!("{term} to open"));
     let result = (|| -> Result<Exit> {
         if !git.is_ancestor(tip, head)? {
-            catch_up::require_possible(repo, &state, tip, Advice::Sync(&request), true)?;
+            catch_up::require_possible(repo, &state, tip, Advice::Sync(&request))?;
             if let Some(exit) = catch_up::run(repo, &mut state, tip)? {
                 say!(
                     "{} stopped on the catch-up merge with the update in progress and nothing pushed{}; resolve \
@@ -1029,14 +960,12 @@ fn discard(repo: &Repo, state: &UpdateState) -> Result<()> {
 /// branch at `head` in the update worktree, the base at its merge base with
 /// the integration tip, and each upstream whose sync merge, copies or
 /// journal change is on the update line queued as merged or carried out.
-#[allow(clippy::too_many_arguments)]
 fn carry_on(
     repo: &Repo,
     config: Config,
     history: &History,
     head: &str,
     base: &str,
-    tip: &str,
     worktree: std::path::PathBuf,
     carried: Option<CarriedMergeRequest>,
 ) -> Result<UpdateState> {
@@ -1057,7 +986,6 @@ fn carry_on(
     ])?;
     let mut state = UpdateState::new(config, base.to_string(), worktree, queue);
     state.main_worktree = repo.main_checkout()?;
-    state.remote_tip = Some(tip.to_string());
     state.carried_from = carried;
     repo.save_state(&state)?;
     upstreams::hold(git, &state)?;

@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 
 use crate::Exit;
-use crate::commands::update::{require_merging, require_worktree};
+use crate::commands::update::require_worktree;
 use crate::config::{self, Check};
 use crate::git::{Git, abbrev};
 use crate::output::say;
@@ -31,7 +31,6 @@ pub fn run(repo: &Repo, only: &[String], skip: &[String]) -> Result<Exit> {
             .cloned()
             .collect::<Vec<Check>>())
     })?;
-    require_merging(repo, &state)?;
     require_worktree(repo, &state)?;
     let open: Vec<String> = state
         .unmerged()

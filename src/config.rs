@@ -13,7 +13,7 @@ pub const FILE_NAME: &str = ".git-intake.toml";
 struct RawConfig {
     integration: String,
     /// Read as a value first so that the string form of earlier releases gets
-    /// a message showing the table form.
+    /// a message showing the table form, and its absence a message of its own.
     publish: Option<toml::Value>,
     install: Option<String>,
     /// Read as a value first so that the plain command strings of earlier
@@ -214,7 +214,9 @@ impl From<ReplaceAfter> for String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub integration: String,
-    pub publish: Option<Publish>,
+    /// The publish remote, whose integration branch is the integration tip
+    /// every command reads, and how `finish` publishes there.
+    pub publish: Publish,
     pub install: Option<String>,
     pub checks: Vec<Check>,
     pub upstreams: Vec<Upstream>,
@@ -358,8 +360,16 @@ pub fn parse(text: &str) -> Result<Config> {
 
     let integration = raw.integration.trim().to_string();
     check_branch("integration", &integration, &mut problems);
+    if integration == crate::state::UPDATE_BRANCH {
+        problems.push(format!(
+            "integration: '{integration}' is reserved for updates"
+        ));
+    }
     let publish = match raw.publish {
-        None => None,
+        None => {
+            problems.push(missing_publish());
+            None
+        }
         Some(value) => match parse_publish(value) {
             Ok(publish) => {
                 check_remote("publish remote", &publish.remote, &mut problems);
@@ -485,16 +495,16 @@ pub fn parse(text: &str) -> Result<Config> {
         });
     }
 
-    check_layout(&integration, &upstreams, &mut problems);
+    check_layout(&upstreams, &mut problems);
     if let Some(publish) = &publish {
         check_replacement(publish, &upstreams, &mut problems);
     }
     let release = match raw.release {
         None => None,
-        Some(value) => parse_release(value, &upstreams, publish.is_some(), &mut problems),
+        Some(value) => parse_release(value, &upstreams, &mut problems),
     };
 
-    if !problems.is_empty() {
+    let Some(publish) = publish.filter(|_| problems.is_empty()) else {
         bail!(
             "invalid {FILE_NAME}:\n{}",
             problems
@@ -503,7 +513,7 @@ pub fn parse(text: &str) -> Result<Config> {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-    }
+    };
     Ok(Config {
         integration,
         publish,
@@ -518,7 +528,6 @@ pub fn parse(text: &str) -> Result<Config> {
 fn parse_release(
     value: toml::Value,
     upstreams: &[Upstream],
-    publish: bool,
     problems: &mut Vec<String>,
 ) -> Option<Release> {
     let raw: RawRelease = match value.try_into() {
@@ -530,14 +539,6 @@ fn parse_release(
         }
     };
     let mut valid = true;
-    if !publish {
-        problems.push(
-            "release: releases are cut on the publish remote's integration branch; configure the publish \
-             remote in a [publish] table"
-                .to_string(),
-        );
-        valid = false;
-    }
     let upstream = upstreams.iter().find(|u| u.name == raw.upstream);
     match upstream {
         None => {
@@ -912,7 +913,7 @@ fn check_api(api: &str) -> std::result::Result<String, String> {
 
 /// Cross-entry rules: unique names and sources, distinct environment
 /// variables, non-nesting paths, a root upstream alone.
-fn check_layout(integration: &str, upstreams: &[Upstream], problems: &mut Vec<String>) {
+fn check_layout(upstreams: &[Upstream], problems: &mut Vec<String>) {
     duplicates(upstreams.iter().map(|u| u.name.as_str()), "name", problems);
     let mut by_variable: Vec<(String, Vec<&str>)> = Vec::new();
     for up in upstreams.iter().filter(|u| !u.name.is_empty()) {
@@ -979,12 +980,15 @@ fn check_layout(integration: &str, upstreams: &[Upstream], problems: &mut Vec<St
             }
         }
     }
+}
 
-    if integration == crate::state::UPDATE_BRANCH {
-        problems.push(format!(
-            "integration: '{integration}' is reserved for updates"
-        ));
-    }
+/// Why a configuration without `[publish]` is refused.
+pub fn missing_publish() -> String {
+    "publish: a [publish] table naming the publish remote is required: the tool reads the integration branch \
+     from that remote and publishes updates there. Add it after the top-level keys:\n\n    [publish]\n    \
+     remote = \"origin\"\n\n  where `origin` is the git remote of this repository that holds the integration \
+     branch; a local bare repository added as a remote serves when there is no hosted one"
+        .to_string()
 }
 
 type Named<'a> = (&'a str, &'a str);
@@ -1108,8 +1112,31 @@ fn check_branch(label: &str, branch: &str, problems: &mut Vec<String>) {
 mod tests {
     use super::*;
 
+    /// Parses `text`, given the publish remote `origin` when it names none,
+    /// so that each test states only what it is about.
+    fn parse(text: &str) -> Result<Config> {
+        if text.contains("[publish]") || text.contains("publish =") {
+            super::parse(text)
+        } else {
+            super::parse(&format!("{text}\n[publish]\nremote = \"origin\"\n"))
+        }
+    }
+
     fn err(text: &str) -> String {
         format!("{:#}", parse(text).unwrap_err())
+    }
+
+    #[test]
+    fn the_publish_remote_is_required() {
+        let e = format!(
+            "{:#}",
+            super::parse(&format!("integration = \"main\"\n{UP_A}")).unwrap_err()
+        );
+        assert!(
+            e.contains("publish: a [publish] table naming the publish remote is required"),
+            "{e}"
+        );
+        assert!(e.contains("remote = \"origin\""), "{e}");
     }
 
     const UP_A: &str = "[[upstream]]\nname = \"a\"\nurl = \"https://example.com/a.git\"\nbranch = \"main\"\npath = \"apps/a\"\n";
@@ -1138,14 +1165,14 @@ via = "merge-request"
         assert_eq!(cfg.integration, "main");
         assert_eq!(
             cfg.publish,
-            Some(Publish {
+            Publish {
                 remote: "origin".into(),
                 via: PublishVia::MergeRequest,
                 forge: None,
                 api: None,
                 queue: None,
                 replace_after: None,
-            })
+            }
         );
         assert_eq!(
             cfg.checks,
@@ -1384,13 +1411,6 @@ via = "merge-request"
             assert!(e.contains(&format!("release.labels: {why}")), "{e}");
         }
         let e = err(&format!(
-            "integration = \"main\"\n{UP_A}[release]\nupstream = \"a\"\ntags = \"v*\"\n"
-        ));
-        assert!(
-            e.contains("release: releases are cut on the publish remote"),
-            "{e}"
-        );
-        let e = err(&format!(
             "integration = \"main\"\n{UP_A}{publish}[release]\nupstream = \"a\"\nlabel = \"x\"\n"
         ));
         assert!(e.contains("release: unknown field `label`"), "{e}");
@@ -1471,9 +1491,7 @@ via = "merge-request"
             "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\n"
         ))
         .unwrap();
-        assert_eq!(cfg.publish.unwrap().via, PublishVia::Push);
-        let cfg = parse(&format!("integration = \"main\"\n{UP_A}")).unwrap();
-        assert_eq!(cfg.publish, None);
+        assert_eq!(cfg.publish.via, PublishVia::Push);
     }
 
     #[test]
@@ -1626,7 +1644,7 @@ via = "merge-request"
              forge = \"gitlab\"\napi = \"https://gitlab.example.com/gitlab/api/v4/\"\n"
         ))
         .unwrap();
-        let publish = cfg.publish.unwrap();
+        let publish = cfg.publish;
         assert_eq!(publish.forge, Some(ForgeKind::Gitlab));
         assert_eq!(
             publish.api.as_deref(),
@@ -1674,7 +1692,7 @@ via = "merge-request"
              queue = \"@merge-bot\"\n"
         ))
         .unwrap();
-        assert_eq!(cfg.publish.unwrap().queue.as_deref(), Some("merge-bot"));
+        assert_eq!(cfg.publish.queue.as_deref(), Some("merge-bot"));
         let e = err(&format!(
             "integration = \"main\"\n{UP_A}[publish]\nremote = \"origin\"\nqueue = \"merge-bot\"\n"
         ));
@@ -1737,7 +1755,7 @@ via = "merge-request"
              replace_after = \"7d\"\n"
         ))
         .unwrap();
-        let after = cfg.publish.unwrap().replace_after.unwrap();
+        let after = cfg.publish.replace_after.unwrap();
         assert_eq!(after.duration(), jiff::SignedDuration::from_hours(168));
         // The update's state keeps it as written.
         assert_eq!(serde_json::to_value(&after).unwrap(), "7d");
