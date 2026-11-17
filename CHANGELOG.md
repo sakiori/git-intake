@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://gitlab.com/sakiori-oss/git-intake/compare/v0.5.3...v0.6.0) - 2026-11-16
+
+### Added
+
+- [**breaking**] read the integration branch from the publish remote only
+
 ## [0.5.3](https://gitlab.com/sakiori-oss/git-intake/compare/v0.5.2...v0.5.3) - 2026-11-09
 
 ### Added
