@@ -47,14 +47,8 @@ fn releasable(f: &Fork, release: &str) -> String {
 
 const RELEASE: &str = "\n[release]\nupstream = \"upstream\"\ntags = \"v*\"\n";
 
-fn release_fork() -> Fork {
-    let f = Fork::new();
-    releasable(&f, RELEASE);
-    f
-}
-
 /// A fork that publishes by push to a fake GitLab, releasable.
-fn forge_fork() -> Fork {
+fn release_fork() -> Fork {
     let f = Fork::push_gitlab();
     releasable(&f, RELEASE);
     f
@@ -328,7 +322,7 @@ fn a_tag_off_the_first_parent_line_is_no_release() {
 }
 
 #[test]
-fn release_tag_pushes_the_next_release_at_the_remote_tip() {
+fn release_tag_creates_the_next_release_at_the_remote_tip_through_the_api() {
     let f = release_fork();
     let env = &f.env;
     env.git(&f.down, &["tag", "own-tag", "main"]);
@@ -338,11 +332,21 @@ fn release_tag_pushes_the_next_release_at_the_remote_tip() {
     let dir = common::forge(env, &f.publish);
     let tip = env.commit(&dir, &[("other.txt", "o\n")], "feat: landed elsewhere");
     env.git(&dir, &["push", "-q", "origin", "HEAD:main"]);
+    // No push credential and no identity of git's: the forge's API creates
+    // the tag with the token.
+    env.git(
+        &f.down,
+        &["remote", "set-url", "--push", "origin", "/nonexistent"],
+    );
+    f.forge().clear_requests();
 
     let out = stdout(&f.tool(&["release", "tag"]).success());
     let name = format!("v0.11.1-custom.{DAY}.1");
     assert!(
-        out.contains(&format!("pushed the release tag {name}")),
+        out.contains(&format!(
+            "created the release tag {name} at {} on the GitLab project 'team/app'",
+            &tip[..12]
+        )),
         "{out}"
     );
     assert_eq!(remote_tags(&f), vec!["own-tag".to_string(), name.clone()]);
@@ -352,11 +356,253 @@ fn release_tag_pushes_the_next_release_at_the_remote_tip() {
     assert_eq!(message, format!("Release 0.11.1-custom.{DAY}.1"));
     assert_eq!(
         env.git(&f.publish, &["tag", "-l", "--format=%(taggername)", &name]),
-        "Test Committer"
+        "release-bot"
     );
-    // The local branch stays; the tag is created locally as well.
+    let changes = f.forge().changes();
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert!(changes[0].path.ends_with("/repository/tags"));
+    assert_eq!(
+        changes[0].header("private-token"),
+        Some(common::forge::TOKEN)
+    );
+    assert_eq!(changes[0].json()["ref"], tip.as_str());
+    // The local branch and tags stay as they were.
     assert_eq!(env.rev(&f.down, "main"), before);
-    assert_eq!(env.rev(&f.down, &format!("{name}^{{commit}}")), tip);
+    assert!(!env.has_rev(&f.down, &format!("refs/tags/{name}")));
+}
+
+#[test]
+fn release_tag_needs_a_token_that_is_not_the_job_s() {
+    let f = release_fork();
+    f.env.unset_var("GITLAB_TOKEN");
+    f.env.set_var("CI_JOB_TOKEN", "job-token-of-the-pipeline");
+    let err = stderr(&f.tool(&["release", "tag"]).code(2));
+    assert!(
+        err.contains("set GITLAB_TOKEN")
+            && err.contains("a CI job token cannot create a tag")
+            && !err.contains("job-token-of-the-pipeline"),
+        "{err}"
+    );
+    assert!(remote_tags(&f).is_empty());
+}
+
+#[test]
+fn a_refused_creation_names_the_forge_s_answer() {
+    let f = release_fork();
+    f.forge().fail(
+        "POST",
+        "/repository/tags",
+        403,
+        "You are not allowed to create this tag as it is protected.",
+    );
+    let err = stderr(&f.tool(&["release", "tag"]).code(2));
+    assert!(
+        err.contains(&format!("creating the release tag v0.11.1-custom.{DAY}.1 on the GitLab project 'team/app' failed"))
+            && err.contains("403 You are not allowed to create this tag as it is protected.")
+            && !err.contains(common::forge::TOKEN),
+        "{err}"
+    );
+    assert!(remote_tags(&f).is_empty());
+}
+
+#[test]
+fn release_tag_dry_run_checks_the_token_and_creates_nothing() {
+    let f = release_fork();
+    let name = format!("v0.11.1-custom.{DAY}.1");
+    let out = stdout(&f.tool(&["release", "tag", "--dry-run"]).success());
+    assert!(
+        out.contains(&format!(
+            "the token in GITLAB_TOKEN, of `release-bot`, may create the release tag {name} on the GitLab project \
+             'team/app'; nothing was created"
+        )),
+        "{out}"
+    );
+    assert!(remote_tags(&f).is_empty());
+    assert!(f.forge().changes().is_empty());
+    // A protected tag only Maintainers create, for a Maintainer.
+    f.forge().world().protected_tags =
+        serde_json::json!([{"name": "v*", "create_access_levels": [{"access_level": 40}]}]);
+    f.tool(&["release", "tag", "--dry-run"]).success();
+    // While the tip carries a release, a tag of its form is checked.
+    f.tool(&["release", "tag"]).success();
+    let out = stdout(&f.tool(&["release", "tag", "--dry-run"]).success());
+    assert!(
+        out.contains(&format!("may create the release tag {name}")),
+        "{out}"
+    );
+}
+
+#[test]
+fn release_tag_dry_run_names_why_the_token_may_not_create_the_tag() {
+    let f = release_fork();
+    let name = format!("v0.11.1-custom.{DAY}.1");
+    let denied = |f: &Fork| stdout(&f.tool(&["release", "tag", "--dry-run"]).code(1));
+    f.forge().world().protected_tags = serde_json::json!([
+        {"name": "v*", "create_access_levels": [{"access_level": 0}]},
+        {"name": "other-*", "create_access_levels": [{"access_level": 30}]}
+    ]);
+    let out = denied(&f);
+    assert!(
+        out.contains(&format!(
+            "the token in GITLAB_TOKEN may not create the release tag {name} on the GitLab project 'team/app': the \
+             account `release-bot`, with the role Maintainer (40), may not create the tag {name}, which the \
+             protected tag `v*` covers"
+        )),
+        "{out}"
+    );
+    // A group the project is shared with, of which the account is a member.
+    f.forge().world().protected_tags =
+        serde_json::json!([{"name": "v*", "create_access_levels": [{"group_id": 7}]}]);
+    f.forge().world().project["shared_with_groups"] =
+        serde_json::json!([{"group_id": 7, "group_access_level": 30}]);
+    denied(&f);
+    f.forge()
+        .world()
+        .group_members
+        .push((7, common::forge::RELEASE_BOT, 30));
+    f.tool(&["release", "tag", "--dry-run"]).success();
+    // A rule naming the account, one for a deploy key, one for
+    // administrators.
+    f.forge().world().protected_tags = serde_json::json!([{"name": "v*", "create_access_levels": [{"user_id": common::forge::RELEASE_BOT}]}]);
+    f.tool(&["release", "tag", "--dry-run"]).success();
+    f.forge().world().protected_tags = serde_json::json!([{"name": "v*", "create_access_levels": [
+        {"deploy_key_id": 3}, {"access_level": 60}, {"user_id": 99}
+    ]}]);
+    denied(&f);
+    f.forge().world().account["is_admin"] = serde_json::json!(true);
+    f.tool(&["release", "tag", "--dry-run"]).success();
+    f.forge().world().account["is_admin"] = serde_json::json!(false);
+    // A role below Developer.
+    f.forge().world().members = vec![(common::forge::RELEASE_BOT, 20)];
+    let out = denied(&f);
+    assert!(out.contains("the role Reporter (20)"), "{out}");
+    // A token without the `api` scope, and one GitLab does not accept.
+    f.forge().world().members = vec![(common::forge::RELEASE_BOT, 40)];
+    f.forge().world().token["active"] = serde_json::json!(false);
+    let out = denied(&f);
+    assert!(
+        out.contains("the token in GITLAB_TOKEN is revoked or expired"),
+        "{out}"
+    );
+    f.forge().world().token["active"] = serde_json::json!(true);
+    f.forge().world().token["scopes"] = serde_json::json!(["write_repository"]);
+    let out = denied(&f);
+    assert!(
+        out.contains(
+            "has the scopes write_repository, and creating a tag through the API needs `api`"
+        ),
+        "{out}"
+    );
+    f.forge().fail(
+        "GET",
+        "/personal_access_tokens/self",
+        401,
+        "401 Unauthorized",
+    );
+    let out = denied(&f);
+    assert!(
+        out.contains("GitLab does not accept the token in GITLAB_TOKEN")
+            && !out.contains(common::forge::TOKEN),
+        "{out}"
+    );
+    assert!(remote_tags(&f).is_empty());
+    assert!(f.forge().changes().is_empty());
+}
+
+#[test]
+fn release_tag_creates_the_tag_through_github_s_api() {
+    let f = Fork::github();
+    releasable(&f, RELEASE);
+    let name = format!("v0.11.1-custom.{DAY}.1");
+    // GitHub tells only the account's access, and the check says so.
+    let out = stdout(&f.tool(&["release", "tag", "--dry-run"]).success());
+    assert!(
+        out.contains(&format!(
+            "the token in GITHUB_TOKEN may create the release tag {name} on the GitHub project 'team/app' as \
+             far as GitHub tells: GitHub reports that the token's account may write to the repository, not \
+             whether the token was granted *Contents: write*; nothing was created"
+        )),
+        "{out}"
+    );
+    f.forge()
+        .world()
+        .project
+        .as_object_mut()
+        .unwrap()
+        .remove("permissions");
+    let out = stdout(&f.tool(&["release", "tag", "--dry-run"]).success());
+    assert!(
+        out.contains("does not report whether it may write to it"),
+        "{out}"
+    );
+    f.forge().world().project["permissions"] = serde_json::json!({"push": false});
+    let out = stdout(&f.tool(&["release", "tag", "--dry-run"]).code(1));
+    assert!(
+        out.contains(
+            "the account of the token in GITHUB_TOKEN may not write to the repository 'team/app'"
+        ),
+        "{out}"
+    );
+    f.forge()
+        .fail("GET", "/repos/team/app", 401, "Bad credentials");
+    let out = stdout(&f.tool(&["release", "tag", "--dry-run"]).code(1));
+    assert!(
+        out.contains("GitHub does not accept the token in GITHUB_TOKEN"),
+        "{out}"
+    );
+    f.forge().world().failures.clear();
+    assert!(remote_tags(&f).is_empty());
+    let out = stdout(&f.tool(&["release", "tag"]).success());
+    assert!(
+        out.contains(&format!("created the release tag {name}")),
+        "{out}"
+    );
+    assert_eq!(f.env.git(&f.publish, &["cat-file", "-t", &name]), "tag");
+    assert_eq!(
+        f.env.rev(&f.publish, &format!("{name}^{{commit}}")),
+        f.tip()
+    );
+    assert_eq!(
+        f.env.git(
+            &f.publish,
+            &["tag", "-l", "--format=%(taggername) %(contents)", &name]
+        ),
+        format!("Test Committer Release 0.11.1-custom.{DAY}.1")
+    );
+}
+
+#[test]
+fn a_tag_another_run_created_first_on_github_is_reported() {
+    use common::forge::Action;
+    let f = Fork::github();
+    releasable(&f, RELEASE);
+    let name = format!("v0.11.1-custom.{DAY}.1");
+    let tip = f.tip();
+    // The other run creates the same tag between this run's tag object and
+    // its reference.
+    f.forge().before_request(
+        "POST",
+        "/git/refs",
+        vec![Action::SetRef(format!("refs/tags/{name}"), tip)],
+    );
+    let err = stderr(&f.tool(&["release", "tag"]).code(2));
+    assert!(
+        err.contains(&format!(
+            "another run created the tag {name} on 'origin' first"
+        )),
+        "{err}"
+    );
+    assert_eq!(f.env.git(&f.publish, &["cat-file", "-t", &name]), "commit");
+    // A reference GitHub refuses otherwise names its answer.
+    f.forge().publish_release(&name);
+    land(&f, "next", "feat: the next feature");
+    f.forge()
+        .fail("POST", "/git/refs", 422, "Repository rule violations found");
+    let err = stderr(&f.tool(&["release", "tag"]).code(2));
+    assert!(
+        err.contains("422 Repository rule violations found"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -371,10 +617,11 @@ fn release_next_creates_no_tag() {
 
 #[test]
 fn a_published_release_at_the_tip_is_left_alone() {
-    let f = forge_fork();
+    let f = release_fork();
     let name = format!("v0.11.1-custom.{DAY}.1");
     f.tool(&["release", "tag"]).success();
     f.forge().publish_release(&name);
+    f.forge().clear_requests();
     let doc = next_json(&f);
     assert_eq!(doc["release"], name.as_str());
     assert_eq!(doc["published"], true);
@@ -390,7 +637,7 @@ fn a_published_release_at_the_tip_is_left_alone() {
 
 #[test]
 fn an_unpublished_release_at_the_tip_fails_the_scheduled_run() {
-    let f = forge_fork();
+    let f = release_fork();
     let name = format!("v0.11.1-custom.{DAY}.1");
     f.tool(&["release", "tag"]).success();
     let doc = next_json(&f);
@@ -408,49 +655,32 @@ fn an_unpublished_release_at_the_tip_fails_the_scheduled_run() {
 }
 
 #[test]
-fn a_tag_another_run_pushed_first_is_reported() {
+fn a_tag_another_run_created_first_is_reported() {
+    use common::forge::Action;
     let f = release_fork();
     let env = &f.env;
     let name = format!("v0.11.1-custom.{DAY}.1");
     let tip = env.rev(&f.publish, "main");
-    // The other run pushes the same tag just before this run's push.
-    let hook = f.down.join(".git/hooks/pre-push");
-    fs::write(
-        &hook,
-        format!(
-            "#!/bin/sh\ngit --git-dir='{}' tag {name} {tip}\n",
-            f.publish.display()
-        ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    // The other run creates the same tag just before this run's request.
+    f.forge().before_request(
+        "POST",
+        "/repository/tags",
+        vec![Action::SetRef(format!("refs/tags/{name}"), tip)],
+    );
     let err = stderr(&f.tool(&["release", "tag"]).code(2));
     assert!(
-        err.contains(&format!("another run created the tag {name}")) && err.contains("again"),
+        err.contains(&format!(
+            "another run created the tag {name} on 'origin' first; nothing was created"
+        )) && err.contains("again"),
         "{err}"
     );
     // The remote's tag is the other run's lightweight tag.
     assert_eq!(env.git(&f.publish, &["cat-file", "-t", &name]), "commit");
-    assert!(!env.has_rev(&f.down, &format!("refs/tags/{name}")));
-}
-
-#[test]
-fn a_publish_remote_that_pushes_to_the_upstream_is_refused() {
-    let f = release_fork();
-    let env = &f.env;
-    env.git(
-        &f.down,
-        &["remote", "set-url", "--push", "origin", &f.up.url()],
-    );
-    let err = stderr(&f.tool(&["release", "tag"]).code(2));
-    assert!(err.contains("never pushes to an upstream"), "{err}");
-    assert_eq!(env.git(&f.up.bare, &["tag", "--list"]), "v0.11.0");
 }
 
 #[test]
 fn release_check_passes_an_unpublished_release_in_its_pipeline() {
-    let f = forge_fork();
+    let f = release_fork();
     let name = format!("v0.11.1-custom.{DAY}.1");
     f.tool(&["release", "tag"]).success();
     let ci = ci_clone(&f, &name);
@@ -481,7 +711,7 @@ fn release_check_passes_an_unpublished_release_in_its_pipeline() {
 
 #[test]
 fn release_check_reads_the_forge_with_the_job_token() {
-    let f = forge_fork();
+    let f = release_fork();
     let name = format!("v0.11.1-custom.{DAY}.1");
     f.tool(&["release", "tag"]).success();
     let ci = ci_clone(&f, &name);
@@ -517,32 +747,8 @@ fn release_check_reads_the_forge_with_the_job_token() {
 }
 
 #[test]
-fn release_tag_refuses_to_push_with_the_job_token() {
-    let f = forge_fork();
-    f.env.set_var("CI_JOB_TOKEN", "job-token-of-the-pipeline");
-    f.env.git(
-        &f.down,
-        &[
-            "remote",
-            "set-url",
-            "--push",
-            "origin",
-            "https://gitlab-ci-token:job-token-of-the-pipeline@gitlab.example.com/team/app.git",
-        ],
-    );
-    let err = stderr(&f.tool(&["release", "tag"]).code(2));
-    assert!(
-        err.contains("would push to 'origin' with its job token")
-            && err.contains("the push URL carries it")
-            && !err.contains("job-token-of-the-pipeline"),
-        "{err}"
-    );
-    assert_eq!(f.env.git(&f.down, &["tag", "--list"]), "");
-}
-
-#[test]
 fn a_private_project_without_a_token_is_refused() {
-    let f = forge_fork();
+    let f = release_fork();
     f.tool(&["release", "tag"]).success();
     f.env.unset_var("GITLAB_TOKEN");
     f.forge().world().private = true;
@@ -694,7 +900,7 @@ fn release_version_rehearses_without_a_tag() {
 
 #[test]
 fn a_tag_pipeline_run_again_uses_the_tagged_configuration() {
-    let f = forge_fork();
+    let f = release_fork();
     let env = &f.env;
     let name = format!("v0.11.1-custom.{DAY}.1");
     f.tool(&["release", "tag"]).success();
@@ -792,8 +998,10 @@ fn status_shows_the_release_state() {
 #[test]
 fn status_without_the_forge_leaves_publication_unknown() {
     // The publish remote is a local path, on no forge.
-    let f = release_fork();
-    f.tool(&["release", "tag"]).success();
+    let f = Fork::new();
+    releasable(&f, RELEASE);
+    let name = format!("v0.11.1-custom.{DAY}.1");
+    release_tag(&f, &name, &f.tip());
     let doc = f.env.tool_json(&f.down, &["status", "--json"], 0);
     let release = &doc["release"];
     assert_eq!(release["release"], format!("v0.11.1-custom.{DAY}.1"));
@@ -809,7 +1017,7 @@ fn status_without_the_forge_leaves_publication_unknown() {
 
 #[test]
 fn the_release_commands_never_change_the_upstream() {
-    let f = forge_fork();
+    let f = release_fork();
     f.tool(&["release", "tag"]).success();
     assert_eq!(f.env.git(&f.up.bare, &["tag", "--list"]), "v0.11.0");
     assert_eq!(
@@ -908,7 +1116,7 @@ fn a_release_form_tag_off_the_line_takes_its_number_of_the_day() {
 
 #[test]
 fn an_unpublished_release_below_the_tip_is_shown_and_does_not_stop_the_next() {
-    let f = forge_fork();
+    let f = release_fork();
     let first = format!("v0.11.1-custom.{DAY}.1");
     f.tool(&["release", "tag"]).success();
     land(&f, "feature", "feat: a feature");
@@ -944,13 +1152,6 @@ const SEMVER: &str =
 /// A fork releasable under `semver`, with a feature of its own: the
 /// fixture's `fork:` commits ask for no release.
 fn semver_fork() -> Fork {
-    let f = Fork::new();
-    releasable(&f, SEMVER);
-    land(&f, "own", "feat: the fork's own feature");
-    f
-}
-
-fn semver_forge_fork() -> Fork {
     let f = Fork::push_gitlab();
     releasable(&f, SEMVER);
     land(&f, "own", "feat: the fork's own feature");
@@ -965,10 +1166,14 @@ fn pull(f: &Fork) {
 
 #[test]
 fn the_first_semver_release_is_1_0_0() {
-    let f = Fork::new();
+    let f = Fork::push_gitlab();
     releasable(&f, SEMVER);
-    // The fixture's `fork:` and `upstream:` commits ask for none.
+    // The fixture's `fork:` and `upstream:` commits ask for none; a dry
+    // run checks the tag the smallest next release would take.
     assert_eq!(next_json(&f)["next"], serde_json::Value::Null);
+    f.tool(&["release", "tag", "--dry-run"])
+        .success()
+        .stdout(contains("may create the release tag v1.0.0"));
     land(&f, "fix", "fix: a fix of the fork");
     let doc = next_json(&f);
     assert_eq!(doc["versioning"], "semver");
@@ -1155,7 +1360,7 @@ fn a_semver_release_below_a_higher_one_is_refused() {
 
 #[test]
 fn release_check_recomputes_the_version_of_a_semver_tag() {
-    let f = semver_forge_fork();
+    let f = semver_fork();
     f.tool(&["release", "tag"]).success();
     let env = &f.env;
     let ci = ci_clone(&f, "v1.0.0");
@@ -1197,7 +1402,7 @@ fn release_check_recomputes_the_version_of_a_semver_tag() {
 
 #[test]
 fn release_tag_warns_of_an_unpublished_release_when_nothing_is_due() {
-    let f = semver_forge_fork();
+    let f = semver_fork();
     f.tool(&["release", "tag"]).success();
     land(&f, "docs", "docs: a");
     let a = f.tool(&["release", "tag"]).code(0);
@@ -1454,7 +1659,7 @@ fn signed_commits_read_alike_whatever_log_show_signature_says() {
 
 #[test]
 fn a_late_upstream_tag_changes_no_semver_release() {
-    let f = semver_forge_fork();
+    let f = semver_fork();
     let env = &f.env;
     f.tool(&["release", "tag"]).success();
     f.forge().publish_release("v1.0.0");
@@ -1684,7 +1889,7 @@ fn release_version_fetches_no_upstream_that_has_a_sync_record() {
 
 #[test]
 fn a_withdrawn_or_moved_upstream_tag_changes_no_semver_release() {
-    let f = semver_forge_fork();
+    let f = semver_fork();
     let env = &f.env;
     let released = env.push_upstream(&f.up, &[("a.txt", "a\n")], "fix: a");
     upstream_tag(&f, "v0.11.3", &released);
@@ -1728,7 +1933,7 @@ fn a_withdrawn_or_moved_upstream_tag_changes_no_semver_release() {
 
 #[test]
 fn a_dated_tag_s_trailers_record_nothing() {
-    let f = forge_fork();
+    let f = release_fork();
     let env = &f.env;
     let ahead = env.push_upstream(&f.up, &[("a.txt", "a\n")], "feat: ahead");
     upstream_tag(&f, "v0.12.0", &ahead);

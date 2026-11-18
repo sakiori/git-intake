@@ -620,6 +620,11 @@ The token must be able to open merge requests:
 
 Pushes go through git with the remote's own credentials; the tool never puts the API token into git's configuration. They must be credentials whose pushes start the forge's pipeline.
 
+`release tag` pushes nothing: it creates the release tag through the API with the same token, so its job configures no git credential. The token's account creates the tag, and the tag's pipeline runs as that account:
+
+- **GitLab**: `GITLAB_TOKEN`, a project, group or personal access token with the `api` scope (`write_repository` does not reach the API), whose account has at least Developer and, where the release tags are protected, may create them. The CI job token cannot create a tag that starts a pipeline and is never used for it. `release tag --dry-run` reads the token (`GET /personal_access_tokens/self`), its account and role, and the protected tags that match the tag, and on Premium the groups a rule names.
+- **GitHub**: the variables above, with *Contents: write*. Not Actions' `GITHUB_TOKEN`: a tag it creates starts no workflow. GitHub has no way to ask what a token was granted, so `release tag --dry-run` proves less there: that GitHub accepts the token and shows it the repository, and, where GitHub reports it in the repository's `permissions`, that the token's account may write to it, which it does not report for an App installation token. It says what it left unproven. Tag rulesets are not read; a ruleset that refuses the tag shows as a refused creation.
+
 #### Merge settings
 
 The guarantee needs a merge that cannot happen without a successful pipeline, of exactly the tree that lands; squash and rebase merges are excluded too, since they drop the merge commits that carry the sync records. `finish` and `sync` read the settings before every push of the update branch, and `doctor` reads them; a refusal names each setting to change.
@@ -931,27 +936,27 @@ The upstream's own tags never count as the downstream's releases; a clone that f
 
 A release is **published** when the publish remote's forge has a release for its tag, which the project's pipeline creates as its last step (GitLab's `release` keyword, `glab release create` or `gh release create`). git intake only reads forge releases.
 
-The release commands find the forge as in *The forge*, in either publication mode. On GitLab they send `GITLAB_TOKEN`, or in a GitLab CI job of the remote's host `CI_JOB_TOKEN`; on GitHub the variables of *Tokens*; without a token they ask anonymously. A forge that hides the project's releases is refused, naming the token variables.
+The release commands find the forge as in *The forge*, in either publication mode. On GitLab they send `GITLAB_TOKEN`, or in a GitLab CI job of the remote's host `CI_JOB_TOKEN`; on GitHub the variables of *Tokens*; without a token they ask anonymously. A forge that hides the project's releases is refused, naming the token variables. `release tag` needs a publish remote on GitLab or GitHub and a token other than the job token (see *Tokens*), even when it has nothing to create.
 
 ### Release commands
 
-The release commands fetch the publish remote's integration branch and tags into references of their own, without the remote's configured refspecs, and remove them before they exit. They change no local branch or tag except the tag `release tag` creates.
+The release commands fetch the publish remote's integration branch and tags into references of their own, without the remote's configured refspecs, and remove them before they exit. They change no local branch or tag.
 
 | Command | Purpose |
 | --- | --- |
 | `release next [--json]` | For the integration tip: the newest upstream release it contains and, under `dated`, the release base; then the release at the tip and whether it is published, or the release a tag cut now would take (under `semver` with the change that sets it, or that none is due), and the newest release below when it is unpublished. Changes nothing; a forge that cannot be read leaves publication unknown. |
-| `release tag` | Cuts a release on the integration tip: creates the next release as an annotated tag `Release <version>` (under `semver` with the trailers of the tip's upstream release) with git's identity, and pushes only that tag, only where the remote lacks it, whatever the push settings; it warns of an unpublished release below. With a published release at the tip it does nothing. With an unpublished one it creates nothing and exits 1: its pipeline is running or failed, and rerunning the failed jobs completes it. Under `semver` with no release due it creates nothing and exits 0. |
+| `release tag [--dry-run]` | Cuts a release on the integration tip: creates the next release through the forge's API as an annotated tag `Release <version>` (under `semver` with the trailers of the tip's upstream release) on the tip, only where the forge has no tag of its name; it warns of an unpublished release below. The tagger is the token's account on GitLab, which the API sets, and git's identity on GitHub. With a published release at the tip it does nothing. With an unpublished one it creates nothing and exits 1: its pipeline is running or failed, and rerunning the failed jobs completes it. Under `semver` with no release due it creates nothing and exits 0. `--dry-run` creates nothing and checks that the token may create the tag the next release takes, or, while the tip carries a release or none is due, a tag of the same form: it exits 1 naming why the token may not, and 2 when the forge's answers do not tell. |
 | `release check [TAG]` | Guards a tag pipeline: checks TAG, or else `CI_COMMIT_TAG`, against the publish remote and reports every problem: not of release form (under `dated` with the current label), not on the remote, not at the checked-out commit, that commit not on the downstream's line, under `dated` a base other than the commit's, under `semver` a recorded upstream release that does not hold, a version other than the one the commit takes, or not sorting after every other release (under `dated` also by day and number). Only then does it ask whether the release is published, which is a problem too. Under `semver` it checks the tag's own recorded upstream release, not that it is the newest the commit contains. Exits 1 on a problem. |
 | `release version [--tag TAG] [--json \| --dotenv]` | Prints the version a build makes. For a release tag (`--tag` or `CI_COMMIT_TAG`), the tag's version, once it has the current label and base (`dated`) or the version the commit takes (`semver`); otherwise it refuses. Otherwise the checked-out commit's rehearsal version, with the UTC day of `CI_PIPELINE_CREATED_AT` or now: `<base>-<label>.<YYYYMMDD>.0` under `dated`, `<next>-rehearsal.<YYYYMMDD>` under `semver`, `<next>` being the next release or else a patch bump. `--dotenv` writes `RELEASE_VERSION`, for a tag `RELEASE_TAG`, and under `semver` `RELEASE_UPSTREAM=<upstream>-<x.y.z>` (characters other than ASCII letters, digits and `-` written `-`). `--json` writes `version`, `tag` (null for a rehearsal), `rehearsal` and under `semver` `upstream`, `previous` (the previous release's tag, or null) and `bump` (`major`, `minor`, `patch` or null) of the versioned commit. It lists the release upstream's tags from its URL, and under `semver` fetches the publish remote's branch and tags. Last synced commits come from the commit's own sync records, a record counting only when the configuration at its merge names that upstream at the same URL and branch; an upstream is fetched only without such a record, so a merge request's build needs no other upstream. |
 | `release notes [TAG]` | Writes the Markdown notes of TAG, or `CI_COMMIT_TAG`: the newest release before the tag, then newest first the subjects of the downstream's own commits since it and each upstream update by name and tag, or else abbreviated target; the upstream's own commits are not listed. The first release, and one with nothing to list, say so. Under `semver` they start with the tag's upstream release and how many upstream commits it carries after it, then the breaking changes: the upstream's move when it raised the major version, and each breaking commit with its `BREAKING CHANGE` text. |
 
 `release next`, `release tag` and `status` read the configuration at the integration tip; `release check`, `release version` and `release notes` read it at the checked-out commit, so a rerun tag pipeline behaves as it did.
 
-Of two runs cutting the same release, the second push fails without effect, exits 2 and says to run again. A release tag is never pushed to an upstream, and needs a credential whose pushes start the forge's pipeline.
+Of two runs cutting the same release, the second creation fails without effect, exits 2 and says to run again. A creation the forge refuses exits 2 with the forge's answer. A release tag is created only in the publish remote's project, which may not name an upstream's repository.
 
 ### Releasing from CI
 
-A scheduled job cuts the release tag; the tag's pipeline checks it, builds with its version and creates the forge release last. On GitLab, protect the release tags (`v*`), so the tag pipeline gets its protected variables, and let the scheduled job's token create them:
+A scheduled job cuts the release tag; the tag's pipeline checks it, builds with its version and creates the forge release last. On GitLab, protect the release tags (`v*`), so the tag pipeline gets its protected variables, and let the account of the scheduled job's token create them. The token is `GITLAB_TOKEN` (see *Tokens*), a masked and protected variable, so it reaches only pipelines of protected branches and tags; the job needs no git credential or identity. A pipeline of the default branch rehearses the release with `release tag --dry-run`, so a token that expired or lost its role fails there, not in the next scheduled run:
 
 ```yaml
 variables:
@@ -969,9 +974,16 @@ release-tag:
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   script:
-    # Pushes with the access token in GITLAB_TOKEN; see Running in CI, GitLab.
-    - !reference [.push-with-token, script]
+    # Creates the tag through the API with the access token in GITLAB_TOKEN.
     - git intake release tag
+
+# Proves that the token may create the next release tag; creates nothing.
+release-tag-rehearsal:
+  stage: check
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - git intake release tag --dry-run
 
 release-check:
   stage: check
@@ -1040,7 +1052,7 @@ build:
 
 A squashed merge request's title becomes its commit message, so check that titles are Conventional Commits.
 
-On GitHub Actions, a scheduled workflow runs `git intake release tag` with a GitHub App installation token with *Contents: write*, passed to `actions/checkout` and as `GH_TOKEN` (a tag pushed with `GITHUB_TOKEN` starts no workflow). A workflow `on: push: tags: ["v*"]` with `fetch-depth: 0` then runs `git intake release check "$GITHUB_REF_NAME"`, `git intake release version --tag "$GITHUB_REF_NAME" --dotenv >> "$GITHUB_ENV"`, the build, `git intake release notes "$GITHUB_REF_NAME" > notes.md` and `gh release create "$GITHUB_REF_NAME" --verify-tag --notes-file notes.md`, with `GH_TOKEN: ${{ github.token }}` (without it a private repository's releases read as hidden) and `permissions: contents: write`.
+On GitHub Actions, a scheduled workflow runs `git intake release tag` with a GitHub App installation token with *Contents: write* as `GH_TOKEN` (a tag created with `GITHUB_TOKEN` starts no workflow), and sets git's `user.name` and `user.email`, the tag's tagger. A workflow `on: push: tags: ["v*"]` with `fetch-depth: 0` then runs `git intake release check "$GITHUB_REF_NAME"`, `git intake release version --tag "$GITHUB_REF_NAME" --dotenv >> "$GITHUB_ENV"`, the build, `git intake release notes "$GITHUB_REF_NAME" > notes.md` and `gh release create "$GITHUB_REF_NAME" --verify-tag --notes-file notes.md`, with `GH_TOKEN: ${{ github.token }}` (without it a private repository's releases read as hidden) and `permissions: contents: write`.
 
 With `[release]`, `status` shows the release state as `release next` does.
 
@@ -1136,8 +1148,8 @@ One object: `tip`, the publish remote's integration tip; `versioning`, `dated` o
 | Status | Meaning |
 | --- | --- |
 | 0 | Success. |
-| 1 | A negative result: `status --check` found drift or pending port commits; `status`, `log` or `branches` could not fetch an upstream; a `doctor` check failed; `verify` failed, partial runs included; `start` or `continue` stopped on conflicts or a copy's failed commit; `finish` stopped on a catch-up merge's conflicts or failed checks, or because the integration branch moved again while it made or verified one; `sync` stopped on a conflict or failed checks, found a replacement conflicting, or left out a follow upstream; `land` met a failed or canceled pipeline or a conflicted catch-up merge; `release tag` found an unpublished release at the tip; `release check` found a problem. An open merge request is not a negative result. |
-| 2 | An error: invalid configuration or usage; a refused command (such as `start` with an unfetchable upstream, `continue` with an invalid plan, `verify` with an unknown check, `finish` on an unverified update in push mode or a head with only a partial run, a forge whose merge settings do not qualify or no token, `sync` on a rewritten merge request or a declined branch, `sync` in merge-request mode, `release tag` or `land` pushing with the job token, any command in a shallow clone); a forge that rejected the token or a request; a push of the update's branch or a release tag rejected because another run pushed first; a release that breaks the order or whose name exists; a forge whose releases `release tag` or `release check` cannot read, or that hides them from `release next`; a catch-up refused because the integration branch was rewritten or changes what the update means; `delta` on a commit it cannot compare; `land` refused, refused a merge, stopped by another run's pause, or given up after its timeout or failed reads; output that cannot be written; a git failure, an unfetchable publish remote and a rejected push included (run `finish` again after it). |
+| 1 | A negative result: `status --check` found drift or pending port commits; `status`, `log` or `branches` could not fetch an upstream; a `doctor` check failed; `verify` failed, partial runs included; `start` or `continue` stopped on conflicts or a copy's failed commit; `finish` stopped on a catch-up merge's conflicts or failed checks, or because the integration branch moved again while it made or verified one; `sync` stopped on a conflict or failed checks, found a replacement conflicting, or left out a follow upstream; `land` met a failed or canceled pipeline or a conflicted catch-up merge; `release tag` found an unpublished release at the tip, or with `--dry-run` that the token may not create the tag; `release check` found a problem. An open merge request is not a negative result. |
+| 2 | An error: invalid configuration or usage; a refused command (such as `start` with an unfetchable upstream, `continue` with an invalid plan, `verify` with an unknown check, `finish` on an unverified update in push mode or a head with only a partial run, a forge whose merge settings do not qualify or no token, `sync` on a rewritten merge request or a declined branch, `sync` in merge-request mode, `land` pushing with the job token, `release tag` without a token or on a remote on neither forge, any command in a shallow clone); a forge that rejected the token or a request; a push of the update's branch rejected because another run pushed first; a release tag another run created first, or whose creation the forge refused; a release that breaks the order or whose name exists; a forge whose releases `release tag` or `release check` cannot read, or that hides them from `release next`; a catch-up refused because the integration branch was rewritten or changes what the update means; `delta` on a commit it cannot compare; `land` refused, refused a merge, stopped by another run's pause, or given up after its timeout or failed reads; output that cannot be written; a git failure, an unfetchable publish remote and a rejected push included (run `finish` again after it). |
 | 129, 130, 143 | `land` stopped by SIGHUP, SIGINT or SIGTERM, with its pause ended. |
 
 `env -- <command>` exits with the command's status, or with status 2 without running it when it cannot read the variables.
@@ -1202,7 +1214,7 @@ The `GIT_CONFIG_*` variables name the checkout in `safe.directory` for every job
 
 Behind a private certificate authority, which the dropped runner configuration may have named, add `export GIT_SSL_CAINFO="$CI_SERVER_TLS_CA_FILE"`.
 
-In a GitLab CI job, `sync` in merge-request mode, `release tag` and `land` refuse with status 2, at the start of every run, a clone that would push with the job token, whose pushes start no pipeline; `sync` in push mode and `land --resume` only warn.
+In a GitLab CI job, `sync` in merge-request mode and `land` refuse with status 2, at the start of every run, a clone that would push with the job token, whose pushes start no pipeline; `sync` in push mode and `land --resume` only warn.
 
 Store `GITLAB_TOKEN` (see *Tokens*) as a **masked and protected** CI/CD variable. It reaches the scheduled pipeline on the protected default branch, and must not reach the merge request pipeline that runs an update's code:
 
@@ -1307,13 +1319,13 @@ The tool does not hide its token variables from the checks, which would not prot
 
 - The tool never rewrites history and never force-pushes. The integration branch only fast-forwards, and so does the update branch, through catch-up merges.
 - The integration branch is read only from the publish remote. No local integration branch is read, created or moved; the only local branches the tool creates are the update branch and the branch `contribute` names.
-- Updates never change the repository's tags. The release commands create release tags and never move, replace or delete a tag, locally or on the remote: `release tag` pushes only the tag it creates, and only where the remote lacks it.
+- Updates never change the repository's tags. The release commands create release tags and never move, replace or delete a tag, locally or on the remote: `release tag` creates only the release tag, through the forge's API, and only where the forge lacks it.
 - It never pushes to an upstream: the publish remote may not name an upstream's repository, and no remote is kept for an upstream.
 - No file of the main checkout is changed. The tool removes only the update worktree git registers at its place, reached through directories alone, and leaves anything else there. The update lives in its own worktree, `.worktrees/git-intake/update` in the main worktree (in the git directory of a bare repository), on `git-intake/update`, with its state and plan in `<git-common-dir>/git-intake/`, which every worktree shares and no commit can carry.
 - Each target is fixed at `start`, and the update holds references to its targets and planned commits until it ends. What is merged or copied, verified and published is the same commit. A replacement with `replace_after` never changes an open merge request's targets: it closes it unmerged and opens a new one.
 - In push mode, `finish` pushes exactly the verified commit, never what a local branch points at, and only when it contains the integration tip just fetched, so the push is a fast-forward; a moved tip is first taken in by a catch-up merge, verified before it is pushed, and a rewritten one is refused. A rejected push publishes nothing, and a retry never publishes anything unverified.
 - In push mode, only a commit `verify` passed reaches the integration branch. In merge-request mode, only a tree the forge's required pipeline tested can be merged, by anyone the forge's rules bind: the tool publishes only to a forge whose settings guarantee it, read before every push. The update's branch only moves forward, and a branch the tool did not leave is never deleted or overwritten; deletions go under a lease on the commit read.
-- The forge's token is read from the environment only, sent only to the API of the publish remote's own host, and never printed or stored; the publication setting is read from the integration tip, never from an update's head. The release commands only read the forge.
+- The forge's token is read from the environment only, sent only to the API of the publish remote's own host, and never printed or stored; the publication setting is read from the integration tip, never from an update's head. The release commands only read the forge, except the tag `release tag` creates.
 - The tool never adds or changes a git remote, and never fetches an upstream through one.
 - A rewritten upstream is detected from the sync record or the port journal and copies, and is not taken.
 - The configuration and a port's journal are read at the publish remote's integration tip, never from a local branch, a working copy or the tree being taken in.

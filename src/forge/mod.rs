@@ -5,9 +5,10 @@
 //! merge requests, opens one, rewrites its title and description, closes
 //! it, reads whether people approved, reviewed or commented on one, reads
 //! whether the project merges only a tree its required pipeline tested,
-//! reads whether a release exists for a tag, reads the pipeline of
-//! a merge request's head, merges it, and reads and changes the assignments
-//! a merge queue works by. [`gitlab`] and [`github`] implement it over
+//! reads whether a release exists for a tag, creates a release tag and
+//! tells whether the token may, reads the pipeline of a merge request's
+//! head, merges it, and reads and changes the assignments a merge queue
+//! works by. [`gitlab`] and [`github`] implement it over
 //! [`http`].
 
 pub mod github;
@@ -158,6 +159,39 @@ pub enum ReleaseLookup {
     Hidden,
 }
 
+/// An annotated tag to create on the forge.
+#[derive(Debug, Clone, Copy)]
+pub struct NewTag<'a> {
+    pub name: &'a str,
+    pub commit: &'a str,
+    pub message: &'a str,
+    /// GitHub: the tagger's name and email. GitLab takes none and writes
+    /// the token's account.
+    pub tagger: Option<(&'a str, &'a str)>,
+}
+
+/// What became of a request to create a tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagCreation {
+    Created,
+    /// The forge has a tag of that name already.
+    Taken,
+}
+
+/// Whether the token may create a tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagAccess {
+    /// It may, as far as the forge's answers tell.
+    Allowed {
+        /// The token's account, when the forge names it.
+        account: Option<String>,
+        /// What the forge's answers leave unproven.
+        unproven: Option<String>,
+    },
+    /// It may not, for the reason given.
+    Denied(String),
+}
+
 /// The outcome of a pipeline, as far as it has one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineState {
@@ -278,6 +312,15 @@ pub trait Forge {
     /// releases is read first, so that a project the forge hides is never
     /// taken for one without the release.
     fn release(&self, tag: &str) -> Result<ReleaseLookup>;
+
+    /// Creates an annotated tag, only where the forge has no tag of its
+    /// name.
+    fn create_tag(&self, tag: &NewTag) -> Result<TagCreation>;
+
+    /// Whether the token may create a tag named `name`, as far as the
+    /// forge's answers tell, without creating anything; an error when they
+    /// do not tell.
+    fn tag_access(&self, name: &str) -> Result<TagAccess>;
 
     /// Reads a merge request with the pipeline of its head, the one the
     /// forge's rule that pipelines must succeed reads; `None` before the

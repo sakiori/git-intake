@@ -13,9 +13,8 @@ use serde::Serialize;
 use crate::Exit;
 use crate::bump::Bump;
 use crate::config::{self, Config, Publish, Versioning};
-use crate::forge::{self, ReleaseLookup};
+use crate::forge::{self, Forge, NewTag, ReleaseLookup, TagAccess, TagCreation};
 use crate::git::{Git, abbrev};
-use crate::identity;
 use crate::integration_line;
 use crate::output::{Render, emit};
 use crate::output::{esay, say};
@@ -205,6 +204,28 @@ impl AtTip {
         Ok((Some(next), bump))
     }
 
+    /// Under `semver`, the tag the smallest next release would take, as a
+    /// rehearsal names it when none is due.
+    fn smallest_next(&self, git: &Git) -> Result<ReleaseTag> {
+        let (settings, up) = release::settings(&self.config, "the integration tip")?;
+        let source = release::Source {
+            settings,
+            up,
+            tags: &self.tags,
+        };
+        let planned = release::semver_next(
+            git,
+            &source,
+            &self.remote.tip,
+            &self.line[1..],
+            &self.releases,
+            &self.upstream,
+        )?;
+        Ok(ReleaseTag::semver(
+            planned.version.unwrap_or(planned.smallest),
+        ))
+    }
+
     /// The newest release on the line below the tip, when the tip carries
     /// none.
     fn previous(&self) -> Option<&Release> {
@@ -287,10 +308,13 @@ enum Lookup {
 }
 
 fn lookup(git: &Git, publish: &Publish, tag: &str) -> Lookup {
-    let forge = match forge::connect(git, publish, forge::Access::Releases) {
-        Ok(forge) => forge,
-        Err(err) => return Lookup::Failed(format!("{err:#}")),
-    };
+    match forge::connect(git, publish, forge::Access::Releases) {
+        Ok(forge) => lookup_on(forge.as_ref(), tag),
+        Err(err) => Lookup::Failed(format!("{err:#}")),
+    }
+}
+
+fn lookup_on(forge: &dyn Forge, tag: &str) -> Lookup {
     match forge.release(tag) {
         Ok(ReleaseLookup::Published) => Lookup::Known(true),
         Ok(ReleaseLookup::Unpublished) => Lookup::Known(false),
@@ -380,15 +404,19 @@ pub fn next(repo: &Repo, json: bool) -> Result<Exit> {
 }
 
 /// `release tag`.
-pub fn tag(repo: &Repo) -> Result<Exit> {
+pub fn tag(repo: &Repo, dry_run: bool) -> Result<Exit> {
     let git = &repo.git;
     let mut fetches = Fetches::new(repo);
     let tip = at_tip(repo, &mut fetches, &repo.bootstrap()?, &Known::default())?;
     let publish = &tip.config.publish;
     let remote = &tip.remote;
-    crate::forge::refuse_job_token_push(git, &publish.remote)?;
+    let forge = forge::connect(git, publish, forge::Access::Tags)?;
+    let forge = forge.as_ref();
+    if dry_run {
+        return check_tag_access(git, forge, &tip);
+    }
     if let Some(at) = tip.release() {
-        return match lookup(git, publish, &at.tag.name) {
+        return match lookup_on(forge, &at.tag.name) {
             Lookup::Known(true) => {
                 say!(
                     "the integration tip {} carries the published release {}; nothing to release",
@@ -417,7 +445,7 @@ pub fn tag(repo: &Repo) -> Result<Exit> {
     }
     let (next, _) = tip.next(git)?;
     if let Some(previous) = tip.previous() {
-        match lookup(git, publish, &previous.tag.name) {
+        match lookup_on(forge, &previous.tag.name) {
             Lookup::Known(true) => {}
             Lookup::Known(false) => esay!(
                 "warning: the release {} below the tip is not published: {}",
@@ -441,83 +469,109 @@ pub fn tag(repo: &Repo) -> Result<Exit> {
         );
         return Ok(Exit::Success);
     };
-    identity::Upstreams::new(git, &tip.config.upstreams)?.refuse_push(git, &publish.remote)?;
     let recorded = (next.dated.is_none()).then_some(&tip.upstream);
-    let object = tag_object(git, &remote.tip, &next, recorded)?;
-    let full = format!("refs/tags/{}", next.name);
-    let out = git.raw(&[
-        "push",
-        "--quiet",
-        // Exactly the one tag, whatever push.followTags or
-        // push.recurseSubmodules say.
-        "--no-follow-tags",
-        "--no-recurse-submodules",
-        &format!("--force-with-lease={full}:"),
-        "--end-of-options",
-        &publish.remote,
-        &format!("{object}:{full}"),
-    ])?;
-    if !out.success() {
-        let taken = crate::commands::merge_request::remote_refs(
-            git,
-            &publish.remote,
-            std::slice::from_ref(&full),
-        )
-        .map(|r| r.contains_key(&full))
-        .unwrap_or(false);
-        if taken {
-            bail!(
-                "another run created the tag {} on '{}' first; nothing was pushed. Run `git intake release tag` \
-                 again, which takes the release after it",
-                next.name,
-                publish.remote
-            );
-        }
-        bail!(
-            "pushing the tag {} to '{}' was rejected: {}\nNothing was pushed",
+    let message = tag_message(&next, recorded);
+    let identity = match forge.kind() {
+        forge::Kind::GitHub => Some(tagger(git)?),
+        forge::Kind::GitLab => None,
+    };
+    let new = NewTag {
+        name: &next.name,
+        commit: &remote.tip,
+        message: &message,
+        tagger: identity.as_ref().map(|(n, e)| (n.as_str(), e.as_str())),
+    };
+    let created = forge.create_tag(&new).with_context(|| {
+        format!(
+            "creating the release tag {} on the {} project '{}' failed; nothing was created",
             next.name,
-            publish.remote,
-            out.into_error()
+            forge.kind().name(),
+            forge.location().project
+        )
+    })?;
+    if created == TagCreation::Taken {
+        bail!(
+            "another run created the tag {} on '{}' first; nothing was created. Run `git intake release tag` \
+             again, which takes the release after it",
+            next.name,
+            publish.remote
         );
     }
-    let local = git.raw(&["update-ref", &full, &object, ""])?;
     say!(
-        "pushed the release tag {} at {} to '{}'",
+        "created the release tag {} at {} on the {} project '{}'",
         next.name,
         abbrev(&remote.tip),
-        publish.remote
+        forge.kind().name(),
+        forge.location().project
     );
-    if !local.success() {
-        esay!(
-            "note: the repository already has a tag {}, which was left as it is",
-            next.name
-        );
-    }
     Ok(Exit::Success)
 }
 
-/// Writes the annotated tag object of `tag` on `commit` with git's
-/// configured identity, without a reference to it.
-/// A semver tag records `upstream` in trailers below the message.
-fn tag_object(
-    git: &Git,
-    commit: &str,
-    tag: &ReleaseTag,
-    upstream: Option<&UpstreamRelease>,
-) -> Result<String> {
-    let tagger = git
-        .line(&["var", "GIT_COMMITTER_IDENT"])
-        .context("the release tag needs git's identity: set user.name and user.email")?;
-    let mut text = format!(
-        "object {commit}\ntype commit\ntag {}\ntagger {tagger}\n\nRelease {}\n",
-        tag.name,
-        tag.version_text()
-    );
+/// `release tag --dry-run`: whether the token may create the tag the next
+/// release takes; while the tip carries a release, or under `semver` none
+/// is due, a tag of the same form.
+fn check_tag_access(git: &Git, forge: &dyn Forge, tip: &AtTip) -> Result<Exit> {
+    let name = match tip.release() {
+        Some(at) => at.tag.name.clone(),
+        None => match tip.next(git)? {
+            (Some(next), _) => next.name,
+            (None, _) => tip.smallest_next(git)?.name,
+        },
+    };
+    let l = forge.location();
+    let place = format!("the {} project '{}'", forge.kind().name(), l.project);
+    match forge.tag_access(&name).with_context(|| {
+        format!(
+            "cannot tell whether the token in {} may create the release tag {name} on {place}",
+            l.token_variable()
+        )
+    })? {
+        TagAccess::Allowed { account, unproven } => {
+            let of = account.map(|a| format!(", of {a},")).unwrap_or_default();
+            let unproven = unproven
+                .map(|u| format!(" as far as {} tells: {u}", forge.kind().name()))
+                .unwrap_or_default();
+            say!(
+                "the token in {}{of} may create the release tag {name} on {place}{unproven}; nothing was created",
+                l.token_variable()
+            );
+            Ok(Exit::Success)
+        }
+        TagAccess::Denied(why) => {
+            say!(
+                "{}",
+                redacted(&format!(
+                    "the token in {} may not create the release tag {name} on {place}: {why}",
+                    l.token_variable()
+                ))
+            );
+            Ok(Exit::Negative)
+        }
+    }
+}
+
+/// The annotation of `tag`: `Release <version>`, and for a semver tag
+/// `upstream` in trailers below it.
+fn tag_message(tag: &ReleaseTag, upstream: Option<&UpstreamRelease>) -> String {
+    let mut text = format!("Release {}\n", tag.version_text());
     if let Some(upstream) = upstream {
         text.push('\n');
         text.push_str(&upstream.trailers());
     }
-    Ok(git.run_with_input(&["mktag"], text)?.trim().to_string())
+    text
+}
+
+/// git's configured identity: name and email.
+fn tagger(git: &Git) -> Result<(String, String)> {
+    let name = git
+        .line(&["var", "GIT_COMMITTER_IDENT"])
+        .context("the release tag on GitHub needs git's identity: set user.name and user.email")?;
+    // `Name <email> <time> <zone>`.
+    let (name, rest) = name
+        .split_once(" <")
+        .context("git's identity has no email")?;
+    let email = rest.split_once('>').map_or(rest, |(e, _)| e);
+    Ok((name.to_string(), email.to_string()))
 }
 
 /// The tag a pipeline command works on: the one named, or else

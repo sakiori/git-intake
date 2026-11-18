@@ -135,6 +135,9 @@ pub enum Access {
     /// Reading the project's releases: a GitLab CI job token serves, and
     /// without any token the forge is asked without credentials.
     Releases,
+    /// Creating a release tag: a token is required, and a GitLab CI job
+    /// token does not serve.
+    Tags,
 }
 
 /// What the location needs from outside: the environment, and the host an
@@ -221,6 +224,7 @@ pub fn locate(
             match access {
                 Access::MergeRequests => "publication through a merge request",
                 Access::Releases => "reading the releases of the forge",
+                Access::Tags => "creating a release tag through the forge's API",
             }
         ));
     };
@@ -313,9 +317,14 @@ pub fn locate(
             });
         }
     }
-    if credential.is_none() && access == Access::MergeRequests {
+    if credential.is_none() && access != Access::Releases {
+        let job = if access == Access::Tags && kind == Kind::GitLab {
+            "; a CI job token cannot create a tag that starts a pipeline"
+        } else {
+            ""
+        };
         return Err(format!(
-            "no token for the {} API at {api} is set; set {token_variables} in the environment",
+            "no token for the {} API at {api} is set; set {token_variables} in the environment{job}",
             kind.name(),
         ));
     }

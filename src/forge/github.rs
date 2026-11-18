@@ -16,8 +16,9 @@ use url::Url;
 
 use super::http::{Auth, Client, Method, PER_PAGE};
 use super::{
-    Account, Failure, Forge, Kind, Location, Merge, MergeRequest, Pipeline, PipelineState, Queued,
-    ReleaseLookup, Review, Signal, State, endpoint, failure, instant, pipeline_state, signal, text,
+    Account, Failure, Forge, Kind, Location, Merge, MergeRequest, NewTag, Pipeline, PipelineState,
+    Queued, ReleaseLookup, Review, Signal, State, TagAccess, TagCreation, endpoint, failure,
+    instant, pipeline_state, signal, text,
 };
 
 /// The API version every request asks for.
@@ -400,6 +401,105 @@ impl Forge for GitHub {
             404 => Ok(ReleaseLookup::Unpublished),
             _ if reply.success() => Ok(ReleaseLookup::Published),
             _ => anyhow::bail!("{}", self.client.refusal(Method::Get, &one, &reply)),
+        }
+    }
+
+    // The tag object, then its reference, which GitHub creates only where
+    // none exists. The tagger is `tag.tagger`.
+    fn create_tag(&self, tag: &NewTag) -> Result<TagCreation> {
+        let mut body = json!({
+            "tag": tag.name,
+            "message": tag.message,
+            "object": tag.commit,
+            "type": "commit",
+        });
+        if let Some((name, email)) = tag.tagger {
+            body["tagger"] = json!({ "name": name, "email": email });
+        }
+        let object =
+            self.client
+                .json(Method::Post, &self.url(&["git", "tags"], &[]), Some(&body))?;
+        let sha = text(&object, "sha");
+        if sha.is_empty() {
+            anyhow::bail!("GitHub answered the creation of the tag object without its name");
+        }
+        let full = format!("refs/tags/{}", tag.name);
+        let url = self.url(&["git", "refs"], &[]);
+        let reply = self.client.send(
+            Method::Post,
+            &url,
+            Some(&json!({ "ref": full, "sha": sha })),
+        )?;
+        if reply.success() {
+            return Ok(TagCreation::Created);
+        }
+        let existing = self.url(&["git", "ref", "tags", tag.name], &[]);
+        let found = self.client.send(Method::Get, &existing, None)?;
+        if found.success() {
+            return Ok(TagCreation::Taken);
+        }
+        Err(Failure::answered(
+            reply.status,
+            self.client.refusal(Method::Post, &url, &reply),
+        )
+        .into())
+    }
+
+    // GitHub has no way to ask what a token was granted: the repository's
+    // `permissions` are its account's access, and are left out for an App
+    // installation token. What it tells is that it accepts the token, which
+    // sees the repository, and whether the account may write to it.
+    fn tag_access(&self, _name: &str) -> Result<TagAccess> {
+        let variable = self.location.token_variable();
+        let url = self.url(&[], &[]);
+        let reply = self.client.send(Method::Get, &url, None)?;
+        match reply.status {
+            401 => {
+                return Ok(TagAccess::Denied(format!(
+                    "GitHub does not accept the token in {variable}"
+                )));
+            }
+            404 => {
+                return Ok(TagAccess::Denied(format!(
+                    "the token in {variable} does not see the repository '{}'",
+                    self.location.project
+                )));
+            }
+            _ if reply.success() => {}
+            status => {
+                return Err(Failure::answered(
+                    status,
+                    self.client.refusal(Method::Get, &url, &reply),
+                )
+                .into());
+            }
+        }
+        match reply
+            .json
+            .get("permissions")
+            .and_then(|p| p.get("push"))
+            .and_then(Value::as_bool)
+        {
+            Some(true) => Ok(TagAccess::Allowed {
+                account: None,
+                unproven: Some(
+                    "GitHub reports that the token's account may write to the repository, not whether \
+                     the token was granted *Contents: write*"
+                        .to_string(),
+                ),
+            }),
+            Some(false) => Ok(TagAccess::Denied(format!(
+                "the account of the token in {variable} may not write to the repository '{}'",
+                self.location.project
+            ))),
+            None => Ok(TagAccess::Allowed {
+                account: None,
+                unproven: Some(
+                    "GitHub accepts the token and shows it the repository, and does not report whether \
+                     it may write to it"
+                        .to_string(),
+                ),
+            }),
         }
     }
 

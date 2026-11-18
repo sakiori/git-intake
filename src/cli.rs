@@ -341,7 +341,7 @@ pub enum Command {
     /// GitHub with the variables `finish` reads; without a token they ask without credentials.
     ///
     /// The commands fetch the publish remote's integration branch and tags into references of
-    /// their own, and change no local branch or tag, except the tag `release tag` creates.
+    /// their own, and change no local branch or tag.
     Release {
         #[command(subcommand)]
         command: ReleaseCommand,
@@ -366,15 +366,22 @@ pub enum ReleaseCommand {
     /// Cut the next release tag on the publish remote's integration tip
     ///
     /// Reads the configuration at the publish remote's integration tip. When no release points
-    /// at the tip, creates the next release as an annotated tag `Release <version>` with git's
-    /// identity and pushes only that tag to the publish remote, creating it only where the remote
-    /// lacks it, with a warning when the newest release below the tip is not published. When a
-    /// published release points at the tip, does nothing. When a release that is
-    /// not published points at the tip, creates nothing and exits with status 1: its pipeline is
-    /// still running or failed, and a failed release is completed by running its pipeline's
-    /// failed jobs again. With semver versions, when the commits since the previous release ask
-    /// for no release, says so and creates nothing. Never moves, replaces or deletes a tag.
-    Tag,
+    /// at the tip, creates the next release as an annotated tag `Release <version>` through the
+    /// API of the publish remote's forge, with the token in `GITLAB_TOKEN` or, on GitHub, the
+    /// variables `finish` reads, only where the forge has no tag of its name, with a warning when
+    /// the newest release below the tip is not published. On GitLab the tagger is the token's
+    /// account, on GitHub git's identity. When a published release points at the tip, does
+    /// nothing. When a release that is not published points at the tip, creates nothing and exits
+    /// with status 1: its pipeline is still running or failed, and a failed release is completed
+    /// by running its pipeline's failed jobs again. With semver versions, when the commits since
+    /// the previous release ask for no release, says so and creates nothing. Never moves,
+    /// replaces or deletes a tag.
+    Tag {
+        /// Create nothing; check that the token may create the tag the next release takes, or,
+        /// when none is due, a tag of the same form, and exit with status 1 when it may not
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Check a release tag in its pipeline before anything is built
     ///
     /// Reads the configuration at the checked-out commit and checks TAG, or else

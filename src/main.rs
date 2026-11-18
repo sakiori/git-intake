@@ -97,7 +97,7 @@ fn run(command: Command) -> anyhow::Result<Exit> {
         }
         Command::Release { command } => match command {
             ReleaseCommand::Next { json } => commands::release::next(&repo, json),
-            ReleaseCommand::Tag => commands::release::tag(&repo),
+            ReleaseCommand::Tag { dry_run } => commands::release::tag(&repo, dry_run),
             ReleaseCommand::Check { tag } => commands::release::check(&repo, tag.as_deref()),
             ReleaseCommand::Version { tag, json, dotenv } => {
                 commands::release::version(&repo, tag.as_deref(), json, dotenv)

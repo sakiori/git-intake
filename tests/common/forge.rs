@@ -21,6 +21,9 @@ use serde_json::{Value, json};
 /// The token the tests give the tool.
 pub const TOKEN: &str = "test-token-never-printed";
 
+/// The id of the account the tests' token belongs to on the fake GitLab.
+pub const RELEASE_BOT: u64 = 50;
+
 /// The project on the fake forge.
 pub const OWNER: &str = "team";
 pub const REPO: &str = "app";
@@ -277,6 +280,16 @@ pub struct World {
     /// Each change of a merge request's assignees: its number, and the
     /// message of the commit `refs/git-intake/pause` pointed at then.
     pub assignments: Vec<(u64, Option<String>)>,
+    /// GitLab: the token as `GET /personal_access_tokens/self` answers.
+    pub token: Value,
+    /// GitLab: the token's account as `GET /user` answers.
+    pub account: Value,
+    /// GitLab: each project member's id and access level.
+    pub members: Vec<(u64, u64)>,
+    /// GitLab: each group membership: group, user and access level.
+    pub group_members: Vec<(u64, u64, u64)>,
+    /// GitLab: the protected tags.
+    pub protected_tags: Value,
     clock: u64,
 }
 
@@ -321,6 +334,7 @@ impl FakeForge {
                 "allow_merge_commit": true,
                 "allow_squash_merge": false,
                 "allow_rebase_merge": false,
+                "permissions": {"push": true},
             }),
         );
         f.world.lock().unwrap().rules = json!([{
@@ -367,6 +381,11 @@ impl FakeForge {
             merge_status: None,
             on_merge: Vec::new(),
             assignments: Vec::new(),
+            token: json!({"active": true, "revoked": false, "scopes": ["api"], "user_id": RELEASE_BOT}),
+            account: json!({"id": RELEASE_BOT, "username": "release-bot"}),
+            members: vec![(RELEASE_BOT, 40)],
+            group_members: Vec::new(),
+            protected_tags: json!([]),
             clock: 0,
         }));
         let mut mocks = Vec::new();
@@ -768,6 +787,36 @@ fn bare_git(bare: &Path, args: &[&str]) -> Option<String> {
         .env("GIT_COMMITTER_NAME", "Fake Forge")
         .env("GIT_COMMITTER_EMAIL", "forge@example.com");
     let out = cmd.arg("--git-dir").arg(bare).args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Writes an annotated tag object of `commit` in the bare repository, as a
+/// forge does; its name, or `None` when git refuses it.
+fn bare_tag_object(
+    bare: &Path,
+    name: &str,
+    commit: &str,
+    tagger: &str,
+    message: &str,
+) -> Option<String> {
+    use std::io::Write;
+    let text = format!(
+        "object {commit}\ntype commit\ntag {name}\ntagger {tagger} 1700000000 +0000\n\n{message}"
+    );
+    let mut child = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("--git-dir")
+        .arg(bare)
+        .arg("mktag")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(text.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -1276,6 +1325,23 @@ fn gitlab(
             ),
         );
     }
+    if (method, path) == ("GET", "/api/v4/user") {
+        return reply(200, w.account.clone());
+    }
+    if (method, path) == ("GET", "/api/v4/personal_access_tokens/self") {
+        return reply(200, w.token.clone());
+    }
+    let group: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if let ["api", "v4", "groups", g, "members", u] = group.as_slice() {
+        return match w
+            .group_members
+            .iter()
+            .find(|(gid, uid, _)| gid.to_string() == *g && uid.to_string() == *u)
+        {
+            Some((_, uid, level)) => reply(200, json!({"id": uid, "access_level": level})),
+            None => reply(404, json!({"message": "404 Not found"})),
+        };
+    }
     let project = format!("/api/v4/projects/{OWNER}%2F{REPO}");
     let Some(rest) = path.strip_prefix(&project) else {
         return reply(404, json!({"message": "404 Project Not Found"}));
@@ -1283,6 +1349,63 @@ fn gitlab(
     let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
     match (method, parts.as_slice()) {
         ("GET", []) => reply(200, w.project.clone()),
+        ("GET", ["members", "all", u]) => {
+            match w.members.iter().find(|(id, _)| id.to_string() == *u) {
+                Some((id, level)) => reply(200, json!({"id": id, "access_level": level})),
+                None => reply(404, json!({"message": "404 Not found"})),
+            }
+        }
+        ("GET", ["protected_tags"]) => reply(200, w.protected_tags.clone()),
+        ("GET", ["repository", "tags", tag]) => {
+            match bare_git(
+                bare,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/tags/{tag}"),
+                ],
+            ) {
+                Some(oid) => reply(200, json!({"name": tag, "target": oid})),
+                None => reply(404, json!({"message": "404 Tag Not Found"})),
+            }
+        }
+        ("POST", ["repository", "tags"]) => {
+            let name = body["tag_name"].as_str().unwrap_or_default();
+            let full = format!("refs/tags/{name}");
+            if bare_git(bare, &["rev-parse", "--verify", "--quiet", &full]).is_some() {
+                return reply(
+                    400,
+                    json!({"message": format!("Tag {name} already exists")}),
+                );
+            }
+            let Some(commit) = bare_git(
+                bare,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{}^{{commit}}", body["ref"].as_str().unwrap_or_default()),
+                ],
+            ) else {
+                return reply(400, json!({"message": "Target is invalid"}));
+            };
+            let tagger = "release-bot <release-bot@example.com>";
+            let message = body["message"].as_str().unwrap_or_default();
+            let Some(object) = bare_tag_object(bare, name, &commit, tagger, message) else {
+                return reply(400, json!({"message": "Tag name invalid"}));
+            };
+            match bare_git(bare, &["update-ref", &full, &object, ""]) {
+                Some(_) => reply(
+                    201,
+                    json!({"name": name, "target": object, "message": message}),
+                ),
+                None => reply(
+                    400,
+                    json!({"message": format!("Tag {name} already exists")}),
+                ),
+            }
+        }
         ("GET", ["releases"]) => reply(
             200,
             Value::Array(w.releases.iter().map(|t| json!({"tag_name": t})).collect()),
@@ -1597,6 +1720,49 @@ fn github(
             }
         }
         ("GET", ["rules", "branches", _]) => reply(200, w.rules.clone()),
+        ("POST", ["git", "tags"]) => {
+            let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
+            let tagger = format!(
+                "{} <{}>",
+                text(&body["tagger"]["name"]),
+                text(&body["tagger"]["email"])
+            );
+            match bare_tag_object(
+                bare,
+                &text(&body["tag"]),
+                &text(&body["object"]),
+                &tagger,
+                &text(&body["message"]),
+            ) {
+                Some(sha) => reply(201, json!({"sha": sha})),
+                None => reply(422, json!({"message": "Validation Failed"})),
+            }
+        }
+        ("POST", ["git", "refs"]) => {
+            let full = body["ref"].as_str().unwrap_or_default();
+            let sha = body["sha"].as_str().unwrap_or_default();
+            match bare_git(bare, &["update-ref", full, sha, ""]) {
+                Some(_) => reply(201, json!({"ref": full, "object": {"sha": sha}})),
+                None => reply(422, json!({"message": "Reference already exists"})),
+            }
+        }
+        ("GET", ["git", "ref", "tags", tag]) => {
+            match bare_git(
+                bare,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/tags/{tag}"),
+                ],
+            ) {
+                Some(sha) => reply(
+                    200,
+                    json!({"ref": format!("refs/tags/{tag}"), "object": {"sha": sha}}),
+                ),
+                None => reply(404, json!({"message": "Not Found"})),
+            }
+        }
         ("GET", ["branches", b]) => reply(200, json!({"name": b, "protected": w.protected})),
         ("GET", ["branches", _, "protection"]) => match &w.protection {
             Ok(p) => reply(200, p.clone()),

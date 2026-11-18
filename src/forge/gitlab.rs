@@ -12,8 +12,9 @@ use url::Url;
 
 use super::http::{Auth, Client, Method};
 use super::{
-    Account, Failure, Forge, Kind, Location, Merge, MergeRequest, Pipeline, Queued, ReleaseLookup,
-    Review, Signal, State, assigns, endpoint, instant, pipeline_state, signal, text,
+    Account, Failure, Forge, Kind, Location, Merge, MergeRequest, NewTag, Pipeline, Queued,
+    ReleaseLookup, Review, Signal, State, TagAccess, TagCreation, assigns, endpoint, instant,
+    pipeline_state, signal, text,
 };
 
 /// The merge statuses of a merge request whose mergeability GitLab is still
@@ -42,6 +43,15 @@ const BLOCKING: [&str; 11] = [
     "security_policy_violations",
     "title_regex",
 ];
+
+/// The role creating a tag needs, and the lowest a group share or a group
+/// membership lets create a protected tag.
+const DEVELOPER: u64 = 30;
+/// The highest role of a member.
+const OWNER: u64 = 50;
+/// The access level of a protected tag rule for the instance's
+/// administrators.
+const ADMINISTRATOR: u64 = 60;
 
 /// The longest description GitLab takes.
 const DESCRIPTION_LIMIT: usize = 1_048_576;
@@ -78,6 +88,80 @@ impl GitLab {
 
     fn project(&self) -> Result<Value> {
         self.client.json(Method::Get, &self.url(&[], &[]), None)
+    }
+
+    /// A JSON answer, `None` for 404.
+    fn optional(&self, url: &Url) -> Result<Option<Value>> {
+        let reply = self.client.send(Method::Get, url, None)?;
+        match reply.status {
+            404 => Ok(None),
+            _ if reply.success() => Ok(Some(reply.json)),
+            status => {
+                Err(Failure::answered(status, self.client.refusal(Method::Get, url, &reply)).into())
+            }
+        }
+    }
+
+    /// Whether a project tag named `name` exists.
+    fn has_tag(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .optional(&self.url(&["repository", "tags", name], &[]))?
+            .is_some())
+    }
+
+    /// The token's account: why it may not create a tag, or its id, name
+    /// and whether it administers the instance.
+    fn token_account(&self) -> Result<std::result::Result<(u64, String, bool), String>> {
+        let variable = self.location.token_variable();
+        let url = endpoint(self.client.base(), &["personal_access_tokens", "self"], &[]);
+        let reply = self.client.send(Method::Get, &url, None)?;
+        if reply.status == 401 {
+            return Ok(Err(format!(
+                "GitLab does not accept the token in {variable}: {}",
+                crate::redact::redacted(&reply.message())
+            )));
+        }
+        if !reply.success() {
+            return Err(Failure::answered(
+                reply.status,
+                self.client.refusal(Method::Get, &url, &reply),
+            )
+            .into());
+        }
+        let token = reply.json;
+        if token.get("active").and_then(Value::as_bool) == Some(false)
+            || token.get("revoked").and_then(Value::as_bool) == Some(true)
+        {
+            return Ok(Err(format!(
+                "the token in {variable} is revoked or expired"
+            )));
+        }
+        let scopes: Vec<&str> = token
+            .get("scopes")
+            .and_then(Value::as_array)
+            .map(|list| list.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if !scopes.contains(&"api") {
+            return Ok(Err(format!(
+                "the token in {variable} has the scopes {}, and creating a tag through the API needs `api`",
+                if scopes.is_empty() {
+                    "none".to_string()
+                } else {
+                    scopes.join(", ")
+                }
+            )));
+        }
+        let user = self.client.json(
+            Method::Get,
+            &endpoint(self.client.base(), &["user"], &[]),
+            None,
+        )?;
+        let id = user
+            .get("id")
+            .and_then(Value::as_u64)
+            .context("GitLab answered with an account without an id")?;
+        let admin = user.get("is_admin").and_then(Value::as_bool) == Some(true);
+        Ok(Ok((id, text(&user, "username"), admin)))
     }
 
     fn single(&self, number: u64, query: &[(&str, &str)]) -> Result<Value> {
@@ -355,6 +439,116 @@ impl Forge for GitLab {
         }
     }
 
+    // An annotated tag, since it has a message; GitLab writes the token's
+    // account as its tagger, and starts the tag's pipeline as that account.
+    fn create_tag(&self, tag: &NewTag) -> Result<TagCreation> {
+        let url = self.url(&["repository", "tags"], &[]);
+        let body = json!({
+            "tag_name": tag.name,
+            "ref": tag.commit,
+            "message": tag.message,
+        });
+        let reply = self.client.send(Method::Post, &url, Some(&body))?;
+        if reply.success() {
+            return Ok(TagCreation::Created);
+        }
+        if self.has_tag(tag.name)? {
+            return Ok(TagCreation::Taken);
+        }
+        Err(Failure::answered(
+            reply.status,
+            self.client.refusal(Method::Post, &url, &reply),
+        )
+        .into())
+    }
+
+    fn tag_access(&self, name: &str) -> Result<TagAccess> {
+        let (user, username, admin) = match self.token_account()? {
+            Ok(account) => account,
+            Err(why) => return Ok(TagAccess::Denied(why)),
+        };
+        let account = format!("`{username}`");
+        let member = self.optional(&self.url(&["members", "all", &user.to_string()], &[]))?;
+        let level = member
+            .as_ref()
+            .and_then(|m| m.get("access_level"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if level < DEVELOPER && !admin {
+            return Ok(TagAccess::Denied(format!(
+                "the account {account} has the role {} in the project '{}', and creating a tag needs Developer \
+                 or higher",
+                role(level),
+                self.location.project
+            )));
+        }
+        let rules: Vec<Value> = self
+            .client
+            .list(&self.url(&["protected_tags"], &[]), "protected tags")?
+            .into_iter()
+            .filter(|rule| wildcard_match(&text(rule, "name"), name))
+            .collect();
+        if rules.is_empty() {
+            return Ok(TagAccess::Allowed {
+                account: Some(account),
+                unproven: None,
+            });
+        }
+        let mut shares = None;
+        let mut unknown = Vec::new();
+        for access in rules.iter().flat_map(|rule| {
+            rule.get("create_access_levels")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        }) {
+            let id = |key: &str| access.get(key).and_then(Value::as_u64);
+            let allowed = if let Some(named) = id("user_id") {
+                // GitLab also requires a user a rule names to be a member.
+                named == user && level > 0
+            } else if let Some(group) = id("group_id") {
+                match self.group_grant(&mut shares, group, user) {
+                    Ok(granted) => granted,
+                    Err(why) => {
+                        unknown.push(format!("group {group}: {why}"));
+                        false
+                    }
+                }
+            } else if id("deploy_key_id").is_some() {
+                false
+            } else {
+                match id("access_level").unwrap_or(0) {
+                    0 => false,
+                    ADMINISTRATOR => admin,
+                    required => level >= required,
+                }
+            };
+            if allowed {
+                return Ok(TagAccess::Allowed {
+                    account: Some(account),
+                    unproven: None,
+                });
+            }
+        }
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "cannot tell whether the account {account} may create the tag {name}, which a protected tag lets \
+                 members of a group create: {}",
+                unknown.join("; ")
+            );
+        }
+        let names: Vec<String> = rules
+            .iter()
+            .map(|rule| format!("`{}`", text(rule, "name")))
+            .collect();
+        Ok(TagAccess::Denied(format!(
+            "the account {account}, with the role {}, may not create the tag {name}, which the protected tag {} \
+             covers; let it create these tags, or raise its role",
+            role(level),
+            names.join(" and ")
+        )))
+    }
+
     fn with_pipeline(&self, number: u64) -> Result<(MergeRequest, Option<Pipeline>)> {
         let v = self.single(number, &[])?;
         Ok((merge_request(&v)?, head_pipeline(&v)))
@@ -498,6 +692,92 @@ impl Forge for GitLab {
     }
 }
 
+impl GitLab {
+    /// Whether a protected tag rule that names `group` lets `user` create
+    /// the tag, as GitLab decides it: the project is shared with exactly
+    /// that group with the Developer role or higher, and the user is a
+    /// member of the group itself, not through a group above it, with the
+    /// Developer role or higher. `Err` names what GitLab's answers leave
+    /// open.
+    fn group_grant(
+        &self,
+        shares: &mut Option<std::result::Result<Vec<(u64, u64)>, String>>,
+        group: u64,
+        user: u64,
+    ) -> std::result::Result<bool, String> {
+        let shares = shares.get_or_insert_with(|| {
+            let project = self.project().map_err(|err| format!("{err:#}"))?;
+            let list = project
+                .get("shared_with_groups")
+                .and_then(Value::as_array)
+                .ok_or("GitLab does not show the groups the project is shared with to the token")?;
+            Ok(list
+                .iter()
+                .filter_map(|s| {
+                    Some((
+                        s.get("group_id")?.as_u64()?,
+                        s.get("group_access_level")?.as_u64()?,
+                    ))
+                })
+                .collect())
+        });
+        let shares = shares.as_ref().map_err(String::clone)?;
+        let roles = DEVELOPER..=OWNER;
+        if !shares
+            .iter()
+            .any(|(id, level)| *id == group && roles.contains(level))
+        {
+            return Ok(false);
+        }
+        let url = endpoint(
+            self.client.base(),
+            &["groups", &group.to_string(), "members", &user.to_string()],
+            &[],
+        );
+        let member = self.optional(&url).map_err(|err| format!("{err:#}"))?;
+        Ok(member
+            .and_then(|m| m.get("access_level").and_then(Value::as_u64))
+            .is_some_and(|level| roles.contains(&level)))
+    }
+}
+
+/// A role by its access level, as GitLab names it.
+fn role(level: u64) -> String {
+    let name = match level {
+        0 => "none",
+        5 => "Minimal Access",
+        10 => "Guest",
+        15 => "Planner",
+        20 => "Reporter",
+        30 => "Developer",
+        40 => "Maintainer",
+        50 => "Owner",
+        _ => return format!("of access level {level}"),
+    };
+    format!("{name} ({level})")
+}
+
+/// Whether a protected tag's name or wildcard, in which `*` stands for any
+/// text, matches `tag`.
+fn wildcard_match(pattern: &str, tag: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or_default();
+    let Some(mut rest) = tag.strip_prefix(first) else {
+        return false;
+    };
+    let parts: Vec<&str> = parts.collect();
+    let Some((last, middle)) = parts.split_last() else {
+        return rest.is_empty();
+    };
+    for part in middle {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    rest.len() >= last.len() && rest.ends_with(last)
+}
+
 /// What a GitLab project's settings mean for an update's merge request.
 pub fn review(project: &Value) -> Review {
     let flag = |key: &str| project.get(key).and_then(Value::as_bool);
@@ -586,6 +866,22 @@ pub fn review(project: &Value) -> Review {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_tag_wildcards() {
+        for (pattern, tag, matches) in [
+            ("v*", "v1.2.3", true),
+            ("v*", "app-v1", false),
+            ("v1.2.3", "v1.2.3", true),
+            ("v1.2.3", "v1.2.30", false),
+            ("*-custom.*", "v0.11.1-custom.20261101.1", true),
+            ("v*.*", "v1", false),
+            ("*", "anything/at-all", true),
+            ("v*1*1", "v1", false),
+        ] {
+            assert_eq!(wildcard_match(pattern, tag), matches, "{pattern} {tag}");
+        }
+    }
 
     fn qualifying() -> Value {
         json!({

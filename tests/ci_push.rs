@@ -310,13 +310,23 @@ fn the_recipe_stops_with_git_s_own_message_when_git_refuses_the_checkout() {
 }
 
 #[test]
-fn both_pipelines_of_the_readme_push_through_the_recipe() {
+fn only_the_sync_pipeline_of_the_readme_pushes_through_the_recipe() {
+    // `release tag` creates its tag through the API and configures no git
+    // credential.
     assert_eq!(
         README
             .matches("- !reference [.push-with-token, script]")
             .count(),
-        2
+        1
     );
+    let release = README
+        .split_once("release-tag:\n")
+        .expect("the README shows the release-tag job")
+        .1
+        .split_once("\n\n")
+        .expect("the job ends with a blank line")
+        .0;
+    assert!(!release.contains(".push-with-token"), "{release}");
 }
 
 #[test]
